@@ -454,6 +454,147 @@ func TestSanitizeFTS(t *testing.T) {
 	}
 }
 
+// TestSearchMemories_EmbeddedQuotesNoError verifies that SearchMemories does not
+// return a SQL error when the query contains embedded double-quote characters.
+// Regression for: strings.Trim stripping only leading/trailing quotes left
+// interior quotes intact, causing FTS5 "unterminated string" errors.
+func TestSearchMemories_EmbeddedQuotesNoError(t *testing.T) {
+	s := openTempStore(t)
+
+	// Insert a row so there is something to search against.
+	_, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('sync-eq-1', 'sess1', 'memory', 'manual', 'embedded quote test', 'no special content', 'testproj', 'project', 'w1')
+	`)
+	if err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+
+	// These two inputs triggered "SQL logic error: unterminated string" before the fix.
+	problemInputs := []string{
+		`a"b`,
+		`foo" OR title:"bar`,
+	}
+	for _, q := range problemInputs {
+		_, err := s.SearchMemories(q, "testproj", 10)
+		if err != nil {
+			t.Errorf("SearchMemories(%q) returned unexpected error: %v", q, err)
+		}
+	}
+}
+
+// TestSearchMemories_EmbeddedQuoteMatchesCleanedTerms verifies that a query
+// whose terms contain embedded quotes still finds rows whose content matches
+// the cleaned (de-quoted) terms.
+func TestSearchMemories_EmbeddedQuoteMatchesCleanedTerms(t *testing.T) {
+	s := openTempStore(t)
+
+	_, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('sync-eq-2', 'sess1', 'memory', 'manual', 'hexagonal architecture', 'ports and adapters pattern', 'testproj', 'project', 'w1')
+	`)
+	if err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+
+	// `hex"agonal` cleans to `hexagonal`, which is in the title — must be found.
+	results, err := s.SearchMemories(`hex"agonal`, "testproj", 10)
+	if err != nil {
+		t.Fatalf("SearchMemories with embedded quote: %v", err)
+	}
+	found := false
+	for _, r := range results {
+		if r.SyncID == "sync-eq-2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("cleaned term 'hexagonal' (from 'hex\"agonal') should match the seeded row")
+	}
+}
+
+// TestSearchMemories_MultiWordNormalQuery verifies that a plain multi-word query
+// (no special characters) still works correctly after the sanitizeFTS change —
+// regression guard for existing behaviour.
+func TestSearchMemories_MultiWordNormalQuery(t *testing.T) {
+	s := openTempStore(t)
+
+	_, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('sync-mw-1', 'sess1', 'memory', 'manual', 'clean architecture principles', 'dependency inversion', 'testproj', 'project', 'w1')
+	`)
+	if err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+
+	// Normal multi-word query — must find the row and not error.
+	results, err := s.SearchMemories("clean architecture", "testproj", 10)
+	if err != nil {
+		t.Fatalf("SearchMemories multi-word: %v", err)
+	}
+	found := false
+	for _, r := range results {
+		if r.SyncID == "sync-mw-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("multi-word query 'clean architecture' should match seeded row")
+	}
+}
+
+// TestSearchMemories_OperatorLikeInputNeutralized verifies that FTS5 operator
+// keywords (OR, AND, title:) in the query do not get executed as operators —
+// they must be wrapped in quotes and treated as literal terms.
+func TestSearchMemories_OperatorLikeInputNeutralized(t *testing.T) {
+	s := openTempStore(t)
+
+	// Insert a row whose content contains the word "OR" literally.
+	_, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('sync-op-1', 'sess1', 'memory', 'manual', 'operator test', 'choose this OR that pattern', 'testproj', 'project', 'w1')
+	`)
+	if err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+
+	// These inputs would cause FTS5 operator errors if not sanitized.
+	operatorInputs := []string{
+		"OR",
+		"title:foo",
+		"foo OR bar",
+		"NOT memory",
+	}
+	for _, q := range operatorInputs {
+		_, err := s.SearchMemories(q, "testproj", 10)
+		if err != nil {
+			t.Errorf("SearchMemories(%q) with operator-like input should not error: %v", q, err)
+		}
+	}
+}
+
+// TestSanitizeFTS_InteriorQuotesStripped verifies that sanitizeFTS removes
+// interior double-quotes, not just leading/trailing ones.
+func TestSanitizeFTS_InteriorQuotesStripped(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{`a"b`, `"ab"`},                    // interior quote removed
+		{`foo" OR title:"bar`, `"foo" "OR" "title:bar"`}, // quotes from injection attempt removed
+		{`"already quoted"`, `"already" "quoted"`},      // outer quotes (existing behaviour)
+		{`a""b`, `"ab"`},                   // multiple interior quotes
+		{`"`, ``},                           // token that is only a quote — skipped
+		{`" "`, ``},                         // two all-quote tokens — both skipped
+	}
+	for _, tc := range cases {
+		got := sanitizeFTS(tc.input)
+		if got != tc.want {
+			t.Errorf("sanitizeFTS(%q) = %q; want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 // TestReader_FindBySyncID verifies the Reader port FindBySyncID implementation.
 func TestReader_FindBySyncID(t *testing.T) {
 	s := openTempStore(t)

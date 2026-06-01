@@ -175,14 +175,24 @@ func (s *Store) SearchMemories(query, project string, limit int) ([]*domain.Reco
 // sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars
 // or operator keywords. Port of old_code store.go:6227.
 // "fix auth bug" → `"fix" "auth" "bug"`
+//
+// Interior double-quotes are removed entirely (not just leading/trailing) before
+// re-wrapping, so a query like `a"b` or `foo" OR title:"bar` never produces an
+// unterminated FTS5 string literal. Tokens that become empty after cleaning are
+// skipped to avoid emitting bare `""` into the FTS expression.
 func sanitizeFTS(query string) string {
 	words := strings.Fields(query)
-	for i, w := range words {
-		// Strip existing quotes to avoid double-quoting.
-		w = strings.Trim(w, `"`)
-		words[i] = `"` + w + `"`
+	out := make([]string, 0, len(words))
+	for _, w := range words {
+		// Remove ALL double-quote characters (not just leading/trailing) to
+		// prevent interior quotes from producing unterminated FTS5 literals.
+		w = strings.ReplaceAll(w, `"`, "")
+		if w == "" {
+			continue // skip tokens that were entirely quote characters
+		}
+		out = append(out, `"`+w+`"`)
 	}
-	return strings.Join(words, " ")
+	return strings.Join(out, " ")
 }
 
 // ── scan helpers ──────────────────────────────────────────────────────────────
