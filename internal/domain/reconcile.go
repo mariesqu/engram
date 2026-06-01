@@ -56,7 +56,15 @@ func Decide(tx Reader, m Mutation) Decision {
 	switch m.Op {
 	case OpDelete:
 		// INV4: write tombstone atomically (adapter executes this).
-		return Decision{Action: ActionWriteTombstone, TargetSyncID: m.SyncID}
+		// Use the RESOLVED row's sync_id when a live row was found via FindByTopic
+		// (cross-writer convergence: the row may have been stored under a different
+		// sync_id Y than the incoming delete's sync_id Z). This mirrors the P1-a
+		// fix for ActionUpdate so the adapter always addresses the correct row.
+		target := m.SyncID
+		if cur != nil {
+			target = cur.SyncID
+		}
+		return Decision{Action: ActionWriteTombstone, TargetSyncID: target}
 
 	case OpUpsert:
 		if cur == nil {

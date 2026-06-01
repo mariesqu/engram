@@ -488,6 +488,149 @@ func TestINV4_TombstoneOnly_UpsertCreatesRow(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TestINV4_CrossWriterDelete_ConvergesToResolvedRow
+//
+// Scenario: machine-A writes topic T with sync_id "sync-Y" (writer-A).
+//           machine-C sends a DELETE for the same topic_key T but with a
+//           DIFFERENT sync_id "sync-Z" (writer-C — has never written this topic
+//           locally, but intends to delete it).
+//
+//   Decide resolves the live row via FindByTopic → cur.SyncID = "sync-Y".
+//   Decision must be Decision{Action: ActionWriteTombstone, TargetSyncID: "sync-Y"}.
+//   Apply must:
+//     • UPDATE memories SET deleted_at=... WHERE sync_id="sync-Y"  (NOT "sync-Z")
+//     • INSERT tombstone row with sync_id="sync-Y" + topic_key=T
+//
+// After apply:
+//   • Row "sync-Y" is soft-deleted (deleted_at IS NOT NULL)
+//   • FindByTopic returns nil (row is invisible to live lookups)
+//   • Tombstone exists for sync_id="sync-Y" AND for topic_key=T
+//   • No spurious row "sync-Z" is created in memories
+//
+// Before the fix, execWriteTombstone uses m.SyncID ("sync-Z") for the UPDATE →
+// 0 rows affected → row "sync-Y" stays VISIBLE. A spurious tombstone for "sync-Z"
+// is written, but the live topic row is never deleted.
+// ─────────────────────────────────────────────────────────────────────────────
+func TestINV4_CrossWriterDelete_ConvergesToResolvedRow(t *testing.T) {
+	s := openTempStore(t)
+	project, scope := "engram", "project"
+	topic := "sdd/test/cross-writer-delete"
+	syncY := "sync-Y"
+	syncZ := "sync-Z"
+
+	tWritten := baseT.Add(50 * time.Second)
+	tDeleted := baseT.Add(100 * time.Second)
+
+	// ── Seed A's live row (topic T, sync_id Y) ───────────────────────────────
+	tk := topic
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, title, content,
+		   project, scope, topic_key, version, seq, writer_id, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		syncY, "sess-A", "memory", "manual", "A title", "A content",
+		project, scope, topic, 1, 1, "writer-A",
+		tWritten.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		t.Fatalf("seed row Y: %v", err)
+	}
+
+	// ── Build DELETE mutation from writer-C with a different sync_id (Z) ─────
+	mutDel := domain.Mutation{
+		MutationID: "mut-del-cross",
+		Op:         domain.OpDelete,
+		SyncID:     syncZ,
+		SessionID:  "sess-C",
+		EntityType: domain.EntityMemory,
+		Project:    project,
+		Scope:      scope,
+		TopicKey:   &tk,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  tDeleted,
+		OccurredAt: tDeleted,
+		WriterID:   "writer-C",
+	}
+
+	// ── Decide ────────────────────────────────────────────────────────────────
+	d := domain.Decide(s, mutDel)
+	if d.Action != domain.ActionWriteTombstone {
+		t.Fatalf("Decide: want ActionWriteTombstone for cross-writer delete; got %v", d.Action)
+	}
+	// TargetSyncID must be the RESOLVED row's sync_id (Y), NOT the mutation's own sync_id (Z).
+	if d.TargetSyncID != syncY {
+		t.Fatalf("Decide: want TargetSyncID=%q (resolved row); got %q (should not be m.SyncID=%q)",
+			syncY, d.TargetSyncID, syncZ)
+	}
+
+	// ── Apply ─────────────────────────────────────────────────────────────────
+	if err := Apply(s.db, d, mutDel); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// ── Assertions ────────────────────────────────────────────────────────────
+
+	// 1. Row Y is soft-deleted (deleted_at IS NOT NULL).
+	var deletedAt sql.NullString
+	err = s.db.QueryRow(
+		`SELECT deleted_at FROM memories WHERE sync_id=?`, syncY,
+	).Scan(&deletedAt)
+	if err == sql.ErrNoRows {
+		t.Fatal("BUG: row Y disappeared entirely — expected soft-delete (deleted_at set)")
+	}
+	if err != nil {
+		t.Fatalf("query row Y deleted_at: %v", err)
+	}
+	if !deletedAt.Valid {
+		t.Error("BUG: row Y still has deleted_at=NULL after cross-writer delete — row stays VISIBLE (should be soft-deleted)")
+	}
+
+	// 2. FindByTopic returns nil (topic is invisible to live lookups).
+	rec, err := s.FindByTopic(topic, project, scope)
+	if err != nil {
+		t.Fatalf("FindByTopic after delete: %v", err)
+	}
+	if rec != nil {
+		t.Errorf("BUG: FindByTopic returned live record after delete (sync_id=%q); expected nil", rec.SyncID)
+	}
+
+	// 3. Tombstone covers the RESOLVED row Y (by sync_id=Y).
+	var tombSyncID string
+	err = s.db.QueryRow(
+		`SELECT sync_id FROM memory_tombstones WHERE sync_id=?`, syncY,
+	).Scan(&tombSyncID)
+	if err == sql.ErrNoRows {
+		t.Errorf("BUG: no tombstone found for sync_id=%q (should cover the resolved row Y)", syncY)
+	} else if err != nil {
+		t.Fatalf("query tombstone by sync_id Y: %v", err)
+	}
+
+	// 4. Tombstone is also findable by topic_key (covers the topic identity).
+	var tombByTopic sql.NullString
+	err = s.db.QueryRow(
+		`SELECT sync_id FROM memory_tombstones WHERE topic_key=? AND project=? AND scope=?`,
+		topic, project, scope,
+	).Scan(&tombByTopic)
+	if err == sql.ErrNoRows {
+		t.Errorf("BUG: no tombstone found for topic_key=%q (should cover the topic identity)", topic)
+	} else if err != nil {
+		t.Fatalf("query tombstone by topic_key: %v", err)
+	}
+
+	// 5. No spurious row Z created in memories.
+	var zCount int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memories WHERE sync_id=?`, syncZ,
+	).Scan(&zCount); err != nil {
+		t.Fatalf("count memories for sync_id Z: %v", err)
+	}
+	if zCount != 0 {
+		t.Errorf("spurious row created for m.SyncID=%q (DELETE should not insert a new row)", syncZ)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TestINV4_StaleUpsertAgainstTombstone_StaysDeleted (regression)
 //
 // A stale upsert (older than the tombstone) must still be blocked.

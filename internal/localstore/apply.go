@@ -54,7 +54,12 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 			err = execClearDeletedAt(tx, d.TargetSyncID)
 		}
 	case domain.ActionWriteTombstone:
-		err = execWriteTombstone(tx, m)
+		// P1-c fix: use d.TargetSyncID (the resolved row's sync_id, set by Decide)
+		// rather than m.SyncID. For same-writer deletes these are identical; for
+		// cross-writer deletes TargetSyncID is cur.SyncID (the row found via
+		// FindByTopic), ensuring the UPDATE and tombstone INSERT address the actual
+		// stored row and not a non-existent incoming sync_id.
+		err = execWriteTombstone(tx, d.TargetSyncID, m)
 	default:
 		err = fmt.Errorf("Apply: unknown action %d", d.Action)
 	}
@@ -163,24 +168,36 @@ func execClearTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) erro
 	return nil
 }
 
-func execWriteTombstone(tx *sql.Tx, m domain.Mutation) error {
+// execWriteTombstone soft-deletes the memories row identified by targetSyncID
+// and writes the corresponding tombstone row.
+//
+// targetSyncID is the RESOLVED row's sync_id from Decision.TargetSyncID.
+// For same-writer deletes this equals m.SyncID; for cross-writer deletes
+// (where FindByTopic resolved a different row Y) this is cur.SyncID (Y).
+// Using targetSyncID for BOTH the UPDATE and the tombstone INSERT ensures the
+// correct row is addressed and the tombstone covers the actual deleted identity.
+//
+// Metadata (project, scope, topic_key, version, writer_id) always comes from m
+// because the DELETE mutation carries the authoritative deletion context.
+func execWriteTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
 	now := m.UpdatedAt.UTC().Format(time.RFC3339Nano)
 
-	// Set deleted_at on the memories row.
+	// Set deleted_at on the resolved memories row.
 	_, err := tx.Exec(
 		`UPDATE memories SET deleted_at=?, version=?, writer_id=? WHERE sync_id=?`,
-		now, m.Version, m.WriterID, m.SyncID,
+		now, m.Version, m.WriterID, targetSyncID,
 	)
 	if err != nil {
 		return fmt.Errorf("execWriteTombstone: update memories: %w", err)
 	}
 
-	// Insert tombstone row (atomically in same tx).
+	// Insert tombstone row keyed by targetSyncID so FindTombstone by sync_id
+	// and by topic_key both resolve to the correct deleted identity.
 	_, err = tx.Exec(`
 		INSERT OR REPLACE INTO memory_tombstones
 		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
 		VALUES (?,?,?,?,?,?,?)`,
-		m.SyncID, m.Project, m.Scope, nullStr(m.TopicKey),
+		targetSyncID, m.Project, m.Scope, nullStr(m.TopicKey),
 		now, m.WriterID, m.Version,
 	)
 	if err != nil {
