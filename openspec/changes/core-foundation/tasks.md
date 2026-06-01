@@ -68,13 +68,13 @@ Chain strategy: pending
 > Spec traceable: reconciliation INV 1 (topic identity), INV 3 (no lost update), INV 5 (idempotent), INV 6 (independent writes).
 > All tests use in-process mock Reader/Writer — zero DB.
 
-- [ ] 4.1 Create `internal/domain/reconcile.go` — implement `Decide(tx domain.Reader, m domain.Mutation) domain.Action` and `writeWins(m domain.Mutation, curUpdatedAt time.Time, curVersion int, curSeq int64) bool` exactly per design pseudocode. No imports outside `domain` package.
-- [ ] 4.2 Create `internal/domain/mock_reader_test.go` — in-process `mockReader` backed by a `map[string]*Record` for topic and sync_id lookups, a tombstone map, and an applied-mutations set; implements `domain.Reader`.
-- [ ] 4.3 Write unit test `TestDecide_INV1_TopicIdentityConvergence` (`internal/domain/reconcile_test.go`): Writer A upserts topic_key="sdd/test/explore" at T+100; Writer B upserts same at T+50; apply B → NoOp; apply A → Update; assert exactly one record with A's content.
-- [ ] 4.4 Write unit test `TestDecide_INV3_NoLostUpdate`: seed record at version=2, updatedAt=T+100; apply mutation version=1, updatedAt=T+50 → assert NoOp; stored row unchanged.
-- [ ] 4.5 Write unit test `TestDecide_INV5_IdempotentReApply`: apply same mutation_id twice; assert second call returns NoOp; applied_mutations has exactly one entry; version unchanged.
-- [ ] 4.6 Write unit test `TestDecide_INV6_IndependentWrites`: Writer A and B each upsert distinct sync_ids with no topic_key; apply both; assert both records inserted; zero conflicts.
-- [ ] 4.7 Write unit test `TestWriteWins_Tiebreakers`: verify primary wall-clock wins; then equal timestamp, higher version wins; then equal timestamp+version, higher seq wins.
+- [x] 4.1 Create `internal/domain/reconcile.go` — implement `Decide(tx domain.Reader, m domain.Mutation) domain.Action` and `writeWins(m domain.Mutation, curUpdatedAt time.Time, curVersion int, curSeq int64) bool` exactly per design pseudocode. No imports outside `domain` package.
+- [x] 4.2 Create `internal/domain/mock_reader_test.go` — in-process `mockReader` backed by a `map[string]*Record` for topic and sync_id lookups, a tombstone map, and an applied-mutations set; implements `domain.Reader`.
+- [x] 4.3 Write unit test `TestDecide_INV1_TopicIdentityConvergence` (`internal/domain/reconcile_test.go`): Writer A upserts topic_key="sdd/test/explore" at T+100; Writer B upserts same at T+50; apply B → NoOp; apply A → Update; assert exactly one record with A's content.
+- [x] 4.4 Write unit test `TestDecide_INV3_NoLostUpdate`: seed record at version=2, updatedAt=T+100; apply mutation version=1, updatedAt=T+50 → assert NoOp; stored row unchanged.
+- [x] 4.5 Write unit test `TestDecide_INV5_IdempotentReApply`: apply same mutation_id twice; assert second call returns NoOp; applied_mutations has exactly one entry; version unchanged.
+- [x] 4.6 Write unit test `TestDecide_INV6_IndependentWrites`: Writer A and B each upsert distinct sync_ids with no topic_key; apply both; assert both records inserted; zero conflicts.
+- [x] 4.7 Write unit test `TestWriteWins_Tiebreakers`: verify primary wall-clock wins; then equal timestamp, higher version wins; then equal timestamp+version, higher seq wins.
 
 ---
 
