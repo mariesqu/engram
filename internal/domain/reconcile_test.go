@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -465,16 +464,15 @@ func TestDecide_TombstonedSyncIDBlocksStaleUpsert(t *testing.T) {
 	}
 }
 
-// TestDecide_TombstoneNewerWriteMaySupersede verifies that a write NEWER than
-// the tombstone is NOT blocked (the spec says "A write newer than the tombstone
-// MAY supersede it"). In this slice the pure Decide returns ActionInsert for
-// newer-than-tombstone so the adapter can handle supersede logic.
+// TestDecide_TombstoneNewerWriteMaySupersede verifies that a write strictly
+// NEWER than the tombstone (higher updated_at) is NOT blocked and results in
+// ActionInsert (the record was deleted, so there is no live row to update).
 func TestDecide_TombstoneNewerWriteMaySupersede(t *testing.T) {
 	syncID := "sync-supersede"
 	project, scope := "engram", "project"
 	r := newMockReader()
 
-	// Tombstone at T+100.
+	// Tombstone at T+100, version=1.
 	r.seedTombstone(&Tombstone{
 		SyncID:    syncID,
 		Project:   project,
@@ -484,17 +482,82 @@ func TestDecide_TombstoneNewerWriteMaySupersede(t *testing.T) {
 		Version:   1,
 	})
 
-	// Incoming upsert at T+150 — newer than tombstone.
+	// Incoming upsert at T+150 — strictly newer timestamp → must supersede.
 	mut := newUpsert(syncID, "mut-supersede", nil, project, scope, t150, 2, 5, "new content")
 	action := Decide(r, mut)
-	// Newer write must NOT be blocked — it should result in an Insert (record was deleted).
-	if action == NoOp {
-		t.Fatalf("INV4-readiness: write newer than tombstone must NOT be NoOp; got NoOp")
+	// Pinned: must be ActionInsert (record was deleted; no live row exists).
+	if action != ActionInsert {
+		t.Fatalf("INV4: write strictly newer than tombstone must return ActionInsert; got %v", action)
 	}
-	if !strings.Contains(action.String(), "Insert") {
-		// action.String() will be defined on reconcile.go; if not defined, this
-		// test catches the missing method. The key invariant is: action != NoOp.
-		// We do not mandate ActionInsert vs ActionUpdate here — just not blocked.
-		_ = action // silence unused-variable warning if String() not yet defined
-	}
+}
+
+// TestDecide_TombstoneTieBreak_SeqAuthority pins both directions of the
+// tombstone tie-break boundary where updated_at and version are EQUAL and seq
+// is the sole deciding factor (the final authoritative tiebreaker per INV4 spec).
+//
+// Current implementation: Decide() passes curSeq=0 when checking against a
+// tombstone (reconcile.go line ~42). This is intentional for PR2: the local
+// SQLite store does not assign Postgres BIGSERIAL seqs. The full wiring of
+// ts.Seq will be done in PR4 when the Postgres central store is live and
+// Tombstone.Seq is populated. These tests pin the boundary at the effective
+// current value (0) and document the required semantics for PR4.
+func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
+	project, scope := "engram", "project"
+	tombstoneTs := t100
+	tombstoneVersion := 1
+	// Effective tombstone seq seen by writeWins in this PR slice = 0
+	// (Decide passes 0 as curSeq for tombstone checks until PR4 wires ts.Seq).
+	const effectiveTombstoneSeq int64 = 0
+
+	// ── Direction 1: incoming seq > effective tombstone seq (0) → superseded ──
+	//
+	// writeWins(mut @ T+100 v=1 seq=1, curUpdatedAt=T+100, curVersion=1, curSeq=0)
+	// → timestamps equal → versions equal → 1 > 0 → true → ActionInsert
+	t.Run("higher_seq_supersedes_tombstone", func(t *testing.T) {
+		syncID := "sync-tiebreak-higher"
+		r := newMockReader()
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: tombstoneTs,
+			DeletedBy: "writer-A",
+			Version:   tombstoneVersion,
+		})
+
+		// seq=1 > effectiveTombstoneSeq(0) → writeWins returns true → ActionInsert
+		mut := newUpsert(syncID, "mut-tiebreak-higher", nil, project, scope,
+			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq+1, "revived content")
+		action := Decide(r, mut)
+		if action != ActionInsert {
+			t.Fatalf("INV4 tie-break: seq(%d) > effective tombstone seq(%d) must supersede → ActionInsert; got %v",
+				effectiveTombstoneSeq+1, effectiveTombstoneSeq, action)
+		}
+	})
+
+	// ── Direction 2: incoming seq == effective tombstone seq (0) → blocked ──
+	//
+	// writeWins(mut @ T+100 v=1 seq=0, curUpdatedAt=T+100, curVersion=1, curSeq=0)
+	// → timestamps equal → versions equal → 0 > 0 = false → NoOp
+	t.Run("equal_seq_blocked_by_tombstone", func(t *testing.T) {
+		syncID := "sync-tiebreak-equal"
+		r := newMockReader()
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: tombstoneTs,
+			DeletedBy: "writer-A",
+			Version:   tombstoneVersion,
+		})
+
+		// seq=0 == effectiveTombstoneSeq(0) → writeWins returns false → NoOp
+		mut := newUpsert(syncID, "mut-tiebreak-equal", nil, project, scope,
+			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq, "equal-seq content")
+		action := Decide(r, mut)
+		if action != NoOp {
+			t.Fatalf("INV4 tie-break: seq(%d) == effective tombstone seq(%d) must be blocked → NoOp; got %v",
+				effectiveTombstoneSeq, effectiveTombstoneSeq, action)
+		}
+	})
 }
