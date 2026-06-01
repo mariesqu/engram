@@ -54,7 +54,7 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 			err = execClearDeletedAt(tx, d.TargetSyncID)
 		}
 	case domain.ActionWriteTombstone:
-		// P1-c fix: use d.TargetSyncID (the resolved row's sync_id, set by Decide)
+		// P1-a fix (cross-writer delete case): use d.TargetSyncID (the resolved row's sync_id, set by Decide)
 		// rather than m.SyncID. For same-writer deletes these are identical; for
 		// cross-writer deletes TargetSyncID is cur.SyncID (the row found via
 		// FindByTopic), ensuring the UPDATE and tombstone INSERT address the actual
