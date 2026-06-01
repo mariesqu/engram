@@ -84,22 +84,49 @@ When the guard condition is not met, the central store MUST return the current r
 
 ### Requirement: No soft-delete resurrection — tombstone blocks upsert (Invariant 4)
 
-The system MUST maintain a `memory_tombstones` table recording `(sync_id, deleted_at, deleted_by)` for every deleted row. When processing an upsert for a given `sync_id`, the central store MUST check the tombstone table first. If a tombstone exists and `tombstone.deleted_at >= incoming.updated_at`, the upsert MUST be blocked. A tombstone MUST be written atomically with the soft-delete of the `memories` row.
+The system MUST maintain a `memory_tombstones` table recording `(sync_id, deleted_at, deleted_by, version, seq)` for every deleted row. When processing an upsert for a given `sync_id`, the central store MUST check the tombstone table first. A tombstone MUST be written atomically with the soft-delete of the `memories` row.
 
-#### Scenario: Delete followed by late-arriving update — delete wins
+**Tombstone supersede rule (precise — authoritative):**
 
-- GIVEN Writer A deletes a row (`sync_id = 'mem-42'`) at `updated_at = T+200` (tombstone written)
-- WHEN Writer B pushes an update for `sync_id = 'mem-42'` with `updated_at = T+150` (older)
-- THEN the central store checks the tombstone, finds `tombstone.deleted_at = T+200 >= T+150`
-- AND the upsert is blocked
+An incoming upsert supersedes an existing tombstone if and only if it wins the full three-level tiebreaker chain against the tombstone's `(deleted_at, version, seq)`:
+
+1. `incoming.updated_at > tombstone.deleted_at` — the incoming write is strictly newer (wall-clock). If so, the upsert MUST supersede (delete is revived).
+2. If timestamps are equal: `incoming.version > tombstone.version` — higher version wins. If so, the upsert MUST supersede.
+3. If timestamps and versions are both equal: `incoming.seq > tombstone.seq` — higher server-assigned seq is the FINAL authoritative tiebreaker. If `incoming.seq > tombstone.seq`, the upsert MUST supersede (delete is revived). If `incoming.seq <= tombstone.seq`, the upsert MUST be blocked (NoOp).
+
+This is identical to the `writeWins(incoming, tombstone.deleted_at, tombstone.version, tombstone.seq)` function used for live-record conflicts. The rule is consistent: `seq` is the server-authoritative tiebreaker in ALL conflict paths.
+
+**Block condition**: An upsert MUST be blocked (NoOp) when `writeWins` returns false against the tombstone — i.e., the incoming write does NOT win the chain above.
+
+#### Scenario: Delete followed by late-arriving update — delete wins (timestamp clear)
+
+- GIVEN Writer A deletes `sync_id = 'mem-42'` at `deleted_at = T+200, version = 2, seq = 10` (tombstone written)
+- WHEN Writer B pushes an update with `updated_at = T+150, version = 1, seq = 5`
+- THEN `writeWins(B, T+200, 2, 10)` returns false (`T+150 < T+200`)
+- AND the upsert MUST be blocked (NoOp)
 - AND after full sync both local stores show `mem-42` as deleted
 
-#### Scenario: Update newer than tombstone replaces deleted row
+#### Scenario: Update strictly newer than tombstone (timestamp) supersedes
 
-- GIVEN a tombstone exists for `sync_id = 'mem-99'` with `deleted_at = T+100`
-- WHEN a write arrives for the same sync_id with `updated_at = T+200` (newer)
-- THEN the tombstone is superseded, the row is undeleted and updated
-- AND `deleted_at` is cleared on the memories row
+- GIVEN a tombstone for `sync_id = 'mem-99'` at `deleted_at = T+100, version = 1, seq = 5`
+- WHEN a write arrives with `updated_at = T+200, version = 2, seq = 6`
+- THEN `writeWins(incoming, T+100, 1, 5)` returns true (`T+200 > T+100`)
+- AND the tombstone MUST be superseded, the row undeleted and updated
+- AND `deleted_at` MUST be cleared on the memories row
+
+#### Scenario: Equal timestamp and version — seq is the final tiebreaker (higher seq supersedes)
+
+- GIVEN a tombstone for `sync_id = 'mem-55'` at `deleted_at = T, version = 1, seq = S`
+- WHEN a write arrives with `updated_at = T` (equal), `version = 1` (equal), `seq = S+1` (higher)
+- THEN `writeWins(incoming, T, 1, S)` returns true (`S+1 > S`)
+- AND the tombstone MUST be superseded (delete is revived; action is Insert or Update, NOT NoOp)
+
+#### Scenario: Equal timestamp and version — lower seq is blocked
+
+- GIVEN a tombstone for `sync_id = 'mem-55'` at `deleted_at = T, version = 1, seq = S`
+- WHEN a write arrives with `updated_at = T` (equal), `version = 1` (equal), `seq = S-1` (lower)
+- THEN `writeWins(incoming, T, 1, S)` returns false (`S-1 < S`)
+- AND the upsert MUST be blocked (NoOp)
 
 #### Scenario: Tombstone written atomically with soft-delete
 
