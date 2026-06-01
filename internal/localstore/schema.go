@@ -33,8 +33,8 @@ const currentSchemaVersion = 2
 // of truth prevents the kind of drift that caused the original CORRUPT_VTAB bug:
 // ApplySchema had the fixed trigger while rebuildMemoriesTable still had the old one.
 
-// ftsvirtualTableDDL is the CREATE VIRTUAL TABLE statement for the FTS5 index.
-const ftsvirtualTableDDL = `CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+// ftsVirtualTableDDL is the CREATE VIRTUAL TABLE statement for the FTS5 index.
+const ftsVirtualTableDDL = `CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 	title,
 	content,
 	type,
@@ -199,7 +199,6 @@ func runMigrations(db *sql.DB) error {
 		ver = 2
 	}
 
-	_ = ver
 	return nil
 }
 
@@ -315,7 +314,8 @@ func migrateV1ToV2(db *sql.DB) error {
 	if _, err = tx.Exec(`PRAGMA user_version = 2`); err != nil {
 		return err
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
 // rebuildMemoriesTable performs the SQLite table-rebuild to drop the legacy FK:
@@ -393,7 +393,7 @@ func rebuildMemoriesTable(db *sql.DB) error {
 	//    and ApplySchema always produce the same trigger bodies — preventing the
 	//    drift that originally caused SQLITE_CORRUPT_VTAB (267).
 	ftsStmts := []string{
-		ftsvirtualTableDDL,
+		ftsVirtualTableDDL,
 		ftsTriggerInsert,
 		ftsTriggerDelete,
 		ftsTriggerUpdate,
@@ -457,7 +457,8 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		return err
 	}
 
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
 // rebuildMemoryRelationsTable performs the SQLite table-rebuild to drop the
@@ -510,7 +511,8 @@ func rebuildMemoryRelationsTable(db *sql.DB) error {
 		return err
 	}
 
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
@@ -583,7 +585,7 @@ func ApplySchema(db *sql.DB) error {
 		// index: we manage it manually via triggers.
 		// Using the shared constant ensures ApplySchema and rebuildMemoriesTable
 		// always produce the same virtual table definition.
-		ftsvirtualTableDDL,
+		ftsVirtualTableDDL,
 
 		// ── FTS maintenance triggers ─────────────────────────────────────────
 		// Using the shared constants ensures all code paths (fresh DB, v0→v1
