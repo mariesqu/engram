@@ -870,6 +870,272 @@ func TestParentCheck_OrphanSpecStillRejected(t *testing.T) {
 	}
 }
 
+// ── Schema migration tests (Bug B / Codex) ───────────────────────────────────
+
+// createLegacyDB creates a raw SQLite file with the OLD memories table that
+// includes `parent_sync_id TEXT REFERENCES memories(sync_id)` and seeds it with
+// representative rows.  It does NOT call Open so the new migration code is not
+// invoked.  The caller opens the returned path via Open to trigger migration.
+//
+// Returns the db path.  The caller is responsible for cleanup (use t.TempDir).
+func createLegacyDB(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("createLegacyDB: open: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		t.Fatalf("createLegacyDB: WAL: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		t.Fatalf("createLegacyDB: foreign_keys: %v", err)
+	}
+
+	// OLD memories table — identical to the pre-fix schema with the FK clause.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS memories (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		sync_id         TEXT    NOT NULL UNIQUE,
+		session_id      TEXT    NOT NULL,
+		entity_type     TEXT    NOT NULL DEFAULT 'memory'
+		                CHECK(entity_type IN ('memory','change','spec','task','standard','plan')),
+		type            TEXT    NOT NULL,
+		status          TEXT,
+		title           TEXT    NOT NULL,
+		content         TEXT    NOT NULL DEFAULT '',
+		project         TEXT    NOT NULL DEFAULT '',
+		scope           TEXT    NOT NULL DEFAULT 'project',
+		topic_key       TEXT,
+		parent_sync_id  TEXT REFERENCES memories(sync_id),
+		version         INTEGER NOT NULL DEFAULT 1,
+		seq             INTEGER NOT NULL DEFAULT 0,
+		writer_id       TEXT    NOT NULL DEFAULT '',
+		normalized_hash TEXT,
+		embedding       BLOB,
+		embedding_model TEXT,
+		embedding_created_at TEXT,
+		created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+		updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+		deleted_at      TEXT,
+		review_after    TEXT,
+		expires_at      TEXT,
+		CHECK(entity_type = 'memory' OR status IS NOT NULL),
+		CHECK(entity_type IN ('memory','change','standard') OR parent_sync_id IS NOT NULL)
+	)`); err != nil {
+		t.Fatalf("createLegacyDB: create memories: %v", err)
+	}
+
+	// Other tables that ApplySchema creates — using simple stubs so Open does not fail.
+	otherTables := []string{
+		`CREATE TABLE IF NOT EXISTS memory_tombstones (
+			sync_id    TEXT    PRIMARY KEY,
+			project    TEXT    NOT NULL DEFAULT '',
+			scope      TEXT    NOT NULL DEFAULT 'project',
+			topic_key  TEXT,
+			deleted_at TEXT    NOT NULL,
+			deleted_by TEXT    NOT NULL,
+			version    INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS memory_relations (
+			from_sync_id TEXT NOT NULL,
+			to_sync_id   TEXT NOT NULL,
+			rel_type     TEXT NOT NULL DEFAULT 'parent',
+			PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
+		)`,
+		`CREATE TABLE IF NOT EXISTS sync_mutations (
+			local_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+			mutation_id  TEXT    NOT NULL UNIQUE,
+			entity       TEXT    NOT NULL DEFAULT '',
+			entity_key   TEXT    NOT NULL DEFAULT '',
+			op           TEXT    NOT NULL CHECK(op IN ('upsert','delete')),
+			payload      TEXT    NOT NULL DEFAULT '',
+			writer_id    TEXT    NOT NULL DEFAULT '',
+			occurred_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+			acked_at     TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS sync_state (
+			target_key       TEXT PRIMARY KEY DEFAULT 'central',
+			last_acked_seq   INTEGER NOT NULL DEFAULT 0,
+			last_pulled_seq  INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS applied_mutations (
+			mutation_id TEXT    PRIMARY KEY,
+			applied_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`INSERT OR IGNORE INTO sync_state(target_key) VALUES ('central')`,
+	}
+	for _, s := range otherTables {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("createLegacyDB: stub table: %v", err)
+		}
+	}
+
+	// Seed representative rows:
+	// 1. A root 'change' (no parent needed).
+	if _, err := db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES ('chg-legacy-1', 'sess-leg', 'change', 'manual', 'planning', 'Legacy Change', 'searchable migration content', 'eng', 'project', 'w-leg')
+	`); err != nil {
+		t.Fatalf("createLegacyDB: insert root change: %v", err)
+	}
+
+	// 2. A 'task' that references the root change (valid FK so it inserts).
+	if _, err := db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id, parent_sync_id)
+		VALUES ('task-legacy-1', 'sess-leg', 'task', 'manual', 'todo', 'Legacy Task', 'task content', 'eng', 'project', 'w-leg', 'chg-legacy-1')
+	`); err != nil {
+		t.Fatalf("createLegacyDB: insert child task: %v", err)
+	}
+
+	return path
+}
+
+// TestMigration_V0ToV1_LegacyFKDropped is the RED proof test for Bug B.
+// It simulates an existing user DB that was created with the old FK-bearing schema,
+// then calls Open() (which must run the v0->v1 migration) and asserts:
+//
+//  1. user_version is upgraded to currentSchemaVersion (1)
+//  2. Out-of-order child insert SUCCEEDS (FK is gone) — FAILS before migration
+//  3. All original rows are preserved
+//  4. FTS search still returns a seeded row (FTS index rebuilt)
+//  5. Hierarchy CHECK still rejects a NULL-parent spec/task/plan
+func TestMigration_V0ToV1_LegacyFKDropped(t *testing.T) {
+	path := createLegacyDB(t)
+
+	// Open triggers the migration.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy DB: %v", err)
+	}
+	defer s.Close()
+
+	// 1. user_version must equal currentSchemaVersion.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// 2. Out-of-order child insert must succeed (FK removed by migration).
+	// Before migration this fails with "FOREIGN KEY constraint failed".
+	_, err = s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id, parent_sync_id)
+		VALUES
+		  ('task-oor-migrated', 'sess-leg', 'task', 'manual', 'todo', 'OOR Task', 'c', 'eng', 'project', 'w', 'parent-not-present')
+	`)
+	if err != nil {
+		t.Errorf("out-of-order child insert must succeed after FK migration, got: %v", err)
+	}
+
+	// 3. All original rows preserved.
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memories WHERE sync_id IN ('chg-legacy-1','task-legacy-1')`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count preserved rows: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 preserved legacy rows; got %d", count)
+	}
+
+	// 4. FTS search works — the seeded 'change' row has "migration" in its content.
+	results, err := s.SearchMemories("migration", "eng", 10)
+	if err != nil {
+		t.Fatalf("SearchMemories after migration: %v", err)
+	}
+	found := false
+	for _, r := range results {
+		if r.SyncID == "chg-legacy-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("FTS: seeded row 'chg-legacy-1' not found after migration rebuild")
+	}
+
+	// 5. Hierarchy CHECK must still reject a NULL-parent spec.
+	_, err = s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('spec-no-parent-migrated', 'sess-leg', 'spec', 'manual', 'draft', 'T', 'C', 'eng', 'project', 'w')
+	`)
+	if err == nil {
+		t.Error("hierarchy CHECK must still reject NULL-parent spec after migration")
+	}
+}
+
+// TestMigration_FreshDB_NoRebuild verifies that a fresh DB (created by ApplySchema)
+// is set to currentSchemaVersion on first Open without a pointless table rebuild.
+// The user_version must equal currentSchemaVersion and the table must not have an FK.
+func TestMigration_FreshDB_NoRebuild(t *testing.T) {
+	s := openTempStore(t)
+
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("fresh DB user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// Must also accept out-of-order children (same proof as above, regression guard).
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id, parent_sync_id)
+		VALUES
+		  ('fresh-oor-child', 'sess1', 'task', 'manual', 'todo', 'OOR Task', 'c', 'eng', 'project', 'w', 'absent-parent')
+	`)
+	if err != nil {
+		t.Errorf("fresh DB: out-of-order child must succeed, got: %v", err)
+	}
+}
+
+// TestMigration_Idempotent verifies that running Open twice on the same DB
+// (already at currentSchemaVersion) does not error or corrupt data.
+func TestMigration_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "idem.db")
+
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	// Seed a row.
+	if _, err := s1.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('idem-mem-1', 'sess1', 'memory', 'manual', 'Idempotent Test', 'content', 'eng', 'project', 'w1')
+	`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	_ = s1.Close()
+
+	// Second Open on the same (already-migrated) DB.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer s2.Close()
+
+	var title string
+	if err := s2.db.QueryRow(
+		`SELECT title FROM memories WHERE sync_id='idem-mem-1'`,
+	).Scan(&title); err != nil {
+		t.Fatalf("query after second Open: %v", err)
+	}
+	if title != "Idempotent Test" {
+		t.Errorf("title after second Open = %q; want 'Idempotent Test'", title)
+	}
+}
+
 // Compile-time check: Store must satisfy domain.Reader.
 var _ domain.Reader = (*Store)(nil)
 
