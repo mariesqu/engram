@@ -630,6 +630,441 @@ func TestINV4_CrossWriterDelete_ConvergesToResolvedRow(t *testing.T) {
 	}
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// STATE-SPACE HARDENING — cross-writer tombstone identity convergence.
+//
+// The tests below drive Decide→Apply against a real store across multi-step
+// cross-writer sequences and assert the two structural invariants directly:
+//
+//   INV-A: at most ONE live (deleted_at IS NULL) row per (topic_key,project,scope).
+//   INV-B: at most ONE tombstone row per topic identity (no duplicate tombstones).
+//
+// Helper assertions count rows so the proofs are unambiguous.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// countLiveRowsForTopic returns the number of live (deleted_at IS NULL) rows for
+// the given topic identity.
+func countLiveRowsForTopic(t *testing.T, s *Store, topic, project, scope string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memories
+		   WHERE topic_key=? AND project=? AND scope=? AND deleted_at IS NULL`,
+		topic, project, scope,
+	).Scan(&n); err != nil {
+		t.Fatalf("countLiveRowsForTopic: %v", err)
+	}
+	return n
+}
+
+// countRowsForTopic returns the total number of rows (live + soft-deleted) for the
+// given topic identity.
+func countRowsForTopic(t *testing.T, s *Store, topic, project, scope string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memories WHERE topic_key=? AND project=? AND scope=?`,
+		topic, project, scope,
+	).Scan(&n); err != nil {
+		t.Fatalf("countRowsForTopic: %v", err)
+	}
+	return n
+}
+
+// countTombstonesForTopic returns the number of tombstone rows that cover the
+// given topic identity (by topic_key).
+func countTombstonesForTopic(t *testing.T, s *Store, topic, project, scope string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memory_tombstones WHERE topic_key=? AND project=? AND scope=?`,
+		topic, project, scope,
+	).Scan(&n); err != nil {
+		t.Fatalf("countTombstonesForTopic: %v", err)
+	}
+	return n
+}
+
+// writeTopic seeds a fresh live row for a topic via Decide→Apply (OpUpsert).
+func writeTopic(t *testing.T, s *Store, mutID, syncID, topic, project, scope, content string, version int, seq int64, at time.Time) {
+	t.Helper()
+	tk := topic
+	m := domain.Mutation{
+		MutationID: mutID,
+		Op:         domain.OpUpsert,
+		SyncID:     syncID,
+		SessionID:  "sess",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "title",
+		Content:    content,
+		Project:    project,
+		Scope:      scope,
+		TopicKey:   &tk,
+		Version:    version,
+		Seq:        seq,
+		UpdatedAt:  at,
+		OccurredAt: at,
+		WriterID:   "writer-" + syncID,
+	}
+	d := domain.Decide(s, m)
+	if err := Apply(s.db, d, m); err != nil {
+		t.Fatalf("writeTopic(%s): Apply: %v", syncID, err)
+	}
+}
+
+// deleteTopic issues a cross-writer DELETE for a topic via Decide→Apply.
+func deleteTopic(t *testing.T, s *Store, mutID, syncID, topic, project, scope string, version int, seq int64, at time.Time) domain.Decision {
+	t.Helper()
+	tk := topic
+	m := domain.Mutation{
+		MutationID: mutID,
+		Op:         domain.OpDelete,
+		SyncID:     syncID,
+		SessionID:  "sess",
+		EntityType: domain.EntityMemory,
+		Project:    project,
+		Scope:      scope,
+		TopicKey:   &tk,
+		Version:    version,
+		Seq:        seq,
+		UpdatedAt:  at,
+		OccurredAt: at,
+		WriterID:   "writer-" + syncID,
+	}
+	d := domain.Decide(s, m)
+	if err := Apply(s.db, d, m); err != nil {
+		t.Fatalf("deleteTopic(%s): Apply: %v", syncID, err)
+	}
+	return d
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TestINV_CrossWriterReDelete_SingleTombstone (Codex confirmed bug — RED before)
+//
+// Sequence (three distinct writers, one topic):
+//   1. write topic T under sync_id Y  (writer-Y)
+//   2. delete T via sync_id Z         (writer-Z) → tombstones the canonical row Y
+//   3. delete T AGAIN via sync_id W   (writer-W) → must RE-tombstone the SAME
+//                                       identity Y, not mint a second tombstone.
+//
+// After the sequence:
+//   • exactly ONE tombstone covers topic T (INV-B) — keyed by Y.
+//   • zero live rows for T (INV-A).
+//
+// BEFORE THE FIX: step 3 has cur==nil (Y is soft-deleted, invisible to the
+// live-only FindByTopic; FindBySyncID(W) misses). The OpDelete branch then uses
+// target = m.SyncID = W and execWriteTombstone INSERTs a SECOND tombstone (PK W).
+// → TWO tombstones for topic T; FindTombstone-by-topic (LIMIT 1, no ORDER BY) is
+// then non-deterministic. This test asserts exactly 1 tombstone → RED before.
+// ─────────────────────────────────────────────────────────────────────────────
+func TestINV_CrossWriterReDelete_SingleTombstone(t *testing.T) {
+	s := openTempStore(t)
+	project, scope := "engram", "project"
+	topic := "sdd/test/cross-writer-redelete"
+
+	syncY, syncZ, syncW := "sync-Y", "sync-Z", "sync-W"
+	tWrite := baseT.Add(10 * time.Second)
+	tDel1 := baseT.Add(50 * time.Second)
+	tDel2 := baseT.Add(90 * time.Second)
+
+	// 1. write T under Y
+	writeTopic(t, s, "mut-write", syncY, topic, project, scope, "Y content", 1, 1, tWrite)
+
+	// 2. delete T via Z (cross-writer) → tombstones canonical row Y
+	deleteTopic(t, s, "mut-del-z", syncZ, topic, project, scope, 2, 2, tDel1)
+
+	// 3. delete T again via W (cross-writer) → must re-tombstone Y, not mint W
+	dW := deleteTopic(t, s, "mut-del-w", syncW, topic, project, scope, 3, 3, tDel2)
+
+	// Decide for the second delete must resolve to the existing identity Y.
+	if dW.Action != domain.ActionWriteTombstone {
+		t.Fatalf("re-delete: want ActionWriteTombstone; got %v", dW.Action)
+	}
+	if dW.TargetSyncID != syncY {
+		t.Errorf("re-delete: TargetSyncID = %q; want %q (reuse existing tombstone identity, not mint W)",
+			dW.TargetSyncID, syncY)
+	}
+
+	// INV-B: exactly ONE tombstone for the topic.
+	if got := countTombstonesForTopic(t, s, topic, project, scope); got != 1 {
+		t.Errorf("INV-B: tombstones for topic %q = %d; want exactly 1 (duplicate tombstone minted)", topic, got)
+	}
+
+	// The single tombstone must be keyed by Y (the canonical identity).
+	var tombSync string
+	if err := s.db.QueryRow(
+		`SELECT sync_id FROM memory_tombstones WHERE topic_key=? AND project=? AND scope=?`,
+		topic, project, scope,
+	).Scan(&tombSync); err != nil {
+		t.Fatalf("query tombstone sync_id: %v", err)
+	}
+	if tombSync != syncY {
+		t.Errorf("tombstone sync_id = %q; want %q (canonical identity)", tombSync, syncY)
+	}
+
+	// No spurious memories row for W or Z.
+	for _, sid := range []string{syncZ, syncW} {
+		var n int
+		if err := s.db.QueryRow(`SELECT count(*) FROM memories WHERE sync_id=?`, sid).Scan(&n); err != nil {
+			t.Fatalf("count memories for %s: %v", sid, err)
+		}
+		if n != 0 {
+			t.Errorf("spurious memories row for %q; want 0", sid)
+		}
+	}
+
+	// INV-A: zero live rows for the topic.
+	if got := countLiveRowsForTopic(t, s, topic, project, scope); got != 0 {
+		t.Errorf("INV-A: live rows for topic %q = %d; want 0 (all deletes)", topic, got)
+	}
+
+	// FindByTopic returns nil (topic invisible to live lookups).
+	if rec, err := s.FindByTopic(topic, project, scope); err != nil {
+		t.Fatalf("FindByTopic: %v", err)
+	} else if rec != nil {
+		t.Errorf("FindByTopic returned live record %q after re-delete; want nil", rec.SyncID)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TestINV_CrossWriterUpsertAfterDelete_RevivesCanonical (sibling — RED before)
+//
+// Sequence (one topic):
+//   1. write topic T under sync_id Y (writer-Y)
+//   2. delete T via Y               (tombstones Y; row Y soft-deleted)
+//   3. upsert T via sync_id X newer (writer-X) — supersedes the tombstone.
+//      Must REVIVE the canonical row Y in place — NOT insert a new row X that
+//      orphans the dead row Y.
+//
+// After step 3:
+//   • exactly ONE live row for T (INV-A), and it is sync_id Y (revived in place).
+//   • zero/cleared tombstones for T (INV-B).
+//   • total rows for T == 1 (no orphan dead row left behind).
+//
+// Then step 4 (the resurrection probe):
+//   4. a STALE topic-less upsert for sync_id Y arrives. Because Y was orphaned
+//      (dead row, no tombstone) in the buggy path, FindBySyncID(Y) would find the
+//      soft-deleted row and a winning write could revive it into a SECOND live
+//      row → INV1 violation. With the fix there is no orphan, so this must NOT
+//      create a second live row.
+//
+// BEFORE THE FIX: step 3 has cur==nil (Y soft-deleted, X never stored). The
+// OpUpsert branch returns ActionInsert{X, Undelete:true}; Apply INSERTs a new row
+// X and execClearTombstone (by topic_key) clears tombstone Y — leaving dead row Y
+// WITHOUT a tombstone. Two rows for T (X live, Y dead). This test asserts exactly
+// 1 total row for T → RED before.
+// ─────────────────────────────────────────────────────────────────────────────
+func TestINV_CrossWriterUpsertAfterDelete_RevivesCanonical(t *testing.T) {
+	s := openTempStore(t)
+	project, scope := "engram", "project"
+	topic := "sdd/test/upsert-after-delete"
+
+	syncY, syncX := "sync-Y", "sync-X"
+	tWrite := baseT.Add(10 * time.Second)
+	tDel := baseT.Add(50 * time.Second)
+	tRevive := baseT.Add(90 * time.Second)
+
+	// 1. write T under Y
+	writeTopic(t, s, "mut-write", syncY, topic, project, scope, "Y content", 1, 1, tWrite)
+
+	// 2. delete T via Y (same writer) → tombstone Y, row Y soft-deleted
+	deleteTopic(t, s, "mut-del", syncY, topic, project, scope, 2, 2, tDel)
+
+	// 3. upsert T via X (newer) → must revive canonical Y, not insert X
+	tk := topic
+	mutX := domain.Mutation{
+		MutationID: "mut-upsert-x",
+		Op:         domain.OpUpsert,
+		SyncID:     syncX,
+		SessionID:  "sess-X",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "X title",
+		Content:    "X content — supersedes tombstone",
+		Project:    project,
+		Scope:      scope,
+		TopicKey:   &tk,
+		Version:    3,
+		Seq:        5,
+		UpdatedAt:  tRevive,
+		OccurredAt: tRevive,
+		WriterID:   "writer-X",
+	}
+	dX := domain.Decide(s, mutX)
+	if !dX.Undelete {
+		t.Errorf("upsert-after-delete: want Undelete=true; got false")
+	}
+	// Must converge on the canonical identity Y (revive in place), not mint X.
+	if dX.TargetSyncID != syncY {
+		t.Errorf("upsert-after-delete: TargetSyncID = %q; want %q (revive canonical, not mint X)",
+			dX.TargetSyncID, syncY)
+	}
+	if err := Apply(s.db, dX, mutX); err != nil {
+		t.Fatalf("apply upsert X: %v", err)
+	}
+
+	// INV-A: exactly ONE live row for the topic.
+	if got := countLiveRowsForTopic(t, s, topic, project, scope); got != 1 {
+		t.Errorf("INV-A: live rows for topic %q = %d; want exactly 1", topic, got)
+	}
+	// Total rows for the topic == 1 (no orphan dead row left behind).
+	if got := countRowsForTopic(t, s, topic, project, scope); got != 1 {
+		t.Errorf("INV-A: total rows for topic %q = %d; want exactly 1 (orphan dead row left behind)", topic, got)
+	}
+	// The surviving live row is Y (revived in place) with X's content.
+	var liveSync, liveContent string
+	if err := s.db.QueryRow(
+		`SELECT sync_id, content FROM memories
+		   WHERE topic_key=? AND project=? AND scope=? AND deleted_at IS NULL`,
+		topic, project, scope,
+	).Scan(&liveSync, &liveContent); err != nil {
+		t.Fatalf("query live row: %v", err)
+	}
+	if liveSync != syncY {
+		t.Errorf("live row sync_id = %q; want %q (canonical revived in place)", liveSync, syncY)
+	}
+	if liveContent != mutX.Content {
+		t.Errorf("live row content = %q; want %q (newer write wins)", liveContent, mutX.Content)
+	}
+	// INV-B: tombstone for the topic is cleared.
+	if got := countTombstonesForTopic(t, s, topic, project, scope); got != 0 {
+		t.Errorf("INV-B: tombstones for topic %q = %d; want 0 (cleared on revive)", topic, got)
+	}
+	// No spurious row X.
+	var xCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM memories WHERE sync_id=?`, syncX).Scan(&xCount); err != nil {
+		t.Fatalf("count X rows: %v", err)
+	}
+	if xCount != 0 {
+		t.Errorf("spurious row for sync_id X = %d; want 0 (must revive Y, not insert X)", xCount)
+	}
+
+	// ── 4. Resurrection probe: stale topic-less upsert for orphaned Y ─────────
+	// In the buggy path Y was a dead row WITHOUT a tombstone; this stale write
+	// could revive it into a SECOND live row. With the fix Y is already the live
+	// canonical row, so a stale (older) write must be a NoOp and must not create
+	// a second live row.
+	staleMutY := domain.Mutation{
+		MutationID: "mut-stale-y",
+		Op:         domain.OpUpsert,
+		SyncID:     syncY, // no topic_key — keyed purely by sync_id
+		SessionID:  "sess-Y",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "stale Y",
+		Content:    "stale Y content",
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        1,
+		UpdatedAt:  tDel, // older than the revive — must lose
+		OccurredAt: tDel,
+		WriterID:   "writer-Y",
+	}
+	dStale := domain.Decide(s, staleMutY)
+	if err := Apply(s.db, dStale, staleMutY); err != nil {
+		t.Fatalf("apply stale Y: %v", err)
+	}
+	// Still exactly one live row for the topic (no resurrection of a second row).
+	if got := countLiveRowsForTopic(t, s, topic, project, scope); got != 1 {
+		t.Errorf("INV-A after stale probe: live rows for topic %q = %d; want exactly 1 (orphan Y revived into a 2nd live row)", topic, got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TestINV_PureTombstoneUpsert_CreatesSingleLiveRow
+//
+// Sequence:
+//   1. delete an UNKNOWN sync_id U for topic T (no memories row ever existed) →
+//      writes a pure tombstone (UPDATE hits 0 rows, tombstone INSERT runs).
+//   2. upsert that same identity (topic T, sync_id U) newer → supersedes the
+//      tombstone.
+//
+// After step 2:
+//   • exactly ONE live row for T (INV-A).
+//   • tombstone cleared (INV-B).
+//
+// This is the pure-tombstone branch: cur==nil AND no row exists for ts.SyncID, so
+// the only correct outcome is ActionInsert{U, Undelete:true} with the stale
+// tombstone cleared. (Distinct from the revive case where a soft-deleted row for
+// ts.SyncID exists.)
+// ─────────────────────────────────────────────────────────────────────────────
+func TestINV_PureTombstoneUpsert_CreatesSingleLiveRow(t *testing.T) {
+	s := openTempStore(t)
+	project, scope := "engram", "project"
+	topic := "sdd/test/pure-tombstone-upsert"
+	syncU := "sync-U"
+
+	tDel := baseT.Add(50 * time.Second)
+	tRevive := baseT.Add(90 * time.Second)
+
+	// 1. delete an unknown sync_id → pure tombstone (no memories row).
+	deleteTopic(t, s, "mut-del-u", syncU, topic, project, scope, 1, 1, tDel)
+
+	// Confirm precondition: tombstone exists, no memories row.
+	if got := countTombstonesForTopic(t, s, topic, project, scope); got != 1 {
+		t.Fatalf("precondition: tombstones for topic = %d; want 1", got)
+	}
+	if got := countRowsForTopic(t, s, topic, project, scope); got != 0 {
+		t.Fatalf("precondition: memories rows for topic = %d; want 0 (pure tombstone)", got)
+	}
+
+	// 2. upsert that identity newer → supersede tombstone, create the row.
+	tk := topic
+	mutU := domain.Mutation{
+		MutationID: "mut-upsert-u",
+		Op:         domain.OpUpsert,
+		SyncID:     syncU,
+		SessionID:  "sess",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "U title",
+		Content:    "U content — created from pure tombstone",
+		Project:    project,
+		Scope:      scope,
+		TopicKey:   &tk,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  tRevive,
+		OccurredAt: tRevive,
+		WriterID:   "writer-U",
+	}
+	dU := domain.Decide(s, mutU)
+	if dU.Action != domain.ActionInsert {
+		t.Fatalf("pure-tombstone upsert: want ActionInsert; got %v", dU.Action)
+	}
+	if !dU.Undelete {
+		t.Errorf("pure-tombstone upsert: want Undelete=true; got false")
+	}
+	if dU.TargetSyncID != syncU {
+		t.Errorf("pure-tombstone upsert: TargetSyncID = %q; want %q", dU.TargetSyncID, syncU)
+	}
+	if err := Apply(s.db, dU, mutU); err != nil {
+		t.Fatalf("apply upsert U: %v", err)
+	}
+
+	// INV-A: exactly one live row.
+	if got := countLiveRowsForTopic(t, s, topic, project, scope); got != 1 {
+		t.Errorf("INV-A: live rows for topic %q = %d; want exactly 1", topic, got)
+	}
+	// INV-B: tombstone cleared.
+	if got := countTombstonesForTopic(t, s, topic, project, scope); got != 0 {
+		t.Errorf("INV-B: tombstones for topic %q = %d; want 0 (cleared)", topic, got)
+	}
+	// FindByTopic returns the live record.
+	rec, err := s.FindByTopic(topic, project, scope)
+	if err != nil {
+		t.Fatalf("FindByTopic: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("FindByTopic returned nil; want live record")
+	}
+	if rec.Content != mutU.Content {
+		t.Errorf("live record content = %q; want %q", rec.Content, mutU.Content)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TestINV4_StaleUpsertAgainstTombstone_StaysDeleted (regression)
 //

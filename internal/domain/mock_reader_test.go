@@ -35,6 +35,16 @@ func (m *mockReader) seedRecord(r *Record) {
 	}
 }
 
+// seedSyncOnlyRecord inserts r ONLY into the sync_id map, NOT into byTopic.
+// This faithfully models a SOFT-DELETED canonical row in the real store: the
+// real FindByTopic is live-only (skips deleted rows) while FindBySyncID returns
+// any row including soft-deleted ones. Used to exercise the cross-writer
+// convergence branch where cur resolves to nil via topic but a deleted row still
+// exists under a different sync_id.
+func (m *mockReader) seedSyncOnlyRecord(r *Record) {
+	m.bySyncID[r.SyncID] = r
+}
+
 // seedTombstone inserts ts into the tombstone map.
 func (m *mockReader) seedTombstone(ts *Tombstone) {
 	// Index by sync_id (primary) and topic key if present.

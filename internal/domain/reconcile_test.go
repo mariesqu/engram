@@ -501,6 +501,123 @@ func TestDecide_TombstoneNewerWriteMaySupersede(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────────────────────
+// Cross-writer convergence (state-space hardening)
+//
+// When a topic's canonical row is soft-deleted under sync_id Y and a new mutation
+// arrives under a DIFFERENT sync_id X, Decide() must recover the canonical
+// identity Y from the tombstone instead of minting X. These pure-decision tests
+// model the real store: the soft-deleted row is reachable only via FindBySyncID
+// (live-only FindByTopic skips it), and a topic-keyed tombstone exists under Y.
+// ─────────────────────────────────────────────
+
+// TestDecide_CrossWriterReDelete_ReusesTombstoneIdentity pins Codex's confirmed
+// bug at the pure-decision layer: a second cross-writer delete (sync_id W) of a
+// topic whose canonical row was already soft-deleted under Y must RE-tombstone Y,
+// not mint a new tombstone under W. cur==nil (Y invisible to live FindByTopic,
+// W never stored) but a topic tombstone under Y exists.
+func TestDecide_CrossWriterReDelete_ReusesTombstoneIdentity(t *testing.T) {
+	project, scope := "engram", "project"
+	tk := strPtr("sdd/test/cross-redelete")
+	syncY, syncW := "sync-Y", "sync-W"
+
+	r := newMockReader()
+	// Canonical row already soft-deleted under Y: reachable via sync_id only.
+	r.seedSyncOnlyRecord(&Record{
+		SyncID: syncY, TopicKey: tk, Project: project, Scope: scope,
+		Version: 2, Seq: 2, UpdatedAt: t50, DeletedAt: &t50,
+		Content: "Y content", EntityType: EntityMemory, Type: "manual", Title: "test",
+		WriterID: "writer-Y",
+	})
+	// Tombstone for the topic identity, keyed under Y.
+	r.seedTombstone(&Tombstone{
+		SyncID: syncY, TopicKey: tk, Project: project, Scope: scope,
+		DeletedAt: t50, DeletedBy: "writer-Y", Version: 2,
+	})
+
+	// Second delete arrives under a DIFFERENT writer's sync_id W.
+	mutDelW := Mutation{
+		MutationID: "mut-del-w", Op: OpDelete, SyncID: syncW,
+		Project: project, Scope: scope, TopicKey: tk,
+		Version: 3, Seq: 3, UpdatedAt: t100, WriterID: "writer-W",
+	}
+	d := Decide(r, mutDelW)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("re-delete: want ActionWriteTombstone; got %v", d.Action)
+	}
+	if d.TargetSyncID != syncY {
+		t.Errorf("re-delete: TargetSyncID = %q; want %q (reuse existing tombstone identity, not mint W)",
+			d.TargetSyncID, syncY)
+	}
+}
+
+// TestDecide_CrossWriterUpsertAfterDelete_RevivesCanonical pins the sibling at
+// the pure-decision layer: a superseding upsert under sync_id X of a topic whose
+// canonical row was soft-deleted under Y must REVIVE Y in place (ActionUpdate,
+// TargetSyncID=Y, Undelete=true), NOT insert a new row X that orphans the dead
+// row Y. cur==nil; a soft-deleted row for Y exists; the tombstone is superseded.
+func TestDecide_CrossWriterUpsertAfterDelete_RevivesCanonical(t *testing.T) {
+	project, scope := "engram", "project"
+	tk := strPtr("sdd/test/cross-upsert-after-delete")
+	syncY, syncX := "sync-Y", "sync-X"
+
+	r := newMockReader()
+	// Canonical row soft-deleted under Y, reachable via sync_id only.
+	r.seedSyncOnlyRecord(&Record{
+		SyncID: syncY, TopicKey: tk, Project: project, Scope: scope,
+		Version: 2, Seq: 2, UpdatedAt: t50, DeletedAt: &t50,
+		Content: "Y content", EntityType: EntityMemory, Type: "manual", Title: "test",
+		WriterID: "writer-Y",
+	})
+	r.seedTombstone(&Tombstone{
+		SyncID: syncY, TopicKey: tk, Project: project, Scope: scope,
+		DeletedAt: t50, DeletedBy: "writer-Y", Version: 2,
+	})
+
+	// Newer upsert under a DIFFERENT writer's sync_id X — supersedes the tombstone.
+	mutX := newUpsert(syncX, "mut-upsert-x", tk, project, scope, t100, 3, 5, "X content")
+	d := Decide(r, mutX)
+	if d.Action != ActionUpdate {
+		t.Fatalf("upsert-after-delete: want ActionUpdate (revive canonical); got %v", d.Action)
+	}
+	if d.TargetSyncID != syncY {
+		t.Errorf("upsert-after-delete: TargetSyncID = %q; want %q (revive canonical, not mint X)",
+			d.TargetSyncID, syncY)
+	}
+	if !d.Undelete {
+		t.Errorf("upsert-after-delete: want Undelete=true; got false")
+	}
+}
+
+// TestDecide_PureTombstoneUpsert_InsertsOwnIdentity pins the pure-tombstone
+// branch: when cur==nil and NO row exists for the tombstone's sync_id (the
+// tombstone covers an identity that was never materialized), a superseding upsert
+// must ActionInsert its OWN sync_id with Undelete=true (clear the stale tombstone).
+func TestDecide_PureTombstoneUpsert_InsertsOwnIdentity(t *testing.T) {
+	project, scope := "engram", "project"
+	tk := strPtr("sdd/test/pure-tombstone")
+	syncU := "sync-U"
+
+	r := newMockReader()
+	// Tombstone exists for the topic identity under U, but NO memories row.
+	r.seedTombstone(&Tombstone{
+		SyncID: syncU, TopicKey: tk, Project: project, Scope: scope,
+		DeletedAt: t50, DeletedBy: "writer-U", Version: 1,
+	})
+
+	mutU := newUpsert(syncU, "mut-upsert-u", tk, project, scope, t100, 2, 5, "U content")
+	d := Decide(r, mutU)
+	if d.Action != ActionInsert {
+		t.Fatalf("pure-tombstone upsert: want ActionInsert; got %v", d.Action)
+	}
+	if d.TargetSyncID != syncU {
+		t.Errorf("pure-tombstone upsert: TargetSyncID = %q; want %q", d.TargetSyncID, syncU)
+	}
+	if !d.Undelete {
+		t.Errorf("pure-tombstone upsert: want Undelete=true; got false")
+	}
+}
+
 // TestDecide_TombstoneTieBreak_SeqAuthority pins both directions of the
 // tombstone tie-break boundary where updated_at and version are EQUAL and seq
 // is the sole deciding factor (the final authoritative tiebreaker per INV4 spec).
