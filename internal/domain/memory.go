@@ -131,10 +131,13 @@ type Decision struct {
 
 	// TargetSyncID is the sync_id of the row the adapter must operate on.
 	//
-	//   ActionUpdate   → the resolved row's sync_id (may differ from m.SyncID when
-	//                    resolved via FindByTopic, i.e. cross-writer topic convergence).
-	//   ActionInsert   → m.SyncID (the incoming record's own identity).
-	//   ActionWriteTombstone / NoOp → m.SyncID (informational; adapter uses m.SyncID directly).
+	//   ActionUpdate         → the resolved row's sync_id (may differ from m.SyncID when
+	//                         resolved via FindByTopic, i.e. cross-writer topic convergence).
+	//   ActionInsert         → m.SyncID (the incoming record's own identity).
+	//   ActionWriteTombstone → the resolved row's sync_id (may differ from m.SyncID for
+	//                         cross-writer deletes resolved via topic_key; adapter MUST use
+	//                         TargetSyncID, not m.SyncID, in the tombstone write).
+	//   NoOp                 → m.SyncID (informational; adapter uses m.SyncID directly).
 	TargetSyncID string
 
 	// Undelete signals that the adapter must reverse a prior soft-delete:
