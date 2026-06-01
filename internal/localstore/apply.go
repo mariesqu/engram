@@ -39,13 +39,13 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 
 	switch d.Action {
 	case domain.ActionInsert:
-		if d.Undelete {
-			// The record already exists as a soft-deleted row (tombstone superseded).
-			// Update it in-place and clear deleted_at rather than inserting a duplicate.
-			err = execUndeleteUpdate(tx, d.TargetSyncID, m)
-		} else {
-			err = execInsert(tx, m)
-		}
+		// Decide returns ActionInsert only when cur == nil — no memories row exists.
+		// This includes the tombstone-only state (a tombstone exists but the memories
+		// row was never written or was already purged). In that state,
+		// execUndeleteUpdate would UPDATE 0 rows and silently drop the write.
+		// We always INSERT here; the execClearTombstone block below removes any
+		// stale tombstone, leaving the new row live and fully visible.
+		err = execInsert(tx, m)
 	case domain.ActionUpdate:
 		// P1-a fix: use d.TargetSyncID (the resolved row) — not m.SyncID.
 		err = execUpdate(tx, d.TargetSyncID, m)
@@ -101,27 +101,6 @@ func execInsert(tx *sql.Tx, m domain.Mutation) error {
 	)
 	if err != nil {
 		return fmt.Errorf("execInsert: %w", err)
-	}
-	return nil
-}
-
-// execUndeleteUpdate handles the Undelete+ActionInsert path: the record
-// already exists as a soft-deleted row (a tombstone was superseded). We UPDATE
-// it in place — restoring its content and clearing deleted_at — rather than
-// INSERTing a duplicate that would violate the UNIQUE(sync_id) constraint.
-func execUndeleteUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
-	_, err := tx.Exec(`
-		UPDATE memories
-		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
-		    version=?, seq=?, writer_id=?, updated_at=?, deleted_at=NULL
-		WHERE sync_id=?`,
-		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
-		m.Version, m.Seq, m.WriterID,
-		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		targetSyncID,
-	)
-	if err != nil {
-		return fmt.Errorf("execUndeleteUpdate: %w", err)
 	}
 	return nil
 }

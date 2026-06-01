@@ -343,6 +343,151 @@ func TestApply_NormalSameSyncIDUpdate_StillWorks(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TestINV4_TombstoneOnly_UpsertCreatesRow (Bug A)
+//
+// Scenario: a DELETE mutation arrives for a sync_id that has NO memories row
+// (this can happen when execWriteTombstone runs on a sync_id that was never in
+// the local store — the UPDATE hits 0 rows but the tombstone INSERT always runs).
+// State: memory_tombstones has a row for sync_id; memories has NO row.
+//
+// A strictly-newer UPSERT for that same sync_id then arrives through Decide→Apply.
+//
+//   Decide should return Decision{Action: ActionInsert, Undelete: true}
+//     (cur == nil because no memories row exists; tombstoneSuperseded == true).
+//   Apply must:
+//     • INSERT the new memories row (NOT update 0 rows)
+//     • DELETE the memory_tombstones row (tombstone cleared)
+//
+// After apply:
+//   • memories row EXISTS with the new content (deleted_at IS NULL)
+//   • memory_tombstones row is GONE
+//   • FindBySyncID and FindByTopic return the live record
+//
+// Before the fix, execUndeleteUpdate runs an UPDATE on a non-existent row →
+// 0 rows updated → the INSERT is silently dropped while the tombstone is cleared.
+// ─────────────────────────────────────────────────────────────────────────────
+func TestINV4_TombstoneOnly_UpsertCreatesRow(t *testing.T) {
+	s := openTempStore(t)
+	project, scope := "engram", "project"
+	syncID := "sync-tombonly"
+	topic := "sdd/test/tombstone-only"
+
+	tDeleted := baseT.Add(50 * time.Second)
+	tRevived := baseT.Add(100 * time.Second)
+	deletedAtStr := tDeleted.UTC().Format(time.RFC3339Nano)
+
+	// ── Seed ONLY the tombstone row — no memories row exists ─────────────────
+	tk := topic
+	_, err := s.db.Exec(`
+		INSERT INTO memory_tombstones
+		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
+		VALUES (?,?,?,?,?,?,?)`,
+		syncID, project, scope, topic, deletedAtStr, "writer-A", 1,
+	)
+	if err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+
+	// Confirm no memories row exists for this sync_id.
+	var memCount int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memories WHERE sync_id=?`, syncID,
+	).Scan(&memCount); err != nil {
+		t.Fatalf("count memories before: %v", err)
+	}
+	if memCount != 0 {
+		t.Fatalf("precondition: expected 0 memories rows, got %d", memCount)
+	}
+
+	// ── Build the superseding mutation (strictly newer) ───────────────────────
+	mut := domain.Mutation{
+		MutationID: "mut-tombonly-revive",
+		Op:         domain.OpUpsert,
+		SyncID:     syncID,
+		SessionID:  "sess-B",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "TombstoneOnly Revived",
+		Content:    "Created from tombstone-only state",
+		Project:    project,
+		Scope:      scope,
+		TopicKey:   &tk,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  tRevived,
+		OccurredAt: tRevived,
+		WriterID:   "writer-B",
+	}
+
+	// ── Decide ────────────────────────────────────────────────────────────────
+	d := domain.Decide(s, mut)
+	if d.Action != domain.ActionInsert {
+		t.Fatalf("Decide: want ActionInsert (cur==nil); got %v", d.Action)
+	}
+	if !d.Undelete {
+		t.Errorf("Decide: want Undelete=true (tombstone superseded); got false")
+	}
+
+	// ── Apply ─────────────────────────────────────────────────────────────────
+	if err := Apply(s.db, d, mut); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// ── Assertions ────────────────────────────────────────────────────────────
+
+	// 1. memories row EXISTS and is LIVE (deleted_at IS NULL).
+	var deletedAt sql.NullString
+	var content string
+	err = s.db.QueryRow(
+		`SELECT deleted_at, content FROM memories WHERE sync_id=?`, syncID,
+	).Scan(&deletedAt, &content)
+	if err == sql.ErrNoRows {
+		t.Fatal("BUG A: memories row does not exist after ActionInsert+Undelete (write was lost)")
+	}
+	if err != nil {
+		t.Fatalf("query memories after apply: %v", err)
+	}
+	if deletedAt.Valid {
+		t.Errorf("BUG A: row still has deleted_at=%q after apply; expected NULL", deletedAt.String)
+	}
+	if content != mut.Content {
+		t.Errorf("BUG A: row content = %q; want %q", content, mut.Content)
+	}
+
+	// 2. Tombstone row is GONE.
+	var tombCount int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memory_tombstones WHERE sync_id=?`, syncID,
+	).Scan(&tombCount); err != nil {
+		t.Fatalf("count tombstones: %v", err)
+	}
+	if tombCount != 0 {
+		t.Errorf("BUG A: tombstone row still exists after apply; expected 0 rows")
+	}
+
+	// 3. FindBySyncID returns the live record.
+	rec, err := s.FindBySyncID(syncID)
+	if err != nil {
+		t.Fatalf("FindBySyncID after apply: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("BUG A: FindBySyncID returned nil after ActionInsert+Undelete")
+	}
+	if rec.Content != mut.Content {
+		t.Errorf("BUG A: FindBySyncID content = %q; want %q", rec.Content, mut.Content)
+	}
+
+	// 4. FindByTopic also returns it.
+	rec2, err := s.FindByTopic(topic, project, scope)
+	if err != nil {
+		t.Fatalf("FindByTopic after apply: %v", err)
+	}
+	if rec2 == nil {
+		t.Fatal("BUG A: FindByTopic returned nil after ActionInsert+Undelete")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TestINV4_StaleUpsertAgainstTombstone_StaysDeleted (regression)
 //
 // A stale upsert (older than the tombstone) must still be blocked.
