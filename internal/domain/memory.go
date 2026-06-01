@@ -1,0 +1,117 @@
+// Package domain contains the pure core types and invariants for engram.
+// No I/O, no database — only types and interfaces.
+package domain
+
+import "time"
+
+// EntityType discriminates rows in the polymorphic memories table.
+type EntityType string
+
+const (
+	EntityMemory   EntityType = "memory"
+	EntityChange   EntityType = "change"
+	EntitySpec     EntityType = "spec"
+	EntityTask     EntityType = "task"
+	EntityStandard EntityType = "standard"
+	EntityPlan     EntityType = "plan"
+)
+
+// ValidEntityType reports whether et is a recognised EntityType.
+func ValidEntityType(et EntityType) bool {
+	switch et {
+	case EntityMemory, EntityChange, EntitySpec, EntityTask, EntityStandard, EntityPlan:
+		return true
+	}
+	return false
+}
+
+// Record is the in-memory representation of a row in the memories table.
+// All fields match the column set defined in the local-store schema.
+type Record struct {
+	// Required
+	SyncID    string     `db:"sync_id"`
+	SessionID string     `db:"session_id"`
+	EntityType EntityType `db:"entity_type"`
+	Type      string     `db:"type"`
+	Title     string     `db:"title"`
+	Content   string     `db:"content"`
+	Project   string     `db:"project"`
+	Scope     string     `db:"scope"`
+	Version   int        `db:"version"`
+	Seq       int64      `db:"seq"`
+	WriterID  string     `db:"writer_id"`
+	CreatedAt time.Time  `db:"created_at"`
+	UpdatedAt time.Time  `db:"updated_at"`
+
+	// Optional
+	TopicKey      *string    `db:"topic_key"`
+	Status        *string    `db:"status"`
+	ParentSyncID  *string    `db:"parent_sync_id"`
+	ReviewAfter   *time.Time `db:"review_after"`
+	ExpiresAt     *time.Time `db:"expires_at"`
+	DeletedAt     *time.Time `db:"deleted_at"`
+	NormalizedHash *string   `db:"normalized_hash"`
+
+	// Reserved — never populated in this change
+	Embedding      []byte  `db:"embedding"`
+	EmbeddingModel *string `db:"embedding_model"`
+	EmbeddingCreatedAt *time.Time `db:"embedding_created_at"`
+}
+
+// Tombstone records a soft-delete so resurrection is blocked (Invariant 4).
+type Tombstone struct {
+	SyncID    string    `db:"sync_id"`
+	Project   string    `db:"project"`
+	Scope     string    `db:"scope"`
+	TopicKey  *string   `db:"topic_key"`
+	DeletedAt time.Time `db:"deleted_at"`
+	DeletedBy string    `db:"deleted_by"` // writer_id
+	Version   int       `db:"version"`
+}
+
+// Op is the mutation operation type.
+type Op string
+
+const (
+	OpUpsert Op = "upsert"
+	OpDelete Op = "delete"
+)
+
+// Mutation is the unit of work carried by the push/pull cycle.
+// MutationID is content-addressed (SHA-256 of canonical payload).
+type Mutation struct {
+	MutationID string
+	Op         Op
+	SyncID     string
+	SessionID  string
+	EntityType EntityType
+	Type       string
+	Title      string
+	Content    string
+	Project    string
+	Scope      string
+	TopicKey   *string
+	ParentSyncID *string
+	Status     *string
+	Version    int
+	Seq        int64
+	UpdatedAt  time.Time
+	OccurredAt time.Time
+	WriterID   string
+	// Payload is the canonical JSON encoding used for MutationID derivation.
+	Payload []byte
+}
+
+// Action is the decision returned by Decide() — what the adapter must execute.
+type Action int
+
+const (
+	// NoOp — nothing to do; the stored state is already correct.
+	NoOp Action = iota
+	// ActionInsert — the record does not exist; insert it.
+	ActionInsert
+	// ActionUpdate — the record exists and the incoming write wins; update it.
+	ActionUpdate
+	// ActionWriteTombstone — incoming op is Delete; write tombstone + set deleted_at.
+	ActionWriteTombstone
+)
