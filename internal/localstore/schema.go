@@ -143,8 +143,12 @@ func migrateV0ToV1(db *sql.DB) error {
 //     d. Drop FTS virtual table + triggers (they reference the old rowid mapping).
 //     e. Recreate FTS virtual table + triggers via the shared DDL statements.
 //     f. Rebuild FTS index from the copied rows.
-//     g. Recreate indexes that reference memories.
-//     h. Drop memories_old.
+//     g. DROP INDEX IF EXISTS for all four idx_mem_* names — necessary because
+//        ALTER TABLE RENAME preserves index names on memories_old, so
+//        CREATE INDEX IF NOT EXISTS would silently no-op (name already exists).
+//        Dropping the names first lets the CREATE INDEX run against the new table.
+//     h. Recreate indexes on the new memories table.
+//     i. Drop memories_old (this also drops any indexes that survived on it).
 //  3. `PRAGMA foreign_keys = ON`.
 //
 // All steps inside one transaction: if any step fails, the rename is rolled back
@@ -283,7 +287,30 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		return err
 	}
 
-	// g. Recreate indexes.
+	// g. Drop old index names before recreating.
+	//
+	// After ALTER TABLE RENAME, SQLite preserves each existing index name and
+	// keeps it pointing at memories_old.  The subsequent CREATE INDEX IF NOT
+	// EXISTS statements would silently no-op because the names already exist —
+	// leaving the new memories table with zero indexes.  DROP INDEX IF EXISTS
+	// frees the names so the CREATE INDEX statements run against the new table.
+	//
+	// Note: memories_old still exists at this point; its rowid mapping is about
+	// to be destroyed by DROP TABLE memories_old in step (i).  Dropping the
+	// index names here is safe because we no longer need them on memories_old.
+	dropIdxStmts := []string{
+		`DROP INDEX IF EXISTS idx_mem_topic`,
+		`DROP INDEX IF EXISTS idx_mem_parent`,
+		`DROP INDEX IF EXISTS idx_mem_entity_status`,
+		`DROP INDEX IF EXISTS idx_mem_deleted`,
+	}
+	for _, s := range dropIdxStmts {
+		if _, err = tx.Exec(s); err != nil {
+			return err
+		}
+	}
+
+	// h. Recreate indexes on the new memories table.
 	idxStmts := []string{
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic
 			ON memories(topic_key, project, scope, updated_at DESC)
@@ -303,7 +330,7 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		}
 	}
 
-	// h. Drop the old table.
+	// i. Drop the old table (and any residual indexes on it).
 	if _, err = tx.Exec(`DROP TABLE memories_old`); err != nil {
 		return err
 	}

@@ -1136,6 +1136,47 @@ func TestMigration_Idempotent(t *testing.T) {
 	}
 }
 
+// TestMigration_V0ToV1_IndexesRebuiltOnNewTable is the RED proof test for Bug A.
+// After migrating a legacy DB, all four indexes that were defined on the original
+// memories table must exist on the NEW memories table — not be lost when
+// memories_old is dropped.
+//
+// Bug: ALTER TABLE memories RENAME TO memories_old preserves the existing
+// idx_mem_* index names pointing at memories_old. The subsequent
+// CREATE INDEX IF NOT EXISTS ... statements silently no-op (name already exists),
+// so after DROP TABLE memories_old the new memories has zero indexes.
+//
+// Fix: explicitly DROP INDEX IF EXISTS idx_mem_* before recreating them so the
+// CREATE INDEX statements run against the new table.
+func TestMigration_V0ToV1_IndexesRebuiltOnNewTable(t *testing.T) {
+	path := createLegacyDB(t)
+
+	// Open triggers the v0→v1 migration.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy DB: %v", err)
+	}
+	defer s.Close()
+
+	// Assert all four expected indexes are present on memories (not memories_old).
+	expectedIndexes := []string{
+		"idx_mem_topic",
+		"idx_mem_parent",
+		"idx_mem_entity_status",
+		"idx_mem_deleted",
+	}
+	for _, idx := range expectedIndexes {
+		var name string
+		err := s.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=? AND tbl_name='memories'`,
+			idx,
+		).Scan(&name)
+		if err != nil {
+			t.Errorf("index %q missing on memories after v0→v1 migration: %v", idx, err)
+		}
+	}
+}
+
 // Compile-time check: Store must satisfy domain.Reader.
 var _ domain.Reader = (*Store)(nil)
 
