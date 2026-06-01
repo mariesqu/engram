@@ -102,7 +102,7 @@ type Mutation struct {
 	Payload []byte
 }
 
-// Action is the decision returned by Decide() — what the adapter must execute.
+// Action is the low-level operation the adapter must execute.
 type Action int
 
 const (
@@ -115,3 +115,36 @@ const (
 	// ActionWriteTombstone — incoming op is Delete; write tombstone + set deleted_at.
 	ActionWriteTombstone
 )
+
+// Decision is the enriched result returned by Decide(). It carries the Action
+// plus the additional context the adapter needs to execute it correctly.
+//
+// The bare Action alone is insufficient when:
+//   - ActionUpdate is resolved via topic_key: the stored row's sync_id (TargetSyncID)
+//     may differ from the incoming mutation's SyncID.  The adapter MUST use
+//     TargetSyncID in the WHERE clause, not m.SyncID.
+//   - A write supersedes a tombstone: the adapter MUST clear deleted_at on the
+//     memories row AND delete the memory_tombstones entry (Undelete = true).
+type Decision struct {
+	// Action is the operation to execute.
+	Action Action
+
+	// TargetSyncID is the sync_id of the row the adapter must operate on.
+	//
+	//   ActionUpdate   → the resolved row's sync_id (may differ from m.SyncID when
+	//                    resolved via FindByTopic, i.e. cross-writer topic convergence).
+	//   ActionInsert   → m.SyncID (the incoming record's own identity).
+	//   ActionWriteTombstone / NoOp → m.SyncID (informational; adapter uses m.SyncID directly).
+	TargetSyncID string
+
+	// Undelete signals that the adapter must reverse a prior soft-delete:
+	//   • SET deleted_at = NULL on the memories row identified by TargetSyncID.
+	//   • DELETE FROM memory_tombstones WHERE sync_id = TargetSyncID (and by
+	//     topic_key/project/scope when applicable).
+	//
+	// True when:
+	//   ActionUpdate — the resolved row (TargetSyncID) currently has deleted_at set.
+	//   ActionInsert — a tombstone for the incoming sync_id (or topic) was superseded
+	//                  and must be cleared before the record becomes live again.
+	Undelete bool
+}

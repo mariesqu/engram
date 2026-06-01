@@ -13,7 +13,7 @@ package domain
 
 import "time"
 
-// Decide examines the current state via tx and returns the Action the adapter
+// Decide examines the current state via tx and returns a Decision the adapter
 // must execute. It is a pure function: same inputs always produce same output.
 //
 // Call sequence per design pseudocode:
@@ -22,10 +22,16 @@ import "time"
 //  3. INV6 — fall back to sync_id lookup (no-topic writes keyed by sync_id).
 //  4. INV4 — check tombstone before allowing upsert.
 //  5. Dispatch on Op.
-func Decide(tx Reader, m Mutation) Action {
+//
+// The returned Decision carries TargetSyncID (the row the adapter must address,
+// which may differ from m.SyncID when resolved via topic_key) and Undelete
+// (true when the adapter must clear deleted_at and remove the tombstone row).
+func Decide(tx Reader, m Mutation) Decision {
+	noop := Decision{Action: NoOp, TargetSyncID: m.SyncID}
+
 	// INV5: idempotent re-apply guard.
 	if applied, err := tx.MutationApplied(m.MutationID); err == nil && applied {
-		return NoOp
+		return noop
 	}
 
 	// INV1 / INV6: resolve current record.
@@ -38,32 +44,48 @@ func Decide(tx Reader, m Mutation) Action {
 	}
 
 	// INV4: tombstone check — must happen BEFORE processing an upsert.
+	tombstoneSuperseded := false
 	if ts, err := tx.FindTombstone(m.SyncID, m.TopicKey, m.Project, m.Scope); err == nil && ts != nil {
 		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, 0) {
-			return NoOp // tombstoned and the incoming write is not newer
+			return noop // tombstoned and the incoming write is not newer
 		}
-		// If writeWins against the tombstone, fall through to the upsert path below.
-		// The adapter is responsible for clearing the tombstone on supersede.
+		// writeWins against the tombstone: adapter must clear it on supersede.
+		tombstoneSuperseded = true
 	}
 
 	switch m.Op {
 	case OpDelete:
 		// INV4: write tombstone atomically (adapter executes this).
-		return ActionWriteTombstone
+		return Decision{Action: ActionWriteTombstone, TargetSyncID: m.SyncID}
 
 	case OpUpsert:
 		if cur == nil {
 			// INV1, INV6: first write for this identity — insert.
-			return ActionInsert
+			// Undelete is true when a tombstone for this identity was superseded
+			// (the record was soft-deleted; adapter must clear it to make it live).
+			return Decision{
+				Action:       ActionInsert,
+				TargetSyncID: m.SyncID,
+				Undelete:     tombstoneSuperseded,
+			}
 		}
 		// INV3: version-guarded LWW — newer write wins.
 		if writeWins(m, cur.UpdatedAt, cur.Version, cur.Seq) {
-			return ActionUpdate // INV1: update converges to one row
+			// INV1: update converges to one row.
+			// TargetSyncID is the RESOLVED row's sync_id (may differ from m.SyncID
+			// when resolved via FindByTopic — the P1-a convergence fix).
+			// Undelete is true when the resolved row is currently soft-deleted OR
+			// a tombstone for this identity was superseded.
+			return Decision{
+				Action:       ActionUpdate,
+				TargetSyncID: cur.SyncID,
+				Undelete:     tombstoneSuperseded || (cur.DeletedAt != nil),
+			}
 		}
-		return NoOp // INV3: older write discarded
+		return noop // INV3: older write discarded
 
 	default:
-		return NoOp
+		return noop
 	}
 }
 

@@ -67,9 +67,9 @@ func TestDecide_INV1_TopicIdentityConvergence(t *testing.T) {
 	r := newMockReader()
 
 	// ── Apply B first (empty store → must Insert) ──
-	actionB := Decide(r, mutB)
-	if actionB != ActionInsert {
-		t.Fatalf("INV1: first upsert (B) must Insert; got %v", actionB)
+	decisionB := Decide(r, mutB)
+	if decisionB.Action != ActionInsert {
+		t.Fatalf("INV1: first upsert (B) must Insert; got %v", decisionB.Action)
 	}
 
 	// Simulate the adapter having executed Insert(mutB) — seed B's record.
@@ -91,9 +91,14 @@ func TestDecide_INV1_TopicIdentityConvergence(t *testing.T) {
 	r.markApplied(mutB.MutationID)
 
 	// ── Apply A (A is newer → must Update the existing record) ──
-	actionA := Decide(r, mutA)
-	if actionA != ActionUpdate {
-		t.Fatalf("INV1: newer upsert (A) must Update; got %v", actionA)
+	decisionA := Decide(r, mutA)
+	if decisionA.Action != ActionUpdate {
+		t.Fatalf("INV1: newer upsert (A) must Update; got %v", decisionA.Action)
+	}
+	// TargetSyncID must be the RESOLVED row's sync_id (syncB, not syncA).
+	// This is the P1-a convergence invariant: the adapter must update syncB's row.
+	if decisionA.TargetSyncID != syncB {
+		t.Fatalf("INV1: TargetSyncID must be resolved row %q; got %q", syncB, decisionA.TargetSyncID)
 	}
 
 	// INV1 guarantee: only ONE record should exist for this topic_key after
@@ -130,9 +135,9 @@ func TestDecide_INV1_OlderUpsertIsNoOp(t *testing.T) {
 
 	// Apply B (older) — must be NoOp.
 	mutB := newUpsert("sync-B", "mut-B", tk, project, scope, t50, 1, 1, "B's content")
-	action := Decide(r, mutB)
-	if action != NoOp {
-		t.Fatalf("INV1: older upsert (B) must be NoOp; got %v", action)
+	decision := Decide(r, mutB)
+	if decision.Action != NoOp {
+		t.Fatalf("INV1: older upsert (B) must be NoOp; got %v", decision.Action)
 	}
 }
 
@@ -164,9 +169,9 @@ func TestDecide_INV3_NoLostUpdate(t *testing.T) {
 
 	// Incoming mutation: v=1, T+50 — older in every dimension.
 	older := newUpsert(syncID, "mut-old", nil, project, scope, t50, 1, 3, "older content")
-	action := Decide(r, older)
-	if action != NoOp {
-		t.Fatalf("INV3: older write must be NoOp; got %v", action)
+	decision := Decide(r, older)
+	if decision.Action != NoOp {
+		t.Fatalf("INV3: older write must be NoOp; got %v", decision.Action)
 	}
 }
 
@@ -194,9 +199,9 @@ func TestDecide_INV3_NewerWriteWins(t *testing.T) {
 
 	// Incoming mutation: v=2, T+100 — newer.
 	newer := newUpsert(syncID, "mut-new", nil, project, scope, t100, 2, 2, "new content")
-	action := Decide(r, newer)
-	if action != ActionUpdate {
-		t.Fatalf("INV3: newer write must Update; got %v", action)
+	decision := Decide(r, newer)
+	if decision.Action != ActionUpdate {
+		t.Fatalf("INV3: newer write must Update; got %v", decision.Action)
 	}
 }
 
@@ -217,8 +222,8 @@ func TestDecide_INV5_IdempotentReApply(t *testing.T) {
 
 	// First apply — store is empty, must Insert.
 	first := Decide(r, mut)
-	if first != ActionInsert {
-		t.Fatalf("INV5: first apply must Insert; got %v", first)
+	if first.Action != ActionInsert {
+		t.Fatalf("INV5: first apply must Insert; got %v", first.Action)
 	}
 
 	// Simulate adapter executed the Insert and recorded the mutation.
@@ -239,8 +244,8 @@ func TestDecide_INV5_IdempotentReApply(t *testing.T) {
 
 	// Second apply — same mutation_id → must be NoOp regardless of state.
 	second := Decide(r, mut)
-	if second != NoOp {
-		t.Fatalf("INV5: re-apply of same mutation_id must be NoOp; got %v", second)
+	if second.Action != NoOp {
+		t.Fatalf("INV5: re-apply of same mutation_id must be NoOp; got %v", second.Action)
 	}
 }
 
@@ -255,10 +260,10 @@ func TestDecide_INV5_DifferentMutationIDNotIdempotent(t *testing.T) {
 
 	// Second mutation has a distinct ID — must not be blocked.
 	mut2 := newUpsert(syncID, "mut-second", nil, project, scope, t100, 1, 1, "content")
-	action := Decide(r, mut2)
+	decision := Decide(r, mut2)
 	// Empty store → should Insert (not NoOp because mut-second is not in applied set).
-	if action != ActionInsert {
-		t.Fatalf("INV5: different mutation_id must be processed; got %v", action)
+	if decision.Action != ActionInsert {
+		t.Fatalf("INV5: different mutation_id must be processed; got %v", decision.Action)
 	}
 }
 
@@ -276,14 +281,14 @@ func TestDecide_INV6_IndependentWritesPreserved(t *testing.T) {
 	mutA := newUpsert("sync-indep-A", "mut-indep-A", nil, project, scope, t100, 1, 1, "A content")
 	mutB := newUpsert("sync-indep-B", "mut-indep-B", nil, project, scope, t100, 1, 2, "B content")
 
-	actionA := Decide(r, mutA)
-	if actionA != ActionInsert {
-		t.Fatalf("INV6: independent write A must Insert; got %v", actionA)
+	decisionA := Decide(r, mutA)
+	if decisionA.Action != ActionInsert {
+		t.Fatalf("INV6: independent write A must Insert; got %v", decisionA.Action)
 	}
 
-	actionB := Decide(r, mutB)
-	if actionB != ActionInsert {
-		t.Fatalf("INV6: independent write B must Insert; got %v", actionB)
+	decisionB := Decide(r, mutB)
+	if decisionB.Action != ActionInsert {
+		t.Fatalf("INV6: independent write B must Insert; got %v", decisionB.Action)
 	}
 }
 
@@ -300,9 +305,9 @@ func TestDecide_INV6_IndependentTopicKeysNeverConflict(t *testing.T) {
 	mutB := newUpsert("sync-tk-B", "mut-tk-B", tkB, project, scope, t100, 1, 2, "B")
 
 	for _, m := range []Mutation{mutA, mutB} {
-		act := Decide(r, m)
-		if act != ActionInsert {
-			t.Fatalf("INV6: distinct topic_key write must Insert; got %v for %s", act, m.SyncID)
+		d := Decide(r, m)
+		if d.Action != ActionInsert {
+			t.Fatalf("INV6: distinct topic_key write must Insert; got %v for %s", d.Action, m.SyncID)
 		}
 	}
 }
@@ -432,9 +437,9 @@ func TestDecide_DeleteWritesTombstone(t *testing.T) {
 		UpdatedAt:  t100,
 		WriterID:   "writer-A",
 	}
-	action := Decide(r, mut)
-	if action != ActionWriteTombstone {
-		t.Fatalf("Delete op must return ActionWriteTombstone; got %v", action)
+	decision := Decide(r, mut)
+	if decision.Action != ActionWriteTombstone {
+		t.Fatalf("Delete op must return ActionWriteTombstone; got %v", decision.Action)
 	}
 }
 
@@ -458,9 +463,9 @@ func TestDecide_TombstonedSyncIDBlocksStaleUpsert(t *testing.T) {
 
 	// Incoming upsert at T+150 — older than the tombstone → must be blocked.
 	mut := newUpsert(syncID, "mut-stale", nil, project, scope, t150, 1, 1, "content")
-	action := Decide(r, mut)
-	if action != NoOp {
-		t.Fatalf("INV4-readiness: stale upsert after tombstone must be NoOp; got %v", action)
+	decision := Decide(r, mut)
+	if decision.Action != NoOp {
+		t.Fatalf("INV4-readiness: stale upsert after tombstone must be NoOp; got %v", decision.Action)
 	}
 }
 
@@ -484,10 +489,15 @@ func TestDecide_TombstoneNewerWriteMaySupersede(t *testing.T) {
 
 	// Incoming upsert at T+150 — strictly newer timestamp → must supersede.
 	mut := newUpsert(syncID, "mut-supersede", nil, project, scope, t150, 2, 5, "new content")
-	action := Decide(r, mut)
-	// Pinned: must be ActionInsert (record was deleted; no live row exists).
-	if action != ActionInsert {
-		t.Fatalf("INV4: write strictly newer than tombstone must return ActionInsert; got %v", action)
+	decision := Decide(r, mut)
+	// Pinned: must be ActionInsert (record was deleted; no live row exists via FindBySyncID
+	// since FindBySyncID returns ANY row including soft-deleted, but there is no live cur).
+	if decision.Action != ActionInsert {
+		t.Fatalf("INV4: write strictly newer than tombstone must return ActionInsert; got %v", decision.Action)
+	}
+	// Undelete must be true so the adapter clears the tombstone.
+	if !decision.Undelete {
+		t.Errorf("INV4: write superseding tombstone must have Undelete=true; got false")
 	}
 }
 
@@ -528,10 +538,13 @@ func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
 		// seq=1 > effectiveTombstoneSeq(0) → writeWins returns true → ActionInsert
 		mut := newUpsert(syncID, "mut-tiebreak-higher", nil, project, scope,
 			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq+1, "revived content")
-		action := Decide(r, mut)
-		if action != ActionInsert {
+		d := Decide(r, mut)
+		if d.Action != ActionInsert {
 			t.Fatalf("INV4 tie-break: seq(%d) > effective tombstone seq(%d) must supersede → ActionInsert; got %v",
-				effectiveTombstoneSeq+1, effectiveTombstoneSeq, action)
+				effectiveTombstoneSeq+1, effectiveTombstoneSeq, d.Action)
+		}
+		if !d.Undelete {
+			t.Errorf("INV4 tie-break: supersede must have Undelete=true; got false")
 		}
 	})
 
@@ -554,10 +567,10 @@ func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
 		// seq=0 == effectiveTombstoneSeq(0) → writeWins returns false → NoOp
 		mut := newUpsert(syncID, "mut-tiebreak-equal", nil, project, scope,
 			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq, "equal-seq content")
-		action := Decide(r, mut)
-		if action != NoOp {
+		d := Decide(r, mut)
+		if d.Action != NoOp {
 			t.Fatalf("INV4 tie-break: seq(%d) == effective tombstone seq(%d) must be blocked → NoOp; got %v",
-				effectiveTombstoneSeq, effectiveTombstoneSeq, action)
+				effectiveTombstoneSeq, effectiveTombstoneSeq, d.Action)
 		}
 	})
 }
