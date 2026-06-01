@@ -17,7 +17,107 @@ import (
 //	immediately by SQLite (not deferred), which would reject out-of-order
 //	children during sync pull. Referential integrity is enforced at the
 //	application level via defer-and-replay (PR3/PR4).
-const currentSchemaVersion = 1
+//
+// v1 → v2: drop and recreate FTS maintenance triggers from the shared constants
+//
+//	below. Existing DBs at user_version=1 may have the OLD mem_fts_update
+//	trigger (VALUES form without the WHERE OLD.deleted_at IS NULL guard) that
+//	causes SQLITE_CORRUPT_VTAB (267) on any undelete sequence. The migration
+//	is a cheap drop+recreate of all three FTS triggers; no data is touched.
+const currentSchemaVersion = 2
+
+// ── Shared FTS DDL constants (single source of truth) ───────────────────────
+//
+// These constants are used by BOTH ApplySchema (fresh DB) and rebuildMemoriesTable
+// (v0→v1 table rebuild) AND migrateV1ToV2 (v1→v2 trigger fix). Having ONE source
+// of truth prevents the kind of drift that caused the original CORRUPT_VTAB bug:
+// ApplySchema had the fixed trigger while rebuildMemoriesTable still had the old one.
+
+// ftsvirtualTableDDL is the CREATE VIRTUAL TABLE statement for the FTS5 index.
+const ftsvirtualTableDDL = `CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+	title,
+	content,
+	type,
+	entity_type,
+	status,
+	project,
+	topic_key,
+	content='memories',
+	content_rowid='id'
+)`
+
+// ftsTriggerInsert is the AFTER INSERT trigger that adds live rows to the FTS index.
+// Rows inserted with deleted_at already set are intentionally skipped (the WHEN guard)
+// because they are not "visible" — adding them would cause a phantom match in searches.
+const ftsTriggerInsert = `CREATE TRIGGER IF NOT EXISTS mem_fts_insert
+	AFTER INSERT ON memories
+	WHEN NEW.deleted_at IS NULL
+BEGIN
+	INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
+	VALUES (
+		NEW.id,
+		NEW.title,
+		NEW.content,
+		NEW.type,
+		NEW.entity_type,
+		COALESCE(NEW.status, ''),
+		NEW.project,
+		COALESCE(NEW.topic_key, '')
+	);
+END`
+
+// ftsTriggerDelete is the AFTER DELETE trigger that removes rows from the FTS index.
+const ftsTriggerDelete = `CREATE TRIGGER IF NOT EXISTS mem_fts_delete
+	AFTER DELETE ON memories
+BEGIN
+	INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
+	VALUES (
+		'delete',
+		OLD.id,
+		OLD.title,
+		OLD.content,
+		OLD.type,
+		OLD.entity_type,
+		COALESCE(OLD.status, ''),
+		OLD.project,
+		COALESCE(OLD.topic_key, '')
+	);
+END`
+
+// ftsTriggerUpdate is the AFTER UPDATE trigger that keeps the FTS index in sync.
+//
+// The FTS 'delete' command is only issued when OLD.deleted_at IS NULL.
+// Rows inserted with deleted_at set are NOT in the FTS index (the INSERT trigger
+// skips them via WHEN NEW.deleted_at IS NULL). Trying to 'delete' a non-indexed
+// rowid from an FTS5 external-content table causes SQLITE_CORRUPT_VTAB (267).
+// The conditional SELECT ... WHERE OLD.deleted_at IS NULL guards against that.
+const ftsTriggerUpdate = `CREATE TRIGGER IF NOT EXISTS mem_fts_update
+	AFTER UPDATE ON memories
+BEGIN
+	INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
+	SELECT
+		'delete',
+		OLD.id,
+		OLD.title,
+		OLD.content,
+		OLD.type,
+		OLD.entity_type,
+		COALESCE(OLD.status, ''),
+		OLD.project,
+		COALESCE(OLD.topic_key, '')
+	WHERE OLD.deleted_at IS NULL;
+	INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
+	SELECT
+		NEW.id,
+		NEW.title,
+		NEW.content,
+		NEW.type,
+		NEW.entity_type,
+		COALESCE(NEW.status, ''),
+		NEW.project,
+		COALESCE(NEW.topic_key, '')
+	WHERE NEW.deleted_at IS NULL;
+END`
 
 // memoriesTableDDL is the authoritative CREATE TABLE statement for the memories
 // table. It is shared between ApplySchema (fresh DB) and migrateV0ToV1 (rebuild)
@@ -92,7 +192,13 @@ func runMigrations(db *sql.DB) error {
 		ver = 1
 	}
 
-	// Future migrations: if ver < 2 { migrateV1ToV2(db); ver = 2 } etc.
+	if ver < 2 {
+		if err := migrateV1ToV2(db); err != nil {
+			return err
+		}
+		ver = 2
+	}
+
 	_ = ver
 	return nil
 }
@@ -159,6 +265,44 @@ func migrateV0ToV1(db *sql.DB) error {
 	// Bump user_version regardless of whether any rebuild was needed so that
 	// runMigrations does not re-enter v0→v1 on the next Open.
 	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateV1ToV2 replaces the three FTS maintenance triggers with the versions
+// from the shared package-level constants. This is necessary because:
+//
+//   - ApplySchema uses CREATE TRIGGER IF NOT EXISTS — a no-op when the trigger
+//     already exists (even with a different body).
+//   - A DB at user_version=1 may still have the OLD mem_fts_update trigger (the
+//     VALUES form without WHERE OLD.deleted_at IS NULL) that causes
+//     SQLITE_CORRUPT_VTAB (267) on any undelete sequence.
+//
+// The fix is a cheap drop+recreate of all three triggers from the shared
+// constants (ftsTriggerInsert, ftsTriggerDelete, ftsTriggerUpdate). No table
+// data is touched; the operation is idempotent and safe to re-run.
+func migrateV1ToV2(db *sql.DB) error {
+	// Drop all three triggers unconditionally so CREATE TRIGGER runs even when
+	// the old version already exists under the same name.
+	for _, drop := range []string{
+		`DROP TRIGGER IF EXISTS mem_fts_insert`,
+		`DROP TRIGGER IF EXISTS mem_fts_delete`,
+		`DROP TRIGGER IF EXISTS mem_fts_update`,
+	} {
+		if _, err := db.Exec(drop); err != nil {
+			return err
+		}
+	}
+
+	// Recreate from the shared authoritative constants.
+	for _, stmt := range []string{ftsTriggerInsert, ftsTriggerDelete, ftsTriggerUpdate} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+
+	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
 		return err
 	}
 	return nil
@@ -234,83 +378,15 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		}
 	}
 
-	// e. Recreate FTS virtual table and triggers.
+	// e. Recreate FTS virtual table and triggers from the shared authoritative
+	//    constants. Using constants here (not inline literals) ensures this path
+	//    and ApplySchema always produce the same trigger bodies — preventing the
+	//    drift that originally caused SQLITE_CORRUPT_VTAB (267).
 	ftsStmts := []string{
-		`CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-			title,
-			content,
-			type,
-			entity_type,
-			status,
-			project,
-			topic_key,
-			content='memories',
-			content_rowid='id'
-		)`,
-		`CREATE TRIGGER IF NOT EXISTS mem_fts_insert
-			AFTER INSERT ON memories
-			WHEN NEW.deleted_at IS NULL
-		BEGIN
-			INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
-			VALUES (
-				NEW.id,
-				NEW.title,
-				NEW.content,
-				NEW.type,
-				NEW.entity_type,
-				COALESCE(NEW.status, ''),
-				NEW.project,
-				COALESCE(NEW.topic_key, '')
-			);
-		END`,
-		`CREATE TRIGGER IF NOT EXISTS mem_fts_delete
-			AFTER DELETE ON memories
-		BEGIN
-			INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
-			VALUES (
-				'delete',
-				OLD.id,
-				OLD.title,
-				OLD.content,
-				OLD.type,
-				OLD.entity_type,
-				COALESCE(OLD.status, ''),
-				OLD.project,
-				COALESCE(OLD.topic_key, '')
-			);
-		END`,
-		// Important: the FTS 'delete' command is only issued when OLD.deleted_at IS NULL.
-		// Rows inserted with deleted_at set are NOT in the FTS index (the INSERT trigger
-		// skips them via WHEN NEW.deleted_at IS NULL). Trying to 'delete' a non-indexed
-		// rowid from FTS5 external-content tables causes SQLITE_CORRUPT_VTAB (267).
-		// The conditional SELECT ... WHERE OLD.deleted_at IS NULL guards against that.
-		`CREATE TRIGGER IF NOT EXISTS mem_fts_update
-			AFTER UPDATE ON memories
-		BEGIN
-			INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
-			SELECT
-				'delete',
-				OLD.id,
-				OLD.title,
-				OLD.content,
-				OLD.type,
-				OLD.entity_type,
-				COALESCE(OLD.status, ''),
-				OLD.project,
-				COALESCE(OLD.topic_key, '')
-			WHERE OLD.deleted_at IS NULL;
-			INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
-			SELECT
-				NEW.id,
-				NEW.title,
-				NEW.content,
-				NEW.type,
-				NEW.entity_type,
-				COALESCE(NEW.status, ''),
-				NEW.project,
-				COALESCE(NEW.topic_key, '')
-			WHERE NEW.deleted_at IS NULL;
-		END`,
+		ftsvirtualTableDDL,
+		ftsTriggerInsert,
+		ftsTriggerDelete,
+		ftsTriggerUpdate,
 	}
 	for _, s := range ftsStmts {
 		if _, err = tx.Exec(s); err != nil {
@@ -495,90 +571,17 @@ func ApplySchema(db *sql.DB) error {
 		// ── FTS5 virtual table over memories ────────────────────────────────
 		// content=memories with content_rowid=id means FTS is a shadow/external
 		// index: we manage it manually via triggers.
-		`CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-			title,
-			content,
-			type,
-			entity_type,
-			status,
-			project,
-			topic_key,
-			content='memories',
-			content_rowid='id'
-		)`,
+		// Using the shared constant ensures ApplySchema and rebuildMemoriesTable
+		// always produce the same virtual table definition.
+		ftsvirtualTableDDL,
 
 		// ── FTS maintenance triggers ─────────────────────────────────────────
-		// INSERT: add new row to FTS index.
-		`CREATE TRIGGER IF NOT EXISTS mem_fts_insert
-			AFTER INSERT ON memories
-			WHEN NEW.deleted_at IS NULL
-		BEGIN
-			INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
-			VALUES (
-				NEW.id,
-				NEW.title,
-				NEW.content,
-				NEW.type,
-				NEW.entity_type,
-				COALESCE(NEW.status, ''),
-				NEW.project,
-				COALESCE(NEW.topic_key, '')
-			);
-		END`,
-
-		// DELETE: remove row from FTS index using the FTS 'delete' command.
-		`CREATE TRIGGER IF NOT EXISTS mem_fts_delete
-			AFTER DELETE ON memories
-		BEGIN
-			INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
-			VALUES (
-				'delete',
-				OLD.id,
-				OLD.title,
-				OLD.content,
-				OLD.type,
-				OLD.entity_type,
-				COALESCE(OLD.status, ''),
-				OLD.project,
-				COALESCE(OLD.topic_key, '')
-			);
-		END`,
-
-		// UPDATE: remove old index entry, add new one. Also handles soft-delete:
-		// if deleted_at becomes non-NULL, remove from FTS without re-inserting.
-		//
-		// Important: the FTS 'delete' command is only issued when OLD.deleted_at IS NULL.
-		// Rows inserted with deleted_at set are NOT in the FTS index (the INSERT trigger
-		// skips them via WHEN NEW.deleted_at IS NULL). Trying to 'delete' a non-indexed
-		// rowid from FTS5 external-content tables causes SQLITE_CORRUPT_VTAB (267).
-		// The conditional SELECT ... WHERE OLD.deleted_at IS NULL guards against that.
-		`CREATE TRIGGER IF NOT EXISTS mem_fts_update
-			AFTER UPDATE ON memories
-		BEGIN
-			INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
-			SELECT
-				'delete',
-				OLD.id,
-				OLD.title,
-				OLD.content,
-				OLD.type,
-				OLD.entity_type,
-				COALESCE(OLD.status, ''),
-				OLD.project,
-				COALESCE(OLD.topic_key, '')
-			WHERE OLD.deleted_at IS NULL;
-			INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
-			SELECT
-				NEW.id,
-				NEW.title,
-				NEW.content,
-				NEW.type,
-				NEW.entity_type,
-				COALESCE(NEW.status, ''),
-				NEW.project,
-				COALESCE(NEW.topic_key, '')
-			WHERE NEW.deleted_at IS NULL;
-		END`,
+		// Using the shared constants ensures all code paths (fresh DB, v0→v1
+		// rebuild, and v1→v2 trigger migration) always install the same trigger
+		// bodies — preventing the drift that originally caused CORRUPT_VTAB (267).
+		ftsTriggerInsert,
+		ftsTriggerDelete,
+		ftsTriggerUpdate,
 
 		// ── Seed the default sync_state row ──────────────────────────────────
 		`INSERT OR IGNORE INTO sync_state(target_key) VALUES ('central')`,
