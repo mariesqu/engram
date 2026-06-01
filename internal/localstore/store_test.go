@@ -832,6 +832,44 @@ func TestFTSRoundtrip_Insert(t *testing.T) {
 	}
 }
 
+// TestParentCheck_OutOfOrderChildAccepted verifies that a spec/task/plan whose
+// parent_sync_id references a sync_id that does NOT yet exist in memories is
+// accepted (out-of-order child arrives first; defer-and-replay reconciles later).
+//
+// With `REFERENCES memories(sync_id)` + `PRAGMA foreign_keys = ON` this INSERT
+// would fail with "FOREIGN KEY constraint failed" — that is the P1 bug.
+// After the fix (REFERENCES clause removed) it must succeed.
+func TestParentCheck_OutOfOrderChildAccepted(t *testing.T) {
+	s := openTempStore(t)
+
+	// "parent-not-yet-arrived" does NOT exist in memories — parent hasn't synced yet.
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id, parent_sync_id)
+		VALUES
+		  ('child-task-oor', 'sess1', 'task', 'manual', 'todo', 'Orphaned Task', 'content', 'p', 'project', 'w', 'parent-not-yet-arrived')
+	`)
+	if err != nil {
+		t.Errorf("out-of-order child insert should succeed (no enforced FK), got: %v", err)
+	}
+}
+
+// TestParentCheck_OrphanSpecStillRejected verifies that inserting a 'spec' row
+// with a NULL parent_sync_id is STILL rejected by the hierarchy CHECK constraint
+// after the FK removal (the CHECK must survive the fix).
+func TestParentCheck_OrphanSpecStillRejected(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('spec-no-parent-post-fix', 'sess1', 'spec', 'manual', 'draft', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err == nil {
+		t.Error("spec with NULL parent_sync_id must still be rejected by hierarchy CHECK after FK removal")
+	}
+}
+
 // Compile-time check: Store must satisfy domain.Reader.
 var _ domain.Reader = (*Store)(nil)
 

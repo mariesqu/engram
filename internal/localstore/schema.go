@@ -23,7 +23,7 @@ func ApplySchema(db *sql.DB) error {
 			project         TEXT    NOT NULL DEFAULT '',
 			scope           TEXT    NOT NULL DEFAULT 'project',
 			topic_key       TEXT,
-			parent_sync_id  TEXT    REFERENCES memories(sync_id),
+			parent_sync_id  TEXT,
 			version         INTEGER NOT NULL DEFAULT 1,
 			seq             INTEGER NOT NULL DEFAULT 0,
 			writer_id       TEXT    NOT NULL DEFAULT '',
@@ -40,9 +40,12 @@ func ApplySchema(db *sql.DB) error {
 			-- Only 'memory' rows may omit status.
 			CHECK(entity_type = 'memory' OR status IS NOT NULL),
 			-- SDD hierarchy: spec/task/plan MUST belong to a parent; memory/change/standard MAY be root.
-			-- NOTE: parent_sync_id REFERENCES memories(sync_id) is a soft FK only — no hard deferred FK
-			-- is added here. Blocking parent referential integrity would reject out-of-order mutations
-			-- during sync apply. Defer-and-replay enforcement is deferred to PR3/PR4.
+			-- NOTE: parent_sync_id carries NO REFERENCES clause. A REFERENCES clause with
+			-- PRAGMA foreign_keys = ON is enforced immediately (not deferred), which would
+			-- reject out-of-order mutations during sync pull (child arrives before parent).
+			-- Referential integrity is enforced at the application level via defer-and-replay
+			-- (see PR3/PR4). The non-null CHECK below ensures spec/task/plan rows always
+			-- declare a parent, but the referenced parent may not yet be present locally.
 			CHECK(entity_type IN ('memory','change','standard') OR parent_sync_id IS NOT NULL)
 		)`,
 
@@ -58,9 +61,13 @@ func ApplySchema(db *sql.DB) error {
 		)`,
 
 		// ── memory_relations — reserved for future M:N promotion ─────────────
+		// NOTE: REFERENCES clauses are intentionally omitted here for the same
+		// reason as parent_sync_id on memories: PRAGMA foreign_keys = ON enforces
+		// them immediately, which would break out-of-order sync. Referential
+		// integrity is enforced at the application level.
 		`CREATE TABLE IF NOT EXISTS memory_relations (
-			from_sync_id TEXT NOT NULL REFERENCES memories(sync_id),
-			to_sync_id   TEXT NOT NULL REFERENCES memories(sync_id),
+			from_sync_id TEXT NOT NULL,
+			to_sync_id   TEXT NOT NULL,
 			rel_type     TEXT NOT NULL DEFAULT 'parent',
 			PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
 		)`,
