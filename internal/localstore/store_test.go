@@ -123,6 +123,122 @@ func TestEntityTypeCheck_NonMemoryRequiresStatus(t *testing.T) {
 	}
 }
 
+// TestParentCheck_OrphanSpecRejected verifies that inserting a 'spec' row
+// without a parent_sync_id is rejected by the hierarchy CHECK constraint.
+func TestParentCheck_OrphanSpecRejected(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('s-orphan-spec', 'sess1', 'spec', 'manual', 'draft', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err == nil {
+		t.Error("expected CHECK constraint error for spec with NULL parent_sync_id, got nil")
+	}
+}
+
+// TestParentCheck_OrphanTaskRejected verifies that inserting a 'task' row
+// without a parent_sync_id is rejected by the hierarchy CHECK constraint.
+func TestParentCheck_OrphanTaskRejected(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('s-orphan-task', 'sess1', 'task', 'manual', 'todo', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err == nil {
+		t.Error("expected CHECK constraint error for task with NULL parent_sync_id, got nil")
+	}
+}
+
+// TestParentCheck_OrphanPlanRejected verifies that inserting a 'plan' row
+// without a parent_sync_id is rejected by the hierarchy CHECK constraint.
+func TestParentCheck_OrphanPlanRejected(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('s-orphan-plan', 'sess1', 'plan', 'manual', 'draft', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err == nil {
+		t.Error("expected CHECK constraint error for plan with NULL parent_sync_id, got nil")
+	}
+}
+
+// TestParentCheck_ParentedSpecAccepted verifies that inserting a 'spec' row
+// WITH a valid parent_sync_id is accepted by the hierarchy CHECK constraint.
+func TestParentCheck_ParentedSpecAccepted(t *testing.T) {
+	s := openTempStore(t)
+	// Insert the parent 'change' row first.
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('chg-parent-1', 'sess1', 'change', 'manual', 'planning', 'Parent Change', 'C', 'p', 'project', 'w')
+	`)
+	if err != nil {
+		t.Fatalf("insert parent change: %v", err)
+	}
+	// Now insert the spec with a parent.
+	_, err = s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id, parent_sync_id)
+		VALUES
+		  ('s-parented-spec', 'sess1', 'spec', 'manual', 'draft', 'T', 'C', 'p', 'project', 'w', 'chg-parent-1')
+	`)
+	if err != nil {
+		t.Errorf("spec with parent_sync_id should be accepted: %v", err)
+	}
+}
+
+// TestParentCheck_MemoryNullParentAccepted verifies that inserting a 'memory' row
+// with NULL parent_sync_id is accepted (root-level memories are always valid).
+func TestParentCheck_MemoryNullParentAccepted(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES
+		  ('s-root-memory', 'sess1', 'memory', 'manual', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err != nil {
+		t.Errorf("memory row with NULL parent_sync_id should be accepted: %v", err)
+	}
+}
+
+// TestParentCheck_ChangeNullParentAccepted verifies that inserting a 'change' row
+// with NULL parent_sync_id is accepted.
+func TestParentCheck_ChangeNullParentAccepted(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('s-root-change', 'sess1', 'change', 'manual', 'planning', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err != nil {
+		t.Errorf("change row with NULL parent_sync_id should be accepted: %v", err)
+	}
+}
+
+// TestParentCheck_StandardNullParentAccepted verifies that inserting a 'standard' row
+// with NULL parent_sync_id is accepted.
+func TestParentCheck_StandardNullParentAccepted(t *testing.T) {
+	s := openTempStore(t)
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, status, title, content, project, scope, writer_id)
+		VALUES
+		  ('s-root-standard', 'sess1', 'standard', 'manual', 'active', 'T', 'C', 'p', 'project', 'w')
+	`)
+	if err != nil {
+		t.Errorf("standard row with NULL parent_sync_id should be accepted: %v", err)
+	}
+}
+
 // TestFTS_InsertTrigger verifies that inserting a memory row populates FTS.
 func TestFTS_InsertTrigger(t *testing.T) {
 	s := openTempStore(t)

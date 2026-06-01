@@ -38,7 +38,12 @@ func ApplySchema(db *sql.DB) error {
 			expires_at      TEXT,
 			-- Application-level invariants encoded as CHECK constraints.
 			-- Only 'memory' rows may omit status.
-			CHECK(entity_type = 'memory' OR status IS NOT NULL)
+			CHECK(entity_type = 'memory' OR status IS NOT NULL),
+			-- SDD hierarchy: spec/task/plan MUST belong to a parent; memory/change/standard MAY be root.
+			-- NOTE: parent_sync_id REFERENCES memories(sync_id) is a soft FK only — no hard deferred FK
+			-- is added here. Blocking parent referential integrity would reject out-of-order mutations
+			-- during sync apply. Defer-and-replay enforcement is deferred to PR3/PR4.
+			CHECK(entity_type IN ('memory','change','standard') OR parent_sync_id IS NOT NULL)
 		)`,
 
 		// ── memory_tombstones — prevent soft-delete resurrection (INV 4) ────
