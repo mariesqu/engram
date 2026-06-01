@@ -931,6 +931,8 @@ func createLegacyDB(t *testing.T) string {
 	}
 
 	// Other tables that ApplySchema creates — using simple stubs so Open does not fail.
+	// NOTE: memory_relations is created separately below with the legacy FK columns
+	// to accurately simulate a v0 DB created from the original bf04dbb schema.
 	otherTables := []string{
 		`CREATE TABLE IF NOT EXISTS memory_tombstones (
 			sync_id    TEXT    PRIMARY KEY,
@@ -940,12 +942,6 @@ func createLegacyDB(t *testing.T) string {
 			deleted_at TEXT    NOT NULL,
 			deleted_by TEXT    NOT NULL,
 			version    INTEGER NOT NULL DEFAULT 0
-		)`,
-		`CREATE TABLE IF NOT EXISTS memory_relations (
-			from_sync_id TEXT NOT NULL,
-			to_sync_id   TEXT NOT NULL,
-			rel_type     TEXT NOT NULL DEFAULT 'parent',
-			PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
 		)`,
 		`CREATE TABLE IF NOT EXISTS sync_mutations (
 			local_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -990,6 +986,27 @@ func createLegacyDB(t *testing.T) string {
 		VALUES ('task-legacy-1', 'sess-leg', 'task', 'manual', 'todo', 'Legacy Task', 'task content', 'eng', 'project', 'w-leg', 'chg-legacy-1')
 	`); err != nil {
 		t.Fatalf("createLegacyDB: insert child task: %v", err)
+	}
+
+	// Legacy memory_relations WITH REFERENCES FKs (Bug B: the original bf04dbb schema).
+	// These must be removed by migrateV0ToV1 so out-of-order relation inserts succeed
+	// under PRAGMA foreign_keys = ON.  Created without IF NOT EXISTS because the table
+	// must not exist yet (we intentionally omitted it from the otherTables loop above).
+	if _, err := db.Exec(`CREATE TABLE memory_relations (
+		from_sync_id TEXT NOT NULL REFERENCES memories(sync_id),
+		to_sync_id   TEXT NOT NULL REFERENCES memories(sync_id),
+		rel_type     TEXT NOT NULL DEFAULT 'parent',
+		PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
+	)`); err != nil {
+		t.Fatalf("createLegacyDB: create legacy memory_relations with FKs: %v", err)
+	}
+
+	// Seed a valid relation (both sync_ids present in memories at this point).
+	if _, err := db.Exec(`
+		INSERT INTO memory_relations (from_sync_id, to_sync_id, rel_type)
+		VALUES ('chg-legacy-1', 'task-legacy-1', 'parent')
+	`); err != nil {
+		t.Fatalf("createLegacyDB: seed legacy relation: %v", err)
 	}
 
 	return path
@@ -1174,6 +1191,53 @@ func TestMigration_V0ToV1_IndexesRebuiltOnNewTable(t *testing.T) {
 		if err != nil {
 			t.Errorf("index %q missing on memories after v0→v1 migration: %v", idx, err)
 		}
+	}
+}
+
+// TestMigration_V0ToV1_RelationsFKsDropped is the RED proof test for Bug B.
+// A legacy DB whose memory_relations table carries REFERENCES FKs must have
+// those FKs removed by migrateV0ToV1 so out-of-order relation inserts succeed
+// under PRAGMA foreign_keys = ON.
+//
+// Bug: migrateV0ToV1 only rebuilt memories; memory_relations was left with its
+// legacy REFERENCES clauses.  Additionally, after rebuildMemoriesTable renames
+// memories→memories_old then drops memories_old, SQLite rewrites the REFERENCES
+// target in memory_relations to "memories_old" — so any FK check would fail with
+// "no such table: main.memories_old".
+//
+// Fix: in migrateV0ToV1, detect any REFERENCES … MEMORIES (or "memories_old")
+// in memory_relations DDL and rebuild it using memoryRelationsTableDDL (no FKs),
+// preserving any existing rows.
+func TestMigration_V0ToV1_RelationsFKsDropped(t *testing.T) {
+	path := createLegacyDB(t)
+
+	// Open triggers the v0→v1 migration.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy DB: %v", err)
+	}
+	defer s.Close()
+
+	// After migration, inserting a relation whose to_sync_id does NOT exist
+	// in memories must succeed (FK removed).  Before the fix this fails with
+	// "FOREIGN KEY constraint failed" or "no such table: main.memories_old".
+	_, err = s.db.Exec(`
+		INSERT INTO memory_relations (from_sync_id, to_sync_id, rel_type)
+		VALUES ('chg-legacy-1', 'absent-target-sync-id', 'ref')
+	`)
+	if err != nil {
+		t.Errorf("out-of-order relation insert must succeed after memory_relations FK migration, got: %v", err)
+	}
+
+	// Existing seeded relation row must be preserved.
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memory_relations WHERE from_sync_id='chg-legacy-1' AND to_sync_id='task-legacy-1'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("query preserved relation: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected seeded relation row to be preserved after migration, got count=%d", count)
 	}
 }
 

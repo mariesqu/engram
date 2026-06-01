@@ -63,6 +63,18 @@ const memoriesTableDDL = `CREATE TABLE IF NOT EXISTS memories (
 	CHECK(entity_type IN ('memory','change','standard') OR parent_sync_id IS NOT NULL)
 )`
 
+// memoryRelationsTableDDL is the authoritative CREATE TABLE statement for the
+// memory_relations table. It is shared between ApplySchema (fresh DB) and
+// migrateV0ToV1 (rebuild) so both always produce the same schema.
+//
+// REFERENCES clauses are intentionally omitted — see memoriesTableDDL comment.
+const memoryRelationsTableDDL = `CREATE TABLE IF NOT EXISTS memory_relations (
+	from_sync_id TEXT NOT NULL,
+	to_sync_id   TEXT NOT NULL,
+	rel_type     TEXT NOT NULL DEFAULT 'parent',
+	PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
+)`
+
 // runMigrations inspects PRAGMA user_version and applies any pending migrations
 // in order.  It is idempotent: a DB already at currentSchemaVersion is a no-op.
 // Migrations are applied inside individual transactions so a failure leaves the
@@ -85,47 +97,66 @@ func runMigrations(db *sql.DB) error {
 	return nil
 }
 
-// migrateV0ToV1 drops the legacy `parent_sync_id REFERENCES memories(sync_id)`
-// FK from the memories table via a standard SQLite table-rebuild pattern:
+// migrateV0ToV1 drops legacy REFERENCES FKs from the memories and
+// memory_relations tables via the standard SQLite table-rebuild pattern.
 //
+// memories: drops `parent_sync_id REFERENCES memories(sync_id)`.
+// memory_relations: drops `from_sync_id/to_sync_id REFERENCES memories(sync_id)`.
+//
+// For each table:
 //  1. Disable FK enforcement for the duration of the rebuild.
 //  2. In a transaction: rename old table, create corrected table, copy all rows,
-//     recreate indexes and FTS triggers, rebuild FTS index, drop old table.
+//     recreate dependent objects (FTS + indexes for memories), drop old table.
 //  3. Re-enable FK enforcement.
 //  4. Set PRAGMA user_version = 1.
 //
-// If memories does NOT contain the FK (already clean), skip the rebuild and
-// only bump user_version — avoids a pointless O(n) copy on fresh DBs.
+// If a table does NOT contain a REFERENCES clause (already clean or non-existent),
+// that table's rebuild is skipped — avoids pointless O(n) copies on fresh DBs.
 func migrateV0ToV1(db *sql.DB) error {
-	// Check whether the existing memories table definition contains the FK.
-	// sqlite_master.sql holds the original CREATE TABLE text verbatim.
-	var tableSQLNullable sql.NullString
-	err := db.QueryRow(
+	// ── memories ─────────────────────────────────────────────────────────────
+	var memoriesSQLNullable sql.NullString
+	if err := db.QueryRow(
 		`SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'`,
-	).Scan(&tableSQLNullable)
-	if err != nil {
+	).Scan(&memoriesSQLNullable); err != nil {
 		return err
 	}
 
-	needsRebuild := false
-	if tableSQLNullable.Valid {
-		// The legacy FK always appears as "REFERENCES memories" (case-insensitive
-		// in SQLite DDL but the stored text preserves the original case).
-		needsRebuild = strings.Contains(
-			strings.ToUpper(tableSQLNullable.String),
-			"REFERENCES MEMORIES",
-		)
-	}
-	// If memories doesn't exist yet (fresh DB mid-Open), ApplySchema will create
-	// it correctly — nothing to rebuild.
-
-	if needsRebuild {
+	if memoriesSQLNullable.Valid && strings.Contains(
+		strings.ToUpper(memoriesSQLNullable.String), "REFERENCES MEMORIES",
+	) {
 		if err := rebuildMemoriesTable(db); err != nil {
 			return err
 		}
 	}
+	// If memories doesn't exist yet (fresh DB mid-Open), ApplySchema will create
+	// it correctly — nothing to rebuild.
 
-	// Bump user_version regardless of whether a rebuild was needed so that
+	// ── memory_relations ─────────────────────────────────────────────────────
+	var relSQLNullable sql.NullString
+	if err := db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_relations'`,
+	).Scan(&relSQLNullable); err != nil {
+		return err
+	}
+
+	// Detect legacy REFERENCES:
+	// - Original v0 DDL: `REFERENCES memories(sync_id)` → contains "REFERENCES MEMORIES"
+	// - After rebuildMemoriesTable renames memories→memories_old, SQLite rewrites
+	//   FKs in memory_relations to `REFERENCES "memories_old"(sync_id)` → contains
+	//   "REFERENCES" (the quoted identifier survives ToUpper as "MEMORIES_OLD").
+	//   We check for "REFERENCES" plus any suffix that contains "MEMORIES" to cover
+	//   both `REFERENCES memories` and `REFERENCES "memories_old"`.
+	if relSQLNullable.Valid && strings.Contains(
+		strings.ToUpper(relSQLNullable.String), "REFERENCES",
+	) && strings.Contains(
+		strings.ToUpper(relSQLNullable.String), "MEMORIES",
+	) {
+		if err := rebuildMemoryRelationsTable(db); err != nil {
+			return err
+		}
+	}
+
+	// Bump user_version regardless of whether any rebuild was needed so that
 	// runMigrations does not re-enter v0→v1 on the next Open.
 	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
 		return err
@@ -338,6 +369,59 @@ func rebuildMemoriesTable(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// rebuildMemoryRelationsTable performs the SQLite table-rebuild to drop the
+// legacy REFERENCES FKs from memory_relations:
+//
+//  1. `PRAGMA foreign_keys = OFF` — required during the rename/create/copy cycle.
+//  2. In a transaction:
+//     a. Rename memory_relations → memory_relations_old.
+//     b. Re-create memory_relations using memoryRelationsTableDDL (no FKs).
+//     c. Copy all rows from memory_relations_old.
+//     d. Drop memory_relations_old.
+//  3. `PRAGMA foreign_keys = ON`.
+//
+// All steps inside one transaction.
+func rebuildMemoryRelationsTable(db *sql.DB) error {
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON`) //nolint:errcheck
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback() //nolint:errcheck
+		}
+	}()
+
+	// a. Rename old table.
+	if _, err = tx.Exec(`ALTER TABLE memory_relations RENAME TO memory_relations_old`); err != nil {
+		return err
+	}
+
+	// b. Create corrected table (no FKs).
+	// Strip IF NOT EXISTS so we get a clean error if something is wrong.
+	newDDL := strings.Replace(memoryRelationsTableDDL, "IF NOT EXISTS ", "", 1)
+	if _, err = tx.Exec(newDDL); err != nil {
+		return err
+	}
+
+	// c. Copy all rows.
+	if _, err = tx.Exec(`INSERT INTO memory_relations SELECT from_sync_id, to_sync_id, rel_type FROM memory_relations_old`); err != nil {
+		return err
+	}
+
+	// d. Drop old table.
+	if _, err = tx.Exec(`DROP TABLE memory_relations_old`); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -358,16 +442,8 @@ func ApplySchema(db *sql.DB) error {
 		)`,
 
 		// ── memory_relations — reserved for future M:N promotion ─────────────
-		// NOTE: REFERENCES clauses are intentionally omitted here for the same
-		// reason as parent_sync_id on memories: PRAGMA foreign_keys = ON enforces
-		// them immediately, which would break out-of-order sync. Referential
-		// integrity is enforced at the application level.
-		`CREATE TABLE IF NOT EXISTS memory_relations (
-			from_sync_id TEXT NOT NULL,
-			to_sync_id   TEXT NOT NULL,
-			rel_type     TEXT NOT NULL DEFAULT 'parent',
-			PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
-		)`,
+		// REFERENCES clauses intentionally omitted — see memoriesTableDDL comment.
+		memoryRelationsTableDDL,
 
 		// ── sync_mutations — outbound push journal ───────────────────────────
 		`CREATE TABLE IF NOT EXISTS sync_mutations (
