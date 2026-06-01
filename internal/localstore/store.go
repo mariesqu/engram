@@ -49,6 +49,11 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("localstore.Open: ApplySchema: %w", err)
 	}
 
+	if err := runMigrations(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("localstore.Open: runMigrations: %w", err)
+	}
+
 	return &Store{db: db}, nil
 }
 
