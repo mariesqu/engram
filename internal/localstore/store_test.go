@@ -407,7 +407,7 @@ func TestTombstone_WrittenAtomically(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
 	}
-	if err := Apply(s.db, domain.ActionWriteTombstone, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply WriteTombstone: %v", err)
 	}
 
@@ -681,7 +681,7 @@ func TestReader_MutationApplied(t *testing.T) {
 		t.Error("mutation should not be applied yet")
 	}
 
-	if err := Apply(s.db, domain.ActionInsert, domain.Mutation{
+	mutX := domain.Mutation{
 		MutationID: "mut-x",
 		Op:         domain.OpUpsert,
 		SyncID:     "sync-x",
@@ -696,7 +696,8 @@ func TestReader_MutationApplied(t *testing.T) {
 		UpdatedAt:  time.Now().UTC(),
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
-	}); err != nil {
+	}
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionInsert, TargetSyncID: mutX.SyncID}, mutX); err != nil {
 		t.Fatalf("Apply Insert: %v", err)
 	}
 
@@ -728,7 +729,7 @@ func TestApply_Insert(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
 	}
-	if err := Apply(s.db, domain.ActionInsert, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionInsert, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply Insert: %v", err)
 	}
 
@@ -772,7 +773,7 @@ func TestApply_Update(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
 	}
-	if err := Apply(s.db, domain.ActionUpdate, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionUpdate, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply Update: %v", err)
 	}
 
@@ -813,7 +814,7 @@ func TestFTSRoundtrip_Insert(t *testing.T) {
 		WriterID:   "w1",
 		TopicKey:   &topicKey,
 	}
-	if err := Apply(s.db, domain.ActionInsert, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionInsert, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply Insert: %v", err)
 	}
 
@@ -1238,6 +1239,145 @@ func TestMigration_V0ToV1_RelationsFKsDropped(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected seeded relation row to be preserved after migration, got count=%d", count)
+	}
+}
+
+// ── Bug B migration test ─────────────────────────────────────────────────────
+
+// createV1DBWithBuggyTrigger creates a SQLite DB that simulates a post-#6/pre-#8
+// state: user_version = 1, FTS virtual table present, but mem_fts_update uses the
+// OLD buggy form (VALUES(...) without WHERE OLD.deleted_at IS NULL guard).
+//
+// This is the exact trigger that causes SQLITE_CORRUPT_VTAB (error 267) when an
+// undelete sequence is executed: INSERT deleted_at row + UPDATE SET deleted_at=NULL.
+// The update trigger unconditionally issues a FTS 'delete' for the OLD rowid, but
+// the row was never in the FTS index (because the insert trigger skips rows where
+// deleted_at IS NOT NULL), causing corruption.
+//
+// Returns the db path. Caller is responsible for cleanup (use t.TempDir).
+func createV1DBWithBuggyTrigger(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v1buggy.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("createV1DBWithBuggyTrigger: open: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		t.Fatalf("createV1DBWithBuggyTrigger: WAL: %v", err)
+	}
+
+	// Apply full current schema (creates correct triggers via ApplySchema).
+	if err := ApplySchema(db); err != nil {
+		t.Fatalf("createV1DBWithBuggyTrigger: ApplySchema: %v", err)
+	}
+
+	// Now REPLACE mem_fts_update with the OLD buggy version that lacks the
+	// WHERE OLD.deleted_at IS NULL guard. This simulates a DB that was created
+	// before the trigger fix landed (pre-PR #8 / post-PR #6 state).
+	if _, err := db.Exec(`DROP TRIGGER IF EXISTS mem_fts_update`); err != nil {
+		t.Fatalf("createV1DBWithBuggyTrigger: drop trigger: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER mem_fts_update
+		AFTER UPDATE ON memories
+	BEGIN
+		INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
+		VALUES (
+			'delete',
+			OLD.id,
+			OLD.title,
+			OLD.content,
+			OLD.type,
+			OLD.entity_type,
+			COALESCE(OLD.status, ''),
+			OLD.project,
+			COALESCE(OLD.topic_key, '')
+		);
+		INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
+		SELECT
+			NEW.id,
+			NEW.title,
+			NEW.content,
+			NEW.type,
+			NEW.entity_type,
+			COALESCE(NEW.status, ''),
+			NEW.project,
+			COALESCE(NEW.topic_key, '')
+		WHERE NEW.deleted_at IS NULL;
+	END`); err != nil {
+		t.Fatalf("createV1DBWithBuggyTrigger: install buggy trigger: %v", err)
+	}
+
+	// Set user_version = 1 to simulate a DB that went through the v0->v1 migration
+	// (FK removal) but has not yet had the trigger fix migration applied.
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatalf("createV1DBWithBuggyTrigger: set user_version: %v", err)
+	}
+
+	return path
+}
+
+// TestMigration_V1ToV2_BuggyTriggerReplaced is the RED proof test for Bug B.
+//
+// It creates a DB at user_version=1 with the OLD buggy mem_fts_update trigger
+// (VALUES form, no WHERE OLD.deleted_at IS NULL guard), then opens it via Open()
+// (which must run migrateV1ToV2 and replace the trigger).
+//
+// After Open, the test executes the exact sequence that triggers SQLITE_CORRUPT_VTAB
+// with the old trigger:
+//  1. INSERT a row with deleted_at set (soft-deleted from birth — not in FTS index)
+//  2. UPDATE that row to clear deleted_at (undelete sequence)
+//
+// With the old trigger, step 2 issues FTS 'delete' for a rowid not in the index →
+// SQLITE_CORRUPT_VTAB (error 267).
+// After migrateV1ToV2, the guarded trigger is installed → no error.
+//
+// Also asserts user_version == currentSchemaVersion after the migration.
+func TestMigration_V1ToV2_BuggyTriggerReplaced(t *testing.T) {
+	path := createV1DBWithBuggyTrigger(t)
+
+	// Open triggers runMigrations → migrateV1ToV2.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open v1-buggy DB: %v", err)
+	}
+	defer s.Close()
+
+	// 1. user_version must equal currentSchemaVersion after migration.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d (currentSchemaVersion)", ver, currentSchemaVersion)
+	}
+
+	// 2. Execute the undelete sequence that triggers CORRUPT_VTAB with the old trigger.
+	//    Step A: INSERT a row that starts soft-deleted (deleted_at set).
+	//            The INSERT trigger skips it (WHEN NEW.deleted_at IS NULL is false)
+	//            so the rowid is NOT in the FTS index.
+	if _, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, title, content,
+		   project, scope, writer_id, deleted_at)
+		VALUES ('v1buggy-test', 'sess1', 'memory', 'manual', 'BugB Title',
+		        'BugB content', 'eng', 'project', 'w1', '2025-01-01T00:00:00Z')
+	`); err != nil {
+		t.Fatalf("INSERT soft-deleted row: %v", err)
+	}
+
+	//    Step B: UPDATE to clear deleted_at (undelete).
+	//            With the OLD trigger: unconditional FTS 'delete' for OLD.id
+	//            which is NOT in the index → SQLITE_CORRUPT_VTAB (267).
+	//            With the NEW guarded trigger: WHERE OLD.deleted_at IS NULL
+	//            is false → FTS 'delete' is skipped → no error.
+	_, err = s.db.Exec(`UPDATE memories SET deleted_at=NULL WHERE sync_id='v1buggy-test'`)
+	if err != nil {
+		t.Errorf("BUG B: UPDATE to undelete returned error (expected none after trigger migration): %v", err)
 	}
 }
 
