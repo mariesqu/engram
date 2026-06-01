@@ -283,6 +283,16 @@ func migrateV0ToV1(db *sql.DB) error {
 // constants (ftsTriggerInsert, ftsTriggerDelete, ftsTriggerUpdate). No table
 // data is touched; the operation is idempotent and safe to re-run.
 func migrateV1ToV2(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback() //nolint:errcheck
+		}
+	}()
+
 	// Drop all three triggers unconditionally so CREATE TRIGGER runs even when
 	// the old version already exists under the same name.
 	for _, drop := range []string{
@@ -290,22 +300,22 @@ func migrateV1ToV2(db *sql.DB) error {
 		`DROP TRIGGER IF EXISTS mem_fts_delete`,
 		`DROP TRIGGER IF EXISTS mem_fts_update`,
 	} {
-		if _, err := db.Exec(drop); err != nil {
+		if _, err = tx.Exec(drop); err != nil {
 			return err
 		}
 	}
 
 	// Recreate from the shared authoritative constants.
 	for _, stmt := range []string{ftsTriggerInsert, ftsTriggerDelete, ftsTriggerUpdate} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err = tx.Exec(stmt); err != nil {
 			return err
 		}
 	}
 
-	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+	if _, err = tx.Exec(`PRAGMA user_version = 2`); err != nil {
 		return err
 	}
-	return nil
+	return tx.Commit()
 }
 
 // rebuildMemoriesTable performs the SQLite table-rebuild to drop the legacy FK:
