@@ -61,3 +61,40 @@ func TestNewMutationID_NotEmpty(t *testing.T) {
 		t.Error("mutation ID must not be empty")
 	}
 }
+
+// TestNewMutationID_DifferentStatus verifies that two mutations identical in
+// every other field but differing ONLY in Status produce different IDs.
+// With the pre-fix canonicalFields (Status absent) they collide — this confirms
+// the P2 bug and proves the fix.
+func TestNewMutationID_DifferentStatus(t *testing.T) {
+	done := "done"
+	m1 := baseM()
+	// m1 has nil Status (zero value from baseM)
+	m2 := baseM()
+	m2.Status = &done
+
+	id1 := NewMutationID(CanonicalPayload(m1))
+	id2 := NewMutationID(CanonicalPayload(m2))
+
+	if id1 == id2 {
+		t.Error("mutations differing only in Status must produce different IDs; got identical IDs (P2 bug: Status missing from canonicalFields)")
+	}
+}
+
+// TestNewMutationID_DifferentParentSyncID verifies that two mutations identical
+// in every other field but differing ONLY in ParentSyncID produce different IDs.
+// With the pre-fix canonicalFields (ParentSyncID absent) they collide.
+func TestNewMutationID_DifferentParentSyncID(t *testing.T) {
+	parent := "parent-sync-abc"
+	m1 := baseM()
+	// m1 has nil ParentSyncID
+	m2 := baseM()
+	m2.ParentSyncID = &parent
+
+	id1 := NewMutationID(CanonicalPayload(m1))
+	id2 := NewMutationID(CanonicalPayload(m2))
+
+	if id1 == id2 {
+		t.Error("mutations differing only in ParentSyncID must produce different IDs; got identical IDs (P2 bug: ParentSyncID missing from canonicalFields)")
+	}
+}

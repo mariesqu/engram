@@ -15,20 +15,26 @@ import (
 // canonicalFields is the stable, ordered subset of Mutation fields that
 // participates in the content-addressed ID. Pointer fields are dereferenced so
 // nil vs absent does not create accidental uniqueness.
+// Every field that is persisted to the memories table and that can change
+// independently of version/updated_at MUST appear here — otherwise two
+// mutations differing only in that field hash to the same ID and the second
+// one is incorrectly skipped by the applied_mutations idempotency guard (INV5).
 type canonicalFields struct {
-	Op         string `json:"op"`
-	SyncID     string `json:"sync_id"`
-	SessionID  string `json:"session_id"`
-	EntityType string `json:"entity_type"`
-	Type       string `json:"type"`
-	Title      string `json:"title"`
-	Content    string `json:"content"`
-	Project    string `json:"project"`
-	Scope      string `json:"scope"`
-	TopicKey   string `json:"topic_key,omitempty"`
-	Version    int    `json:"version"`
-	UpdatedAt  string `json:"updated_at"` // RFC3339Nano for precision
-	WriterID   string `json:"writer_id"`
+	Op           string `json:"op"`
+	SyncID       string `json:"sync_id"`
+	SessionID    string `json:"session_id"`
+	EntityType   string `json:"entity_type"`
+	Type         string `json:"type"`
+	Title        string `json:"title"`
+	Content      string `json:"content"`
+	Project      string `json:"project"`
+	Scope        string `json:"scope"`
+	TopicKey     string `json:"topic_key,omitempty"`
+	Status       string `json:"status,omitempty"`
+	ParentSyncID string `json:"parent_sync_id,omitempty"`
+	Version      int    `json:"version"`
+	UpdatedAt    string `json:"updated_at"` // RFC3339Nano for precision
+	WriterID     string `json:"writer_id"`
 }
 
 // CanonicalPayload returns the deterministic JSON encoding of the fields that
@@ -51,6 +57,12 @@ func CanonicalPayload(m domain.Mutation) []byte {
 	}
 	if m.TopicKey != nil {
 		cf.TopicKey = *m.TopicKey
+	}
+	if m.Status != nil {
+		cf.Status = *m.Status
+	}
+	if m.ParentSyncID != nil {
+		cf.ParentSyncID = *m.ParentSyncID
 	}
 
 	b, err := json.Marshal(cf)
