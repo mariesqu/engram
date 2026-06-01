@@ -161,11 +161,17 @@ func ApplySchema(db *sql.DB) error {
 
 		// UPDATE: remove old index entry, add new one. Also handles soft-delete:
 		// if deleted_at becomes non-NULL, remove from FTS without re-inserting.
+		//
+		// Important: the FTS 'delete' command is only issued when OLD.deleted_at IS NULL.
+		// Rows inserted with deleted_at set are NOT in the FTS index (the INSERT trigger
+		// skips them via WHEN NEW.deleted_at IS NULL). Trying to 'delete' a non-indexed
+		// rowid from FTS5 external-content tables causes SQLITE_CORRUPT_VTAB (267).
+		// The conditional SELECT ... WHERE OLD.deleted_at IS NULL guards against that.
 		`CREATE TRIGGER IF NOT EXISTS mem_fts_update
 			AFTER UPDATE ON memories
 		BEGIN
 			INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
-			VALUES (
+			SELECT
 				'delete',
 				OLD.id,
 				OLD.title,
@@ -175,7 +181,7 @@ func ApplySchema(db *sql.DB) error {
 				COALESCE(OLD.status, ''),
 				OLD.project,
 				COALESCE(OLD.topic_key, '')
-			);
+			WHERE OLD.deleted_at IS NULL;
 			INSERT INTO memories_fts(rowid, title, content, type, entity_type, status, project, topic_key)
 			SELECT
 				NEW.id,

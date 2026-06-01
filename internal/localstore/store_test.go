@@ -407,7 +407,7 @@ func TestTombstone_WrittenAtomically(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
 	}
-	if err := Apply(s.db, domain.ActionWriteTombstone, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply WriteTombstone: %v", err)
 	}
 
@@ -681,7 +681,7 @@ func TestReader_MutationApplied(t *testing.T) {
 		t.Error("mutation should not be applied yet")
 	}
 
-	if err := Apply(s.db, domain.ActionInsert, domain.Mutation{
+	mutX := domain.Mutation{
 		MutationID: "mut-x",
 		Op:         domain.OpUpsert,
 		SyncID:     "sync-x",
@@ -696,7 +696,8 @@ func TestReader_MutationApplied(t *testing.T) {
 		UpdatedAt:  time.Now().UTC(),
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
-	}); err != nil {
+	}
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionInsert, TargetSyncID: mutX.SyncID}, mutX); err != nil {
 		t.Fatalf("Apply Insert: %v", err)
 	}
 
@@ -728,7 +729,7 @@ func TestApply_Insert(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
 	}
-	if err := Apply(s.db, domain.ActionInsert, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionInsert, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply Insert: %v", err)
 	}
 
@@ -772,7 +773,7 @@ func TestApply_Update(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		WriterID:   "w1",
 	}
-	if err := Apply(s.db, domain.ActionUpdate, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionUpdate, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply Update: %v", err)
 	}
 
@@ -813,7 +814,7 @@ func TestFTSRoundtrip_Insert(t *testing.T) {
 		WriterID:   "w1",
 		TopicKey:   &topicKey,
 	}
-	if err := Apply(s.db, domain.ActionInsert, m); err != nil {
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionInsert, TargetSyncID: m.SyncID}, m); err != nil {
 		t.Fatalf("Apply Insert: %v", err)
 	}
 

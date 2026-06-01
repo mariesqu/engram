@@ -8,15 +8,22 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 )
 
-// Apply executes a domain.Action against the local SQLite store inside a single
-// transaction. It is the pull-apply adapter: callers (the sync loop) invoke
-// Decide() first, then pass the returned Action here.
+// Apply executes a domain.Decision against the local SQLite store inside a
+// single transaction. It is the pull-apply adapter: callers (the sync loop)
+// invoke Decide() first, then pass the returned Decision here.
 //
 // NoOp is a valid input — Apply returns nil immediately.
 // For all other actions, the applied_mutations row is written so future
 // Decide() calls detect idempotent re-apply (Invariant 5).
-func Apply(db *sql.DB, a domain.Action, m domain.Mutation) error {
-	if a == domain.NoOp {
+//
+// The Decision contract enriches the bare Action with:
+//   - TargetSyncID: the resolved row's sync_id (may differ from m.SyncID when
+//     resolved via topic_key — fixes the P1-a silent write-loss bug).
+//   - Undelete: when true, the adapter clears deleted_at on the memories row
+//     AND removes the memory_tombstones entry, making the record live again
+//     (fixes the P1-b tombstone-undelete omission).
+func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
+	if d.Action == domain.NoOp {
 		return nil
 	}
 
@@ -30,18 +37,37 @@ func Apply(db *sql.DB, a domain.Action, m domain.Mutation) error {
 		}
 	}()
 
-	switch a {
+	switch d.Action {
 	case domain.ActionInsert:
-		err = execInsert(tx, m)
+		if d.Undelete {
+			// The record already exists as a soft-deleted row (tombstone superseded).
+			// Update it in-place and clear deleted_at rather than inserting a duplicate.
+			err = execUndeleteUpdate(tx, d.TargetSyncID, m)
+		} else {
+			err = execInsert(tx, m)
+		}
 	case domain.ActionUpdate:
-		err = execUpdate(tx, m)
+		// P1-a fix: use d.TargetSyncID (the resolved row) — not m.SyncID.
+		err = execUpdate(tx, d.TargetSyncID, m)
+		if err == nil && d.Undelete {
+			// The resolved row was soft-deleted; clear it.
+			err = execClearDeletedAt(tx, d.TargetSyncID)
+		}
 	case domain.ActionWriteTombstone:
 		err = execWriteTombstone(tx, m)
 	default:
-		err = fmt.Errorf("Apply: unknown action %d", a)
+		err = fmt.Errorf("Apply: unknown action %d", d.Action)
 	}
 	if err != nil {
 		return err
+	}
+
+	// P1-b fix: when undeleting, remove the tombstone row so the record is
+	// fully live and FindByTopic / SearchMemories return it again.
+	if d.Undelete {
+		if err = execClearTombstone(tx, d.TargetSyncID, m); err != nil {
+			return err
+		}
 	}
 
 	// Record applied mutation for idempotency (INV 5).
@@ -79,7 +105,31 @@ func execInsert(tx *sql.Tx, m domain.Mutation) error {
 	return nil
 }
 
-func execUpdate(tx *sql.Tx, m domain.Mutation) error {
+// execUndeleteUpdate handles the Undelete+ActionInsert path: the record
+// already exists as a soft-deleted row (a tombstone was superseded). We UPDATE
+// it in place — restoring its content and clearing deleted_at — rather than
+// INSERTing a duplicate that would violate the UNIQUE(sync_id) constraint.
+func execUndeleteUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
+	_, err := tx.Exec(`
+		UPDATE memories
+		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
+		    version=?, seq=?, writer_id=?, updated_at=?, deleted_at=NULL
+		WHERE sync_id=?`,
+		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
+		m.Version, m.Seq, m.WriterID,
+		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		targetSyncID,
+	)
+	if err != nil {
+		return fmt.Errorf("execUndeleteUpdate: %w", err)
+	}
+	return nil
+}
+
+// execUpdate overwrites the existing record identified by targetSyncID.
+// P1-a fix: targetSyncID is the RESOLVED row's sync_id from Decision.TargetSyncID,
+// which may differ from m.SyncID when resolved via FindByTopic.
+func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
 	_, err := tx.Exec(`
 		UPDATE memories
 		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
@@ -88,10 +138,48 @@ func execUpdate(tx *sql.Tx, m domain.Mutation) error {
 		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
 		m.Version, m.Seq, m.WriterID,
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		m.SyncID,
+		targetSyncID,
 	)
 	if err != nil {
 		return fmt.Errorf("execUpdate: %w", err)
+	}
+	return nil
+}
+
+// execClearDeletedAt clears the soft-delete flag on the row identified by
+// targetSyncID, making it visible to FindByTopic and SearchMemories again.
+func execClearDeletedAt(tx *sql.Tx, targetSyncID string) error {
+	_, err := tx.Exec(
+		`UPDATE memories SET deleted_at=NULL WHERE sync_id=?`,
+		targetSyncID,
+	)
+	if err != nil {
+		return fmt.Errorf("execClearDeletedAt: %w", err)
+	}
+	return nil
+}
+
+// execClearTombstone removes the tombstone entry for the revived record.
+// Looks up by sync_id (primary) and also by topic_key+project+scope when a
+// topic_key is present, ensuring stale topic-keyed tombstones are also gone.
+func execClearTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
+	// Remove by sync_id first (covers both topic-keyed and topic-less records).
+	_, err := tx.Exec(
+		`DELETE FROM memory_tombstones WHERE sync_id=?`,
+		targetSyncID,
+	)
+	if err != nil {
+		return fmt.Errorf("execClearTombstone (by sync_id): %w", err)
+	}
+	// Also remove any topic-key tombstone that covers the same identity.
+	if m.TopicKey != nil && *m.TopicKey != "" {
+		_, err = tx.Exec(
+			`DELETE FROM memory_tombstones WHERE topic_key=? AND project=? AND scope=?`,
+			*m.TopicKey, m.Project, m.Scope,
+		)
+		if err != nil {
+			return fmt.Errorf("execClearTombstone (by topic_key): %w", err)
+		}
 	}
 	return nil
 }
