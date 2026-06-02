@@ -37,6 +37,25 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 		}
 	}()
 
+	if err = applyTx(tx, d, m); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("Apply: commit: %w", err)
+	}
+	return nil
+}
+
+// applyTx executes the decision switch and applied_mutations INSERT against an
+// existing transaction. It is the tx-aware core used by both Apply (pull-apply)
+// and LocalWrite (local write + outbox enqueue in ONE atomic transaction).
+//
+// The caller is responsible for beginning and committing (or rolling back) the
+// transaction. applyTx itself never calls Begin, Commit, or Rollback.
+func applyTx(tx *sql.Tx, d domain.Decision, m domain.Mutation) error {
+	var err error
+
 	switch d.Action {
 	case domain.ActionInsert:
 		// Decide returns ActionInsert only when cur == nil — no memories row exists.
@@ -61,7 +80,7 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 		// stored row and not a non-existent incoming sync_id.
 		err = execWriteTombstone(tx, d.TargetSyncID, m)
 	default:
-		err = fmt.Errorf("Apply: unknown action %d", d.Action)
+		err = fmt.Errorf("applyTx: unknown action %d", d.Action)
 	}
 	if err != nil {
 		return err
@@ -82,13 +101,10 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 			m.MutationID,
 		)
 		if err != nil {
-			return fmt.Errorf("Apply: record applied: %w", err)
+			return fmt.Errorf("applyTx: record applied: %w", err)
 		}
 	}
 
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("Apply: commit: %w", err)
-	}
 	return nil
 }
 

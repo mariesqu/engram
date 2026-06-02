@@ -186,6 +186,45 @@ func TestPullCursor_DefaultsZeroAndAdvancesMonotonically(t *testing.T) {
 	}
 }
 
+// TestLocalWrite_Atomic verifies that LocalWrite leaves BOTH a live memory row
+// (visible to FindByTopic) AND a pending outbox entry in the same SQLite
+// database state after a single call. Both results commit together — the
+// atomicity guarantee introduced by the single-tx refactor.
+func TestLocalWrite_Atomic(t *testing.T) {
+	s := openTempStore(t)
+	topic := "sdd/test/atomic"
+
+	m := upsertMut("sync-atom-1", topic, "atomic-content", 1, baseT.Add(5*time.Second))
+	got, err := s.LocalWrite(m)
+	if err != nil {
+		t.Fatalf("LocalWrite: %v", err)
+	}
+
+	// Memory row must be live.
+	rec, err := s.FindByTopic(topic, "engram", "project")
+	if err != nil {
+		t.Fatalf("FindByTopic: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("FindByTopic: got nil; want live memory row")
+	}
+	if rec.Content != "atomic-content" {
+		t.Errorf("FindByTopic content=%q, want %q", rec.Content, "atomic-content")
+	}
+
+	// Outbox must also have exactly one pending entry for the same mutation.
+	entries, err := s.DrainOutbox(0)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("DrainOutbox: got %d entries, want 1 (atomic commit)", len(entries))
+	}
+	if entries[0].Mutation.MutationID != got.MutationID {
+		t.Errorf("outbox entry MutationID=%q, want %q", entries[0].Mutation.MutationID, got.MutationID)
+	}
+}
+
 // TestLocalWrite_IdempotentReenqueue verifies that re-running the SAME logical
 // write (same content → same content-addressed MutationID) does not create a
 // second outbox row.

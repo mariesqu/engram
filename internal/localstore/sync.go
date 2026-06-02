@@ -33,10 +33,13 @@ const defaultTargetKey = "central"
 // OutboxEntry is one pending row in the sync_mutations push journal, decoded
 // back into a domain.Mutation plus the local push-ordering key (LocalSeq).
 //
-// Mutation carries the full content (decoded from the canonical Payload) plus
-// MutationID, Op, EntityType (entity), SyncID (entity_key) and WriterID read
-// straight from the row, so the harness can push it to central without touching
-// the memories table again.
+// Mutation carries the full content reconstructed from the canonical Payload
+// via mutation.FromCanonicalPayload (Op, EntityType, SyncID, WriterID and the
+// content fields are all decoded from the JSON payload). The identity and
+// ordering fields that live in the row but not inside the payload — MutationID,
+// Payload itself, and OccurredAt — are filled from the corresponding columns
+// after decoding. The entry is ready to push to central without touching the
+// memories table again.
 type OutboxEntry struct {
 	// LocalSeq is the sync_mutations.local_seq AUTOINCREMENT — the local push
 	// order. AckMutation advances last_acked_seq to this value.
@@ -51,32 +54,51 @@ type OutboxEntry struct {
 //  1. Derive the canonical Payload and MutationID if the caller left them unset
 //     (MutationID = NewMutationID(CanonicalPayload(m))). This makes the local
 //     write content-addressed and idempotent on re-apply (INV5).
-//  2. Run domain.Decide(localReader, m) against THIS store, then localstore.Apply
-//     the resulting Decision — exactly the path a pulled mutation takes — so the
-//     local memories/tombstone state is updated through the one guarded apply.
-//  3. Enqueue the mutation into sync_mutations (the outbox) so DrainOutbox/push
-//     can deliver it to central later.
+//  2. Run domain.Decide(localReader, m) against THIS store to compute the
+//     Decision.
+//  3. Execute applyTx (the local state change) AND enqueueOutboxTx (the outbox
+//     INSERT) inside a SINGLE SQLite transaction. Both operations commit
+//     together or not at all: a crash between the two can never leave the
+//     local memory table updated without a corresponding outbox entry.
 //
 // The returned Mutation is the normalized mutation (Payload + MutationID filled
 // in) so callers can inspect the derived ID.
-//
-// Note: steps 2 and 3 are not wrapped in a single SQLite transaction here.
-// Apply already commits its own tx; the outbox INSERT uses INSERT OR IGNORE on
-// the UNIQUE mutation_id, so a re-run of the same logical write is a no-op in
-// the outbox too. For the in-process spike this ordering is sufficient; a
-// production transport would fold both into one tx (a documented follow-up).
 func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
 	m = normalizeMutation(m)
 
-	// Apply locally through the SAME Decide path pull-apply uses.
+	// Compute the Decision before opening the transaction (read-only).
 	d := domain.Decide(s, m)
-	if err := Apply(s.db, d, m); err != nil {
-		return m, fmt.Errorf("LocalWrite: apply: %w", err)
+
+	// Single atomic transaction: apply local state change (if any) + enqueue
+	// outbox row. Both commit together or not at all.
+	//
+	// The outbox is populated even when the local Decision is NoOp. A local NoOp
+	// means the local store already reflects this mutation (or an equivalent
+	// newer write), but the central store may not — it assigns authoritative seqs
+	// independently. Forwarding the mutation lets central reconcile with its own
+	// Decide path. INSERT OR IGNORE on the UNIQUE mutation_id makes a true
+	// idempotent re-enqueue a no-op at the SQL layer (INV5).
+	tx, err := s.db.Begin()
+	if err != nil {
+		return m, fmt.Errorf("LocalWrite: begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if d.Action != domain.NoOp {
+		if err = applyTx(tx, d, m); err != nil {
+			return m, fmt.Errorf("LocalWrite: applyTx: %w", err)
+		}
+	}
+	if err = enqueueOutboxTx(tx, m); err != nil {
+		return m, fmt.Errorf("LocalWrite: enqueueOutboxTx: %w", err)
 	}
 
-	// Enqueue into the outbox for push.
-	if err := s.enqueueOutbox(m); err != nil {
-		return m, fmt.Errorf("LocalWrite: enqueue: %w", err)
+	if err = tx.Commit(); err != nil {
+		return m, fmt.Errorf("LocalWrite: commit: %w", err)
 	}
 	return m, nil
 }
@@ -98,10 +120,12 @@ func normalizeMutation(m domain.Mutation) domain.Mutation {
 	return m
 }
 
-// enqueueOutbox inserts the mutation into sync_mutations. INSERT OR IGNORE on the
-// UNIQUE mutation_id makes a duplicate enqueue a no-op (idempotent local write).
-func (s *Store) enqueueOutbox(m domain.Mutation) error {
-	_, err := s.db.Exec(`
+// enqueueOutboxTx inserts the mutation into sync_mutations on the given
+// transaction. INSERT OR IGNORE on the UNIQUE mutation_id makes a duplicate
+// enqueue a no-op (idempotent local write — INV5 at the outbox layer).
+// The caller owns the transaction lifecycle (Begin/Commit/Rollback).
+func enqueueOutboxTx(tx *sql.Tx, m domain.Mutation) error {
+	_, err := tx.Exec(`
 		INSERT OR IGNORE INTO sync_mutations
 		  (mutation_id, entity, entity_key, op, payload, writer_id, occurred_at)
 		VALUES (?,?,?,?,?,?,?)`,
@@ -114,7 +138,7 @@ func (s *Store) enqueueOutbox(m domain.Mutation) error {
 		m.OccurredAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
-		return fmt.Errorf("enqueueOutbox: %w", err)
+		return fmt.Errorf("enqueueOutboxTx: %w", err)
 	}
 	return nil
 }
@@ -162,7 +186,11 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 		}
 		m.MutationID = mutationID
 		m.Payload = []byte(payload)
-		m.OccurredAt = parseTime(occurredAtStr)
+		t := parseTime(occurredAtStr)
+		if t.IsZero() {
+			return nil, fmt.Errorf("DrainOutbox: mutation_id=%s: occurred_at %q is not a valid timestamp", mutationID, occurredAtStr)
+		}
+		m.OccurredAt = t
 
 		out = append(out, OutboxEntry{LocalSeq: localSeq, Mutation: m})
 	}
