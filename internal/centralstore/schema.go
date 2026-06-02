@@ -96,6 +96,9 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		// One row per soft-deleted identity.  sync_id PK prevents duplicate rows
 		// for the same sync_id.  The partial UNIQUE on topic identity (INV-B)
 		// ensures FindTombstone-by-topic is deterministic (≤1 result).
+		// seq carries the central BIGSERIAL seq of the delete mutation so that
+		// domain.Decide can use ts.Seq as the spec-authoritative tiebreaker
+		// (spec.md:89-97) when updated_at and version both tie.
 		`CREATE TABLE IF NOT EXISTS central_tombstones (
 			sync_id    TEXT         PRIMARY KEY,
 			project    TEXT         NOT NULL DEFAULT '',
@@ -103,7 +106,8 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			topic_key  TEXT,
 			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
 			deleted_by TEXT         NOT NULL DEFAULT '',
-			version    INT          NOT NULL DEFAULT 0
+			version    INT          NOT NULL DEFAULT 0,
+			seq        BIGINT       NOT NULL DEFAULT 0
 		)`,
 
 		// Partial UNIQUE: ≤1 tombstone per live topic identity (INV-B).

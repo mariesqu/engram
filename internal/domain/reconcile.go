@@ -70,13 +70,20 @@ func Decide(tx Reader, m Mutation) Decision {
 	// INV4: tombstone check — must happen BEFORE processing an upsert.
 	// ts is HOISTED out of the guard so the switch below can recover the canonical
 	// identity from it when cur == nil (cross-writer convergence).
+	//
+	// ts.Seq is the spec-authoritative seq tiebreaker (spec.md:89-97): when
+	// updated_at and version are both equal, writeWins falls through to
+	// (m.Seq > ts.Seq). The tombstone seq is now carried by the persistent store
+	// (local memory_tombstones.seq and central central_tombstones.seq) and
+	// returned here via FindTombstone. 0 means not yet server-assigned (own
+	// pre-push write), matching the memories.seq convention for local-only writes.
 	var ts *Tombstone
 	if t, err := tx.FindTombstone(m.SyncID, m.TopicKey, m.Project, m.Scope); err == nil {
 		ts = t
 	}
 	tombstoneSuperseded := false
 	if ts != nil {
-		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, 0) {
+		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.Seq) {
 			return noop // tombstoned and the incoming write is not newer
 		}
 		// writeWins against the tombstone: adapter must clear it on supersede.

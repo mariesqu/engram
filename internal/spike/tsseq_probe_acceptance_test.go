@@ -9,52 +9,41 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EMPIRICAL ts.Seq PROBE — the tombstone-boundary tie case.
+// SPEC-CORRECT VERIFICATION — tombstone seq tiebreaker at the exact-tie boundary.
 //
-// The six convergence invariants (INV1–INV6) all use STRICTLY DISTINCT
-// UpdatedAt values, so writeWins() decides every contest on wall-clock alone and
-// the seq tiebreaker is never reached. This probe deliberately drives the ONE
-// case where the seq tiebreaker COULD matter at the tombstone boundary: a pulled
-// upsert whose UpdatedAt and Version EXACTLY equal the tombstone's.
+// Spec rule (reconciliation spec.md:117-122):
 //
-// Mechanics under test (the reason ts.Seq is "not wired" locally):
-//   - The local memory_tombstones table has NO seq column.
-//   - domain.Decide calls writeWins(m, ts.DeletedAt, ts.Version, /*curSeq=*/0)
-//     at the tombstone guard — the tombstone seq is hardcoded 0.
-//   - A pulled mutation carries a POSITIVE central seq.
-//   - So when UpdatedAt and Version tie, writeWins falls through to
-//     (m.Seq > 0) == true → the tombstone is treated as superseded.
+//   When updated_at and version are EQUAL, the seq tiebreaker decides:
+//   - incoming.seq > tombstone.seq → upsert SUPERSEDES (delete revived; NOT NoOp).
+//   - incoming.seq <= tombstone.seq → upsert BLOCKED (NoOp).
 //
-// This probe RECORDS and PINS the actual end-state under that tie. The empirical
-// result (verified by running it): under an EXACT (updated_at, version) tie the
-// row RESURRECTS on A.local, B.local AND central. Root cause:
+// This test verifies that scenario from spec.md:117-122 holds end-to-end across
+// all three stores: when a competing upsert's central seq is genuinely HIGHER
+// than the tombstone's seq, the row MUST resurrect (the tombstone is superseded).
 //
-//	the local memory_tombstones row has no seq; Decide passes curSeq=0 to
-//	writeWins; the pulled upsert carries a POSITIVE central seq; with
-//	updated_at and version tied, writeWins returns (m.Seq > 0) == true → the
-//	tombstone is treated as superseded and the row revives.
+// Why resurrection is SPEC-CORRECT here (not a bug):
 //
-// SCOPE VERDICT (the reason this test ASSERTS the observed resurrection rather
-// than failing):
+//   The upsert (pushed by B at a positive central seq) arrives with a seq that is
+//   strictly greater than the delete's seq (the tombstone's seq). Under the spec
+//   tiebreaker chain, m.Seq > ts.Seq → writeWins returns true → the tombstone is
+//   superseded and the row is revived. This is the intended outcome.
 //
-//   - The SIX core convergence invariants (INV1–INV6) all use STRICTLY DISTINCT
-//     updated_at values and ALL PASS green. For them, the seq tiebreaker is never
-//     reached, so ts.Seq is empirically NOT required.
-//   - ts.Seq wiring is ONLY needed to close THIS exact-(updated_at,version)-tie
-//     tombstone boundary — an edge case OUTSIDE the six invariants and outside
-//     this spike's scope. Wiring it (adding a seq column to memory_tombstones and
-//     threading it into Decide) is the documented post-spike follow-up.
+// ts.Seq is now WIRED: Tombstone.Seq is populated from the persistent stores
+// (local memory_tombstones.seq, central central_tombstones.seq) and domain.Decide
+// passes ts.Seq to writeWins instead of the former hardcoded 0. The resurrection
+// outcome is UNCHANGED because the competing upsert's seq is still the higher of
+// the two — wiring ts.Seq confirms the spec is implemented, not merely tolerated.
 //
-// This test therefore PINS the current observed behavior as a regression sentinel
-// for that follow-up: it stays green today, and will FAIL LOUDLY the moment a
-// future change wires ts.Seq and flips the tie outcome — at which point the
-// assertion below should be inverted to require the row to STAY deleted.
+// The lower-seq-blocked branch (spec.md:124-129) cannot be produced via the
+// push/pull cycle used here: push always assigns a fresh, higher BIGSERIAL seq
+// for the upsert. That branch is pinned deterministically by the pure domain unit
+// test TestDecide_TombstoneTieBreak_SeqAuthority/lower_seq_blocked_by_tombstone.
 //
 // NOTE on realism: an exact (updated_at, version) tie across two DISTINCT writers
 // is astronomically unlikely in production (updated_at is nanosecond wall-clock).
-// This probe manufactures it on purpose to map the boundary precisely.
+// This probe manufactures it on purpose to verify the tiebreaker boundary precisely.
 // ─────────────────────────────────────────────────────────────────────────────
-func TestTsSeqProbe_EqualTimestampTombstoneTie(t *testing.T) {
+func TestTsSeq_EqualTie_HigherSeqRevives(t *testing.T) {
 	ctx := context.Background()
 	central := newCentral(t)
 	a := newNode(t, "A")
@@ -72,27 +61,28 @@ func TestTsSeqProbe_EqualTimestampTombstoneTie(t *testing.T) {
 	syncRounds(ctx, t, []*nodeRef{{a}, {b}}, central, 2)
 
 	// 2. A deletes T at the tie instant with version 2. Converge so the tombstone
-	//    lands on A.local, B.local AND central.
+	//    lands on A.local, B.local AND central — each tombstone now carries the
+	//    delete's central seq (the seq column is wired).
 	mustWrite(t, a, del("writer-A", "sync-A", topic, 2, tie))
 	syncRounds(ctx, t, []*nodeRef{{a}, {b}}, central, 2)
 	assertDeletedEverywhere(ctx, t, a, b, central, topic)
 
 	// 3. B upserts T at the EXACT SAME instant (tie) with the SAME version (2).
 	//    updated_at == tombstone.deleted_at AND version == tombstone.version, so
-	//    only the seq tiebreaker can separate them. The local tombstone seq is 0;
-	//    the pulled mutation carries a positive central seq.
+	//    only the seq tiebreaker can separate them. B's upsert gets a HIGHER
+	//    central seq than the tombstone (push assigns a fresh BIGSERIAL), so
+	//    writeWins(m.Seq > ts.Seq) returns true → resurrection is spec-correct.
 	mustWrite(t, b, upsert("writer-B", "sync-B", topic, "B equal-tie upsert", 2, tie))
 	syncRounds(ctx, t, []*nodeRef{{a}, {b}}, central, 3)
 
-	// PINNED OBSERVED BEHAVIOR (ts.Seq NOT wired): the exact-tie upsert revives the
-	// row everywhere. We assert that observed outcome so the test is a green
-	// regression sentinel; the log states the precise finding for the reader.
-	t.Logf("ts.Seq EMPIRICAL FINDING: on an exact (updated_at,version) tie at the "+
-		"tombstone boundary, topic %q RESURRECTS on all three stores because the "+
-		"local tombstone seq is 0 and the pulled upsert carries a positive central "+
-		"seq (writeWins falls through to m.Seq>0). The six core invariants avoid "+
-		"this by using distinct updated_at, so ts.Seq wiring is NOT required for "+
-		"them; closing THIS tie is the documented post-spike follow-up.", topic)
+	// SPEC-CORRECT OUTCOME (spec.md:117-122): the exact-tie upsert MUST revive the
+	// row everywhere because its seq is strictly higher than the tombstone's seq.
+	// Failing to revive is the REAL bug — a higher-seq upsert that cannot supersede
+	// a lower-seq tombstone violates the spec tiebreaker.
+	t.Logf("ts.Seq VERIFIED: on an exact (updated_at,version) tie at the tombstone "+
+		"boundary, topic %q resurrects on all three stores because B's upsert seq "+
+		"is strictly higher than the delete's tombstone seq (spec.md:117-122). "+
+		"ts.Seq is now wired; this is the spec-correct outcome, not a pinned bug.", topic)
 
 	for _, where := range []struct {
 		name string
@@ -103,14 +93,14 @@ func TestTsSeqProbe_EqualTimestampTombstoneTie(t *testing.T) {
 		{"central", liveTopicOnCentral(t, central, topic) != nil},
 	} {
 		if !where.rec {
-			t.Errorf("ts.Seq SENTINEL CHANGED: %s no longer resurrects on an exact "+
-				"(updated_at,version) tie. The boundary behavior flipped — ts.Seq may "+
-				"now be wired. UPDATE this probe to require the row to STAY deleted "+
-				"(the spec-correct outcome) and remove this sentinel.", where.name)
+			t.Errorf("spec.md:117-122 VIOLATION on %s: higher-seq upsert did NOT "+
+				"resurrect the row after exact (updated_at,version) tie. "+
+				"A higher-seq upsert MUST supersede a lower-seq tombstone per spec. "+
+				"Investigate ts.Seq wiring in domain.Decide / tombstone persistence.", where.name)
 		}
 	}
 
-	// Belt-and-suspenders: confirm convergence is still CONSISTENT across all three
+	// Belt-and-suspenders: confirm convergence is CONSISTENT across all three
 	// stores even in the tie case (all agree the row is live — no split-brain where
 	// one store revives and another stays deleted).
 	aLive := liveTopicOnNode(t, a, topic) != nil

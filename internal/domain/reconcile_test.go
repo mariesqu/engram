@@ -618,29 +618,33 @@ func TestDecide_PureTombstoneUpsert_InsertsOwnIdentity(t *testing.T) {
 	}
 }
 
-// TestDecide_TombstoneTieBreak_SeqAuthority pins both directions of the
-// tombstone tie-break boundary where updated_at and version are EQUAL and seq
-// is the sole deciding factor (the final authoritative tiebreaker per INV4 spec).
+// TestDecide_TombstoneTieBreak_SeqAuthority pins all three directions of the
+// tombstone seq tie-break boundary where updated_at and version are EQUAL and
+// seq is the sole deciding factor (the final authoritative tiebreaker per INV4
+// spec.md:89-97).
 //
-// Current implementation: Decide() passes curSeq=0 when checking against a
-// tombstone (reconcile.go line ~42). This is intentional for PR2: the local
-// SQLite store does not assign Postgres BIGSERIAL seqs. The full wiring of
-// ts.Seq will be done in PR4 when the Postgres central store is live and
-// Tombstone.Seq is populated. These tests pin the boundary at the effective
-// current value (0) and document the required semantics for PR4.
+// Now that Tombstone.Seq is wired (ts.Seq is passed to writeWins instead of the
+// former hardcoded 0), these tests use an EXPLICIT non-zero tombstone seq so the
+// boundary is deterministic and independent of the 0-default.
+//
+// Scenarios (spec.md:117-122 and spec.md:124-129):
+//   - higher seq (incoming.seq = ts.Seq+1) → supersede → ActionInsert/Update (NOT NoOp)
+//   - lower seq  (incoming.seq = ts.Seq-1) → blocked  → NoOp
+//   - equal seq  (incoming.seq == ts.Seq)  → blocked  → NoOp (full equality)
 func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
 	project, scope := "engram", "project"
 	tombstoneTs := t100
 	tombstoneVersion := 1
-	// Effective tombstone seq seen by writeWins in this PR slice = 0
-	// (Decide passes 0 as curSeq for tombstone checks until PR4 wires ts.Seq).
-	const effectiveTombstoneSeq int64 = 0
+	// Explicit non-zero tombstone seq — ts.Seq is now wired into Decide.
+	const tombstoneSeq int64 = 10
 
-	// ── Direction 1: incoming seq > effective tombstone seq (0) → superseded ──
+	// ── Direction 1: incoming seq > ts.Seq → superseded (spec.md:117-122) ──
 	//
-	// writeWins(mut @ T+100 v=1 seq=1, curUpdatedAt=T+100, curVersion=1, curSeq=0)
-	// → timestamps equal → versions equal → 1 > 0 → true → ActionInsert
+	// writeWins(mut @ T+100 v=1 seq=11, curUpdatedAt=T+100, curVersion=1, curSeq=10)
+	// → timestamps equal → versions equal → 11 > 10 → true → ActionInsert
 	t.Run("higher_seq_supersedes_tombstone", func(t *testing.T) {
+		// spec.md:117-122: equal (updated_at, version), incoming.seq > tombstone.seq
+		// → upsert SUPERSEDES (delete revived; Insert/Update, NOT NoOp).
 		syncID := "sync-tiebreak-higher"
 		r := newMockReader()
 		r.seedTombstone(&Tombstone{
@@ -650,26 +654,56 @@ func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
 			DeletedAt: tombstoneTs,
 			DeletedBy: "writer-A",
 			Version:   tombstoneVersion,
+			Seq:       tombstoneSeq,
 		})
 
-		// seq=1 > effectiveTombstoneSeq(0) → writeWins returns true → ActionInsert
 		mut := newUpsert(syncID, "mut-tiebreak-higher", nil, project, scope,
-			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq+1, "revived content")
+			tombstoneTs, tombstoneVersion, tombstoneSeq+1, "revived content")
 		d := Decide(r, mut)
 		if d.Action != ActionInsert {
-			t.Fatalf("INV4 tie-break: seq(%d) > effective tombstone seq(%d) must supersede → ActionInsert; got %v",
-				effectiveTombstoneSeq+1, effectiveTombstoneSeq, d.Action)
+			t.Fatalf("spec.md:117-122: seq(%d) > ts.Seq(%d) must supersede → ActionInsert; got %v",
+				tombstoneSeq+1, tombstoneSeq, d.Action)
 		}
 		if !d.Undelete {
-			t.Errorf("INV4 tie-break: supersede must have Undelete=true; got false")
+			t.Errorf("spec.md:117-122: supersede must have Undelete=true; got false")
 		}
 	})
 
-	// ── Direction 2: incoming seq == effective tombstone seq (0) → blocked ──
+	// ── Direction 2: incoming seq < ts.Seq → blocked (spec.md:124-129) ──
 	//
-	// writeWins(mut @ T+100 v=1 seq=0, curUpdatedAt=T+100, curVersion=1, curSeq=0)
-	// → timestamps equal → versions equal → 0 > 0 = false → NoOp
+	// writeWins(mut @ T+100 v=1 seq=9, curUpdatedAt=T+100, curVersion=1, curSeq=10)
+	// → timestamps equal → versions equal → 9 > 10 = false → NoOp
+	t.Run("lower_seq_blocked_by_tombstone", func(t *testing.T) {
+		// spec.md:124-129: equal (updated_at, version), incoming.seq <= tombstone.seq
+		// → upsert BLOCKED (NoOp).
+		syncID := "sync-tiebreak-lower"
+		r := newMockReader()
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: tombstoneTs,
+			DeletedBy: "writer-A",
+			Version:   tombstoneVersion,
+			Seq:       tombstoneSeq,
+		})
+
+		mut := newUpsert(syncID, "mut-tiebreak-lower", nil, project, scope,
+			tombstoneTs, tombstoneVersion, tombstoneSeq-1, "stale content")
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("spec.md:124-129: seq(%d) < ts.Seq(%d) must be blocked → NoOp; got %v",
+				tombstoneSeq-1, tombstoneSeq, d.Action)
+		}
+	})
+
+	// ── Direction 3: incoming seq == ts.Seq → blocked (full equality) ──
+	//
+	// writeWins(mut @ T+100 v=1 seq=10, curUpdatedAt=T+100, curVersion=1, curSeq=10)
+	// → timestamps equal → versions equal → 10 > 10 = false → NoOp
 	t.Run("equal_seq_blocked_by_tombstone", func(t *testing.T) {
+		// spec.md:124-129 (full-equality sub-case): incoming.seq == tombstone.seq
+		// → upsert BLOCKED (NoOp — deterministic no-op when all dimensions match).
 		syncID := "sync-tiebreak-equal"
 		r := newMockReader()
 		r.seedTombstone(&Tombstone{
@@ -679,15 +713,15 @@ func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
 			DeletedAt: tombstoneTs,
 			DeletedBy: "writer-A",
 			Version:   tombstoneVersion,
+			Seq:       tombstoneSeq,
 		})
 
-		// seq=0 == effectiveTombstoneSeq(0) → writeWins returns false → NoOp
 		mut := newUpsert(syncID, "mut-tiebreak-equal", nil, project, scope,
-			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq, "equal-seq content")
+			tombstoneTs, tombstoneVersion, tombstoneSeq, "equal-seq content")
 		d := Decide(r, mut)
 		if d.Action != NoOp {
-			t.Fatalf("INV4 tie-break: seq(%d) == effective tombstone seq(%d) must be blocked → NoOp; got %v",
-				effectiveTombstoneSeq, effectiveTombstoneSeq, d.Action)
+			t.Fatalf("full-equality: seq(%d) == ts.Seq(%d) must be blocked → NoOp; got %v",
+				tombstoneSeq, tombstoneSeq, d.Action)
 		}
 	})
 }

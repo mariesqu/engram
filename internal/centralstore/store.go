@@ -127,7 +127,7 @@ func findBySyncIDQ(ctx context.Context, q querier, syncID string) (*domain.Recor
 
 func findTombstoneQ(ctx context.Context, q querier, syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
 	const bySyncID = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, seq
 		FROM central_tombstones
 		WHERE sync_id = $1
 		LIMIT 1`
@@ -142,7 +142,7 @@ func findTombstoneQ(ctx context.Context, q querier, syncID string, topicKey *str
 		return nil, nil
 	}
 	const byTopic = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, seq
 		FROM central_tombstones
 		WHERE topic_key = $1 AND project = $2 AND scope = $3
 		LIMIT 1`
@@ -294,26 +294,33 @@ func (s *Store) WriteTombstone(ctx context.Context, targetSyncID string, m domai
 // writeTombstoneQ is the ctx+querier core for WriteTombstone. Apply runs it on
 // its transaction so the tombstone row and the deleted_at flag on
 // central_memories are set within one atomic unit.
+//
+// seq ($8) carries the central BIGSERIAL seq assigned to this delete mutation
+// (m.Seq is set to that value by Apply before calling writeTombstoneQ). On
+// conflict the seq is also updated so a cross-writer re-delete refreshes the
+// tombstone's seq to the new delete's authoritative value.
 func writeTombstoneQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	const q = `
 		INSERT INTO central_tombstones
-		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, seq)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (sync_id) DO UPDATE SET
 		  project    = EXCLUDED.project,
 		  scope      = EXCLUDED.scope,
 		  topic_key  = EXCLUDED.topic_key,
 		  deleted_at = EXCLUDED.deleted_at,
 		  deleted_by = EXCLUDED.deleted_by,
-		  version    = EXCLUDED.version`
+		  version    = EXCLUDED.version,
+		  seq        = EXCLUDED.seq`
 	_, err := qr.Exec(ctx, q,
-		targetSyncID,     // $1 — canonical tombstone identity (may differ from m.SyncID)
-		m.Project,        // $2
-		m.Scope,          // $3
-		m.TopicKey,       // $4 (nil → NULL)
+		targetSyncID,      // $1 — canonical tombstone identity (may differ from m.SyncID)
+		m.Project,         // $2
+		m.Scope,           // $3
+		m.TopicKey,        // $4 (nil → NULL)
 		m.UpdatedAt.UTC(), // $5
-		m.WriterID,       // $6
-		m.Version,        // $7
+		m.WriterID,        // $6
+		m.Version,         // $7
+		m.Seq,             // $8 — central seq of the delete (assigned in Apply step 3)
 	)
 	if err != nil {
 		return fmt.Errorf("WriteTombstone: %w", err)
@@ -360,7 +367,7 @@ func scanTombstone(row pgx.Row) (*domain.Tombstone, error) {
 
 	err := row.Scan(
 		&ts.SyncID, &ts.Project, &ts.Scope, &topicKey,
-		&deletedAt, &ts.DeletedBy, &ts.Version,
+		&deletedAt, &ts.DeletedBy, &ts.Version, &ts.Seq,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -227,7 +227,7 @@ func Decide(tx Reader, m Mutation) Action {
             return Action{Kind: Insert, Mutation: m}     // first write; INV 1, 6
         }
         // (3) Version-guarded LWW: newer-by-(updated_at, version, seq) wins; older is dropped.
-        if writeWins(m, cur.UpdatedAt, cur.Version) {    // INV 3
+        if writeWins(m, cur.UpdatedAt, cur.Version, cur.Seq) {    // INV 3
             return Action{Kind: Update, Target: cur.SyncID, Mutation: m} // INV 1 converges to one row
         }
         return Action{Kind: NoOp, Reason: "stale, local newer"}        // INV 3 no lost update
@@ -236,14 +236,14 @@ func Decide(tx Reader, m Mutation) Action {
 }
 
 // Deterministic ordering — clock-skew safe because seq is server-assigned and monotonic.
-func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int) bool {
+func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curSeq int64) bool {
     if !m.UpdatedAt.Equal(curUpdatedAt) {       // INV 3 primary: wall-clock LWW
         return m.UpdatedAt.After(curUpdatedAt)
     }
     if m.Version != curVersion {                 // INV 3 secondary: monotonic version
         return m.Version > curVersion
     }
-    return m.Seq > 0 && m.Seq > 0               // INV 2 final tiebreaker: server seq (filled on pull)
+    return m.Seq > curSeq                        // INV 2 final tiebreaker: server seq (filled on pull)
 }
 ```
 

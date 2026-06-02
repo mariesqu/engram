@@ -418,6 +418,82 @@ func TestReaderRoundtrip_FindTombstone(t *testing.T) {
 	}
 }
 
+// TestReaderRoundtrip_TombstoneSeq verifies that WriteTombstone persists seq
+// and FindTombstone returns ts.Seq populated — the central seq tiebreaker
+// wiring per spec.md:89-97.
+//
+// WriteTombstone carries m.Seq which in Apply is the just-assigned BIGSERIAL.
+// Here we set m.Seq explicitly so the roundtrip is deterministic.
+//
+// Note: the lower-seq-blocked case cannot be produced via push because push
+// always assigns a fresh, higher BIGSERIAL seq — only the delete gets a lower
+// seq than any subsequent mutation. That branch is covered by the domain unit
+// test TestDecide_TombstoneTieBreak_SeqAuthority/lower_seq_blocked_by_tombstone.
+func TestReaderRoundtrip_TombstoneSeq(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	const wantSeq int64 = 77
+	m := testMutation("mut-tsseq-1", "sync-tsseq-1", "proj", domain.OpDelete)
+	m.Seq = wantSeq
+
+	if err := store.WriteTombstone(ctx, m.SyncID, m); err != nil {
+		t.Fatalf("WriteTombstone with seq: %v", err)
+	}
+
+	ts, err := store.FindTombstone("sync-tsseq-1", nil, "proj", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone, got nil")
+	}
+	if ts.Seq != wantSeq {
+		t.Errorf("tombstone seq roundtrip: ts.Seq = %d; want %d", ts.Seq, wantSeq)
+	}
+}
+
+// TestApply_TombstoneSeqWired verifies the full Apply path: after a push-apply
+// delete, the central_tombstones row carries the seq assigned by the BIGSERIAL,
+// and FindTombstone returns that seq. This confirms spec.md:89-97 is honoured
+// end-to-end through the central push-apply path.
+//
+// The higher-seq revive branch is already covered by the existing
+// TestApply_INV4_DeleteThenStaleThenReviveUpsert test; this test focuses solely
+// on the tombstone seq persistence.
+func TestApply_TombstoneSeqWired(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	// Step 1 — upsert so there is a live row to delete.
+	mUpsert := testMutation("mut-tsw-up", "sync-tsw-1", "proj", domain.OpUpsert)
+	mUpsert.UpdatedAt = time.Now().UTC()
+	if err := store.Apply(ctx, mUpsert); err != nil {
+		t.Fatalf("Apply upsert: %v", err)
+	}
+
+	// Step 2 — delete; Apply assigns the BIGSERIAL seq and writes the tombstone.
+	mDelete := testMutation("mut-tsw-del", "sync-tsw-1", "proj", domain.OpDelete)
+	mDelete.UpdatedAt = mUpsert.UpdatedAt.Add(time.Second)
+	if err := store.Apply(ctx, mDelete); err != nil {
+		t.Fatalf("Apply delete: %v", err)
+	}
+
+	// The tombstone must exist and its seq must be > 0 (the BIGSERIAL assigned by
+	// the delete Apply). We verify ts.Seq > 0 rather than an exact value because
+	// the BIGSERIAL value depends on other tests that may have run in this schema.
+	ts, err := store.FindTombstone("sync-tsw-1", nil, "proj", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone after Apply delete, got nil")
+	}
+	if ts.Seq <= 0 {
+		t.Errorf("tombstone seq after Apply delete: ts.Seq = %d; want > 0 (BIGSERIAL assigned)", ts.Seq)
+	}
+}
+
 // TestPartialUniqueIndex_RejectsSecondLiveRow verifies the partial UNIQUE INDEX
 // central_memories_topic_uidx enforces INV-A at the DB level: inserting a
 // second LIVE row for the same (topic_key, project, scope) must fail with a

@@ -1017,7 +1017,7 @@ func createLegacyDB(t *testing.T) string {
 // It simulates an existing user DB that was created with the old FK-bearing schema,
 // then calls Open() (which must run the v0->v1 migration) and asserts:
 //
-//  1. user_version is upgraded to currentSchemaVersion (1)
+//  1. user_version is upgraded to currentSchemaVersion
 //  2. Out-of-order child insert SUCCEEDS (FK is gone) — FAILS before migration
 //  3. All original rows are preserved
 //  4. FTS search still returns a seeded row (FTS index rebuilt)
@@ -1378,6 +1378,245 @@ func TestMigration_V1ToV2_BuggyTriggerReplaced(t *testing.T) {
 	_, err = s.db.Exec(`UPDATE memories SET deleted_at=NULL WHERE sync_id='v1buggy-test'`)
 	if err != nil {
 		t.Errorf("BUG B: UPDATE to undelete returned error (expected none after trigger migration): %v", err)
+	}
+}
+
+// ── v2→v3 migration tests ─────────────────────────────────────────────────────
+
+// createV2DBWithoutSeq creates a SQLite DB that simulates an existing v2 DB:
+// memory_tombstones WITHOUT the seq column, user_version = 2.
+// The caller opens the returned path via Open() to trigger the v2→v3 migration.
+// Returns the db path; caller is responsible for cleanup (use t.TempDir).
+func createV2DBWithoutSeq(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v2.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("createV2DBWithoutSeq: open: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		t.Fatalf("createV2DBWithoutSeq: WAL: %v", err)
+	}
+
+	// Apply the full current schema first (gets the correct memories table, FTS,
+	// triggers, etc.) then immediately drop and recreate memory_tombstones WITHOUT
+	// the seq column to simulate the v2 schema.
+	if err := ApplySchema(db); err != nil {
+		t.Fatalf("createV2DBWithoutSeq: ApplySchema: %v", err)
+	}
+
+	// Replace memory_tombstones with the v2 form (no seq column).
+	if _, err := db.Exec(`DROP TABLE IF EXISTS memory_tombstones`); err != nil {
+		t.Fatalf("createV2DBWithoutSeq: drop: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE memory_tombstones (
+		sync_id    TEXT    PRIMARY KEY,
+		project    TEXT    NOT NULL DEFAULT '',
+		scope      TEXT    NOT NULL DEFAULT 'project',
+		topic_key  TEXT,
+		deleted_at TEXT    NOT NULL,
+		deleted_by TEXT    NOT NULL,
+		version    INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatalf("createV2DBWithoutSeq: create v2 tombstones: %v", err)
+	}
+
+	// Seed a tombstone row so we can verify rows are preserved through migration.
+	if _, err := db.Exec(`
+		INSERT INTO memory_tombstones (sync_id, project, scope, deleted_at, deleted_by, version)
+		VALUES ('sync-v2-tomb', 'proj', 'project', '2025-01-01T00:00:00Z', 'writer-v2', 1)
+	`); err != nil {
+		t.Fatalf("createV2DBWithoutSeq: seed tombstone: %v", err)
+	}
+
+	// Set user_version = 2 to mark this as a pre-v3 DB.
+	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatalf("createV2DBWithoutSeq: set user_version: %v", err)
+	}
+
+	return path
+}
+
+// TestMigration_V2ToV3_SeqColumnAdded is the authoritative proof test for the
+// v2→v3 migration. It creates a DB at user_version=2 with memory_tombstones
+// that lacks the seq column, opens it via Open() (which runs migrateV2ToV3),
+// and asserts:
+//
+//  1. user_version == 3 after migration.
+//  2. The seq column now exists on memory_tombstones.
+//  3. Existing tombstone rows are preserved (seq defaults to 0).
+//  4. A tombstone written with a non-zero seq round-trips via FindTombstone.
+func TestMigration_V2ToV3_SeqColumnAdded(t *testing.T) {
+	path := createV2DBWithoutSeq(t)
+
+	// Open triggers runMigrations → migrateV2ToV3.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open v2 DB: %v", err)
+	}
+	defer s.Close()
+
+	// 1. user_version must be 3.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// 2. seq column must exist on memory_tombstones.
+	seqFound := false
+	rows, err := s.db.Query(`PRAGMA table_info(memory_tombstones)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			t.Fatalf("table_info scan: %v", err)
+		}
+		if name == "seq" {
+			seqFound = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows.Err: %v", err)
+	}
+	if !seqFound {
+		t.Error("v2→v3 migration: seq column not found on memory_tombstones after migration")
+	}
+
+	// 3. Existing tombstone row preserved; seq defaults to 0.
+	var seqVal int64
+	if err := s.db.QueryRow(
+		`SELECT seq FROM memory_tombstones WHERE sync_id = 'sync-v2-tomb'`,
+	).Scan(&seqVal); err != nil {
+		t.Fatalf("query preserved tombstone: %v", err)
+	}
+	if seqVal != 0 {
+		t.Errorf("preserved tombstone seq = %d; want 0 (DEFAULT backfill)", seqVal)
+	}
+
+	// 4. Round-trip: write a tombstone with seq=7, read it back via FindTombstone.
+	if _, err := s.db.Exec(`
+		INSERT INTO memory_tombstones (sync_id, project, scope, deleted_at, deleted_by, version, seq)
+		VALUES ('sync-v3-roundtrip', 'proj', 'project', '2025-06-01T00:00:00Z', 'writer-v3', 2, 7)
+	`); err != nil {
+		t.Fatalf("insert roundtrip tombstone: %v", err)
+	}
+	ts, err := s.FindTombstone("sync-v3-roundtrip", nil, "proj", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone, got nil")
+	}
+	if ts.Seq != 7 {
+		t.Errorf("tombstone roundtrip: ts.Seq = %d; want 7", ts.Seq)
+	}
+}
+
+// TestMigration_V2ToV3_FreshDB_Idempotent verifies that Open on a FRESH DB
+// (where ApplySchema already creates memory_tombstones WITH seq) reaches
+// user_version=3 without erroring — the migration must not attempt a duplicate
+// ALTER TABLE.
+func TestMigration_V2ToV3_FreshDB_Idempotent(t *testing.T) {
+	s := openTempStore(t)
+
+	// user_version must be 3 on a fresh DB.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("fresh DB user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// seq column must exist.
+	seqFound := false
+	rows, err := s.db.Query(`PRAGMA table_info(memory_tombstones)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			t.Fatalf("table_info scan: %v", err)
+		}
+		if name == "seq" {
+			seqFound = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows.Err: %v", err)
+	}
+	if !seqFound {
+		t.Error("fresh DB: seq column missing on memory_tombstones")
+	}
+}
+
+// TestTombstone_SeqRoundtrip verifies that a tombstone written with a specific
+// seq (via Apply WriteTombstone) is returned with ts.Seq populated by
+// FindTombstone. This is the integration proof that the localstore wires seq
+// end-to-end.
+func TestTombstone_SeqRoundtrip(t *testing.T) {
+	s := openTempStore(t)
+
+	// Seed the memories row that will be soft-deleted.
+	if _, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('sync-seq-rt', 'sess1', 'memory', 'manual', 'Seq Roundtrip', 'content', 'eng', 'project', 'w1')
+	`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const wantSeq int64 = 42
+	m := domain.Mutation{
+		MutationID: "mut-seq-rt",
+		Op:         domain.OpDelete,
+		SyncID:     "sync-seq-rt",
+		SessionID:  "sess1",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "Seq Roundtrip",
+		Content:    "content",
+		Project:    "eng",
+		Scope:      "project",
+		Version:    1,
+		Seq:        wantSeq,
+		UpdatedAt:  time.Now().UTC(),
+		OccurredAt: time.Now().UTC(),
+		WriterID:   "w1",
+	}
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: m.SyncID}, m); err != nil {
+		t.Fatalf("Apply WriteTombstone: %v", err)
+	}
+
+	ts, err := s.FindTombstone("sync-seq-rt", nil, "eng", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone, got nil")
+	}
+	if ts.Seq != wantSeq {
+		t.Errorf("ts.Seq = %d; want %d", ts.Seq, wantSeq)
 	}
 }
 
