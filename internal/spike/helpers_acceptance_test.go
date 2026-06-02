@@ -136,9 +136,18 @@ func strp(s string) *string { return &s }
 
 // ── full snapshot equality across nodes and central ─────────────────────────────
 
-// liveSnap is the canonical content of one live record used for cross-store
-// equality. It excludes seq (which is server-assigned and identical after
-// convergence anyway) to keep the comparison on the user-visible canonical state.
+// liveSnap is the convergence-relevant state of one live record used for
+// cross-store equality checks.
+//
+// seq is intentionally excluded: a node that authored the winning write keeps
+// its own local row with seq=0 (the central seq was not applied back to it
+// because the pull was an INV5 no-op), while the other node's pulled copy
+// carries the positive central seq. sync_id is also intentionally excluded from
+// the comparison: when two writers write the same topic_key, the canonical row
+// retains the FIRST writer's sync_id regardless of which write wins on content,
+// so the two nodes may hold the same topic under different sync_ids.
+// topic_key + content + version is the portable convergence state — that is
+// what must be identical across A.local, B.local, and central.
 type liveSnap struct {
 	syncID   string
 	topicKey string
@@ -147,9 +156,11 @@ type liveSnap struct {
 }
 
 // assertNodesAndCentralAgree asserts that the set of LIVE records (keyed by
-// topic) is identical across A.local, B.local, and central — same sync_id,
-// content, and version for every topic. This is the strongest end-to-end
-// convergence statement.
+// topic_key) is identical across A.local, B.local, and central — same CONTENT
+// and VERSION for every topic_key. sync_id and seq are NOT compared (see
+// liveSnap and compareSnaps for the rationale). This is the end-to-end
+// convergence statement: all three stores converge on the same canonical state
+// for every topic in the workload.
 func assertNodesAndCentralAgree(ctx context.Context, t *testing.T, a, b *spike.Node, c *centralStore) {
 	t.Helper()
 
@@ -217,15 +228,21 @@ func centralLiveSnap(ctx context.Context, t *testing.T, c *centralStore) map[str
 	return out
 }
 
-// compareSnaps asserts two live-snapshot maps AGREE on the convergence key: the
-// same set of topic_keys, each with identical CONTENT and VERSION (the canonical
-// converged state).
+// compareSnaps asserts two live-snapshot maps AGREE on topic-keyed canonical
+// state: same set of topic_keys, each with identical CONTENT and VERSION.
 //
-// sync_id is intentionally NOT part of the equality: it is a per-replica
-// surrogate that can legitimately differ when a node authored the winning write
-// under its own sync_id (see assertOneLiveEverywhere for the full rationale).
-// topic_key + content + version is the portable, convergence-relevant state, and
-// THAT must be byte-for-byte identical across A.local, B.local and central.
+// What IS compared: topic_key presence, content, and version — the portable
+// convergence-relevant state that must be identical across A.local, B.local,
+// and central after a full bidirectional sync.
+//
+// What is NOT compared:
+//   - sync_id: a node that authored the winning write keeps its own sync_id for
+//     that topic row, while the other node's pulled copy carries a different
+//     sync_id (the canonical one from the first writer). Both are correct.
+//   - seq: a node's authored row keeps seq=0 locally (the pulled central-seq'd
+//     copy is an INV5 no-op on the author's store), while the other node's
+//     pulled copy carries the positive central seq. The seq difference is
+//     expected and does not indicate divergence.
 func compareSnaps(t *testing.T, label string, x, y map[string]liveSnap) {
 	t.Helper()
 	if len(x) != len(y) {

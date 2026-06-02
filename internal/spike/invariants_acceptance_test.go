@@ -62,9 +62,12 @@ func TestConvergence_INV1_TopicConvergence(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 // INV2 — monotonic seq.
 //
-// Central assigns strictly increasing seq across the interleaved pushes from two
-// writers. We push A, B, A, B (distinct topics so no reconciliation no-ops) and
-// assert central_mutations.seq is strictly increasing in push order.
+// Central assigns strictly increasing seq regardless of which writer pushes.
+// Each writer writes ONE mutation, then pushes it immediately, alternating:
+// A1 write+push, B1 write+push, A2 write+push, B2 write+push. This means each
+// Push call drains exactly one outbox entry so the seq assignment genuinely
+// interleaves across writers — A1 gets seq N, B1 gets N+1, A2 gets N+2, B2
+// gets N+3 — rather than A1+A2 landing before B1+B2.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestConvergence_INV2_MonotonicSeq(t *testing.T) {
 	ctx := context.Background()
@@ -72,26 +75,35 @@ func TestConvergence_INV2_MonotonicSeq(t *testing.T) {
 	a := newNode(t, "A")
 	b := newNode(t, "B")
 
-	// Four distinct-topic writes interleaved across the two writers.
+	// Interleave writes AND pushes: A1, B1, A2, B2.
+	// Each write is followed immediately by a push so central assigns seq in the
+	// true interleaved order — A1:seq1, B1:seq2, A2:seq3, B2:seq4.
 	if _, err := a.Write(upsert("writer-A", "sync-2a1", "sdd/test/inv2-a1", "a1", 1, base.Add(1*time.Second))); err != nil {
-		t.Fatalf("A1: %v", err)
+		t.Fatalf("A1 write: %v", err)
 	}
-	if _, err := b.Write(upsert("writer-B", "sync-2b1", "sdd/test/inv2-b1", "b1", 1, base.Add(2*time.Second))); err != nil {
-		t.Fatalf("B1: %v", err)
-	}
-	if _, err := a.Write(upsert("writer-A", "sync-2a2", "sdd/test/inv2-a2", "a2", 1, base.Add(3*time.Second))); err != nil {
-		t.Fatalf("A2: %v", err)
-	}
-	if _, err := b.Write(upsert("writer-B", "sync-2b2", "sdd/test/inv2-b2", "b2", 1, base.Add(4*time.Second))); err != nil {
-		t.Fatalf("B2: %v", err)
+	if _, err := spikePush(ctx, t, a, central); err != nil { // pushes a1 only
+		t.Fatalf("push A1: %v", err)
 	}
 
-	// Interleave the pushes: A, B, A, B.
-	if _, err := spikePush(ctx, t, a, central); err != nil { // pushes a1, a2
-		t.Fatalf("push A: %v", err)
+	if _, err := b.Write(upsert("writer-B", "sync-2b1", "sdd/test/inv2-b1", "b1", 1, base.Add(2*time.Second))); err != nil {
+		t.Fatalf("B1 write: %v", err)
 	}
-	if _, err := spikePush(ctx, t, b, central); err != nil { // pushes b1, b2
-		t.Fatalf("push B: %v", err)
+	if _, err := spikePush(ctx, t, b, central); err != nil { // pushes b1 only
+		t.Fatalf("push B1: %v", err)
+	}
+
+	if _, err := a.Write(upsert("writer-A", "sync-2a2", "sdd/test/inv2-a2", "a2", 1, base.Add(3*time.Second))); err != nil {
+		t.Fatalf("A2 write: %v", err)
+	}
+	if _, err := spikePush(ctx, t, a, central); err != nil { // pushes a2 only
+		t.Fatalf("push A2: %v", err)
+	}
+
+	if _, err := b.Write(upsert("writer-B", "sync-2b2", "sdd/test/inv2-b2", "b2", 1, base.Add(4*time.Second))); err != nil {
+		t.Fatalf("B2 write: %v", err)
+	}
+	if _, err := spikePush(ctx, t, b, central); err != nil { // pushes b2 only
+		t.Fatalf("push B2: %v", err)
 	}
 
 	// central_mutations.seq must be strictly increasing in insertion order.
@@ -340,9 +352,12 @@ func TestConvergence_INV6_IndependentWrites(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settling proof — after a full bidirectional sync, A.local == B.local ==
-// central for EVERY record (live + tombstoned). This is the strongest
-// convergence statement: the two writers and the authority are byte-for-byte in
-// agreement on the canonical state for a non-trivial mixed workload.
+// central for EVERY live record. This is the strongest convergence statement:
+// all three stores agree on the canonical CONTENT and VERSION for each topic
+// (the user-visible convergence state). sync_id and seq are NOT compared here —
+// a node that authored the winning write keeps its own sync_id and local seq 0
+// for that row, while the other node's pulled copy carries the central seq.
+// See compareSnaps for the exact equality predicate.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestConvergence_FullBidirectionalSettles(t *testing.T) {
 	ctx := context.Background()
