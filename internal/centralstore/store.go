@@ -136,7 +136,16 @@ func (s *Store) MutationApplied(mutationID string) (bool, error) {
 // InsertMutation inserts a row into central_mutations and returns the BIGSERIAL
 // seq assigned by Postgres. This is the seq authority: the returned seq is the
 // canonical monotonic order for this mutation.
+//
+// central_mutations.payload is JSONB NOT NULL. If m.Payload is nil or empty the
+// INSERT would pass NULL, violating the NOT NULL constraint. We default to the
+// empty JSON object '{}' in that case without mutating the caller's Mutation.
 func (s *Store) InsertMutation(ctx context.Context, m domain.Mutation) (seq int64, err error) {
+	payload := m.Payload
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+
 	const q = `
 		INSERT INTO central_mutations
 		  (mutation_id, entity, entity_key, op, payload, writer_id, project, occurred_at)
@@ -147,7 +156,7 @@ func (s *Store) InsertMutation(ctx context.Context, m domain.Mutation) (seq int6
 		string(m.EntityType),
 		m.SyncID,
 		string(m.Op),
-		m.Payload,
+		payload,
 		m.WriterID,
 		m.Project,
 		m.OccurredAt.UTC(),
