@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mariesqu/engram/internal/domain"
@@ -52,13 +53,53 @@ func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
 }
 
+// querier is the subset of the pgx API shared by *pgxpool.Pool and pgx.Tx.
+// Both the pool (autocommit, one statement per acquired conn) and a transaction
+// (many statements on one conn) satisfy it, so the read/write cores below can run
+// either standalone (public Store methods) or inside a single Apply transaction.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
 // ── domain.Reader implementation ─────────────────────────────────────────────
+//
+// The public Store methods satisfy domain.Reader against the pool with a
+// background context. Each delegates to a ctx+querier core (the *Q functions)
+// so the exact same SQL also runs inside an Apply transaction against a pgx.Tx.
 
 // FindByTopic returns the live (non-deleted) record for the given
 // (topicKey, project, scope) triple, or nil if none exists.
 // Deterministic because central_memories_topic_uidx enforces ≤1 live row.
 func (s *Store) FindByTopic(topicKey, project, scope string) (*domain.Record, error) {
-	const q = `
+	return findByTopicQ(context.Background(), s.pool, topicKey, project, scope)
+}
+
+// FindBySyncID returns the record for the given sync_id regardless of
+// deletion state (including soft-deleted rows), or nil if not found.
+func (s *Store) FindBySyncID(syncID string) (*domain.Record, error) {
+	return findBySyncIDQ(context.Background(), s.pool, syncID)
+}
+
+// FindTombstone returns the tombstone for the given sync_id or topic_key,
+// or nil if no tombstone exists. Prefers sync_id; falls back to topic_key.
+// Deterministic because central_tombstones_topic_uidx enforces ≤1 tombstone
+// per topic identity.
+func (s *Store) FindTombstone(syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
+	return findTombstoneQ(context.Background(), s.pool, syncID, topicKey, project, scope)
+}
+
+// MutationApplied reports whether a mutation with the given ID has already
+// been applied (idempotency guard — Invariant 5).
+func (s *Store) MutationApplied(mutationID string) (bool, error) {
+	return mutationAppliedQ(context.Background(), s.pool, mutationID)
+}
+
+// ── ctx+querier read cores (shared by pool and tx) ───────────────────────────
+
+func findByTopicQ(ctx context.Context, q querier, topicKey, project, scope string) (*domain.Record, error) {
+	const sql = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
 		       project, scope, version, seq, writer_id,
 		       topic_key, status, parent_sync_id,
@@ -69,14 +110,11 @@ func (s *Store) FindByTopic(topicKey, project, scope string) (*domain.Record, er
 		  AND scope       = $3
 		  AND deleted_at IS NULL
 		LIMIT 1`
-	row := s.pool.QueryRow(context.Background(), q, topicKey, project, scope)
-	return scanRecord(row)
+	return scanRecord(q.QueryRow(ctx, sql, topicKey, project, scope))
 }
 
-// FindBySyncID returns the record for the given sync_id regardless of
-// deletion state (including soft-deleted rows), or nil if not found.
-func (s *Store) FindBySyncID(syncID string) (*domain.Record, error) {
-	const q = `
+func findBySyncIDQ(ctx context.Context, q querier, syncID string) (*domain.Record, error) {
+	const sql = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
 		       project, scope, version, seq, writer_id,
 		       topic_key, status, parent_sync_id,
@@ -84,21 +122,16 @@ func (s *Store) FindBySyncID(syncID string) (*domain.Record, error) {
 		FROM central_memories
 		WHERE sync_id = $1
 		LIMIT 1`
-	row := s.pool.QueryRow(context.Background(), q, syncID)
-	return scanRecord(row)
+	return scanRecord(q.QueryRow(ctx, sql, syncID))
 }
 
-// FindTombstone returns the tombstone for the given sync_id or topic_key,
-// or nil if no tombstone exists. Prefers sync_id; falls back to topic_key.
-// Deterministic because central_tombstones_topic_uidx enforces ≤1 tombstone
-// per topic identity.
-func (s *Store) FindTombstone(syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
+func findTombstoneQ(ctx context.Context, q querier, syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
 	const bySyncID = `
 		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
 		FROM central_tombstones
 		WHERE sync_id = $1
 		LIMIT 1`
-	ts, err := scanTombstone(s.pool.QueryRow(context.Background(), bySyncID, syncID))
+	ts, err := scanTombstone(q.QueryRow(ctx, bySyncID, syncID))
 	if err != nil {
 		return nil, err
 	}
@@ -113,15 +146,13 @@ func (s *Store) FindTombstone(syncID string, topicKey *string, project, scope st
 		FROM central_tombstones
 		WHERE topic_key = $1 AND project = $2 AND scope = $3
 		LIMIT 1`
-	return scanTombstone(s.pool.QueryRow(context.Background(), byTopic, *topicKey, project, scope))
+	return scanTombstone(q.QueryRow(ctx, byTopic, *topicKey, project, scope))
 }
 
-// MutationApplied reports whether a mutation with the given ID has already
-// been applied (idempotency guard — Invariant 5).
-func (s *Store) MutationApplied(mutationID string) (bool, error) {
-	const q = `SELECT 1 FROM central_mutations WHERE mutation_id = $1 LIMIT 1`
+func mutationAppliedQ(ctx context.Context, q querier, mutationID string) (bool, error) {
+	const sql = `SELECT 1 FROM central_mutations WHERE mutation_id = $1 LIMIT 1`
 	var dummy int
-	err := s.pool.QueryRow(context.Background(), q, mutationID).Scan(&dummy)
+	err := q.QueryRow(ctx, sql, mutationID).Scan(&dummy)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -141,17 +172,25 @@ func (s *Store) MutationApplied(mutationID string) (bool, error) {
 // INSERT would pass NULL, violating the NOT NULL constraint. We default to the
 // empty JSON object '{}' in that case without mutating the caller's Mutation.
 func (s *Store) InsertMutation(ctx context.Context, m domain.Mutation) (seq int64, err error) {
+	return insertMutationQ(ctx, s.pool, m)
+}
+
+// insertMutationQ is the ctx+querier core for InsertMutation. Running it on an
+// Apply transaction's pgx.Tx makes the seq assignment and the durable
+// applied-marker (central_mutations.mutation_id UNIQUE) part of the same atomic
+// unit as the reconciliation.
+func insertMutationQ(ctx context.Context, q querier, m domain.Mutation) (seq int64, err error) {
 	payload := m.Payload
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
 
-	const q = `
+	const sql = `
 		INSERT INTO central_mutations
 		  (mutation_id, entity, entity_key, op, payload, writer_id, project, occurred_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING seq`
-	err = s.pool.QueryRow(ctx, q,
+	err = q.QueryRow(ctx, sql,
 		m.MutationID,
 		string(m.EntityType),
 		m.SyncID,
@@ -179,6 +218,13 @@ func (s *Store) InsertMutation(ctx context.Context, m domain.Mutation) (seq int6
 // The caller (PR3b Decide-driven Apply) is responsible for running Decide()
 // and passing only winning mutations here.
 func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.Mutation, seq int64) error {
+	return upsertMemoryQ(ctx, s.pool, targetSyncID, m, seq)
+}
+
+// upsertMemoryQ is the ctx+querier core for UpsertMemory. Apply runs it on its
+// transaction so the canonical-state write commits atomically with the seq
+// assignment and the applied-marker.
+func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation, seq int64) error {
 	// created_at is intentionally omitted from the INSERT column list so the
 	// server's DEFAULT now() applies. This makes created_at server-authoritative
 	// and immune to client clock skew. created_at must NOT appear in the
@@ -207,7 +253,7 @@ func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.
 		  writer_id      = EXCLUDED.writer_id,
 		  updated_at     = EXCLUDED.updated_at,
 		  deleted_at     = NULL`
-	_, err := s.pool.Exec(ctx, q,
+	_, err := qr.Exec(ctx, q,
 		targetSyncID,         // $1 — canonical row identity (may differ from m.SyncID)
 		m.SessionID,          // $2
 		string(m.EntityType), // $3
@@ -242,6 +288,13 @@ func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.
 // Metadata (project, scope, topic_key, version, writer_id) always comes from m
 // because the DELETE mutation carries the authoritative deletion context.
 func (s *Store) WriteTombstone(ctx context.Context, targetSyncID string, m domain.Mutation) error {
+	return writeTombstoneQ(ctx, s.pool, targetSyncID, m)
+}
+
+// writeTombstoneQ is the ctx+querier core for WriteTombstone. Apply runs it on
+// its transaction so the tombstone row and the deleted_at flag on
+// central_memories are set within one atomic unit.
+func writeTombstoneQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	const q = `
 		INSERT INTO central_tombstones
 		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
@@ -253,7 +306,7 @@ func (s *Store) WriteTombstone(ctx context.Context, targetSyncID string, m domai
 		  deleted_at = EXCLUDED.deleted_at,
 		  deleted_by = EXCLUDED.deleted_by,
 		  version    = EXCLUDED.version`
-	_, err := s.pool.Exec(ctx, q,
+	_, err := qr.Exec(ctx, q,
 		targetSyncID,     // $1 — canonical tombstone identity (may differ from m.SyncID)
 		m.Project,        // $2
 		m.Scope,          // $3
