@@ -102,12 +102,12 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 // localstore.ApplyPulled runs Decide(localReader, m) → Apply, with INV5 making a
 // re-pulled mutation a no-op.
 //
-// ts.Seq is now WIRED through the local tombstone: memory_tombstones.seq is
-// persisted by execWriteTombstone and read back by findTombstoneQ, and Decide
-// passes ts.Seq to writeWins (not a hardcoded 0). The INV4 acceptance tests use
-// DISTINCT UpdatedAt values so wall-clock decides convergence; ts.Seq is the
-// authoritative final tiebreaker only when updated_at and version are equal
-// (probed explicitly in tsseq_probe_acceptance_test.go).
+// LWW tiebreaker: at the exact (updated_at, version) tie, writeWins resolves by
+// (writer_id, then sync_id) — both stable and replica-identical fields so every
+// store computes the same winner (no central seq back-channel required). The INV4
+// acceptance tests use DISTINCT UpdatedAt values so wall-clock decides convergence;
+// the identity tiebreaker is the final authority only when updated_at and version
+// are equal (probed explicitly in tsseq_probe_acceptance_test.go).
 //
 // Returns the number of mutations pulled (applied or no-op'd) this round.
 func Pull(ctx context.Context, n *Node, central Central, project string) (int, error) {

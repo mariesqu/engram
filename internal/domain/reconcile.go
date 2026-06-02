@@ -4,11 +4,21 @@
 //
 // All six two-writer convergence invariants are encoded here:
 //   INV1 — topic_key identity convergence (one record per topic)
-//   INV2 — monotonic seq (enforced by central BIGSERIAL; respected here by seq tiebreaker)
+//   INV2 — monotonic seq (enforced by central BIGSERIAL; pull/cursor ordering only)
 //   INV3 — no lost updates (version-guarded LWW)
 //   INV4 — no soft-delete resurrection (tombstone check before upsert)
 //   INV5 — idempotent re-apply (applied_mutations seen-set)
 //   INV6 — independent new writes preserved (distinct sync_ids never conflict)
+//
+// Final tiebreaker: when updated_at and version are both equal, writeWins
+// resolves the tie by (writer_id, then sync_id) — both fields are STABLE and
+// REPLICA-IDENTICAL (every store derives them from the same mutation payload,
+// with no central back-channel). This guarantees every store computes the SAME
+// winner from the SAME inputs: divergence at the exact tie is STRUCTURALLY
+// IMPOSSIBLE. Central seq is NOT used as a tiebreaker: a node's own authored
+// rows/tombstones keep seq=0 until the central-assigned seq is pulled back, so
+// seq is ASYMMETRIC (central sees the real BIGSERIAL; the author sees 0) and
+// cannot safely break a tie between two stores.
 package domain
 
 import "time"
@@ -71,19 +81,17 @@ func Decide(tx Reader, m Mutation) Decision {
 	// ts is HOISTED out of the guard so the switch below can recover the canonical
 	// identity from it when cur == nil (cross-writer convergence).
 	//
-	// ts.Seq is the spec-authoritative seq tiebreaker (spec.md:89-97): when
-	// updated_at and version are both equal, writeWins falls through to
-	// (m.Seq > ts.Seq). The tombstone seq is now carried by the persistent store
-	// (local memory_tombstones.seq and central central_tombstones.seq) and
-	// returned here via FindTombstone. 0 means not yet server-assigned (own
-	// pre-push write), matching the memories.seq convention for local-only writes.
+	// Tiebreaker: when updated_at and version are both equal, writeWins falls
+	// through to (writer_id, then sync_id) — both stable, replica-identical fields
+	// so every store computes the same winner (see package-level comment).
+	// ts.DeletedBy is the tombstone writer_id; ts.SyncID is the tombstone identity.
 	var ts *Tombstone
 	if t, err := tx.FindTombstone(m.SyncID, m.TopicKey, m.Project, m.Scope); err == nil {
 		ts = t
 	}
 	tombstoneSuperseded := false
 	if ts != nil {
-		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.Seq) {
+		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
 			return noop // tombstoned and the incoming write is not newer
 		}
 		// writeWins against the tombstone: adapter must clear it on supersede.
@@ -141,7 +149,7 @@ func Decide(tx Reader, m Mutation) Decision {
 			}
 		}
 		// INV3: version-guarded LWW — newer write wins.
-		if writeWins(m, cur.UpdatedAt, cur.Version, cur.Seq) {
+		if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
 			// INV1: update converges to one row.
 			// TargetSyncID is the RESOLVED row's sync_id (may differ from m.SyncID
 			// when resolved via FindByTopic — the P1-a convergence fix).
@@ -161,20 +169,39 @@ func Decide(tx Reader, m Mutation) Decision {
 }
 
 // writeWins reports whether the incoming mutation should overwrite the current
-// stored state. Priority order (per design decision 3 — clock-skew-proof):
+// stored state. Priority order (clock-skew-proof, symmetric/convergent):
+//
 //  1. updated_at (wall-clock) — primary comparator.
 //  2. version    — monotonic counter; tiebreaker when timestamps equal.
-//  3. seq        — server-assigned BIGSERIAL; final tiebreaker (INV2).
+//  3. writer_id  — stable, replica-identical string; final tiebreaker on the
+//     exact (updated_at, version) tie. Higher string wins (arbitrary but consistent).
+//  4. sync_id    — stable, content-addressed identity; resolved only when writer_id
+//     is also equal. Higher string wins; full equality returns false (deterministic
+//     no-op).
 //
-// Returns false on full equality (deterministic no-op when all dimensions match).
-func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curSeq int64) bool {
+// Why identity fields and not central seq: central seq is ASYMMETRIC — a node's
+// own authored rows/tombstones keep seq=0 (AckMutation never back-patches it;
+// self-authored mutations pulled back are INV5 NoOps), so the author and central
+// compute different tie winners → permanent split-brain. writer_id and sync_id are
+// derived from the mutation payload and are REPLICA-IDENTICAL: every store computes
+// the same winner from the same inputs, making split-brain at the tie structurally
+// impossible with no central back-channel required.
+func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, curSyncID string) bool {
 	if !m.UpdatedAt.Equal(curUpdatedAt) {
 		return m.UpdatedAt.After(curUpdatedAt)
 	}
 	if m.Version != curVersion {
 		return m.Version > curVersion
 	}
-	return m.Seq > curSeq
+	// Final tiebreaker: deterministic on STABLE, replica-identical fields (writer_id
+	// then sync_id) so EVERY store computes the same winner from the same inputs.
+	// This makes the exact (updated_at,version) tie converge with NO central seq
+	// back-channel. "Higher wins" is arbitrary but consistent; full equality returns
+	// false (deterministic no-op).
+	if m.WriterID != curWriterID {
+		return m.WriterID > curWriterID
+	}
+	return m.SyncID > curSyncID
 }
 
 // String returns a human-readable label for the Action constant.

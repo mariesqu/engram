@@ -14,7 +14,7 @@ A single polymorphic `memories` table (discriminated by `entity_type`) backs eve
 |---|----------|--------|----------|-----------|
 | 1 | Schema shape | Single polymorphic table + `entity_type` + CHECK | Typed tables per entity | One FTS index, one apply path, additive migrations, 1:1 engram retrofit. Typed tables only if type-specific NOT-NULL enforcement provably blocks (V2). |
 | 2 | Local driver | `modernc.org/sqlite` (pure Go) | `mattn/go-sqlite3` (CGO) | FTS5 is all core needs; clean single Windows binary. CGO unlocks `sqlite-vec` but breaks cross-compile; deferred to semantic-search change. |
-| 3 | Canonical order | Server `BIGSERIAL seq` + `version` int | Client timestamp LWW alone | Clock-skew-proof. `updated_at` is primary LWW key; `version` then `seq` are deterministic tiebreakers. |
+| 3 | Canonical order | `updated_at` (wall-clock) → `version` → `writer_id` → `sync_id` | Client timestamp LWW alone | Clock-skew-proof. `updated_at` is primary LWW key; `version` then `writer_id`/`sync_id` are deterministic tiebreakers. Central `seq` is the pull-cursor/journal ordering authority only — NOT used for LWW tiebreaking (seq is asymmetric: a node's own rows keep seq=0 until the central-assigned value is pulled, which creates split-brain at the exact tie). |
 | 4 | Idempotency key | Content-addressed `mutation_id` (SHA-256 of canonical payload) | DB unique on payload | Reuses `chunkcodec.ChunkID` pattern (`old_code/.../chunkcodec.go:13`); re-apply is a cheap seen-set lookup, no row churn. |
 | 5 | Apply purity | Pure `Reconciler.Decide()` returns an `Action`; adapters execute | Apply logic inside SQL handlers | Same decision function runs local + central + mock → invariants are unit-provable without Postgres. |
 | 6 | Writer identity | Per-writer ID + HMAC-signed token; `writer_id` audit column | Full JWT/RBAC | Spike needs distinct attributed writers only. Full auth is a later change. |
@@ -227,23 +227,29 @@ func Decide(tx Reader, m Mutation) Action {
             return Action{Kind: Insert, Mutation: m}     // first write; INV 1, 6
         }
         // (3) Version-guarded LWW: newer-by-(updated_at, version, seq) wins; older is dropped.
-        if writeWins(m, cur.UpdatedAt, cur.Version, cur.Seq) {    // INV 3
+        if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {  // INV 3
             return Action{Kind: Update, Target: cur.SyncID, Mutation: m} // INV 1 converges to one row
         }
-        return Action{Kind: NoOp, Reason: "stale, local newer"}        // INV 3 no lost update
+        return Action{Kind: NoOp, Reason: "stale, local newer"}                // INV 3 no lost update
     }
     return Action{Kind: NoOp}
 }
 
-// Deterministic ordering — clock-skew safe because seq is server-assigned and monotonic.
-func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curSeq int64) bool {
-    if !m.UpdatedAt.Equal(curUpdatedAt) {       // INV 3 primary: wall-clock LWW
+// Deterministic ordering — clock-skew safe. Final tiebreaker uses stable, replica-identical
+// fields (writer_id then sync_id) so every store computes the same winner from the same
+// inputs. Central seq is NOT used: a node's own rows keep seq=0 until the pull back-patches
+// it, making seq ASYMMETRIC and unsafe as a tie-break (causes split-brain at the exact tie).
+func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, curSyncID string) bool {
+    if !m.UpdatedAt.Equal(curUpdatedAt) {          // primary: wall-clock LWW
         return m.UpdatedAt.After(curUpdatedAt)
     }
-    if m.Version != curVersion {                 // INV 3 secondary: monotonic version
+    if m.Version != curVersion {                    // secondary: monotonic version
         return m.Version > curVersion
     }
-    return m.Seq > curSeq                        // INV 2 final tiebreaker: server seq (filled on pull)
+    if m.WriterID != curWriterID {                  // tertiary: writer identity
+        return m.WriterID > curWriterID
+    }
+    return m.SyncID > curSyncID                     // final: sync_id (full equality → false)
 }
 ```
 
