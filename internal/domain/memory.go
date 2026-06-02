@@ -38,8 +38,12 @@ type Record struct {
 	Project   string     `db:"project"`
 	Scope     string     `db:"scope"`
 	Version   int        `db:"version"`
-	Seq       int64      `db:"seq"`
-	WriterID  string     `db:"writer_id"`
+	// Seq is the central journal seq of the last mutation that materialized this
+	// row (retained for pull-cursor ordering and INV2 seq-propagation assertions).
+	// NOT used by the LWW tiebreaker — the final (updated_at,version) tie is
+	// resolved by (WriterID, SyncID); see writeWins in reconcile.go.
+	Seq      int64      `db:"seq"`
+	WriterID string     `db:"writer_id"`
 	CreatedAt time.Time  `db:"created_at"`
 	UpdatedAt time.Time  `db:"updated_at"`
 
