@@ -110,8 +110,12 @@ func newIsolatedStore(t *testing.T) *centralstore.Store {
 		t.Fatalf("newIsolatedStore: CREATE SCHEMA: %v", err)
 	}
 
-	// Build a DSN that sets search_path to the isolated schema.
-	dsn := fmt.Sprintf("%s options='-c search_path=%s,public'", pgDSN, schemaName)
+	// Build a DSN that sets search_path to the isolated schema.  withSearchPath
+	// handles both URL-form (postgres://...) and keyword/value DSNs correctly.
+	dsn, err := withSearchPath(pgDSN, schemaName)
+	if err != nil {
+		t.Fatalf("newIsolatedStore: withSearchPath: %v", err)
+	}
 
 	store, err := centralstore.Open(ctx, dsn)
 	if err != nil {
@@ -177,7 +181,12 @@ func TestCentralSchema_IdempotentApply(t *testing.T) {
 		cleanPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)) //nolint:errcheck
 	})
 
-	dsn := fmt.Sprintf("%s options='-c search_path=%s,public'", pgDSN, schemaName)
+	// Build a DSN that sets search_path to the isolated schema.  withSearchPath
+	// handles both URL-form (postgres://...) and keyword/value DSNs correctly.
+	dsn, err := withSearchPath(pgDSN, schemaName)
+	if err != nil {
+		t.Fatalf("TestCentralSchema_IdempotentApply: withSearchPath: %v", err)
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -300,13 +309,14 @@ func TestReaderRoundtrip_FindBySyncID(t *testing.T) {
 		t.Errorf("FindBySyncID live: SyncID=%q", got.SyncID)
 	}
 
-	// Soft-delete via WriteTombstone (sets deleted_at on central_memories).
+	// WriteTombstone only inserts the tombstone row in central_tombstones; it does
+	// NOT touch central_memories.deleted_at.  The full Decide-driven apply (PR3b)
+	// does both.  Manually set deleted_at on the memory row to test FindBySyncID
+	// with a soft-deleted record.
 	md := testMutation("mut-fbs-del", "sync-fbs-1", "proj", domain.OpDelete)
 	if err = store.WriteTombstone(ctx, md.SyncID, md); err != nil {
 		t.Fatalf("WriteTombstone: %v", err)
 	}
-	// Manually set deleted_at on the memory row (WriteTombstone only creates the
-	// tombstone row; the full Decide-driven apply in PR3b does both).
 	if _, err = store.Pool().Exec(ctx,
 		"UPDATE central_memories SET deleted_at = now() WHERE sync_id = $1",
 		"sync-fbs-1",
