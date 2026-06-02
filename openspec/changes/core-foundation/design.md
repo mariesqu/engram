@@ -214,19 +214,26 @@ func Decide(tx Reader, m Mutation) Action {
 
     // (4) Tombstone guard BEFORE any upsert: a delete at >= write time blocks resurrection.
     if ts := tx.FindTombstone(m.SyncID, m.TopicKey, m.Project, m.Scope); ts != nil { // INV 4
-        if m.Op == Upsert && !writeWins(m, ts.DeletedAt, ts.Version) {
+        if m.Op == Upsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
             return Action{Kind: NoOp, Reason: "tombstoned, stale write"}
         }
     }
 
     switch m.Op {
     case Delete:
+        // Uniform LWW gate: a delete supersedes the live row only if it wins the
+        // total order. When cur != nil and the delete loses writeWins, it is a NoOp
+        // (prevents stale-delete split-brain). When cur == nil the gate is skipped
+        // (pure tombstone or cross-writer re-tombstone paths).
+        if cur != nil && !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+            return Action{Kind: NoOp, Reason: "stale delete, live row newer"}
+        }
         return Action{Kind: WriteTombstone, Mutation: m} // sets deleted_at + tombstone row; INV 4
     case Upsert:
         if cur == nil {
             return Action{Kind: Insert, Mutation: m}     // first write; INV 1, 6
         }
-        // (3) Version-guarded LWW: newer-by-(updated_at, version, seq) wins; older is dropped.
+        // (3) Version-guarded LWW: newer-by-(updated_at, version, writer_id, sync_id) wins.
         if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {  // INV 3
             return Action{Kind: Update, Target: cur.SyncID, Mutation: m} // INV 1 converges to one row
         }
