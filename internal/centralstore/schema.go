@@ -124,9 +124,9 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			ON cloud_sync_audit(project, created_at DESC)`,
 	}
 
-	for _, stmt := range stmts {
+	for i, stmt := range stmts {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("centralstore.ApplySchema: %w", err)
+			return fmt.Errorf("ApplySchema: stmt %d: %w", i, err)
 		}
 	}
 	return nil
