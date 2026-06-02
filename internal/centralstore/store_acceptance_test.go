@@ -494,6 +494,112 @@ func TestApply_TombstoneSeqWired(t *testing.T) {
 	}
 }
 
+// TestApplySchema_UpgradesTombstoneSeqColumn verifies that ApplySchema adds the
+// seq column to a pre-PR5 central_tombstones table that was created without it.
+//
+// The test manually creates a minimal central_tombstones table WITHOUT the seq
+// column (simulating an existing central DB from before PR5), then calls
+// ApplySchema.  The ALTER TABLE ... ADD COLUMN IF NOT EXISTS statement that was
+// added to fix the runtime "column seq does not exist" regression must add the
+// column, making the schema coherent for reads/writes that reference seq.
+//
+// This genuinely exercises the ALTER upgrade path (not just the fresh-DB no-op
+// where CREATE TABLE already includes seq).
+func TestApplySchema_UpgradesTombstoneSeqColumn(t *testing.T) {
+	ctx := context.Background()
+	schemaName := schemaFor(t)
+
+	adminPool, err := pgxpool.New(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("pgxpool.New admin: %v", err)
+	}
+	defer adminPool.Close()
+
+	// Start from a clean schema.
+	if _, err := adminPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)); err != nil {
+		t.Fatalf("DROP SCHEMA: %v", err)
+	}
+	if _, err := adminPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %q", schemaName)); err != nil {
+		t.Fatalf("CREATE SCHEMA: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanPool, err2 := pgxpool.New(ctx, pgDSN)
+		if err2 != nil {
+			return
+		}
+		defer cleanPool.Close()
+		cleanPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)) //nolint:errcheck
+	})
+
+	dsn, err := withSearchPath(pgDSN, schemaName)
+	if err != nil {
+		t.Fatalf("withSearchPath: %v", err)
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New isolated: %v", err)
+	}
+	defer pool.Close()
+
+	// Create a minimal pre-PR5 central_tombstones WITHOUT the seq column.
+	// This is the exact scenario that caused "column seq does not exist" at runtime
+	// on a central Postgres DB that had the table before PR5 added seq.
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE central_tombstones (
+			sync_id    TEXT         PRIMARY KEY,
+			project    TEXT         NOT NULL DEFAULT '',
+			scope      TEXT         NOT NULL DEFAULT 'project',
+			topic_key  TEXT,
+			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+			deleted_by TEXT         NOT NULL DEFAULT '',
+			version    INT          NOT NULL DEFAULT 0
+		)`)
+	if err != nil {
+		t.Fatalf("CREATE pre-PR5 central_tombstones (no seq): %v", err)
+	}
+
+	// ApplySchema must succeed: the CREATE TABLE IF NOT EXISTS is a no-op, but the
+	// ALTER TABLE ... ADD COLUMN IF NOT EXISTS adds seq.
+	if err := centralstore.ApplySchema(ctx, pool); err != nil {
+		t.Fatalf("ApplySchema on pre-PR5 schema: %v", err)
+	}
+
+	// Assert the seq column now exists.
+	var colCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = $1
+		  AND table_name   = 'central_tombstones'
+		  AND column_name  = 'seq'`,
+		schemaName,
+	).Scan(&colCount)
+	if err != nil {
+		t.Fatalf("query information_schema.columns for seq: %v", err)
+	}
+	if colCount != 1 {
+		t.Errorf("seq column count = %d after ApplySchema upgrade; want 1", colCount)
+	}
+
+	// Confirm the column is usable: insert a row and read back seq (must be the DEFAULT 0).
+	_, err = pool.Exec(ctx, `
+		INSERT INTO central_tombstones (sync_id, deleted_by)
+		VALUES ('upgrade-test-sync-1', 'test')`)
+	if err != nil {
+		t.Fatalf("INSERT into upgraded central_tombstones: %v", err)
+	}
+	var seq int64
+	err = pool.QueryRow(ctx,
+		`SELECT seq FROM central_tombstones WHERE sync_id = 'upgrade-test-sync-1'`,
+	).Scan(&seq)
+	if err != nil {
+		t.Fatalf("SELECT seq from upgraded central_tombstones: %v", err)
+	}
+	if seq != 0 {
+		t.Errorf("upgraded tombstone seq = %d; want 0 (DEFAULT)", seq)
+	}
+}
+
 // TestPartialUniqueIndex_RejectsSecondLiveRow verifies the partial UNIQUE INDEX
 // central_memories_topic_uidx enforces INV-A at the DB level: inserting a
 // second LIVE row for the same (topic_key, project, scope) must fail with a

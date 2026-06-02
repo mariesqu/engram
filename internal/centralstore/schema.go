@@ -110,6 +110,14 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			seq        BIGINT       NOT NULL DEFAULT 0
 		)`,
 
+		// Idempotent upgrade for pre-PR5 central DBs: CREATE TABLE IF NOT EXISTS above
+		// is a no-op when central_tombstones already exists, so the seq column (added in
+		// PR5, now referenced by reads/writes) must be added explicitly. ADD COLUMN IF
+		// NOT EXISTS is a no-op on a fresh DB (column already present from the CREATE)
+		// and adds it on an upgrade. On Postgres 11+ a NOT NULL column with a constant
+		// default is a fast metadata-only change (no table rewrite).
+		`ALTER TABLE central_tombstones ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 0`,
+
 		// Partial UNIQUE: ≤1 tombstone per live topic identity (INV-B).
 		// Allows topic_key IS NULL rows (non-topic records) to share NULL freely.
 		`CREATE UNIQUE INDEX IF NOT EXISTS central_tombstones_topic_uidx

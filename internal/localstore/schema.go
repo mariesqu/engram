@@ -360,11 +360,11 @@ func migrateV2ToV3(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback() //nolint:errcheck
-		}
-	}()
+	// Unconditional rollback: the table_info scan loop uses local-err returns that
+	// do not assign the outer err variable, making the conditional-defer pattern
+	// error-prone (tx stays open on scan/close errors). An unconditional Rollback
+	// after a successful Commit is a harmless no-op in database/sql.
+	defer tx.Rollback() //nolint:errcheck
 
 	// Check whether the seq column already exists in memory_tombstones.
 	// PRAGMA table_info returns one row per column; we scan for a column named "seq".
@@ -406,8 +406,7 @@ func migrateV2ToV3(db *sql.DB) error {
 	if _, err = tx.Exec(`PRAGMA user_version = 3`); err != nil {
 		return err
 	}
-	err = tx.Commit()
-	return err
+	return tx.Commit()
 }
 
 // rebuildMemoriesTable performs the SQLite table-rebuild to drop the legacy FK:
