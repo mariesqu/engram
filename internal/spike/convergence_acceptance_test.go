@@ -28,6 +28,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -313,9 +314,30 @@ func assertNodeLiveCount(t *testing.T, n *spike.Node, topic string, want int) {
 // ── DSN / port / cache helpers (mirror centralstore_test) ──────────────────────
 
 // withSearchPath returns a DSN that sets search_path to "<schema>,public".
+//
+// Two DSN forms are handled:
+//   - URL-form (scheme "postgres://" or "postgresql://"): the "options" query
+//     parameter is set to "-c search_path=<schema>,public" (URL-encoded) and
+//     the URL is re-encoded and returned.
+//   - Keyword/value form (everything else): the options string is appended as a
+//     space-separated key=value pair — the format produced by embedded-postgres
+//     and accepted by pgx.
+//
+// An error is returned only when the URL-form DSN cannot be parsed by net/url.
+// NOTE: this duplicates centralstore_test.withSearchPath intentionally — a
+// shared testutil extraction is a future cleanup; for now behaviour must match.
 func withSearchPath(dsn, schema string) (string, error) {
-	// embedded-postgres always produces keyword/value DSNs; append the options
-	// pair. (URL-form handling omitted — the package never produces one.)
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", fmt.Errorf("withSearchPath: parse DSN: %w", err)
+		}
+		q := u.Query()
+		q.Set("options", fmt.Sprintf("-c search_path=%s,public", schema))
+		u.RawQuery = q.Encode()
+		return u.String(), nil
+	}
+	// Keyword/value form — append options key=value pair.
 	return fmt.Sprintf("%s options='-c search_path=%s,public'", dsn, schema), nil
 }
 
