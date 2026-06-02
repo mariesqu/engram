@@ -13,6 +13,7 @@ package centralstore_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mariesqu/engram/internal/centralstore"
@@ -53,8 +55,9 @@ func TestMain(m *testing.M) {
 		}
 
 		// Cache/runtime directories under the module cache so the Postgres binary
-		// is only downloaded once across test runs.
-		cacheDir := filepath.Join(cacheRoot(), "embeddedpg")
+		// is only downloaded once across test runs. cacheRoot() already returns a
+		// path ending in "embeddedpg" — do NOT append another "embeddedpg" suffix.
+		cacheDir := cacheRoot()
 		runtimeDir := filepath.Join(os.TempDir(), fmt.Sprintf("engram-epg-%d", port))
 
 		cfg := embeddedpostgres.DefaultConfig().
@@ -254,7 +257,7 @@ func TestReaderRoundtrip_FindByTopic(t *testing.T) {
 	tk := "sdd/test/topic"
 	m := testMutationWithTopic("mut-fbt-1", "sync-fbt-1", "proj", "scp", tk, domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -281,7 +284,7 @@ func TestReaderRoundtrip_FindBySyncID(t *testing.T) {
 
 	m := testMutation("mut-fbs-1", "sync-fbs-1", "proj", domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -299,7 +302,7 @@ func TestReaderRoundtrip_FindBySyncID(t *testing.T) {
 
 	// Soft-delete via WriteTombstone (sets deleted_at on central_memories).
 	md := testMutation("mut-fbs-del", "sync-fbs-1", "proj", domain.OpDelete)
-	if err = store.WriteTombstone(ctx, md); err != nil {
+	if err = store.WriteTombstone(ctx, md.SyncID, md); err != nil {
 		t.Fatalf("WriteTombstone: %v", err)
 	}
 	// Manually set deleted_at on the memory row (WriteTombstone only creates the
@@ -333,7 +336,7 @@ func TestReaderRoundtrip_FindTombstone(t *testing.T) {
 	tk := "sdd/test/tombstone"
 	m := testMutationWithTopic("mut-ts-1", "sync-ts-1", "proj", "scp", tk, domain.OpDelete)
 
-	if err := store.WriteTombstone(ctx, m); err != nil {
+	if err := store.WriteTombstone(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("WriteTombstone: %v", err)
 	}
 
@@ -374,7 +377,7 @@ func TestPartialUniqueIndex_RejectsSecondLiveRow(t *testing.T) {
 	m1 := testMutationWithTopic("mut-uniq-1", "sync-uniq-1", "proj", "scp", tk, domain.OpUpsert)
 	m2 := testMutationWithTopic("mut-uniq-2", "sync-uniq-2", "proj", "scp", tk, domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m1, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m1.SyncID, m1, 1); err != nil {
 		t.Fatalf("UpsertMemory first live row: %v", err)
 	}
 
@@ -391,10 +394,216 @@ func TestPartialUniqueIndex_RejectsSecondLiveRow(t *testing.T) {
 	if err == nil {
 		t.Fatal("second live row with same topic_key/project/scope: expected unique-violation error, got nil")
 	}
-	errMsg := err.Error()
-	if !strings.Contains(errMsg, "unique") && !strings.Contains(errMsg, "duplicate") &&
-		!strings.Contains(errMsg, "central_memories_topic_uidx") {
-		t.Errorf("expected unique-violation error; got: %v", err)
+	// Assert the SQLSTATE code deterministically (23505 = unique_violation) rather
+	// than pattern-matching error message text, which varies across Postgres versions.
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected *pgconn.PgError, got %T: %v", err, err)
+	}
+	if pgErr.Code != "23505" {
+		t.Errorf("expected SQLSTATE 23505 (unique_violation), got %q: %v", pgErr.Code, err)
+	}
+}
+
+// TestUpsertMemory_CrossWriterConvergence verifies that UpsertMemory with a
+// targetSyncID different from m.SyncID updates the canonical row Y rather than
+// creating a second live row — no central_memories_topic_uidx violation and no
+// duplicate-key failure. This is the P1-a cross-writer convergence fix.
+//
+// Setup: seed a live row Y for topic T under writer A.
+// Action: call UpsertMemory(ctx, "Y", mX, seq) where mX.SyncID="X" (Writer B,
+// newer wall-clock) but targetSyncID="Y" (Decide resolved canonical row Y).
+// Assert: exactly one live row for T, its sync_id is still Y, its content is
+// mX's content (the winning update was applied to the canonical row).
+func TestUpsertMemory_CrossWriterConvergence(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	tk := "sdd/test/crosswriter-upsert"
+	tptr := &tk
+
+	// Writer A seeds the canonical row Y.
+	mY := domain.Mutation{
+		MutationID: "mut-cw-y",
+		Op:         domain.OpUpsert,
+		SyncID:     "sync-cw-Y",
+		SessionID:  "sess-A",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "Row Y (Writer A)",
+		Content:    "content from writer A",
+		Project:    "proj",
+		Scope:      "scp",
+		TopicKey:   tptr,
+		Version:    1,
+		Seq:        0,
+		WriterID:   "writer-A",
+		UpdatedAt:  time.Now().Add(-10 * time.Second).UTC(),
+		OccurredAt: time.Now().Add(-10 * time.Second).UTC(),
+		Payload:    []byte(`{}`),
+	}
+	if err := store.UpsertMemory(ctx, mY.SyncID, mY, 1); err != nil {
+		t.Fatalf("seed canonical row Y: %v", err)
+	}
+
+	// Writer B has a newer mutation X for the same topic. Decide() resolved
+	// canonical row Y; it returns TargetSyncID="sync-cw-Y". We simulate calling
+	// UpsertMemory with targetSyncID=Y and m.SyncID=X.
+	mX := domain.Mutation{
+		MutationID: "mut-cw-x",
+		Op:         domain.OpUpsert,
+		SyncID:     "sync-cw-X", // incoming writer B sync_id — NOT the canonical row
+		SessionID:  "sess-B",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "Row X (Writer B — newer)",
+		Content:    "content from writer B (winner)",
+		Project:    "proj",
+		Scope:      "scp",
+		TopicKey:   tptr,
+		Version:    2,
+		Seq:        0,
+		WriterID:   "writer-B",
+		UpdatedAt:  time.Now().UTC(), // newer wall-clock → wins
+		OccurredAt: time.Now().UTC(),
+		Payload:    []byte(`{}`),
+	}
+	// targetSyncID = "sync-cw-Y" (the canonical row resolved by Decide).
+	// This must NOT fail with central_memories_topic_uidx violation.
+	if err := store.UpsertMemory(ctx, "sync-cw-Y", mX, 2); err != nil {
+		t.Fatalf("UpsertMemory cross-writer (targetSyncID=Y, m.SyncID=X): %v", err)
+	}
+
+	// Assert: exactly one live row for topic T.
+	rows, err := store.Pool().Query(ctx,
+		`SELECT sync_id, title, content FROM central_memories
+		 WHERE topic_key=$1 AND project=$2 AND scope=$3 AND deleted_at IS NULL`,
+		tk, "proj", "scp",
+	)
+	if err != nil {
+		t.Fatalf("query live rows: %v", err)
+	}
+	defer rows.Close()
+
+	type row struct{ syncID, title, content string }
+	var live []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.syncID, &r.title, &r.content); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		live = append(live, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	if len(live) != 1 {
+		t.Fatalf("expected exactly 1 live row for topic T, got %d: %+v", len(live), live)
+	}
+	if live[0].syncID != "sync-cw-Y" {
+		t.Errorf("canonical row sync_id=%q, want %q", live[0].syncID, "sync-cw-Y")
+	}
+	if live[0].content != mX.Content {
+		t.Errorf("canonical row content=%q, want %q (writer B's winning content)", live[0].content, mX.Content)
+	}
+}
+
+// TestWriteTombstone_CrossWriterConvergence verifies that WriteTombstone with a
+// targetSyncID different from m.SyncID reuses the canonical tombstone Y rather
+// than creating a second tombstone — no central_tombstones_topic_uidx violation.
+// This is the P1-b cross-writer convergence fix.
+//
+// Setup: seed a tombstone under Y for topic T.
+// Action: call WriteTombstone(ctx, "Y", mX) where mX.SyncID="X" (different
+// writer) but targetSyncID="Y" (Decide resolved canonical tombstone Y).
+// Assert: exactly one tombstone for T (ON CONFLICT reused Y, no duplicate).
+func TestWriteTombstone_CrossWriterConvergence(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	tk := "sdd/test/crosswriter-tombstone"
+	tptr := &tk
+
+	// Seed the canonical tombstone under Y (Writer A's delete).
+	mY := domain.Mutation{
+		MutationID: "mut-cwts-y",
+		Op:         domain.OpDelete,
+		SyncID:     "sync-cwts-Y",
+		SessionID:  "sess-A",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "",
+		Content:    "",
+		Project:    "proj",
+		Scope:      "scp",
+		TopicKey:   tptr,
+		Version:    1,
+		Seq:        0,
+		WriterID:   "writer-A",
+		UpdatedAt:  time.Now().Add(-5 * time.Second).UTC(),
+		OccurredAt: time.Now().Add(-5 * time.Second).UTC(),
+		Payload:    []byte(`{}`),
+	}
+	if err := store.WriteTombstone(ctx, mY.SyncID, mY); err != nil {
+		t.Fatalf("seed canonical tombstone Y: %v", err)
+	}
+
+	// Writer B tries to re-delete the same topic (mX.SyncID=X). Decide resolved
+	// canonical tombstone Y → TargetSyncID="sync-cwts-Y". We call WriteTombstone
+	// with targetSyncID=Y and m.SyncID=X. Must not hit central_tombstones_topic_uidx.
+	mX := domain.Mutation{
+		MutationID: "mut-cwts-x",
+		Op:         domain.OpDelete,
+		SyncID:     "sync-cwts-X", // incoming — NOT the canonical tombstone
+		SessionID:  "sess-B",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "",
+		Content:    "",
+		Project:    "proj",
+		Scope:      "scp",
+		TopicKey:   tptr,
+		Version:    2,
+		Seq:        0,
+		WriterID:   "writer-B",
+		UpdatedAt:  time.Now().UTC(),
+		OccurredAt: time.Now().UTC(),
+		Payload:    []byte(`{}`),
+	}
+	// targetSyncID = "sync-cwts-Y" — must reuse the canonical tombstone, not create a new one.
+	if err := store.WriteTombstone(ctx, "sync-cwts-Y", mX); err != nil {
+		t.Fatalf("WriteTombstone cross-writer (targetSyncID=Y, m.SyncID=X): %v", err)
+	}
+
+	// Assert: exactly one tombstone for topic T.
+	rows, err := store.Pool().Query(ctx,
+		`SELECT sync_id FROM central_tombstones
+		 WHERE topic_key=$1 AND project=$2 AND scope=$3`,
+		tk, "proj", "scp",
+	)
+	if err != nil {
+		t.Fatalf("query tombstones: %v", err)
+	}
+	defer rows.Close()
+
+	var syncIDs []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		syncIDs = append(syncIDs, sid)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	if len(syncIDs) != 1 {
+		t.Fatalf("expected exactly 1 tombstone for topic T, got %d: %v", len(syncIDs), syncIDs)
+	}
+	if syncIDs[0] != "sync-cwts-Y" {
+		t.Errorf("tombstone sync_id=%q, want %q (canonical row reused)", syncIDs[0], "sync-cwts-Y")
 	}
 }
 
