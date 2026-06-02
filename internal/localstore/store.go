@@ -62,12 +62,28 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// DB exposes the underlying *sql.DB so callers (the sync harness, tests) can run
+// raw queries and pass it to the package-level Apply without going through the
+// Store's typed methods. Mirrors centralstore.Store.Pool(). The connection is
+// configured with SetMaxOpenConns(1) — callers must not assume concurrency.
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 // ── domain.Reader implementation ─────────────────────────────────────────────
 
-// FindByTopic returns the live (non-deleted) record for the given
-// (topicKey, project, scope) triple, or nil if none exists.
-func (s *Store) FindByTopic(topicKey, project, scope string) (*domain.Record, error) {
-	const q = `
+// rowQuerier is the minimal interface shared by *sql.DB and *sql.Tx that is
+// sufficient for the Reader query cores. Both types implement QueryRow with
+// the same signature, allowing the *Q helper functions below to be called from
+// either a live connection (via s.db) or an in-flight transaction (via tx).
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// findByTopicQ is the query core for FindByTopic, parameterised over rowQuerier
+// so it can run inside or outside a transaction.
+func findByTopicQ(q rowQuerier, topicKey, project, scope string) (*domain.Record, error) {
+	const query = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
 		       project, scope, version, seq, writer_id,
 		       topic_key, status, parent_sync_id,
@@ -78,12 +94,12 @@ func (s *Store) FindByTopic(topicKey, project, scope string) (*domain.Record, er
 		  AND scope     = ?
 		  AND deleted_at IS NULL
 		LIMIT 1`
-	return scanRecord(s.db.QueryRow(q, topicKey, project, scope))
+	return scanRecord(q.QueryRow(query, topicKey, project, scope))
 }
 
-// FindBySyncID returns the record for the given sync_id, or nil if not found.
-func (s *Store) FindBySyncID(syncID string) (*domain.Record, error) {
-	const q = `
+// findBySyncIDQ is the query core for FindBySyncID.
+func findBySyncIDQ(q rowQuerier, syncID string) (*domain.Record, error) {
+	const query = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
 		       project, scope, version, seq, writer_id,
 		       topic_key, status, parent_sync_id,
@@ -91,19 +107,17 @@ func (s *Store) FindBySyncID(syncID string) (*domain.Record, error) {
 		FROM memories
 		WHERE sync_id = ?
 		LIMIT 1`
-	return scanRecord(s.db.QueryRow(q, syncID))
+	return scanRecord(q.QueryRow(query, syncID))
 }
 
-// FindTombstone returns the tombstone for the given sync_id or topic_key,
-// or nil if no tombstone exists.
-func (s *Store) FindTombstone(syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
-	// Prefer sync_id lookup; fall back to topic_key.
+// findTombstoneQ is the query core for FindTombstone.
+func findTombstoneQ(q rowQuerier, syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
 	const bySyncID = `
 		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
 		FROM memory_tombstones
 		WHERE sync_id = ?
 		LIMIT 1`
-	ts, err := scanTombstone(s.db.QueryRow(bySyncID, syncID))
+	ts, err := scanTombstone(q.QueryRow(bySyncID, syncID))
 	if err != nil {
 		return nil, err
 	}
@@ -118,20 +132,70 @@ func (s *Store) FindTombstone(syncID string, topicKey *string, project, scope st
 		FROM memory_tombstones
 		WHERE topic_key = ? AND project = ? AND scope = ?
 		LIMIT 1`
-	return scanTombstone(s.db.QueryRow(byTopic, *topicKey, project, scope))
+	return scanTombstone(q.QueryRow(byTopic, *topicKey, project, scope))
+}
+
+// mutationAppliedQ is the query core for MutationApplied.
+func mutationAppliedQ(q rowQuerier, mutationID string) (bool, error) {
+	var count int
+	err := q.QueryRow(
+		`SELECT count(*) FROM applied_mutations WHERE mutation_id = ?`, mutationID,
+	).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("mutationAppliedQ: %w", err)
+	}
+	return count > 0, nil
+}
+
+// txReader adapts an in-flight *sql.Tx to domain.Reader so that domain.Decide
+// reads from the same snapshot the pending writes will commit against. This
+// mirrors centralstore's decideReader pattern.
+//
+// With db.SetMaxOpenConns(1) the single connection is held by the transaction
+// for its entire duration, so Decide + applyTx + enqueueOutboxTx are all
+// serialized on that connection — no interleaving from a concurrent goroutine
+// is possible while the tx is open.
+type txReader struct {
+	tx *sql.Tx
+}
+
+func (r *txReader) FindByTopic(topicKey, project, scope string) (*domain.Record, error) {
+	return findByTopicQ(r.tx, topicKey, project, scope)
+}
+
+func (r *txReader) FindBySyncID(syncID string) (*domain.Record, error) {
+	return findBySyncIDQ(r.tx, syncID)
+}
+
+func (r *txReader) FindTombstone(syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
+	return findTombstoneQ(r.tx, syncID, topicKey, project, scope)
+}
+
+func (r *txReader) MutationApplied(mutationID string) (bool, error) {
+	return mutationAppliedQ(r.tx, mutationID)
+}
+
+// FindByTopic returns the live (non-deleted) record for the given
+// (topicKey, project, scope) triple, or nil if none exists.
+func (s *Store) FindByTopic(topicKey, project, scope string) (*domain.Record, error) {
+	return findByTopicQ(s.db, topicKey, project, scope)
+}
+
+// FindBySyncID returns the record for the given sync_id, or nil if not found.
+func (s *Store) FindBySyncID(syncID string) (*domain.Record, error) {
+	return findBySyncIDQ(s.db, syncID)
+}
+
+// FindTombstone returns the tombstone for the given sync_id or topic_key,
+// or nil if no tombstone exists.
+func (s *Store) FindTombstone(syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
+	return findTombstoneQ(s.db, syncID, topicKey, project, scope)
 }
 
 // MutationApplied reports whether a mutation with the given ID has already been
 // applied (idempotency guard — Invariant 5).
 func (s *Store) MutationApplied(mutationID string) (bool, error) {
-	var count int
-	err := s.db.QueryRow(
-		`SELECT count(*) FROM applied_mutations WHERE mutation_id = ?`, mutationID,
-	).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("MutationApplied: %w", err)
-	}
-	return count > 0, nil
+	return mutationAppliedQ(s.db, mutationID)
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
