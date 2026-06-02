@@ -49,7 +49,8 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE TABLE IF NOT EXISTS central_memories (
 			sync_id        TEXT         PRIMARY KEY,
 			session_id     TEXT         NOT NULL DEFAULT '',
-			entity_type    TEXT         NOT NULL DEFAULT 'memory',
+			entity_type    TEXT         NOT NULL DEFAULT 'memory'
+			               CHECK(entity_type IN ('memory','change','spec','task','standard','plan')),
 			type           TEXT         NOT NULL DEFAULT '',
 			status         TEXT,
 			title          TEXT         NOT NULL DEFAULT '',
@@ -65,7 +66,12 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			embedding      BYTEA,
 			created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
 			updated_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
-			deleted_at     TIMESTAMPTZ
+			deleted_at     TIMESTAMPTZ,
+			-- Application-level invariants encoded as CHECK constraints (parity with local memories table).
+			-- Only 'memory' rows may omit status.
+			CHECK(entity_type = 'memory' OR status IS NOT NULL),
+			-- SDD hierarchy: spec/task/plan MUST belong to a parent; memory/change/standard MAY be root.
+			CHECK(entity_type IN ('memory','change','standard') OR parent_sync_id IS NOT NULL)
 		)`,
 
 		// CRITICAL: partial UNIQUE on (topic_key, project, scope) WHERE deleted_at IS NULL

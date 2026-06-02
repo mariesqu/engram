@@ -170,12 +170,18 @@ func (s *Store) InsertMutation(ctx context.Context, m domain.Mutation) (seq int6
 // The caller (PR3b Decide-driven Apply) is responsible for running Decide()
 // and passing only winning mutations here.
 func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.Mutation, seq int64) error {
+	// created_at is intentionally omitted from the INSERT column list so the
+	// server's DEFAULT now() applies. This makes created_at server-authoritative
+	// and immune to client clock skew. created_at must NOT appear in the
+	// ON CONFLICT DO UPDATE SET list either (it stays immutable after first
+	// creation). updated_at IS updated — it is the client logical write time used
+	// by writeWins() as the LWW tiebreaker across writers.
 	const q = `
 		INSERT INTO central_memories
 		  (sync_id, session_id, entity_type, type, status, title, content,
 		   project, scope, topic_key, parent_sync_id, version, seq, writer_id,
-		   created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$15)
+		   created_by, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15)
 		ON CONFLICT (sync_id) DO UPDATE SET
 		  session_id     = EXCLUDED.session_id,
 		  entity_type    = EXCLUDED.entity_type,
@@ -207,7 +213,7 @@ func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.
 		m.Version,            // $12
 		seq,                  // $13
 		m.WriterID,           // $14 (used for both writer_id AND created_by on INSERT via $14 twice)
-		m.UpdatedAt.UTC(),    // $15 (used for both created_at AND updated_at on INSERT via $15 twice)
+		m.UpdatedAt.UTC(),    // $15 — client logical write time (LWW tiebreaker); NOT used for created_at
 	)
 	if err != nil {
 		return fmt.Errorf("UpsertMemory: %w", err)

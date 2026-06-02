@@ -617,6 +617,80 @@ func TestWriteTombstone_CrossWriterConvergence(t *testing.T) {
 	}
 }
 
+// TestUpsertMemory_CreatedAtIsServerTime verifies that UpsertMemory does NOT
+// override the server's DEFAULT now() for created_at with the client's
+// m.UpdatedAt value. The test inserts with m.UpdatedAt set to a stale past
+// time (2020-01-01) and then reads the row back, asserting:
+//   - created_at is recent (within a few seconds of server now(), NOT 2020).
+//   - updated_at is the stale m.UpdatedAt value (proving updated_at keeps the
+//     client logical write time used by writeWins() as the LWW tiebreaker).
+func TestUpsertMemory_CreatedAtIsServerTime(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	// m.UpdatedAt is intentionally set to a stale past time to prove that
+	// created_at does NOT inherit this value from the INSERT.
+	staleTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	m := testMutation("mut-creat-1", "sync-creat-1", "proj", domain.OpUpsert)
+	m.UpdatedAt = staleTime
+
+	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+		t.Fatalf("UpsertMemory: %v", err)
+	}
+
+	// Read the raw row back to inspect both timestamp columns.
+	var createdAt, updatedAt time.Time
+	err := store.Pool().QueryRow(ctx,
+		`SELECT created_at, updated_at FROM central_memories WHERE sync_id = $1`,
+		"sync-creat-1",
+	).Scan(&createdAt, &updatedAt)
+	if err != nil {
+		t.Fatalf("SELECT created_at/updated_at: %v", err)
+	}
+
+	// created_at must be server now(), not 2020. Allow 30-second window for slow CI.
+	threshold := 30 * time.Second
+	sinceCreated := time.Since(createdAt.UTC())
+	if sinceCreated < 0 || sinceCreated > threshold {
+		t.Errorf("created_at=%v is not server now(): time.Since=%v (want within %v)", createdAt, sinceCreated, threshold)
+	}
+
+	// updated_at must be the stale m.UpdatedAt — the client logical write time
+	// that writeWins() uses as the LWW tiebreaker.
+	if !updatedAt.UTC().Equal(staleTime) {
+		t.Errorf("updated_at=%v, want stale client value %v (LWW tiebreaker must be preserved)", updatedAt.UTC(), staleTime)
+	}
+}
+
+// TestEntityTypeCheck_RejectsBogusValue verifies that the entity_type CHECK
+// constraint on central_memories rejects an INSERT with an invalid entity_type.
+// A raw INSERT with entity_type='bogus' must fail with SQLSTATE 23514
+// (check_violation) — the same pgconn assertion pattern used in
+// TestPartialUniqueIndex_RejectsSecondLiveRow.
+func TestEntityTypeCheck_RejectsBogusValue(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	_, err := store.Pool().Exec(ctx, `
+		INSERT INTO central_memories
+		  (sync_id, entity_type, type, title, content, project, scope,
+		   version, seq, writer_id, created_by)
+		VALUES ($1,$2,'manual','title','content','proj','project',1,1,'w','w')`,
+		"sync-check-bogus", "bogus",
+	)
+	if err == nil {
+		t.Fatal("INSERT with entity_type='bogus': expected check_violation error, got nil")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected *pgconn.PgError, got %T: %v", err, err)
+	}
+	// SQLSTATE 23514 = check_violation
+	if pgErr.Code != "23514" {
+		t.Errorf("expected SQLSTATE 23514 (check_violation), got %q: %v", pgErr.Code, err)
+	}
+}
+
 // ── Utility helpers ───────────────────────────────────────────────────────────
 
 func testMutation(mutID, syncID, project string, op domain.Op) domain.Mutation {
