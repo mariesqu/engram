@@ -122,7 +122,8 @@ func TestEqualTie_UpsertBeforeDelete_Converges(t *testing.T) {
 		t.Fatalf("FORCED-ORDERING NOT ACHIEVED: need S_up < S_del, got %d >= %d", sUp, sDel)
 	}
 
-	// Central must be DELETED (delete supersedes unconditionally in OpDelete path).
+	// Central must be DELETED: the delete WINS the LWW total order against the live
+	// upsert (deleter writer-Z > upserter writer-A), so the OpDelete gate tombstones.
 	if rec := liveTopicOnCentral(t, central, topic); rec != nil {
 		t.Fatalf("central: topic %q unexpectedly LIVE after delete pushed; expected DELETED", topic)
 	}

@@ -62,7 +62,7 @@ When a topic_key conflict is detected, the central store MUST apply Last-Write-W
 
 ### Requirement: No lost updates — LWW version guard (Invariant 3)
 
-Every UPDATE on the central store MUST include a guard: the update is applied only when `stored.updated_at < incoming.updated_at` AND `stored.version < incoming.version`. An older arriving write MUST NOT overwrite a newer stored row.
+Every UPDATE on the central store MUST be guarded by the LWW total order `updated_at → version → writer_id → sync_id`: the update is applied only when the incoming write WINS that order against the stored row — a strictly-newer `incoming.updated_at` wins outright; on equal `updated_at`, a higher `incoming.version` wins; on equal `version`, the higher `writer_id` then `sync_id` wins (the same `writeWins` chain used in every conflict path). `version` is a tiebreaker on equal timestamps ONLY — it MUST NOT reject a write whose `updated_at` is strictly newer but whose `version` is lower. An older arriving write MUST NOT overwrite a newer stored row.
 
 When the guard condition is not met, the current core layer resolves the losing write as a deterministic NoOp (see design.md — `Action{Kind: NoOp, Reason: "stale, local newer"}`). HTTP 409 Conflict is the future transport-phase manifestation of this outcome: once a transport layer is added, it MAY surface the NoOp decision as a 409 response so the client can decide to discard or merge. The core layer itself does not return HTTP status codes.
 
@@ -84,7 +84,7 @@ When the guard condition is not met, the current core layer resolves the losing 
 
 ### Requirement: No soft-delete resurrection — tombstone blocks upsert (Invariant 4)
 
-The system MUST maintain a `memory_tombstones` table recording `(sync_id, deleted_at, deleted_by, version)` for every deleted row. When processing an upsert for a given `sync_id`, the central store MUST check the tombstone table first. A tombstone MUST be written atomically with the soft-delete of the `memories` row.
+The system MUST maintain a `memory_tombstones` table recording `(sync_id, project, scope, topic_key, deleted_at, deleted_by, version)` for every deleted row. The `project`, `scope`, and `topic_key` columns are required so a tombstone can be resolved by topic identity (FindTombstone-by-topic), not only by `sync_id`. When processing an upsert for a given `sync_id` or `topic_key`, the central store MUST check the tombstone table first. A tombstone MUST be written atomically with the soft-delete of the `memories` row.
 
 **Tombstone supersede rule (precise — authoritative):**
 
