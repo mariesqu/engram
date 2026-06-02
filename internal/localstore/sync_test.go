@@ -5,6 +5,7 @@ package localstore
 // in-process convergence spike wires them to a real central store.
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -222,6 +223,149 @@ func TestLocalWrite_Atomic(t *testing.T) {
 	}
 	if entries[0].Mutation.MutationID != got.MutationID {
 		t.Errorf("outbox entry MutationID=%q, want %q", entries[0].Mutation.MutationID, got.MutationID)
+	}
+}
+
+// TestAckMutation_ErrorOnNonExistentSeq verifies that AckMutation returns an
+// error when the supplied local_seq does not exist or has already been acked,
+// and that last_acked_seq is NOT advanced in either case.
+func TestAckMutation_ErrorOnNonExistentSeq(t *testing.T) {
+	s := openTempStore(t)
+
+	readCursor := func() int64 {
+		t.Helper()
+		var v int64
+		if err := s.db.QueryRow(
+			`SELECT last_acked_seq FROM sync_state WHERE target_key = 'central'`,
+		).Scan(&v); err != nil {
+			t.Fatalf("read last_acked_seq: %v", err)
+		}
+		return v
+	}
+
+	// 1. Ack a local_seq that was never inserted — must error.
+	if err := s.AckMutation(999); err == nil {
+		t.Error("AckMutation(non-existent): want error, got nil")
+	}
+	if got := readCursor(); got != 0 {
+		t.Errorf("cursor after non-existent ack = %d; want 0 (must not advance)", got)
+	}
+
+	// 2. Write one mutation, ack it successfully, then try to ack it again (already-acked).
+	_, err := s.LocalWrite(upsertMut("sync-ack-err", "sdd/test/ack-err", "v1", 1, baseT.Add(1*time.Second)))
+	if err != nil {
+		t.Fatalf("LocalWrite: %v", err)
+	}
+	entries, err := s.DrainOutbox(0)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 pending entry, got %d", len(entries))
+	}
+	localSeq := entries[0].LocalSeq
+
+	// First ack succeeds and advances the cursor.
+	if err := s.AckMutation(localSeq); err != nil {
+		t.Fatalf("first AckMutation: %v", err)
+	}
+	if got := readCursor(); got != localSeq {
+		t.Errorf("cursor after first ack = %d; want %d", got, localSeq)
+	}
+
+	// Second ack of the same (already-acked) local_seq must error.
+	if err := s.AckMutation(localSeq); err == nil {
+		t.Error("AckMutation(already-acked): want error, got nil")
+	}
+	// Cursor must remain at localSeq (not double-advance or reset).
+	if got := readCursor(); got != localSeq {
+		t.Errorf("cursor after double-ack attempt = %d; want %d (must not change)", got, localSeq)
+	}
+}
+
+// TestLocalWrite_ConcurrentWrites_NoError launches several goroutines that each
+// perform LocalWrite and ApplyPulled calls concurrently against the same Store
+// (distinct topics so Decide sees no conflicts). With db.SetMaxOpenConns(1) the
+// single SQLite connection serializes the transactions — the whole
+// decide+apply+enqueue sequence is atomic per call, so there are no race
+// conditions, constraint errors, or stale decisions.
+//
+// After all goroutines finish the test asserts:
+//   - No errors occurred.
+//   - The expected number of live rows is present (one per topic).
+//   - The outbox has the expected number of pending entries (one per LocalWrite).
+func TestLocalWrite_ConcurrentWrites_NoError(t *testing.T) {
+	s := openTempStore(t)
+
+	const nWriters = 8 // goroutines
+	errCh := make(chan error, nWriters*2)
+
+	for i := 0; i < nWriters; i++ {
+		i := i
+		go func() {
+			topic := fmt.Sprintf("sdd/test/concurrent-%d", i)
+			syncID := fmt.Sprintf("sync-c%d", i)
+			m := upsertMut(syncID, topic, fmt.Sprintf("content-%d", i), 1, baseT.Add(time.Duration(i+1)*time.Second))
+			_, err := s.LocalWrite(m)
+			errCh <- err
+		}()
+	}
+
+	// Also run ApplyPulled concurrently for distinct topics (simulating pull-apply
+	// interleaved with local writes). These are distinct topics so no conflict.
+	for i := 0; i < nWriters; i++ {
+		i := i
+		go func() {
+			topic := fmt.Sprintf("sdd/test/concurrent-pull-%d", i)
+			syncID := fmt.Sprintf("sync-p%d", i)
+			m := upsertMut(syncID, topic, fmt.Sprintf("pulled-%d", i), 1, baseT.Add(time.Duration(i+1)*time.Second))
+			// normalizeMutation so MutationID is set (ApplyPulled preserves it).
+			m = normalizeMutation(m)
+			err := s.ApplyPulled(m)
+			errCh <- err
+		}()
+	}
+
+	for i := 0; i < nWriters*2; i++ {
+		if err := <-errCh; err != nil {
+			t.Errorf("concurrent write/pull error: %v", err)
+		}
+	}
+
+	// Each LocalWrite topic must be live.
+	for i := 0; i < nWriters; i++ {
+		topic := fmt.Sprintf("sdd/test/concurrent-%d", i)
+		rec, err := s.FindByTopic(topic, "engram", "project")
+		if err != nil {
+			t.Errorf("FindByTopic(%s): %v", topic, err)
+			continue
+		}
+		if rec == nil {
+			t.Errorf("topic %s: missing live row after concurrent LocalWrite", topic)
+		}
+	}
+
+	// Each ApplyPulled topic must also be live.
+	for i := 0; i < nWriters; i++ {
+		topic := fmt.Sprintf("sdd/test/concurrent-pull-%d", i)
+		rec, err := s.FindByTopic(topic, "engram", "project")
+		if err != nil {
+			t.Errorf("FindByTopic(%s): %v", topic, err)
+			continue
+		}
+		if rec == nil {
+			t.Errorf("topic %s: missing live row after concurrent ApplyPulled", topic)
+		}
+	}
+
+	// Outbox must have exactly nWriters pending entries (one per LocalWrite).
+	// ApplyPulled does NOT enqueue, so pulled rows don't appear here.
+	n, err := s.PendingCount()
+	if err != nil {
+		t.Fatalf("PendingCount: %v", err)
+	}
+	if n != nWriters {
+		t.Errorf("PendingCount=%d, want %d (one outbox entry per LocalWrite)", n, nWriters)
 	}
 }
 
