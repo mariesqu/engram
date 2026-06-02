@@ -102,6 +102,17 @@ This is identical to the `writeWins(incoming, tombstone.deleted_at, tombstone.ve
 
 **Block condition**: An upsert MUST be blocked (NoOp) when `writeWins` returns false against the tombstone — i.e., the incoming write does NOT win the chain above.
 
+**Uniform LWW model — deletes compete on the same total order as upserts:**
+
+The `updated_at → version → writer_id → sync_id` total order governs ALL conflicts, including delete-vs-live-row. A delete supersedes the current LIVE row ONLY if it wins that order; a stale or tie-losing delete against a live row is a NoOp. This closes two permanent split-brain cases the unconditional `OpDelete` left open:
+
+- **Stale delete vs newer upsert**: a delete at `updated_at=T1` must NOT tombstone a live row at `updated_at=T2` when `T2 > T1`, regardless of push order or application order.
+- **Exact-tie, upserter-higher**: at identical `(updated_at, version)`, a delete from a writer with a LOWER `writer_id` than the live row's writer must NOT tombstone it (the delete loses `writeWins`).
+
+When there is no live row (`cur == nil`) the gate is skipped: the delete tombstones unconditionally (pure tombstone or cross-writer re-tombstone paths — see INV-B hardening).
+
+This symmetric treatment is what guarantees every store computes the same outcome from the same mutation payload fields: no central back-channel, no seq asymmetry, no split-brain.
+
 #### Scenario: Delete followed by late-arriving update — delete wins (timestamp clear)
 
 - GIVEN Writer A deletes `sync_id = 'mem-42'` at `deleted_at = T+200, version = 2` (tombstone written)

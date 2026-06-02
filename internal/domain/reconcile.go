@@ -3,22 +3,35 @@
 // port and carry no I/O, no database, no side effects.
 //
 // All six two-writer convergence invariants are encoded here:
-//   INV1 — topic_key identity convergence (one record per topic)
-//   INV2 — monotonic seq (enforced by central BIGSERIAL; pull/cursor ordering only)
-//   INV3 — no lost updates (version-guarded LWW)
-//   INV4 — no soft-delete resurrection (tombstone check before upsert)
-//   INV5 — idempotent re-apply (applied_mutations seen-set)
-//   INV6 — independent new writes preserved (distinct sync_ids never conflict)
 //
-// Final tiebreaker: when updated_at and version are both equal, writeWins
-// resolves the tie by (writer_id, then sync_id) — both fields are STABLE and
-// REPLICA-IDENTICAL (every store derives them from the same mutation payload,
-// with no central back-channel). This guarantees every store computes the SAME
-// winner from the SAME inputs: divergence at the exact tie is STRUCTURALLY
-// IMPOSSIBLE. Central seq is NOT used as a tiebreaker: a node's own authored
-// rows/tombstones keep seq=0 until the central-assigned seq is pulled back, so
-// seq is ASYMMETRIC (central sees the real BIGSERIAL; the author sees 0) and
-// cannot safely break a tie between two stores.
+//	INV1 — topic_key identity convergence (one record per topic)
+//	INV2 — monotonic seq (enforced by central BIGSERIAL; pull/cursor ordering only)
+//	INV3 — no lost updates (version-guarded LWW)
+//	INV4 — no soft-delete resurrection (tombstone check before upsert)
+//	INV5 — idempotent re-apply (applied_mutations seen-set)
+//	INV6 — independent new writes preserved (distinct sync_ids never conflict)
+//
+// UNIFORM LWW MODEL — applies to EVERY write (upsert or delete):
+//
+// The four-level total order  updated_at → version → writer_id → sync_id
+// governs ALL conflicts, including delete-vs-live-row. A delete supersedes the
+// current LIVE row only if it WINS that order; a stale or tie-losing delete is a
+// NoOp against a live row. When there is no live row (cur == nil) the gate is
+// skipped and the delete tombstones unconditionally (pure tombstone / cross-writer
+// re-tombstone paths are unchanged).
+//
+// This symmetry is what makes every store converge regardless of push order or
+// which writer holds the higher identity: upserts and deletes compete on the
+// same inputs, so every store computes the same winner from the same payload
+// fields — no central back-channel is needed.
+//
+// Tiebreaker rationale — identity fields, NOT central seq:
+// Central seq is ASYMMETRIC — a node's own authored rows/tombstones keep seq=0
+// until the central-assigned seq is pulled back, so the authoring node and
+// central would compute different seq-based tie winners → permanent split-brain.
+// writer_id and sync_id are derived from the mutation payload and are
+// REPLICA-IDENTICAL: every store derives them from the same data. Divergence at
+// the exact (updated_at, version) tie is STRUCTURALLY IMPOSSIBLE.
 package domain
 
 import "time"
@@ -100,6 +113,21 @@ func Decide(tx Reader, m Mutation) Decision {
 
 	switch m.Op {
 	case OpDelete:
+		// A delete competes on the SAME total order as an upsert
+		// (updated_at → version → writer_id → sync_id). It supersedes the current
+		// LIVE row only if it WINS that order; a stale or tie-losing delete against
+		// a live row is a NoOp. This is what makes deletes symmetric with the pull
+		// side and with upsert-vs-upsert, so every store converges regardless of
+		// push order or which writer holds the higher identity.
+		//
+		// When cur == nil (no live row) the gate is skipped — the delete still
+		// tombstones unconditionally: either it is the first delete of this identity
+		// (pure tombstone) or the canonical row was already soft-deleted by a prior
+		// writer and the INV-B re-tombstone hardening below is unchanged.
+		if cur != nil && !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+			return noop
+		}
+
 		// INV4 / INV-B: write tombstone atomically (adapter executes this).
 		//
 		// TargetSyncID must address the CANONICAL identity so the adapter's

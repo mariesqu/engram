@@ -485,6 +485,198 @@ func TestDecide_DeleteWritesTombstone(t *testing.T) {
 	}
 }
 
+// TestDecide_Delete_CurNil_TombstonesUnconditionally verifies that when there is
+// no live row (cur == nil) the LWW gate is skipped and OpDelete always tombstones.
+// This covers the pure-tombstone and cross-writer re-tombstone paths.
+func TestDecide_Delete_CurNil_TombstonesUnconditionally(t *testing.T) {
+	syncID := "sync-del-nil"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Delete with a LOW updated_at — there is no live cur, so the gate does not fire.
+	mut := Mutation{
+		MutationID: "mut-del-nil",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        1,
+		UpdatedAt:  t0, // oldest possible — would lose any LWW comparison
+		WriterID:   "writer-A",
+	}
+	d := Decide(r, mut)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("OpDelete with no live row must tombstone unconditionally; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_StaleDelete_IsNoOp verifies that a delete with a strictly
+// OLDER updated_at than the live row is a NoOp (the uniform LWW gate).
+// This closes the stale-delete split-brain: a delete that loses the total order
+// must NOT tombstone a newer live row.
+func TestDecide_Delete_StaleDelete_IsNoOp(t *testing.T) {
+	syncID := "sync-del-stale"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Seed a live row at T+100 v=2.
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  t100,
+		Content:    "newer live content",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-Z",
+	})
+
+	// Delete at T+50 v=1 — strictly older in every dimension.
+	mut := Mutation{
+		MutationID: "mut-del-stale",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        2,
+		UpdatedAt:  t50, // older than the live row
+		WriterID:   "writer-A",
+	}
+	d := Decide(r, mut)
+	if d.Action != NoOp {
+		t.Fatalf("stale delete must be NoOp against a newer live row; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_NewerDelete_Tombstones verifies that a delete with a strictly
+// NEWER updated_at than the live row returns ActionWriteTombstone (wins LWW gate).
+func TestDecide_Delete_NewerDelete_Tombstones(t *testing.T) {
+	syncID := "sync-del-newer"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Seed a live row at T+50 v=1.
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        2,
+		UpdatedAt:  t50,
+		Content:    "older live content",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-A",
+	})
+
+	// Delete at T+100 v=2 — strictly newer.
+	mut := Mutation{
+		MutationID: "mut-del-newer",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  t100, // newer than the live row
+		WriterID:   "writer-B",
+	}
+	d := Decide(r, mut)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("newer delete must tombstone a live row; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_TieLoss_IsNoOp verifies that at the exact (updated_at,
+// version) tie where the incoming delete's writer_id is LOWER than the live
+// row's writer_id, the delete is a NoOp (it loses the identity tiebreaker).
+// This is the "upserter-higher, delete-loses" case that caused the split-brain.
+func TestDecide_Delete_TieLoss_IsNoOp(t *testing.T) {
+	syncID := "sync-del-tie-loss"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Live row at T+100 v=2, written by "writer-Z" (higher writer_id).
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        3,
+		UpdatedAt:  t100,
+		Content:    "live content writer-Z",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-Z",
+	})
+
+	// Delete at the SAME (updated_at, version) but LOWER writer_id — loses the
+	// identity tiebreaker.
+	mut := Mutation{
+		MutationID: "mut-del-tie-loss",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        4,
+		UpdatedAt:  t100,      // same timestamp
+		WriterID:   "writer-A", // lower than "writer-Z" → loses
+	}
+	d := Decide(r, mut)
+	if d.Action != NoOp {
+		t.Fatalf("tie-losing delete (writer-A < writer-Z) must be NoOp; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_TieWin_Tombstones verifies that at the exact (updated_at,
+// version) tie where the incoming delete's writer_id is HIGHER than the live
+// row's writer_id, the delete wins and returns ActionWriteTombstone.
+func TestDecide_Delete_TieWin_Tombstones(t *testing.T) {
+	syncID := "sync-del-tie-win"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Live row at T+100 v=2, written by "writer-A" (lower writer_id).
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        3,
+		UpdatedAt:  t100,
+		Content:    "live content writer-A",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-A",
+	})
+
+	// Delete at the SAME (updated_at, version) but HIGHER writer_id — wins.
+	mut := Mutation{
+		MutationID: "mut-del-tie-win",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        4,
+		UpdatedAt:  t100,      // same timestamp
+		WriterID:   "writer-Z", // higher than "writer-A" → wins
+	}
+	d := Decide(r, mut)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("tie-winning delete (writer-Z > writer-A) must tombstone; got %v", d.Action)
+	}
+}
+
 // TestDecide_TombstonedSyncIDBlocksStaleUpsert verifies INV4-readiness:
 // a tombstone with deleted_at >= mutation.updated_at blocks the upsert (NoOp).
 // The full INV4 proof is PR4 acceptance, but Decide() must already handle it.
