@@ -9,17 +9,19 @@
 // runs in its own isolated schema via newIsolatedStore (see store_acceptance_test.go).
 //
 // Invariant coverage matrix:
-//   INV1  TestApply_INV1_TopicConvergence            — one live row per topic, newer wins, canonical sync_id
-//   INV2  TestApply_INV2_MonotonicSeq                 — central_memories.seq + central_mutations.seq strictly increase
-//   INV3  TestApply_INV3_NoLostUpdate                 — older upsert after newer is a no-op
+//   INV1  TestApply_INV1_TopicConvergence              — one live row per topic, newer wins, canonical sync_id
+//   INV2  TestApply_INV2_MonotonicSeq                   — central_memories.seq + central_mutations.seq strictly increase
+//   INV3  TestApply_INV3_NoLostUpdate                   — older upsert after newer is a no-op
 //   INV4  TestApply_INV4_DeleteThenStaleThenReviveUpsert — delete, stale upsert stays deleted, newer upsert revives
-//   INV5  TestApply_INV5_IdempotentSameMutationID     — same mutation_id twice → one row, one mutation, no error
-//   INV6  TestApply_INV6_IndependentTopicsSurvive     — two different topics both survive
+//   INV5  TestApply_INV5_IdempotentSameMutationID       — same mutation_id twice → one row, one mutation, no error
+//   RACE  TestApply_ConcurrentDuplicate_Idempotent      — N goroutines race the same mutation_id; all must return nil; exactly one row
+//   INV6  TestApply_INV6_IndependentTopicsSurvive       — two different topics both survive
 //   X-del TestApply_CrossWriterDeleteTombstonesCanonical — delete via topic resolves to another writer's sync_id
 package centralstore_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -387,55 +389,96 @@ func TestApply_INV5_IdempotentSameMutationID(t *testing.T) {
 	}
 }
 
-// TestApply_INV5_RacingDuplicateInsertNoOp exercises the defense-in-depth path
-// directly: a second mutation row with the same mutation_id (simulating a push
-// that raced past the step-1 check) is rejected by the UNIQUE constraint, and
-// Apply treats the 23505 as an idempotent no-op rather than surfacing an error.
+// TestApply_ConcurrentDuplicate_Idempotent genuinely races the 23505 branch in
+// Apply by launching N goroutines that ALL call store.Apply with the SAME
+// mutation_id simultaneously, released together via a start barrier.
 //
-// We simulate the race by pre-inserting the mutation_id row out-of-band, then
-// calling Apply with the same mutation_id but a DIFFERENT sync_id. Because
-// step 1 sees it already applied, Apply returns nil immediately and writes
-// nothing new — there is still exactly one mutation and zero memory rows for the
-// incoming sync_id.
-func TestApply_INV5_RacingDuplicateInsertNoOp(t *testing.T) {
+// Because all goroutines start before any commits, several of them will pass the
+// step-1 MutationApplied check (pool read sees nothing yet) and race to INSERT
+// into central_mutations. Exactly ONE wins; the rest hit the UNIQUE(mutation_id)
+// constraint (SQLSTATE 23505) inside insertMutationQ. Apply must treat that
+// 23505 as an idempotent no-op and return nil — NOT surface an error.
+//
+// Assertions:
+//   - every goroutine returns a nil error
+//   - exactly ONE central_mutations row for the mutation_id
+//   - exactly ONE central_memories row for the sync_id (no double-apply)
+//
+// This test exercises the isUniqueViolation handler (apply.go:88-92) under
+// real concurrent load. Combined with the unit test in apply_internal_test.go
+// (no build tag), the handler is verified both deterministically (predicate
+// shape) and under real concurrency (end-to-end correctness).
+func TestApply_ConcurrentDuplicate_Idempotent(t *testing.T) {
+	const goroutines = 24
+
 	store := newIsolatedStore(t)
 	ctx := context.Background()
 
-	// Pre-insert the mutation_id directly (this stands in for the winning push).
-	if _, err := store.Pool().Exec(ctx, `
-		INSERT INTO central_mutations (mutation_id, entity, entity_key, op, payload, writer_id, project)
-		VALUES ($1, 'memory', 'sync-other', 'upsert', '{}', 'w', 'proj')`,
-		"mut-inv5-race",
-	); err != nil {
-		t.Fatalf("pre-insert mutation: %v", err)
+	tk := "sdd/test/concurrent-dup"
+	m := testMutationWithTopic("mut-concurrent-dup", "sync-concurrent-dup", "proj", "scp", tk, domain.OpUpsert)
+	m.Content = "concurrent duplicate content"
+
+	// Start barrier: all goroutines block until closed, maximising the chance
+	// that multiple goroutines pass the step-1 MutationApplied check before any
+	// of them commits, which forces the 23505 path.
+	start := make(chan struct{})
+
+	errs := make([]error, goroutines)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			<-start // wait for the barrier to open
+			errs[i] = store.Apply(ctx, m)
+		}()
 	}
 
-	// Apply with the SAME mutation_id but a different incoming sync_id.
-	m := testMutation("mut-inv5-race", "sync-inv5-race", "proj", domain.OpUpsert)
-	if err := store.Apply(ctx, m); err != nil {
-		t.Fatalf("Apply duplicate mutation_id must be a no-op, got: %v", err)
+	// Release all goroutines at once.
+	close(start)
+	wg.Wait()
+
+	// Every goroutine must return nil — 23505 losers are idempotent no-ops.
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: Apply returned error: %v", i, err)
+		}
 	}
 
-	// No memory row should have been written for the incoming sync_id.
-	var memCount int
-	if err := store.Pool().QueryRow(ctx,
-		`SELECT count(*) FROM central_memories WHERE sync_id = $1`, "sync-inv5-race",
-	).Scan(&memCount); err != nil {
-		t.Fatalf("count memories: %v", err)
-	}
-	if memCount != 0 {
-		t.Errorf("INV5 race: expected 0 memory rows for the duplicate, got %d", memCount)
-	}
-
-	// Still exactly one mutation row for the id.
+	// Exactly one mutation row must exist.
 	var mutCount int
 	if err := store.Pool().QueryRow(ctx,
-		`SELECT count(*) FROM central_mutations WHERE mutation_id = $1`, "mut-inv5-race",
+		`SELECT count(*) FROM central_mutations WHERE mutation_id = $1`, m.MutationID,
 	).Scan(&mutCount); err != nil {
 		t.Fatalf("count mutations: %v", err)
 	}
 	if mutCount != 1 {
-		t.Errorf("INV5 race: expected exactly 1 mutation row, got %d", mutCount)
+		t.Errorf("expected exactly 1 central_mutations row, got %d", mutCount)
+	}
+
+	// Exactly one live memory row must exist for the sync_id.
+	var memCount int
+	if err := store.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM central_memories WHERE sync_id = $1 AND deleted_at IS NULL`, m.SyncID,
+	).Scan(&memCount); err != nil {
+		t.Fatalf("count memories: %v", err)
+	}
+	if memCount != 1 {
+		t.Errorf("expected exactly 1 central_memories row, got %d", memCount)
+	}
+
+	// Verify FindByTopic returns the single canonical row.
+	got, err := store.FindByTopic(tk, "proj", "scp")
+	if err != nil {
+		t.Fatalf("FindByTopic: %v", err)
+	}
+	if got == nil {
+		t.Fatal("FindByTopic returned nil — concurrent duplicate must not have erased the record")
+	}
+	if got.Content != m.Content {
+		t.Errorf("FindByTopic content mismatch: got %q want %q", got.Content, m.Content)
 	}
 }
 
