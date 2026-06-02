@@ -196,6 +196,9 @@ func runMigrations(db *sql.DB) error {
 		if err := migrateV1ToV2(db); err != nil {
 			return err
 		}
+		// Keep ver in sync (migrateV1ToV2 also persists PRAGMA user_version = 2) so a
+		// future `if ver < 3` block evaluates against the correct version.
+		ver = 2
 	}
 
 	return nil
