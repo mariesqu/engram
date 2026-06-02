@@ -54,30 +54,25 @@ type OutboxEntry struct {
 //  1. Derive the canonical Payload and MutationID if the caller left them unset
 //     (MutationID = NewMutationID(CanonicalPayload(m))). This makes the local
 //     write content-addressed and idempotent on re-apply (INV5).
-//  2. Run domain.Decide(localReader, m) against THIS store to compute the
-//     Decision.
+//  2. Open a SQLite transaction, then run domain.Decide(&txReader{tx}, m) INSIDE
+//     the transaction so the decision and the subsequent apply see the same
+//     consistent snapshot. With db.SetMaxOpenConns(1) the single connection is
+//     held by the tx for its entire duration, so a concurrent LocalWrite or
+//     ApplyPulled on another goroutine cannot interleave between Decide and
+//     applyTx — the whole decide+apply+enqueue sequence is atomic.
 //  3. Execute applyTx (the local state change) AND enqueueOutboxTx (the outbox
-//     INSERT) inside a SINGLE SQLite transaction. Both operations commit
-//     together or not at all: a crash between the two can never leave the
-//     local memory table updated without a corresponding outbox entry.
+//     INSERT) inside that SAME transaction. Both operations commit together or
+//     not at all: a crash between the two can never leave the local memory table
+//     updated without a corresponding outbox entry.
 //
 // The returned Mutation is the normalized mutation (Payload + MutationID filled
 // in) so callers can inspect the derived ID.
 func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
 	m = normalizeMutation(m)
 
-	// Compute the Decision before opening the transaction (read-only).
-	d := domain.Decide(s, m)
-
-	// Single atomic transaction: apply local state change (if any) + enqueue
-	// outbox row. Both commit together or not at all.
-	//
-	// The outbox is populated even when the local Decision is NoOp. A local NoOp
-	// means the local store already reflects this mutation (or an equivalent
-	// newer write), but the central store may not — it assigns authoritative seqs
-	// independently. Forwarding the mutation lets central reconcile with its own
-	// Decide path. INSERT OR IGNORE on the UNIQUE mutation_id makes a true
-	// idempotent re-enqueue a no-op at the SQL layer (INV5).
+	// Open the transaction FIRST so that Decide, applyTx, and enqueueOutboxTx all
+	// run on the same snapshot. This mirrors centralstore.Apply's pattern where
+	// Decide is run against a decideReader wrapping the in-flight transaction.
 	tx, err := s.db.Begin()
 	if err != nil {
 		return m, fmt.Errorf("LocalWrite: begin tx: %w", err)
@@ -88,6 +83,17 @@ func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
 		}
 	}()
 
+	// Decide inside the transaction: txReader routes all Reader calls through the
+	// same *sql.Tx, so Decide sees a consistent snapshot that includes no writes
+	// from concurrent goroutines that haven't committed yet.
+	d := domain.Decide(&txReader{tx: tx}, m)
+
+	// The outbox is populated even when the local Decision is NoOp. A local NoOp
+	// means the local store already reflects this mutation (or an equivalent
+	// newer write), but the central store may not — it assigns authoritative seqs
+	// independently. Forwarding the mutation lets central reconcile with its own
+	// Decide path. INSERT OR IGNORE on the UNIQUE mutation_id makes a true
+	// idempotent re-enqueue a no-op at the SQL layer (INV5).
 	if d.Action != domain.NoOp {
 		if err = applyTx(tx, d, m); err != nil {
 			return m, fmt.Errorf("LocalWrite: applyTx: %w", err)
@@ -204,6 +210,10 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 // acked_at = now) and advances the push cursor (sync_state.last_acked_seq) to
 // localSeq when it is ahead of the stored value. Both writes run in one tx so the
 // outbox marker and the cursor stay consistent.
+//
+// If the UPDATE matches no row — because localSeq does not exist or the row is
+// already acked — AckMutation returns an error and does NOT advance the cursor.
+// This prevents the cursor from drifting ahead of genuinely pushed mutations.
 func (s *Store) AckMutation(localSeq int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -216,11 +226,25 @@ func (s *Store) AckMutation(localSeq int64) error {
 	}()
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err = tx.Exec(
+	var res sql.Result
+	if res, err = tx.Exec(
 		`UPDATE sync_mutations SET acked_at = ? WHERE local_seq = ? AND acked_at IS NULL`,
 		now, localSeq,
 	); err != nil {
 		return fmt.Errorf("AckMutation: mark acked: %w", err)
+	}
+
+	// Guard: if no row was updated the caller supplied a wrong local_seq (does not
+	// exist) or already-acked local_seq. Do NOT advance the cursor in that case —
+	// the cursor must only move when a real pending row is acked.
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("AckMutation: rows affected: %w", err)
+	}
+	if affected == 0 {
+		// Roll back via defer; return a named error so callers can detect the case.
+		err = fmt.Errorf("AckMutation: no pending outbox row for local_seq=%d", localSeq)
+		return err
 	}
 
 	// Advance the monotonic push cursor (never move it backwards).
@@ -289,16 +313,36 @@ func (s *Store) SetPullCursor(seq int64) error {
 
 // ApplyPulled applies a mutation pulled FROM central to this local store. It is
 // a thin convenience wrapper used by the pull half of the sync harness: it runs
-// the SAME domain.Decide(localReader, m) → Apply path as a local write, but does
-// NOT enqueue anything into the outbox (a pulled mutation must not be re-pushed).
+// the SAME domain.Decide → applyTx path as LocalWrite, but does NOT enqueue
+// anything into the outbox (a pulled mutation must not be re-pushed).
+//
+// Like LocalWrite, Decide runs INSIDE the transaction (via txReader) so the
+// decision and the apply see the same consistent snapshot — a concurrent
+// LocalWrite that commits between Decide and apply cannot make the decision stale.
 //
 // The mutation arrives carrying its central Seq, MutationID and Payload (from
 // PullSince); those are preserved as-is. Decide's INV5 guard (MutationApplied)
-// plus Apply's applied_mutations INSERT make a re-pulled mutation a no-op.
+// plus applyTx's applied_mutations INSERT make a re-pulled mutation a no-op.
 func (s *Store) ApplyPulled(m domain.Mutation) error {
-	d := domain.Decide(s, m)
-	if err := Apply(s.db, d, m); err != nil {
-		return fmt.Errorf("ApplyPulled: %w", err)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("ApplyPulled: begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	d := domain.Decide(&txReader{tx: tx}, m)
+	if d.Action != domain.NoOp {
+		if err = applyTx(tx, d, m); err != nil {
+			return fmt.Errorf("ApplyPulled: applyTx: %w", err)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("ApplyPulled: commit: %w", err)
 	}
 	return nil
 }
