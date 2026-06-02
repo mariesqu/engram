@@ -62,6 +62,14 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// DB exposes the underlying *sql.DB so callers (the sync harness, tests) can run
+// raw queries and pass it to the package-level Apply without going through the
+// Store's typed methods. Mirrors centralstore.Store.Pool(). The connection is
+// configured with SetMaxOpenConns(1) — callers must not assume concurrency.
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 // ── domain.Reader implementation ─────────────────────────────────────────────
 
 // FindByTopic returns the live (non-deleted) record for the given
