@@ -213,16 +213,15 @@ func TestConvergence_INV3_NoLostUpdate(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INV4 — no resurrection (the tombstone boundary — the ts.Seq probe).
+// INV4 — no resurrection (the tombstone boundary).
 //
 // A writes T, both converge. A DELETES T. B's STALE upsert (older than the
 // delete) must NOT revive it after sync. A strictly-NEWER upsert DOES revive it
 // (deleted_at cleared on A.local, B.local AND central; FindByTopic returns it).
 //
-// ts.Seq is now wired: the local tombstone carries the persisted seq from
-// memory_tombstones.seq, and Decide passes ts.Seq to writeWins. All scenarios
-// here use DISTINCT UpdatedAt values, so wall-clock decides the outcome and the
-// seq tiebreaker is not exercised — the results are unchanged by the wiring.
+// All scenarios here use DISTINCT UpdatedAt values, so wall-clock (updated_at)
+// decides the outcome. The identity tiebreaker (writer_id→sync_id) is not
+// exercised — these results are independent of the final tiebreaker field.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestConvergence_INV4_NoResurrection(t *testing.T) {
 	ctx := context.Background()
@@ -248,8 +247,8 @@ func TestConvergence_INV4_NoResurrection(t *testing.T) {
 
 	// 3. B's STALE upsert — OLDER than the delete (updated_at < delete time).
 	//    Must NOT revive T anywhere. This is the resurrection guard (INV4) and the
-	//    ts.Seq is wired, but updated_at is strictly older than the delete time, so
-	//    wall-clock alone blocks resurrection here — seq is not the deciding factor.
+	//    updated_at is strictly older than the delete time, so wall-clock alone
+	//    blocks resurrection here — the identity tiebreaker is not the deciding factor.
 	if _, err := b.Write(upsert("writer-B", "sync-B", topic, "B STALE revive attempt", 1, base.Add(30*time.Second))); err != nil {
 		t.Fatalf("B stale write: %v", err)
 	}
