@@ -106,6 +106,11 @@ func newIsolatedStore(t *testing.T) *centralstore.Store {
 	}
 	defer adminPool.Close()
 
+	// Drop any leftover schema from an interrupted prior run so every run starts
+	// from a guaranteed-absent, clean schema (hermetic reruns against external DSN).
+	if _, err := adminPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)); err != nil {
+		t.Fatalf("newIsolatedStore: DROP SCHEMA: %v", err)
+	}
 	if _, err := adminPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %q", schemaName)); err != nil {
 		t.Fatalf("newIsolatedStore: CREATE SCHEMA: %v", err)
 	}
@@ -169,6 +174,11 @@ func TestCentralSchema_IdempotentApply(t *testing.T) {
 	}
 	defer adminPool.Close()
 
+	// Drop any leftover schema from an interrupted prior run so every run starts
+	// from a guaranteed-absent, clean schema (hermetic reruns against external DSN).
+	if _, err := adminPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)); err != nil {
+		t.Fatalf("DROP SCHEMA: %v", err)
+	}
 	if _, err := adminPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %q", schemaName)); err != nil {
 		t.Fatalf("CREATE SCHEMA: %v", err)
 	}
@@ -225,6 +235,39 @@ func TestInsertMutation_MonotonicSeq(t *testing.T) {
 
 	if seq2 <= seq1 {
 		t.Errorf("seq not monotonic: seq1=%d seq2=%d (want seq2 > seq1)", seq1, seq2)
+	}
+}
+
+// TestInsertMutation_NilPayloadDefaultsToEmptyObject verifies that calling
+// InsertMutation with a Mutation whose Payload is nil (zero value) does not
+// cause a NOT NULL violation on central_mutations.payload (JSONB NOT NULL).
+// The stored payload must be the empty JSON object '{}'.
+func TestInsertMutation_NilPayloadDefaultsToEmptyObject(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	m := testMutation("mut-nil-payload-1", "sync-nil-payload-1", "proj", domain.OpUpsert)
+	m.Payload = nil // explicitly unset — simulates a caller that left Payload zero
+
+	seq, err := store.InsertMutation(ctx, m)
+	if err != nil {
+		t.Fatalf("InsertMutation with nil Payload: %v", err)
+	}
+	if seq <= 0 {
+		t.Errorf("InsertMutation with nil Payload: seq=%d, want > 0", seq)
+	}
+
+	// Read back the raw payload to confirm it was stored as '{}'.
+	var payload []byte
+	err = store.Pool().QueryRow(ctx,
+		`SELECT payload FROM central_mutations WHERE mutation_id = $1`,
+		"mut-nil-payload-1",
+	).Scan(&payload)
+	if err != nil {
+		t.Fatalf("SELECT payload: %v", err)
+	}
+	if string(payload) != "{}" {
+		t.Errorf("stored payload=%q, want %q", string(payload), "{}")
 	}
 }
 
