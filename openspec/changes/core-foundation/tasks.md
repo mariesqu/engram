@@ -82,9 +82,9 @@ Chain strategy: pending
 
 > Spec traceable: reconciliation (central BIGSERIAL, UNIQUE topic index, tombstones, guarded UPDATE).
 
-- [ ] 5.1 Create `internal/centralstore/schema.go` — `ApplySchema(db *sql.DB) error`; emits DDL for `central_mutations` (BIGSERIAL seq PK, mutation_id UNIQUE, writer_id, payload JSONB, occurred_at); `central_memories` (sync_id PK, all fields, embedding BYTEA reserved, `UNIQUE INDEX central_memories_topic_uidx` partial on `topic_key,project,scope WHERE topic_key IS NOT NULL AND deleted_at IS NULL`); `central_tombstones`; all indexes. Idempotent.
-- [ ] 5.2 Create `internal/centralstore/apply.go` — `PushApply(db *sql.DB, m domain.Mutation) (seq int64, err error)`: wraps in Postgres transaction; inserts into `central_mutations` with `INSERT...RETURNING seq`; builds `pgReader` implementing `domain.Reader` against Postgres tables; calls `domain.Decide(pgReader, m)`; executes Action with SQL guards (`UPDATE...WHERE updated_at < $incoming_updated_at OR (updated_at = $incoming_updated_at AND version < $incoming_version)`); `ON CONFLICT(topic_key,project,scope) DO UPDATE WHERE` same predicate; returns assigned seq.
-- [ ] 5.3 Create `internal/centralstore/pull.go` — `PullSince(db *sql.DB, sinceSeq int64) ([]domain.Mutation, error)`: `SELECT ... FROM central_mutations WHERE seq > $1 ORDER BY seq ASC`; unmarshals JSONB payload into Mutation.
+- [x] 5.1 (PR3a) Create `internal/centralstore/schema.go` — `ApplySchema(ctx, pool)`: `central_mutations` (BIGSERIAL seq PK, mutation_id UNIQUE, writer_id, payload JSONB, occurred_at); `central_memories` (sync_id PK, embedding BYTEA reserved, partial `central_memories_topic_uidx` on `topic_key,project,scope WHERE topic_key IS NOT NULL AND deleted_at IS NULL`); `central_tombstones` (+ partial `central_tombstones_topic_uidx`); `cloud_sync_audit`; all indexes. Idempotent.
+- [x] 5.2 (PR3a + PR3b) Create `internal/centralstore/store.go` + `apply.go` — `Store` over `pgxpool.Pool`; `domain.Reader` impl + write primitives (`InsertMutation` RETURNING seq, `UpsertMemory`, `WriteTombstone`); `Store.Apply(ctx, m)`: Postgres tx, INV5 idempotency, INSERT RETURNING seq, `domain.Decide` via `decideReader`, guarded upsert/tombstone keyed by `Decision.TargetSyncID`. Implemented as the Decide-driven adapter (mirrors localstore.Apply) rather than a free `PushApply`. 23 acceptance tests PASS.
+- [x] 5.3 (PR3c) Create `internal/centralstore/pull.go` — `Store.PullSince(ctx, project, sinceSeq, limit) ([]domain.Mutation, error)`: `WHERE project=$1 AND seq>$2 ORDER BY seq ASC LIMIT $3`; decodes each row via `mutation.FromCanonicalPayload`; fills MutationID/Seq/OccurredAt/Payload; asserts strict ascending seq. 28 acceptance tests PASS (5 new).
 
 ---
 
@@ -104,12 +104,20 @@ Chain strategy: pending
 
 > Spec traceable: reconciliation INV 2 (monotonic seq), INV 4 (no resurrection); design (spike harness, two writers, real Postgres).
 
-- [ ] 7.1 Create `internal/spike/spike.go` — `RunSpike(centralDSN string, secret []byte) error`: initializes two `Identity` instances (writerA, writerB) with distinct `WriterID`s; opens two temp SQLite stores (A.db, B.db) and one shared Postgres central; exports a `Writer` helper that calls `mutation.NewMutationID`, signs, and calls `centralstore.PushApply`.
-- [ ] 7.2 Create `internal/spike/spike_test.go` — build tag `//go:build acceptance`; requires `ENGRAM_TEST_PG_DSN` env var; each test calls `RunSpike` or exercises scenario directly.
-- [ ] 7.3 Write acceptance test `TestINV2_MonotonicSeq`: push 3 mutations interleaved from A and B; call `PullSince(0)`; assert `seqs[i+1] > seqs[i]` for all i; assert pull order == seq order regardless of `occurred_at`.
-- [ ] 7.4 Write acceptance test `TestINV4_NoResurrection`: A pushes delete at T+200 (tombstone written); B pushes upsert for same sync_id at T+150; apply B → assert Decide returns NoOp (tombstone.deleted_at >= mutation.updated_at); after pull, both local stores have `deleted_at NOT NULL`; tombstone row present.
-- [ ] 7.5 Verify INV 1 end-to-end with real Postgres (`TestINV1_E2E_TopicIdentityConvergence`): same scenario as unit test 4.3 but through `PushApply` and `PullSince`; both SQLite stores converge to one row with A's content.
-- [ ] 7.6 Verify INV 5 end-to-end (`TestINV5_E2E_IdempotentReApply`): push same mutation_id twice to central; assert `central_mutations` has exactly one row for that ID; no version churn.
+> IMPLEMENTATION NOTE (PR4): the harness was built as a UNIFIED push/pull driver
+> (`internal/spike/harness.go`: `Node`, `Central` port, `Push`/`Pull`/`Sync`/`SyncAll`)
+> on top of a real local SYNC API added to localstore (`LocalWrite`, `DrainOutbox`,
+> `AckMutation`, `PullCursor`/`SetPullCursor`, `ApplyPulled`) — NOT a one-shot
+> `RunSpike`/`spike.go`. Writer-identity HMAC (Phase 6) is deferred per scope; the
+> harness mints two writers via distinct `WriterID` strings on the mutations. The
+> convergence tests prove all SIX invariants end-to-end (not just INV2/INV4).
+
+- [x] 7.1 Create `internal/spike/harness.go` — `Node` (one localstore.Store + outbox/cursor), `Central` port (Apply + PullSince, satisfied by *centralstore.Store), `Push`/`Pull`/`Sync`/`SyncAll`. Plus local sync API in `internal/localstore/sync.go` (LocalWrite/DrainOutbox/AckMutation/PullCursor/SetPullCursor/ApplyPulled/PendingCount) + `Store.DB()` accessor. 5 real-SQLite unit tests for the sync API.
+- [x] 7.2 Create acceptance test files (`//go:build acceptance`): `convergence_acceptance_test.go` (embedded-postgres TestMain on own port + isolated-schema + node factory, mirrors centralstore_test; ENGRAM_TEST_PG_DSN override), `invariants_acceptance_test.go`, `helpers_acceptance_test.go`, `tsseq_probe_acceptance_test.go`. ACTUALLY RAN via embedded-postgres; 8 tests PASS, stable -count=2.
+- [x] 7.3 `TestConvergence_INV2_MonotonicSeq` — interleaved A/B pushes; central_mutations.seq strictly increasing; central seq propagates onto a replica row on accept (assertPulledTopicHasSeq).
+- [x] 7.4 `TestConvergence_INV4_NoResurrection` — A deletes T; B STALE upsert (older) stays deleted everywhere; strictly-newer upsert revives (deleted_at cleared on A.local/B.local/central; FindByTopic returns it). Plus `TestTsSeqProbe_EqualTimestampTombstoneTie` (the empirical ts.Seq boundary finding).
+- [x] 7.5 `TestConvergence_INV1_TopicConvergence` — full push/pull cycle; one live row per topic on A.local/B.local/central with the winning content + central canonical sync_id. (Plus `TestConvergence_FullBidirectionalSettles`: A.local == B.local == central for a mixed live+tombstone workload.)
+- [x] 7.6 `TestConvergence_INV5_Idempotent` — repeated sync no double-apply; central max seq + mutation count + version stable on no-op rounds. (Plus INV3 `TestConvergence_INV3_NoLostUpdate` and INV6 `TestConvergence_INV6_IndependentWrites`.)
 
 ---
 
