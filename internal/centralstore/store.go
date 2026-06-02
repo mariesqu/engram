@@ -158,11 +158,18 @@ func (s *Store) InsertMutation(ctx context.Context, m domain.Mutation) (seq int6
 	return seq, nil
 }
 
-// UpsertMemory inserts or updates a row in central_memories.
-// On conflict on sync_id the row is updated with the incoming values.
+// UpsertMemory inserts or updates a row in central_memories keyed by
+// targetSyncID. targetSyncID is the resolved row identity returned by
+// domain.Decide (Decision.TargetSyncID). For same-writer upserts
+// targetSyncID == m.SyncID; for cross-writer topic convergence it is the
+// canonical row's sync_id Y (which may differ from m.SyncID X). Using
+// targetSyncID as the primary key ensures ON CONFLICT(sync_id) addresses the
+// correct canonical row and avoids hitting central_memories_topic_uidx with a
+// second live row under a different sync_id.
+//
 // The caller (PR3b Decide-driven Apply) is responsible for running Decide()
 // and passing only winning mutations here.
-func (s *Store) UpsertMemory(ctx context.Context, m domain.Mutation, seq int64) error {
+func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.Mutation, seq int64) error {
 	const q = `
 		INSERT INTO central_memories
 		  (sync_id, session_id, entity_type, type, status, title, content,
@@ -186,7 +193,7 @@ func (s *Store) UpsertMemory(ctx context.Context, m domain.Mutation, seq int64) 
 		  updated_at     = EXCLUDED.updated_at,
 		  deleted_at     = NULL`
 	_, err := s.pool.Exec(ctx, q,
-		m.SyncID,             // $1
+		targetSyncID,         // $1 — canonical row identity (may differ from m.SyncID)
 		m.SessionID,          // $2
 		string(m.EntityType), // $3
 		m.Type,               // $4
@@ -208,9 +215,18 @@ func (s *Store) UpsertMemory(ctx context.Context, m domain.Mutation, seq int64) 
 	return nil
 }
 
-// WriteTombstone inserts a row into central_tombstones. Uses INSERT OR REPLACE
-// semantics (ON CONFLICT DO UPDATE) so re-deleting the same sync_id is safe.
-func (s *Store) WriteTombstone(ctx context.Context, m domain.Mutation) error {
+// WriteTombstone inserts or updates a row in central_tombstones keyed by
+// targetSyncID. targetSyncID is the resolved row identity returned by
+// domain.Decide (Decision.TargetSyncID). For same-writer deletes
+// targetSyncID == m.SyncID; for cross-writer re-deletes of an already-
+// tombstoned topic it is the canonical tombstone's sync_id Y. Using
+// targetSyncID as the primary key ensures ON CONFLICT(sync_id) reuses the
+// canonical tombstone and avoids hitting central_tombstones_topic_uidx with a
+// second tombstone under a different sync_id (which would be a unique violation).
+//
+// Metadata (project, scope, topic_key, version, writer_id) always comes from m
+// because the DELETE mutation carries the authoritative deletion context.
+func (s *Store) WriteTombstone(ctx context.Context, targetSyncID string, m domain.Mutation) error {
 	const q = `
 		INSERT INTO central_tombstones
 		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
@@ -223,13 +239,13 @@ func (s *Store) WriteTombstone(ctx context.Context, m domain.Mutation) error {
 		  deleted_by = EXCLUDED.deleted_by,
 		  version    = EXCLUDED.version`
 	_, err := s.pool.Exec(ctx, q,
-		m.SyncID,
-		m.Project,
-		m.Scope,
-		m.TopicKey,
-		m.UpdatedAt.UTC(),
-		m.WriterID,
-		m.Version,
+		targetSyncID,     // $1 — canonical tombstone identity (may differ from m.SyncID)
+		m.Project,        // $2
+		m.Scope,          // $3
+		m.TopicKey,       // $4 (nil → NULL)
+		m.UpdatedAt.UTC(), // $5
+		m.WriterID,       // $6
+		m.Version,        // $7
 	)
 	if err != nil {
 		return fmt.Errorf("WriteTombstone: %w", err)

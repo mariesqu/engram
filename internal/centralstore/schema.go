@@ -39,9 +39,6 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			occurred_at TIMESTAMPTZ  NOT NULL DEFAULT now()
 		)`,
 
-		`CREATE INDEX IF NOT EXISTS idx_cmut_seq
-			ON central_mutations(seq)`,
-
 		`CREATE INDEX IF NOT EXISTS idx_cmut_project_seq
 			ON central_mutations(project, seq)`,
 
