@@ -158,3 +158,172 @@ func TestNewMutationID_NilVsEmptyStringTopicKey(t *testing.T) {
 		t.Error("nil TopicKey and &\"\" TopicKey must produce different IDs; omitempty conflates them (Codex bug A)")
 	}
 }
+
+// TestFromCanonicalPayload_RoundTrip verifies that a Mutation can be encoded
+// with CanonicalPayload and faithfully reconstructed by FromCanonicalPayload.
+//
+// The round-trip covers:
+//   - All content fields present in canonicalFields (Op, SyncID, SessionID,
+//     EntityType, Type, Title, Content, Project, Scope, Version, UpdatedAt,
+//     WriterID)
+//   - Nil nullable pointer fields (TopicKey, Status, ParentSyncID → nil → nil)
+//   - Non-nil pointer fields (&"nonEmpty" → &"nonEmpty")
+//   - Empty-string pointer fields (&"" → &"")
+//   - UpdatedAt nanosecond precision preserved through the canonical string format
+//
+// Fields NOT in the canonical payload (MutationID, Seq, OccurredAt, Payload)
+// are not checked here — those are the caller's responsibility to fill in.
+func TestFromCanonicalPayload_RoundTrip(t *testing.T) {
+	t.Run("nil nullable fields", func(t *testing.T) {
+		m := baseM()
+		// TopicKey, Status, ParentSyncID are nil in baseM (zero value).
+		payload := CanonicalPayload(m)
+		got, err := FromCanonicalPayload(payload)
+		if err != nil {
+			t.Fatalf("FromCanonicalPayload: %v", err)
+		}
+		assertContentFields(t, m, got)
+		if got.TopicKey != nil {
+			t.Errorf("TopicKey: got %v, want nil", got.TopicKey)
+		}
+		if got.Status != nil {
+			t.Errorf("Status: got %v, want nil", got.Status)
+		}
+		if got.ParentSyncID != nil {
+			t.Errorf("ParentSyncID: got %v, want nil", got.ParentSyncID)
+		}
+	})
+
+	t.Run("non-nil non-empty nullable fields", func(t *testing.T) {
+		tk := "sdd/test/roundtrip"
+		st := "done"
+		ps := "parent-sync-xyz"
+		m := baseM()
+		m.TopicKey = &tk
+		m.Status = &st
+		m.ParentSyncID = &ps
+		payload := CanonicalPayload(m)
+		got, err := FromCanonicalPayload(payload)
+		if err != nil {
+			t.Fatalf("FromCanonicalPayload: %v", err)
+		}
+		assertContentFields(t, m, got)
+		if got.TopicKey == nil || *got.TopicKey != tk {
+			t.Errorf("TopicKey: got %v, want %q", got.TopicKey, tk)
+		}
+		if got.Status == nil || *got.Status != st {
+			t.Errorf("Status: got %v, want %q", got.Status, st)
+		}
+		if got.ParentSyncID == nil || *got.ParentSyncID != ps {
+			t.Errorf("ParentSyncID: got %v, want %q", got.ParentSyncID, ps)
+		}
+	})
+
+	t.Run("empty-string nullable fields distinct from nil", func(t *testing.T) {
+		emptyStr := ""
+		m := baseM()
+		m.TopicKey = &emptyStr
+		m.Status = &emptyStr
+		m.ParentSyncID = &emptyStr
+		payload := CanonicalPayload(m)
+		got, err := FromCanonicalPayload(payload)
+		if err != nil {
+			t.Fatalf("FromCanonicalPayload: %v", err)
+		}
+		// Must NOT be nil — &"" round-trips as &"", not as nil.
+		if got.TopicKey == nil {
+			t.Error("TopicKey: got nil, want &\"\" (empty-string must not collapse to nil)")
+		} else if *got.TopicKey != "" {
+			t.Errorf("TopicKey: got %q, want \"\"", *got.TopicKey)
+		}
+		if got.Status == nil {
+			t.Error("Status: got nil, want &\"\"")
+		} else if *got.Status != "" {
+			t.Errorf("Status: got %q, want \"\"", *got.Status)
+		}
+		if got.ParentSyncID == nil {
+			t.Error("ParentSyncID: got nil, want &\"\"")
+		} else if *got.ParentSyncID != "" {
+			t.Errorf("ParentSyncID: got %q, want \"\"", *got.ParentSyncID)
+		}
+	})
+
+	t.Run("nil TopicKey and &empty TopicKey round-trip distinctly", func(t *testing.T) {
+		mNil := baseM()
+		emptyStr := ""
+		mEmpty := baseM()
+		mEmpty.TopicKey = &emptyStr
+
+		gotNil, err := FromCanonicalPayload(CanonicalPayload(mNil))
+		if err != nil {
+			t.Fatalf("FromCanonicalPayload nil: %v", err)
+		}
+		gotEmpty, err := FromCanonicalPayload(CanonicalPayload(mEmpty))
+		if err != nil {
+			t.Fatalf("FromCanonicalPayload empty: %v", err)
+		}
+		if gotNil.TopicKey != nil {
+			t.Errorf("nil TopicKey round-trip: got %v, want nil", gotNil.TopicKey)
+		}
+		if gotEmpty.TopicKey == nil {
+			t.Error("&\"\" TopicKey round-trip: got nil, want &\"\"")
+		}
+	})
+
+	t.Run("UpdatedAt nanosecond precision preserved", func(t *testing.T) {
+		m := baseM()
+		// Use a time with nanoseconds to verify sub-second precision is preserved.
+		m.UpdatedAt = time.Date(2024, 6, 15, 12, 34, 56, 789012345, time.UTC)
+		payload := CanonicalPayload(m)
+		got, err := FromCanonicalPayload(payload)
+		if err != nil {
+			t.Fatalf("FromCanonicalPayload: %v", err)
+		}
+		if !got.UpdatedAt.Equal(m.UpdatedAt) {
+			t.Errorf("UpdatedAt: got %v, want %v", got.UpdatedAt, m.UpdatedAt)
+		}
+	})
+}
+
+// assertContentFields verifies that all scalar content fields present in the
+// canonical payload round-trip correctly from want to got. It does NOT check
+// nullable pointer fields or non-canonical fields (MutationID, Seq, etc.).
+func assertContentFields(t *testing.T, want, got domain.Mutation) {
+	t.Helper()
+	if got.Op != want.Op {
+		t.Errorf("Op: got %q, want %q", got.Op, want.Op)
+	}
+	if got.SyncID != want.SyncID {
+		t.Errorf("SyncID: got %q, want %q", got.SyncID, want.SyncID)
+	}
+	if got.SessionID != want.SessionID {
+		t.Errorf("SessionID: got %q, want %q", got.SessionID, want.SessionID)
+	}
+	if got.EntityType != want.EntityType {
+		t.Errorf("EntityType: got %q, want %q", got.EntityType, want.EntityType)
+	}
+	if got.Type != want.Type {
+		t.Errorf("Type: got %q, want %q", got.Type, want.Type)
+	}
+	if got.Title != want.Title {
+		t.Errorf("Title: got %q, want %q", got.Title, want.Title)
+	}
+	if got.Content != want.Content {
+		t.Errorf("Content: got %q, want %q", got.Content, want.Content)
+	}
+	if got.Project != want.Project {
+		t.Errorf("Project: got %q, want %q", got.Project, want.Project)
+	}
+	if got.Scope != want.Scope {
+		t.Errorf("Scope: got %q, want %q", got.Scope, want.Scope)
+	}
+	if got.Version != want.Version {
+		t.Errorf("Version: got %d, want %d", got.Version, want.Version)
+	}
+	if !got.UpdatedAt.Equal(want.UpdatedAt) {
+		t.Errorf("UpdatedAt: got %v, want %v", got.UpdatedAt, want.UpdatedAt)
+	}
+	if got.WriterID != want.WriterID {
+		t.Errorf("WriterID: got %q, want %q", got.WriterID, want.WriterID)
+	}
+}

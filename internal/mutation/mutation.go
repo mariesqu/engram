@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/mariesqu/engram/internal/domain"
 )
@@ -88,4 +89,55 @@ func CanonicalPayload(m domain.Mutation) []byte {
 func NewMutationID(payload []byte) string {
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
+}
+
+// FromCanonicalPayload is the inverse of CanonicalPayload. It unmarshals the
+// canonical JSON encoding back into the content fields of a domain.Mutation.
+//
+// The caller (PullSince) is responsible for filling in the identity and
+// ordering fields that are NOT part of the canonical payload:
+//   - MutationID — the SHA-256 hash of the payload (stored separately)
+//   - Seq        — the BIGSERIAL seq assigned by the central store
+//   - OccurredAt — the server timestamp stored in central_mutations
+//   - Payload    — the raw bytes (kept for downstream re-application)
+//
+// Nullable pointer fields (TopicKey, Status, ParentSyncID) round-trip their
+// nil/non-nil distinction correctly because canonicalFields encodes them
+// without omitempty: JSON null → nil, JSON "" → &"".
+func FromCanonicalPayload(payload []byte) (domain.Mutation, error) {
+	var cf canonicalFields
+	if err := json.Unmarshal(payload, &cf); err != nil {
+		return domain.Mutation{}, fmt.Errorf("mutation.FromCanonicalPayload: unmarshal: %w", err)
+	}
+
+	// UpdatedAt is stored in canonical form as RFC3339Nano with explicit UTC "Z"
+	// suffix — parse it back to time.Time.
+	updatedAt, err := time.Parse("2006-01-02T15:04:05.999999999Z", cf.UpdatedAt)
+	if err != nil {
+		// Fall back to standard RFC3339Nano in case the format varies.
+		updatedAt, err = time.Parse(time.RFC3339Nano, cf.UpdatedAt)
+		if err != nil {
+			return domain.Mutation{}, fmt.Errorf("mutation.FromCanonicalPayload: parse updated_at %q: %w", cf.UpdatedAt, err)
+		}
+	}
+	updatedAt = updatedAt.UTC()
+
+	m := domain.Mutation{
+		Op:           domain.Op(cf.Op),
+		SyncID:       cf.SyncID,
+		SessionID:    cf.SessionID,
+		EntityType:   domain.EntityType(cf.EntityType),
+		Type:         cf.Type,
+		Title:        cf.Title,
+		Content:      cf.Content,
+		Project:      cf.Project,
+		Scope:        cf.Scope,
+		TopicKey:     cf.TopicKey,
+		Status:       cf.Status,
+		ParentSyncID: cf.ParentSyncID,
+		Version:      cf.Version,
+		UpdatedAt:    updatedAt,
+		WriterID:     cf.WriterID,
+	}
+	return m, nil
 }
