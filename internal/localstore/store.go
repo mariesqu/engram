@@ -113,7 +113,7 @@ func findBySyncIDQ(q rowQuerier, syncID string) (*domain.Record, error) {
 // findTombstoneQ is the query core for FindTombstone.
 func findTombstoneQ(q rowQuerier, syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
 	const bySyncID = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, seq
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
 		FROM memory_tombstones
 		WHERE sync_id = ?
 		LIMIT 1`
@@ -128,7 +128,7 @@ func findTombstoneQ(q rowQuerier, syncID string, topicKey *string, project, scop
 		return nil, nil
 	}
 	const byTopic = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, seq
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
 		FROM memory_tombstones
 		WHERE topic_key = ? AND project = ? AND scope = ?
 		LIMIT 1`
@@ -345,7 +345,7 @@ func scanTombstone(row *sql.Row) (*domain.Tombstone, error) {
 
 	err := row.Scan(
 		&ts.SyncID, &ts.Project, &ts.Scope, &topicKey,
-		&deletedAtStr, &ts.DeletedBy, &ts.Version, &ts.Seq,
+		&deletedAtStr, &ts.DeletedBy, &ts.Version,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

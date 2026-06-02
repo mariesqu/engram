@@ -418,185 +418,98 @@ func TestReaderRoundtrip_FindTombstone(t *testing.T) {
 	}
 }
 
-// TestReaderRoundtrip_TombstoneSeq verifies that WriteTombstone persists seq
-// and FindTombstone returns ts.Seq populated — the central seq tiebreaker
-// wiring per spec.md:89-97.
-//
-// WriteTombstone carries m.Seq which in Apply is the just-assigned BIGSERIAL.
-// Here we set m.Seq explicitly so the roundtrip is deterministic.
-//
-// Note: the lower-seq-blocked case cannot be produced via push because push
-// always assigns a fresh, higher BIGSERIAL seq — only the delete gets a lower
-// seq than any subsequent mutation. That branch is covered by the domain unit
-// test TestDecide_TombstoneTieBreak_SeqAuthority/lower_seq_blocked_by_tombstone.
-func TestReaderRoundtrip_TombstoneSeq(t *testing.T) {
+// TestReaderRoundtrip_TombstoneIdentityFields verifies that WriteTombstone
+// persists deleted_by (writer_id) and that FindTombstone returns ts.DeletedBy
+// and ts.SyncID populated — these are the final tiebreaker fields used by
+// writeWins when updated_at and version tie (identity tiebreaker).
+func TestReaderRoundtrip_TombstoneIdentityFields(t *testing.T) {
 	store := newIsolatedStore(t)
 	ctx := context.Background()
 
-	const wantSeq int64 = 77
-	m := testMutation("mut-tsseq-1", "sync-tsseq-1", "proj", domain.OpDelete)
-	m.Seq = wantSeq
+	const wantWriter = "writer-identity-test"
+	const wantSyncID = "sync-identity-test"
+
+	m := testMutation("mut-ident-1", wantSyncID, "proj", domain.OpDelete)
+	m.WriterID = wantWriter
 
 	if err := store.WriteTombstone(ctx, m.SyncID, m); err != nil {
-		t.Fatalf("WriteTombstone with seq: %v", err)
+		t.Fatalf("WriteTombstone with writer: %v", err)
 	}
 
-	ts, err := store.FindTombstone("sync-tsseq-1", nil, "proj", "project")
+	ts, err := store.FindTombstone(wantSyncID, nil, "proj", "project")
 	if err != nil {
 		t.Fatalf("FindTombstone: %v", err)
 	}
 	if ts == nil {
 		t.Fatal("FindTombstone: expected tombstone, got nil")
 	}
-	if ts.Seq != wantSeq {
-		t.Errorf("tombstone seq roundtrip: ts.Seq = %d; want %d", ts.Seq, wantSeq)
+	if ts.DeletedBy != wantWriter {
+		t.Errorf("tombstone deleted_by roundtrip: ts.DeletedBy = %q; want %q", ts.DeletedBy, wantWriter)
+	}
+	if ts.SyncID != wantSyncID {
+		t.Errorf("tombstone sync_id roundtrip: ts.SyncID = %q; want %q", ts.SyncID, wantSyncID)
 	}
 }
 
-// TestApply_TombstoneSeqWired verifies the full Apply path: after a push-apply
-// delete, the central_tombstones row carries the seq assigned by the BIGSERIAL,
-// and FindTombstone returns that seq. This confirms spec.md:89-97 is honoured
-// end-to-end through the central push-apply path.
-//
-// The higher-seq revive branch is already covered by the existing
-// TestApply_INV4_DeleteThenStaleThenReviveUpsert test; this test focuses solely
-// on the tombstone seq persistence.
-func TestApply_TombstoneSeqWired(t *testing.T) {
+// TestApply_TombstoneIdentityFieldsWired verifies the full Apply path: after a
+// push-apply delete, the central_tombstones row has deleted_by and sync_id
+// populated — the identity tiebreaker fields used by writeWins.
+func TestApply_TombstoneIdentityFieldsWired(t *testing.T) {
 	store := newIsolatedStore(t)
 	ctx := context.Background()
 
+	const wantWriter = "writer-apply-wired"
+
 	// Step 1 — upsert so there is a live row to delete.
-	mUpsert := testMutation("mut-tsw-up", "sync-tsw-1", "proj", domain.OpUpsert)
+	mUpsert := testMutation("mut-taw-up", "sync-taw-1", "proj", domain.OpUpsert)
 	mUpsert.UpdatedAt = time.Now().UTC()
+	mUpsert.WriterID = wantWriter
 	if err := store.Apply(ctx, mUpsert); err != nil {
 		t.Fatalf("Apply upsert: %v", err)
 	}
 
-	// Step 2 — delete; Apply assigns the BIGSERIAL seq and writes the tombstone.
-	mDelete := testMutation("mut-tsw-del", "sync-tsw-1", "proj", domain.OpDelete)
+	// Step 2 — delete; Apply writes the tombstone with deleted_by = writer_id.
+	mDelete := testMutation("mut-taw-del", "sync-taw-1", "proj", domain.OpDelete)
 	mDelete.UpdatedAt = mUpsert.UpdatedAt.Add(time.Second)
+	mDelete.WriterID = wantWriter
 	if err := store.Apply(ctx, mDelete); err != nil {
 		t.Fatalf("Apply delete: %v", err)
 	}
 
-	// The tombstone must exist and its seq must be > 0 (the BIGSERIAL assigned by
-	// the delete Apply). We verify ts.Seq > 0 rather than an exact value because
-	// the BIGSERIAL value depends on other tests that may have run in this schema.
-	ts, err := store.FindTombstone("sync-tsw-1", nil, "proj", "project")
+	ts, err := store.FindTombstone("sync-taw-1", nil, "proj", "project")
 	if err != nil {
 		t.Fatalf("FindTombstone: %v", err)
 	}
 	if ts == nil {
 		t.Fatal("FindTombstone: expected tombstone after Apply delete, got nil")
 	}
-	if ts.Seq <= 0 {
-		t.Errorf("tombstone seq after Apply delete: ts.Seq = %d; want > 0 (BIGSERIAL assigned)", ts.Seq)
+	if ts.DeletedBy != wantWriter {
+		t.Errorf("tombstone deleted_by after Apply delete: ts.DeletedBy = %q; want %q", ts.DeletedBy, wantWriter)
+	}
+	if ts.SyncID != "sync-taw-1" {
+		t.Errorf("tombstone sync_id after Apply delete: ts.SyncID = %q; want %q", ts.SyncID, "sync-taw-1")
 	}
 }
 
-// TestApplySchema_UpgradesTombstoneSeqColumn verifies that ApplySchema adds the
-// seq column to a pre-PR5 central_tombstones table that was created without it.
-//
-// The test manually creates a minimal central_tombstones table WITHOUT the seq
-// column (simulating an existing central DB from before PR5), then calls
-// ApplySchema.  The ALTER TABLE ... ADD COLUMN IF NOT EXISTS statement that was
-// added to fix the runtime "column seq does not exist" regression must add the
-// column, making the schema coherent for reads/writes that reference seq.
-//
-// This genuinely exercises the ALTER upgrade path (not just the fresh-DB no-op
-// where CREATE TABLE already includes seq).
-func TestApplySchema_UpgradesTombstoneSeqColumn(t *testing.T) {
+// TestCentralTombstone_HasNoSeqColumn verifies that central_tombstones does NOT
+// have a seq column — it was removed when the tiebreaker changed from central
+// seq to (writer_id, sync_id). Having no seq column prevents the old tombstone
+// seq roundtrip and proves the schema is clean.
+func TestCentralTombstone_HasNoSeqColumn(t *testing.T) {
+	store := newIsolatedStore(t)
 	ctx := context.Background()
-	schemaName := schemaFor(t)
 
-	adminPool, err := pgxpool.New(ctx, pgDSN)
-	if err != nil {
-		t.Fatalf("pgxpool.New admin: %v", err)
-	}
-	defer adminPool.Close()
-
-	// Start from a clean schema.
-	if _, err := adminPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)); err != nil {
-		t.Fatalf("DROP SCHEMA: %v", err)
-	}
-	if _, err := adminPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %q", schemaName)); err != nil {
-		t.Fatalf("CREATE SCHEMA: %v", err)
-	}
-	t.Cleanup(func() {
-		cleanPool, err2 := pgxpool.New(ctx, pgDSN)
-		if err2 != nil {
-			return
-		}
-		defer cleanPool.Close()
-		cleanPool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)) //nolint:errcheck
-	})
-
-	dsn, err := withSearchPath(pgDSN, schemaName)
-	if err != nil {
-		t.Fatalf("withSearchPath: %v", err)
-	}
-
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("pgxpool.New isolated: %v", err)
-	}
-	defer pool.Close()
-
-	// Create a minimal pre-PR5 central_tombstones WITHOUT the seq column.
-	// This is the exact scenario that caused "column seq does not exist" at runtime
-	// on a central Postgres DB that had the table before PR5 added seq.
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE central_tombstones (
-			sync_id    TEXT         PRIMARY KEY,
-			project    TEXT         NOT NULL DEFAULT '',
-			scope      TEXT         NOT NULL DEFAULT 'project',
-			topic_key  TEXT,
-			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
-			deleted_by TEXT         NOT NULL DEFAULT '',
-			version    INT          NOT NULL DEFAULT 0
-		)`)
-	if err != nil {
-		t.Fatalf("CREATE pre-PR5 central_tombstones (no seq): %v", err)
-	}
-
-	// ApplySchema must succeed: the CREATE TABLE IF NOT EXISTS is a no-op, but the
-	// ALTER TABLE ... ADD COLUMN IF NOT EXISTS adds seq.
-	if err := centralstore.ApplySchema(ctx, pool); err != nil {
-		t.Fatalf("ApplySchema on pre-PR5 schema: %v", err)
-	}
-
-	// Assert the seq column now exists.
 	var colCount int
-	err = pool.QueryRow(ctx, `
+	err := store.Pool().QueryRow(ctx, `
 		SELECT COUNT(*) FROM information_schema.columns
-		WHERE table_schema = $1
-		  AND table_name   = 'central_tombstones'
-		  AND column_name  = 'seq'`,
-		schemaName,
+		WHERE table_name  = 'central_tombstones'
+		  AND column_name = 'seq'`,
 	).Scan(&colCount)
 	if err != nil {
 		t.Fatalf("query information_schema.columns for seq: %v", err)
 	}
-	if colCount != 1 {
-		t.Errorf("seq column count = %d after ApplySchema upgrade; want 1", colCount)
-	}
-
-	// Confirm the column is usable: insert a row and read back seq (must be the DEFAULT 0).
-	_, err = pool.Exec(ctx, `
-		INSERT INTO central_tombstones (sync_id, deleted_by)
-		VALUES ('upgrade-test-sync-1', 'test')`)
-	if err != nil {
-		t.Fatalf("INSERT into upgraded central_tombstones: %v", err)
-	}
-	var seq int64
-	err = pool.QueryRow(ctx,
-		`SELECT seq FROM central_tombstones WHERE sync_id = 'upgrade-test-sync-1'`,
-	).Scan(&seq)
-	if err != nil {
-		t.Fatalf("SELECT seq from upgraded central_tombstones: %v", err)
-	}
-	if seq != 0 {
-		t.Errorf("upgraded tombstone seq = %d; want 0 (DEFAULT)", seq)
+	if colCount != 0 {
+		t.Errorf("central_tombstones must NOT have a seq column after the identity-tiebreaker change; found %d", colCount)
 	}
 }
 

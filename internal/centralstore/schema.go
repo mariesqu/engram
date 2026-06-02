@@ -16,11 +16,13 @@ import (
 //
 // Schema overview:
 //
-//   - central_mutations: authoritative journal; assigns monotonic BIGSERIAL seq.
+//   - central_mutations: authoritative journal; assigns monotonic BIGSERIAL seq
+//     (used for pull cursors and journal ordering only, NOT for LWW tiebreaking).
 //   - central_memories:  canonical materialized state; partial UNIQUE on topic
 //     identity enforces INV-A at the DB level.
 //   - central_tombstones: records every soft-delete; partial UNIQUE on topic
-//     prevents duplicate tombstones (INV-B).
+//     prevents duplicate tombstones (INV-B). deleted_by+sync_id are the final
+//     tiebreaker fields used by writeWins (writer_id→sync_id, replica-identical).
 //   - cloud_sync_audit:  push/pull audit trail (written by PR3b onwards).
 func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 	stmts := []string{
@@ -96,9 +98,9 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		// One row per soft-deleted identity.  sync_id PK prevents duplicate rows
 		// for the same sync_id.  The partial UNIQUE on topic identity (INV-B)
 		// ensures FindTombstone-by-topic is deterministic (≤1 result).
-		// seq carries the central BIGSERIAL seq of the delete mutation so that
-		// domain.Decide can use ts.Seq as the spec-authoritative tiebreaker
-		// (spec.md:89-97) when updated_at and version both tie.
+		// deleted_by (writer_id) and sync_id are the final tiebreaker fields used
+		// by writeWins when updated_at and version tie — both are stable and
+		// replica-identical (see writeWins doc comment in domain/reconcile.go).
 		`CREATE TABLE IF NOT EXISTS central_tombstones (
 			sync_id    TEXT         PRIMARY KEY,
 			project    TEXT         NOT NULL DEFAULT '',
@@ -106,17 +108,8 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			topic_key  TEXT,
 			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
 			deleted_by TEXT         NOT NULL DEFAULT '',
-			version    INT          NOT NULL DEFAULT 0,
-			seq        BIGINT       NOT NULL DEFAULT 0
+			version    INT          NOT NULL DEFAULT 0
 		)`,
-
-		// Idempotent upgrade for pre-PR5 central DBs: CREATE TABLE IF NOT EXISTS above
-		// is a no-op when central_tombstones already exists, so the seq column (added in
-		// PR5, now referenced by reads/writes) must be added explicitly. ADD COLUMN IF
-		// NOT EXISTS is a no-op on a fresh DB (column already present from the CREATE)
-		// and adds it on an upgrade. On Postgres 11+ a NOT NULL column with a constant
-		// default is a fast metadata-only change (no table rewrite).
-		`ALTER TABLE central_tombstones ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 0`,
 
 		// Partial UNIQUE: ≤1 tombstone per live topic identity (INV-B).
 		// Allows topic_key IS NULL rows (non-topic records) to share NULL freely.

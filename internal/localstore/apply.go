@@ -198,12 +198,13 @@ func execClearTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) erro
 func execWriteTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
 	now := m.UpdatedAt.UTC().Format(time.RFC3339Nano)
 
-	// Set deleted_at and seq on the resolved memories row. seq is updated to
-	// m.Seq (the central seq of this delete mutation) for parity with the
-	// central setDeletedAtQ, so the soft-deleted row's seq stays truthful.
+	// Set deleted_at on the resolved memories row. seq on the memories row is
+	// retained (it carries the last-applied central seq for cursor/audit purposes)
+	// but is NOT updated here — it is not used in the LWW tiebreaker (see
+	// writeWins doc comment; the tiebreaker is writer_id → sync_id).
 	_, err := tx.Exec(
-		`UPDATE memories SET deleted_at=?, version=?, writer_id=?, seq=? WHERE sync_id=?`,
-		now, m.Version, m.WriterID, m.Seq, targetSyncID,
+		`UPDATE memories SET deleted_at=?, version=?, writer_id=? WHERE sync_id=?`,
+		now, m.Version, m.WriterID, targetSyncID,
 	)
 	if err != nil {
 		return fmt.Errorf("execWriteTombstone: update memories: %w", err)
@@ -211,14 +212,14 @@ func execWriteTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) erro
 
 	// Insert tombstone row keyed by targetSyncID so FindTombstone by sync_id
 	// and by topic_key both resolve to the correct deleted identity.
-	// seq carries the central seq of the delete mutation so domain.Decide can
-	// use ts.Seq as the spec-authoritative tiebreaker (spec.md:89-97).
+	// deleted_by (writer_id) and sync_id are the identity tiebreaker fields used
+	// by writeWins; both are stable and replica-identical (see writeWins doc comment).
 	_, err = tx.Exec(`
 		INSERT OR REPLACE INTO memory_tombstones
-		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, seq)
-		VALUES (?,?,?,?,?,?,?,?)`,
+		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
+		VALUES (?,?,?,?,?,?,?)`,
 		targetSyncID, m.Project, m.Scope, nullStr(m.TopicKey),
-		now, m.WriterID, m.Version, m.Seq,
+		now, m.WriterID, m.Version,
 	)
 	if err != nil {
 		return fmt.Errorf("execWriteTombstone: insert tombstone: %w", err)

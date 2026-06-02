@@ -21,7 +21,7 @@ import (
 // purpose: Decide produces the Decision; the adapter dispatches on
 // Decision.Action using Decision.TargetSyncID and Decision.Undelete.
 //
-// Flow (the heart of PR3b):
+// Flow:
 //
 //  1. INV5 idempotency — check MutationApplied(m.MutationID) on the pool FIRST.
 //     A re-pushed mutation that already landed is a cheap no-op: return nil
@@ -29,8 +29,9 @@ import (
 //  2. Begin a transaction. Every subsequent read and write runs on this tx so
 //     Decide sees a consistent snapshot and the whole reconciliation is atomic.
 //  3. Assign seq — InsertMutation on the tx returns the BIGSERIAL seq (INV2,
-//     the canonical monotonic order). m.Seq is set to this value locally so the
-//     reconciliation and the materialized row both record the central seq.
+//     the canonical monotonic order for pull cursors / journal ordering). m.Seq
+//     is set to this value so the materialized memory row records the last
+//     mutation seq that touched it.
 //     central_mutations.mutation_id is UNIQUE: a concurrent duplicate push that
 //     races past step 1 surfaces here as SQLSTATE 23505 — treated as an
 //     idempotent no-op (rollback, return nil). This UNIQUE is the durable
@@ -54,12 +55,11 @@ import (
 //     - NoOp → nothing.
 //  6. Commit. Any error rolls back the whole transaction.
 //
-// Tombstone seq wiring: central_tombstones now carries a seq column populated
-// with the central BIGSERIAL seq of the delete mutation (assigned in step 3).
-// domain.Decide uses ts.Seq as the spec-authoritative tiebreaker (spec.md:89-97)
-// when updated_at and version both tie. At push time the incoming mutation's seq
-// is assigned fresh in step 3 (unchanged), so it is always the highest seen seq
-// for this writer; the tombstone's seq reflects the seq of the prior delete.
+// LWW tiebreaker: the final (updated_at, version) tie is resolved by
+// (writer_id, sync_id) — stable, replica-identical fields so every store
+// computes the same winner. Central seq is NOT used as a tiebreaker; it serves
+// only as the pull-cursor / journal ordering authority (see writeWins in
+// domain/reconcile.go).
 func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 	// Step 1 — INV5 idempotency: a mutation that already landed is a no-op.
 	// Checked on the pool before opening a transaction so re-pushes are cheap.
@@ -166,12 +166,12 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 }
 
 // setDeletedAtQ soft-deletes the canonical memory row identified by targetSyncID,
-// stamping the deletion's version, writer, and seq so the row reflects the tombstone.
-// The version/writer_id/seq come from the DELETE mutation (the authoritative deletion
+// stamping the deletion's version and writer so the row reflects the tombstone.
+// The version/writer_id come from the DELETE mutation (the authoritative deletion
 // context), matching localstore.execWriteTombstone's UPDATE of the memories row.
-// Setting seq on the soft-deleted row keeps it truthful: the row's seq records the
-// central seq of the last mutation that touched it (the delete), providing parity
-// with upsert rows whose seq is also the seq of the mutation that last updated them.
+// seq on the central_memories row is retained at the upsert-assigned value — it
+// is the last central journal seq that materialized this row and is used only for
+// cursor ordering, NOT for LWW tiebreaking (see writeWins in domain/reconcile.go).
 //
 // The WHERE clause is intentionally unconditional on deleted_at: if the row is
 // already soft-deleted (cross-writer re-delete), this refreshes the deletion
@@ -179,9 +179,9 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 func setDeletedAtQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	const sql = `
 		UPDATE central_memories
-		SET deleted_at = $1, version = $2, writer_id = $3, seq = $4
-		WHERE sync_id = $5`
-	if _, err := qr.Exec(ctx, sql, m.UpdatedAt.UTC(), m.Version, m.WriterID, m.Seq, targetSyncID); err != nil {
+		SET deleted_at = $1, version = $2, writer_id = $3
+		WHERE sync_id = $4`
+	if _, err := qr.Exec(ctx, sql, m.UpdatedAt.UTC(), m.Version, m.WriterID, targetSyncID); err != nil {
 		return fmt.Errorf("setDeletedAt: %w", err)
 	}
 	return nil

@@ -65,15 +65,11 @@ type Tombstone struct {
 	Scope     string    `db:"scope"`
 	TopicKey  *string   `db:"topic_key"`
 	DeletedAt time.Time `db:"deleted_at"`
-	DeletedBy string    `db:"deleted_by"` // writer_id
+	DeletedBy string    `db:"deleted_by"` // writer_id — used as tiebreaker by writeWins
 	Version   int       `db:"version"`
-	// Seq is the central seq of the delete mutation that created this tombstone.
-	// 0 means not yet server-assigned (own pre-push write, same convention as
-	// memories.seq for local-only writes). Populated from the persistent store
-	// (local memory_tombstones.seq or central central_tombstones.seq) so that
-	// domain.Decide can pass the real tombstone seq to writeWins as the
-	// spec-authoritative tiebreaker (spec.md:89-97).
-	Seq int64 `db:"seq"`
+	// SyncID (above) is also used as the final tiebreaker when DeletedBy ties.
+	// Both fields are stable, replica-identical (derived from the mutation payload)
+	// so every store computes the same winner — see writeWins doc comment.
 }
 
 // Op is the mutation operation type.

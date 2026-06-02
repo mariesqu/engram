@@ -24,16 +24,7 @@ import (
 //	trigger (VALUES form without the WHERE OLD.deleted_at IS NULL guard) that
 //	causes SQLITE_CORRUPT_VTAB (267) on any undelete sequence. The migration
 //	is a cheap drop+recreate of all three FTS triggers; no data is touched.
-//
-// v2 → v3: add `seq INTEGER NOT NULL DEFAULT 0` to memory_tombstones so the
-//
-//	tombstone carries the central seq of its delete mutation. domain.Decide
-//	passes ts.Seq to writeWins as the spec-authoritative tiebreaker
-//	(spec.md:89-97). The migration uses a PRAGMA table_info guard: if the seq
-//	column is absent (existing v2 DB) it is added via ALTER TABLE; if already
-//	present (fresh DB where ApplySchema already ran with the column) the ALTER
-//	is skipped, keeping the migration idempotent.
-const currentSchemaVersion = 3
+const currentSchemaVersion = 2
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -205,14 +196,6 @@ func runMigrations(db *sql.DB) error {
 		if err := migrateV1ToV2(db); err != nil {
 			return err
 		}
-		ver = 2
-	}
-
-	if ver < 3 {
-		if err := migrateV2ToV3(db); err != nil {
-			return err
-		}
-		ver = 3
 	}
 
 	return nil
@@ -332,81 +315,6 @@ func migrateV1ToV2(db *sql.DB) error {
 	}
 	err = tx.Commit()
 	return err
-}
-
-// migrateV2ToV3 adds the `seq INTEGER NOT NULL DEFAULT 0` column to
-// memory_tombstones so that domain.Decide can use ts.Seq as the
-// spec-authoritative tiebreaker (spec.md:89-97) when updated_at and version
-// both tie at the tombstone boundary.
-//
-// Guard strategy: PRAGMA table_info(memory_tombstones) is inspected before the
-// ALTER so the migration is safe under two scenarios:
-//
-//   - Existing v2 DB (seq column absent): ALTER TABLE adds the column; DEFAULT 0
-//     backfills all existing rows so the NOT NULL constraint is satisfied
-//     immediately, with no data scan cost.
-//   - Fresh DB (ApplySchema already created memory_tombstones WITH seq): the
-//     column is already present; the ALTER is skipped, keeping the migration a
-//     no-op as required by idempotency.
-//
-// If table_info returns zero rows (memory_tombstones absent — impossible in
-// practice because ApplySchema runs before runMigrations per store.go:47,52,
-// but defensive), the ALTER is skipped and only the version bump is applied.
-//
-// The whole operation runs in a transaction so a failure leaves the DB at
-// user_version=2 (unchanged), mirroring migrateV1ToV2's structure.
-func migrateV2ToV3(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	// Unconditional rollback: the table_info scan loop uses local-err returns that
-	// do not assign the outer err variable, making the conditional-defer pattern
-	// error-prone (tx stays open on scan/close errors). An unconditional Rollback
-	// after a successful Commit is a harmless no-op in database/sql.
-	defer tx.Rollback() //nolint:errcheck
-
-	// Check whether the seq column already exists in memory_tombstones.
-	// PRAGMA table_info returns one row per column; we scan for a column named "seq".
-	rows, err := tx.Query(`PRAGMA table_info(memory_tombstones)`)
-	if err != nil {
-		return err
-	}
-	seqExists := false
-	tableHasRows := false
-	for rows.Next() {
-		tableHasRows = true
-		var cid int
-		var name, colType string
-		var notNull int
-		var dfltValue sql.NullString
-		var pk int
-		if scanErr := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); scanErr != nil {
-			rows.Close()
-			return scanErr
-		}
-		if name == "seq" {
-			seqExists = true
-		}
-	}
-	if closeErr := rows.Close(); closeErr != nil {
-		return closeErr
-	}
-	if err = rows.Err(); err != nil {
-		return err
-	}
-
-	// Only ALTER when the table exists AND the column is absent.
-	if tableHasRows && !seqExists {
-		if _, err = tx.Exec(`ALTER TABLE memory_tombstones ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return err
-		}
-	}
-
-	if _, err = tx.Exec(`PRAGMA user_version = 3`); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 // rebuildMemoriesTable performs the SQLite table-rebuild to drop the legacy FK:
@@ -615,9 +523,9 @@ func ApplySchema(db *sql.DB) error {
 		memoriesTableDDL,
 
 		// ── memory_tombstones — prevent soft-delete resurrection (INV 4) ────
-		// seq carries the central seq of the delete mutation that created this
-		// tombstone (same 0-means-local-only convention as memories.seq).
-		// domain.Decide passes ts.Seq to writeWins for the spec tiebreaker.
+		// deleted_by (writer_id) and sync_id (primary key) are the final
+		// tiebreakers used by writeWins when updated_at and version tie.
+		// Both fields are stable and replica-identical — see writeWins doc comment.
 		`CREATE TABLE IF NOT EXISTS memory_tombstones (
 			sync_id    TEXT    PRIMARY KEY,
 			project    TEXT    NOT NULL DEFAULT '',
@@ -625,8 +533,7 @@ func ApplySchema(db *sql.DB) error {
 			topic_key  TEXT,
 			deleted_at TEXT    NOT NULL,
 			deleted_by TEXT    NOT NULL,
-			version    INTEGER NOT NULL DEFAULT 0,
-			seq        INTEGER NOT NULL DEFAULT 0
+			version    INTEGER NOT NULL DEFAULT 0
 		)`,
 
 		// ── memory_relations — reserved for future M:N promotion ─────────────
