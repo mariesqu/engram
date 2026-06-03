@@ -101,7 +101,7 @@ func (s *Store) MutationApplied(mutationID string) (bool, error) {
 func findByTopicQ(ctx context.Context, q querier, topicKey, project, scope string) (*domain.Record, error) {
 	const sql = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
-		       project, scope, version, seq, writer_id,
+		       project, scope, version, seq, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
 		FROM central_memories
@@ -116,7 +116,7 @@ func findByTopicQ(ctx context.Context, q querier, topicKey, project, scope strin
 func findBySyncIDQ(ctx context.Context, q querier, syncID string) (*domain.Record, error) {
 	const sql = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
-		       project, scope, version, seq, writer_id,
+		       project, scope, version, seq, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
 		FROM central_memories
@@ -127,7 +127,7 @@ func findBySyncIDQ(ctx context.Context, q querier, syncID string) (*domain.Recor
 
 func findTombstoneQ(ctx context.Context, q querier, syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
 	const bySyncID = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id
 		FROM central_tombstones
 		WHERE sync_id = $1
 		LIMIT 1`
@@ -142,7 +142,7 @@ func findTombstoneQ(ctx context.Context, q querier, syncID string, topicKey *str
 		return nil, nil
 	}
 	const byTopic = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id
 		FROM central_tombstones
 		WHERE topic_key = $1 AND project = $2 AND scope = $3
 		LIMIT 1`
@@ -235,8 +235,8 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 		INSERT INTO central_memories
 		  (sync_id, session_id, entity_type, type, status, title, content,
 		   project, scope, topic_key, parent_sync_id, version, seq, writer_id,
-		   created_by, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15)
+		   created_by, updated_at, last_write_mutation_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$16)
 		ON CONFLICT (sync_id) DO UPDATE SET
 		  session_id     = EXCLUDED.session_id,
 		  entity_type    = EXCLUDED.entity_type,
@@ -252,6 +252,7 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 		  seq            = EXCLUDED.seq,
 		  writer_id      = EXCLUDED.writer_id,
 		  updated_at     = EXCLUDED.updated_at,
+		  last_write_mutation_id = EXCLUDED.last_write_mutation_id,
 		  deleted_at     = NULL`
 	_, err := qr.Exec(ctx, q,
 		targetSyncID,         // $1 — canonical row identity (may differ from m.SyncID)
@@ -269,6 +270,7 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 		seq,                  // $13
 		m.WriterID,           // $14 (used for both writer_id AND created_by on INSERT via $14 twice)
 		m.UpdatedAt.UTC(),    // $15 — client logical write time (LWW tiebreaker); NOT used for created_at
+		m.MutationID,         // $16 — winning write's content-addressed id; final LWW tiebreaker
 	)
 	if err != nil {
 		return fmt.Errorf("UpsertMemory: %w", err)
@@ -301,15 +303,16 @@ func (s *Store) WriteTombstone(ctx context.Context, targetSyncID string, m domai
 func writeTombstoneQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	const q = `
 		INSERT INTO central_tombstones
-		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (sync_id) DO UPDATE SET
 		  project    = EXCLUDED.project,
 		  scope      = EXCLUDED.scope,
 		  topic_key  = EXCLUDED.topic_key,
 		  deleted_at = EXCLUDED.deleted_at,
 		  deleted_by = EXCLUDED.deleted_by,
-		  version    = EXCLUDED.version`
+		  version    = EXCLUDED.version,
+		  last_write_mutation_id = EXCLUDED.last_write_mutation_id`
 	_, err := qr.Exec(ctx, q,
 		targetSyncID,      // $1 — canonical tombstone identity (may differ from m.SyncID)
 		m.Project,         // $2
@@ -318,6 +321,7 @@ func writeTombstoneQ(ctx context.Context, qr querier, targetSyncID string, m dom
 		m.UpdatedAt.UTC(), // $5
 		m.WriterID,        // $6
 		m.Version,         // $7
+		m.MutationID,      // $8 — winning delete's content-addressed id; final LWW tiebreaker
 	)
 	if err != nil {
 		return fmt.Errorf("WriteTombstone: %w", err)
@@ -335,7 +339,7 @@ func scanRecord(row pgx.Row) (*domain.Record, error) {
 
 	err := row.Scan(
 		&r.SyncID, &r.SessionID, &r.EntityType, &r.Type, &r.Title, &r.Content,
-		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID,
+		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID, &r.LastWriteMutationID,
 		&topicKey, &status, &parentSyncID,
 		&createdAt, &updatedAt, &deletedAt,
 	)
@@ -364,7 +368,7 @@ func scanTombstone(row pgx.Row) (*domain.Tombstone, error) {
 
 	err := row.Scan(
 		&ts.SyncID, &ts.Project, &ts.Scope, &topicKey,
-		&deletedAt, &ts.DeletedBy, &ts.Version,
+		&deletedAt, &ts.DeletedBy, &ts.Version, &ts.LastWriteMutationID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -56,10 +56,12 @@ import (
 //  6. Commit. Any error rolls back the whole transaction.
 //
 // LWW tiebreaker: the final (updated_at, version) tie is resolved by
-// (writer_id, sync_id) — stable, replica-identical fields so every store
-// computes the same winner. Central seq is NOT used as a tiebreaker; it serves
-// only as the pull-cursor / journal ordering authority (see writeWins in
-// domain/reconcile.go).
+// (writer_id, then the WINNING mutation's content-addressed mutation_id carried
+// by last_write_mutation_id) — replica-identical payload-derived fields so every
+// store computes the same winner. NOT the canonical PK sync_id (which is
+// divergent across replicas for the same topic). Central seq is NOT used as a
+// tiebreaker; it serves only as the pull-cursor / journal ordering authority
+// (see writeWins in domain/reconcile.go).
 func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 	// Step 1 — INV5 idempotency: a mutation that already landed is a no-op.
 	// Checked on the pool before opening a transaction so re-pushes are cheap.
@@ -166,12 +168,16 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 }
 
 // setDeletedAtQ soft-deletes the canonical memory row identified by targetSyncID,
-// stamping the deletion's version and writer so the row reflects the tombstone.
-// The version/writer_id come from the DELETE mutation (the authoritative deletion
-// context), matching localstore.execWriteTombstone's UPDATE of the memories row.
-// seq on the central_memories row is retained at the upsert-assigned value — it
-// is the last central journal seq that materialized this row and is used only for
-// cursor ordering, NOT for LWW tiebreaking (see writeWins in domain/reconcile.go).
+// stamping the deletion's version, writer, and the winning delete's content-
+// addressed mutation_id (last_write_mutation_id) so the row reflects the tombstone.
+// The version/writer_id/mutation_id come from the DELETE mutation (the
+// authoritative deletion context), matching localstore.execWriteTombstone's
+// UPDATE of the memories row. last_write_mutation_id MUST be stamped here so the
+// soft-deleted row carries the same final-tiebreaker value as the tombstone — a
+// later delete-vs-live-row comparison reads cur.LastWriteMutationID. seq on the
+// central_memories row is retained at the upsert-assigned value — it is the last
+// central journal seq that materialized this row and is used only for cursor
+// ordering, NOT for LWW tiebreaking (see writeWins in domain/reconcile.go).
 //
 // The WHERE clause is intentionally unconditional on deleted_at: if the row is
 // already soft-deleted (cross-writer re-delete), this refreshes the deletion
@@ -179,9 +185,9 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 func setDeletedAtQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	const sql = `
 		UPDATE central_memories
-		SET deleted_at = $1, version = $2, writer_id = $3
-		WHERE sync_id = $4`
-	if _, err := qr.Exec(ctx, sql, m.UpdatedAt.UTC(), m.Version, m.WriterID, targetSyncID); err != nil {
+		SET deleted_at = $1, version = $2, writer_id = $3, last_write_mutation_id = $4
+		WHERE sync_id = $5`
+	if _, err := qr.Exec(ctx, sql, m.UpdatedAt.UTC(), m.Version, m.WriterID, m.MutationID, targetSyncID); err != nil {
 		return fmt.Errorf("setDeletedAt: %w", err)
 	}
 	return nil

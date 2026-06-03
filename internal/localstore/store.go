@@ -85,7 +85,7 @@ type rowQuerier interface {
 func findByTopicQ(q rowQuerier, topicKey, project, scope string) (*domain.Record, error) {
 	const query = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
-		       project, scope, version, seq, writer_id,
+		       project, scope, version, seq, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
 		FROM memories
@@ -101,7 +101,7 @@ func findByTopicQ(q rowQuerier, topicKey, project, scope string) (*domain.Record
 func findBySyncIDQ(q rowQuerier, syncID string) (*domain.Record, error) {
 	const query = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
-		       project, scope, version, seq, writer_id,
+		       project, scope, version, seq, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
 		FROM memories
@@ -113,7 +113,7 @@ func findBySyncIDQ(q rowQuerier, syncID string) (*domain.Record, error) {
 // findTombstoneQ is the query core for FindTombstone.
 func findTombstoneQ(q rowQuerier, syncID string, topicKey *string, project, scope string) (*domain.Tombstone, error) {
 	const bySyncID = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id
 		FROM memory_tombstones
 		WHERE sync_id = ?
 		LIMIT 1`
@@ -128,7 +128,7 @@ func findTombstoneQ(q rowQuerier, syncID string, topicKey *string, project, scop
 		return nil, nil
 	}
 	const byTopic = `
-		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version
+		SELECT sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id
 		FROM memory_tombstones
 		WHERE topic_key = ? AND project = ? AND scope = ?
 		LIMIT 1`
@@ -212,7 +212,7 @@ func (s *Store) SearchMemories(query, project string, limit int) ([]*domain.Reco
 	}
 	const q = `
 		SELECT m.sync_id, m.session_id, m.entity_type, m.type, m.title, m.content,
-		       m.project, m.scope, m.version, m.seq, m.writer_id,
+		       m.project, m.scope, m.version, m.seq, m.writer_id, m.last_write_mutation_id,
 		       m.topic_key, m.status, m.parent_sync_id,
 		       m.created_at, m.updated_at, m.deleted_at
 		FROM memories_fts fts
@@ -276,7 +276,7 @@ func scanRecord(row *sql.Row) (*domain.Record, error) {
 
 	err := row.Scan(
 		&r.SyncID, &r.SessionID, &r.EntityType, &r.Type, &r.Title, &r.Content,
-		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID,
+		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID, &r.LastWriteMutationID,
 		&topicKey, &status, &parentSyncID,
 		&createdAtStr, &updatedAtStr, &deletedAt,
 	)
@@ -313,7 +313,7 @@ func scanRecordFromRows(rows *sql.Rows) (*domain.Record, error) {
 
 	err := rows.Scan(
 		&r.SyncID, &r.SessionID, &r.EntityType, &r.Type, &r.Title, &r.Content,
-		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID,
+		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID, &r.LastWriteMutationID,
 		&topicKey, &status, &parentSyncID,
 		&createdAtStr, &updatedAtStr, &deletedAt,
 	)
@@ -345,7 +345,7 @@ func scanTombstone(row *sql.Row) (*domain.Tombstone, error) {
 
 	err := row.Scan(
 		&ts.SyncID, &ts.Project, &ts.Scope, &topicKey,
-		&deletedAtStr, &ts.DeletedBy, &ts.Version,
+		&deletedAtStr, &ts.DeletedBy, &ts.Version, &ts.LastWriteMutationID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

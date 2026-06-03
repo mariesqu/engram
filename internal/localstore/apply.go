@@ -113,11 +113,11 @@ func execInsert(tx *sql.Tx, m domain.Mutation) error {
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
 		   project, scope, topic_key, parent_sync_id, status,
-		   version, seq, writer_id, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   version, seq, writer_id, last_write_mutation_id, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		m.SyncID, m.SessionID, string(m.EntityType), m.Type, m.Title, m.Content,
 		m.Project, m.Scope, nullStr(m.TopicKey), nullStr(m.ParentSyncID), nullStr(m.Status),
-		m.Version, m.Seq, m.WriterID,
+		m.Version, m.Seq, m.WriterID, m.MutationID,
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -133,10 +133,10 @@ func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
 	_, err := tx.Exec(`
 		UPDATE memories
 		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
-		    version=?, seq=?, writer_id=?, updated_at=?
+		    version=?, seq=?, writer_id=?, last_write_mutation_id=?, updated_at=?
 		WHERE sync_id=?`,
 		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
-		m.Version, m.Seq, m.WriterID,
+		m.Version, m.Seq, m.WriterID, m.MutationID,
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		targetSyncID,
 	)
@@ -200,11 +200,12 @@ func execWriteTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) erro
 
 	// Set deleted_at on the resolved memories row. seq on the memories row is
 	// retained (it carries the last-applied central seq for cursor/audit purposes)
-	// but is NOT updated here — it is not used in the LWW tiebreaker (see
-	// writeWins doc comment; the tiebreaker is writer_id → sync_id).
+	// but is NOT updated here — it is not used in the LWW tiebreaker. The winning
+	// delete's content-addressed mutation_id IS stamped (last_write_mutation_id)
+	// because that is the final LWW tiebreaker (see writeWins doc comment).
 	_, err := tx.Exec(
-		`UPDATE memories SET deleted_at=?, version=?, writer_id=? WHERE sync_id=?`,
-		now, m.Version, m.WriterID, targetSyncID,
+		`UPDATE memories SET deleted_at=?, version=?, writer_id=?, last_write_mutation_id=? WHERE sync_id=?`,
+		now, m.Version, m.WriterID, m.MutationID, targetSyncID,
 	)
 	if err != nil {
 		return fmt.Errorf("execWriteTombstone: update memories: %w", err)
@@ -212,14 +213,15 @@ func execWriteTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) erro
 
 	// Insert tombstone row keyed by targetSyncID so FindTombstone by sync_id
 	// and by topic_key both resolve to the correct deleted identity.
-	// deleted_by (writer_id) and sync_id are the identity tiebreaker fields used
-	// by writeWins; both are stable and replica-identical (see writeWins doc comment).
+	// deleted_by (writer_id) and last_write_mutation_id (the winning delete's
+	// content-addressed id) are the identity tiebreaker fields used by writeWins;
+	// both are replica-identical (see writeWins doc comment), unlike sync_id (PK).
 	_, err = tx.Exec(`
 		INSERT OR REPLACE INTO memory_tombstones
-		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version)
-		VALUES (?,?,?,?,?,?,?)`,
+		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
+		VALUES (?,?,?,?,?,?,?,?)`,
 		targetSyncID, m.Project, m.Scope, nullStr(m.TopicKey),
-		now, m.WriterID, m.Version,
+		now, m.WriterID, m.Version, m.MutationID,
 	)
 	if err != nil {
 		return fmt.Errorf("execWriteTombstone: insert tombstone: %w", err)
