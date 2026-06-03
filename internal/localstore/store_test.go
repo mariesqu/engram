@@ -1956,6 +1956,183 @@ func TestTombstone_TopicUniqueIndex_ReDeleteUnaffected(t *testing.T) {
 	}
 }
 
+// ── migrateV4ToV5 migration tests ────────────────────────────────────────────
+
+// createV4DB creates a minimal v4 schema SQLite DB at a temp path.
+// The memories table includes seq INTEGER NOT NULL DEFAULT 0 (the column removed
+// by migrateV4ToV5). user_version is set to 4 so Open/runMigrations enters the
+// v4→v5 path. A seed row is inserted so we can prove data survives the migration.
+func createV4DB(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v4.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("createV4DB: sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	// Create the memories table with seq (the v4 schema).
+	if _, err := db.Exec(`CREATE TABLE memories (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		sync_id         TEXT    NOT NULL UNIQUE,
+		session_id      TEXT    NOT NULL,
+		entity_type     TEXT    NOT NULL DEFAULT 'memory',
+		type            TEXT    NOT NULL,
+		status          TEXT,
+		title           TEXT    NOT NULL,
+		content         TEXT    NOT NULL DEFAULT '',
+		project         TEXT    NOT NULL DEFAULT '',
+		scope           TEXT    NOT NULL DEFAULT 'project',
+		topic_key       TEXT,
+		parent_sync_id  TEXT,
+		version         INTEGER NOT NULL DEFAULT 1,
+		seq             INTEGER NOT NULL DEFAULT 0,
+		writer_id       TEXT    NOT NULL DEFAULT '',
+		last_write_mutation_id TEXT NOT NULL DEFAULT '',
+		normalized_hash TEXT,
+		embedding       BLOB,
+		embedding_model TEXT,
+		embedding_created_at TEXT,
+		created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+		updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+		deleted_at      TEXT,
+		review_after    TEXT,
+		expires_at      TEXT
+	)`); err != nil {
+		t.Fatalf("createV4DB: create memories: %v", err)
+	}
+
+	// Create remaining required tables so Open/ApplySchema can run idempotently.
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS memory_tombstones (
+			sync_id    TEXT PRIMARY KEY,
+			project    TEXT NOT NULL DEFAULT '',
+			scope      TEXT NOT NULL DEFAULT 'project',
+			topic_key  TEXT,
+			deleted_at TEXT NOT NULL,
+			deleted_by TEXT NOT NULL DEFAULT '',
+			version    INTEGER NOT NULL DEFAULT 0,
+			last_write_mutation_id TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS memory_relations (
+			from_sync_id TEXT NOT NULL,
+			to_sync_id   TEXT NOT NULL,
+			rel_type     TEXT NOT NULL DEFAULT 'parent',
+			PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
+		)`,
+		`CREATE TABLE IF NOT EXISTS sync_mutations (
+			local_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+			mutation_id  TEXT NOT NULL UNIQUE,
+			entity       TEXT NOT NULL DEFAULT '',
+			entity_key   TEXT NOT NULL DEFAULT '',
+			op           TEXT NOT NULL,
+			payload      TEXT NOT NULL DEFAULT '',
+			writer_id    TEXT NOT NULL DEFAULT '',
+			occurred_at  TEXT NOT NULL DEFAULT (datetime('now')),
+			acked_at     TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS sync_state (
+			target_key       TEXT PRIMARY KEY DEFAULT 'central',
+			last_acked_seq   INTEGER NOT NULL DEFAULT 0,
+			last_pulled_seq  INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS applied_mutations (
+			mutation_id TEXT PRIMARY KEY,
+			applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`INSERT OR IGNORE INTO sync_state(target_key) VALUES ('central')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("createV4DB: setup: %v", err)
+		}
+	}
+
+	// Seed one memories row so we can verify data survives the DROP COLUMN.
+	if _, err := db.Exec(`INSERT INTO memories
+		(sync_id, session_id, entity_type, type, title, content, project, scope, seq, writer_id)
+		VALUES ('v4-mem-1', 'sess-v4', 'memory', 'manual', 'V4 Row', 'v4 content', 'eng', 'project', 42, 'w-v4')`); err != nil {
+		t.Fatalf("createV4DB: seed: %v", err)
+	}
+
+	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+		t.Fatalf("createV4DB: user_version: %v", err)
+	}
+	return path
+}
+
+// TestMigration_V4ToV5_SeqColumnDropped verifies that opening a v4 DB (which has
+// memories.seq) runs migrateV4ToV5 and drops the column. Pre-existing rows must
+// survive; user_version must reach currentSchemaVersion; and re-running is a no-op.
+func TestMigration_V4ToV5_SeqColumnDropped(t *testing.T) {
+	path := createV4DB(t)
+
+	s, err := Open(path) // triggers runMigrations → …V4→V5
+	if err != nil {
+		t.Fatalf("Open v4 DB: %v", err)
+	}
+	defer s.Close()
+
+	// 1. user_version upgraded to currentSchemaVersion.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// 2. seq column is gone from memories.
+	has, err := columnExists(s.db, "memories", "seq")
+	if err != nil {
+		t.Fatalf("columnExists(memories, seq): %v", err)
+	}
+	if has {
+		t.Error("memories.seq column must be dropped by v4→v5 migration")
+	}
+
+	// 3. Pre-existing row survived (data is intact).
+	var content string
+	if err := s.db.QueryRow(
+		`SELECT content FROM memories WHERE sync_id='v4-mem-1'`,
+	).Scan(&content); err != nil {
+		t.Fatalf("read migrated row: %v", err)
+	}
+	if content != "v4 content" {
+		t.Errorf("migrated row content = %q; want %q", content, "v4 content")
+	}
+
+	// 4. Re-running migrations on the now-current DB is a no-op (idempotent).
+	if err := runMigrations(s.db); err != nil {
+		t.Errorf("re-running migrations on current DB must be a no-op: %v", err)
+	}
+}
+
+// TestMigration_V4ToV5_FreshDB_NoSeqColumn verifies that a fresh DB opened via
+// Open never has a memories.seq column (ApplySchema no longer creates it, and
+// migrateV4ToV5 is a no-op when the column is absent).
+func TestMigration_V4ToV5_FreshDB_NoSeqColumn(t *testing.T) {
+	s := openTempStore(t) // fresh DB via Open → ApplySchema + runMigrations
+
+	has, err := columnExists(s.db, "memories", "seq")
+	if err != nil {
+		t.Fatalf("columnExists: %v", err)
+	}
+	if has {
+		t.Error("fresh DB must NOT have a memories.seq column (removed from schema in v5)")
+	}
+
+	// user_version must be at currentSchemaVersion.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("fresh DB user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+}
+
 // Compile-time check: Store must satisfy domain.Reader.
 var _ domain.Reader = (*Store)(nil)
 

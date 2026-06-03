@@ -19,7 +19,9 @@ import (
 //   - central_mutations: authoritative journal; assigns monotonic BIGSERIAL seq
 //     (used for pull cursors and journal ordering only, NOT for LWW tiebreaking).
 //   - central_memories:  canonical materialized state; partial UNIQUE on topic
-//     identity enforces INV-A at the DB level.
+//     identity enforces INV-A at the DB level. Does NOT carry a seq column —
+//     the materialized-row seq was removed (dead field; pull cursor uses
+//     sync_state.last_pulled_seq / Mutation.Seq from central_mutations directly).
 //   - central_tombstones: records every soft-delete; partial UNIQUE on topic
 //     prevents duplicate tombstones (INV-B). deleted_by + last_write_mutation_id
 //     are the final tiebreaker fields used by writeWins (writer_id → winning
@@ -46,9 +48,11 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			ON central_mutations(project, seq)`,
 
 		// ── central_memories ─────────────────────────────────────────────────────
-		// Canonical materialized read model.  sync_id is the portable identity;
-		// seq records the last central_mutations seq that touched this row.
+		// Canonical materialized read model. sync_id is the portable identity.
 		// embedding is BYTEA reserved for pgvector (not populated in this change).
+		// Note: seq was removed in the v4→v5 close-out (the materialized-row copy
+		// was dead; the pull cursor uses sync_state.last_pulled_seq / Mutation.Seq
+		// from central_mutations). The LWW tiebreaker uses last_write_mutation_id.
 		`CREATE TABLE IF NOT EXISTS central_memories (
 			sync_id        TEXT         PRIMARY KEY,
 			session_id     TEXT         NOT NULL DEFAULT '',
@@ -63,7 +67,6 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			topic_key      TEXT,
 			parent_sync_id TEXT,
 			version        INT          NOT NULL DEFAULT 1,
-			seq            BIGINT       NOT NULL DEFAULT 0,
 			writer_id      TEXT         NOT NULL DEFAULT '',
 			last_write_mutation_id TEXT NOT NULL DEFAULT '',
 			created_by     TEXT         NOT NULL DEFAULT '',
@@ -89,12 +92,16 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_cmem_project_updated
 			ON central_memories(project, updated_at DESC)`,
 
-		`CREATE INDEX IF NOT EXISTS idx_cmem_seq
-			ON central_memories(seq)`,
-
 		`CREATE INDEX IF NOT EXISTS idx_cmem_deleted
 			ON central_memories(deleted_at)
 			WHERE deleted_at IS NOT NULL`,
+
+		// ── Existing-DB upgrade: drop dead materialized-row seq ──────────────────
+		// These are idempotent on a fresh DB (no seq column, no idx_cmem_seq index
+		// to drop). On an existing DB they remove the dead column and its index.
+		// DROP INDEX IF EXISTS and DROP COLUMN IF EXISTS never error when absent.
+		`DROP INDEX IF EXISTS idx_cmem_seq`,
+		`ALTER TABLE central_memories DROP COLUMN IF EXISTS seq`,
 
 		// ── central_tombstones ───────────────────────────────────────────────────
 		// One row per soft-deleted identity.  sync_id PK prevents duplicate rows

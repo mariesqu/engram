@@ -6,8 +6,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/mariesqu/engram/internal/spike"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,21 +131,18 @@ func TestConvergence_INV2_MonotonicSeq(t *testing.T) {
 		}
 	}
 
-	// After settling, the central seq propagates onto a node's local row ONLY for
-	// topics the node PULLED (accepted from central via Insert/Update). For topics
-	// the node AUTHORED, its own local row already holds the content and the pulled
-	// central-seq'd copy is an INV5 NoOp — so the authored row keeps local seq 0.
-	// This is the correct, observed behavior: central seq is the authority; it
-	// reaches a replica when that replica ACCEPTS the central row, not when the
-	// replica authored the winning content itself.
+	// After settling, nodes pull each other's topics from central. Verify that
+	// central has a positive journal seq (central_mutations.seq) for each topic —
+	// that is the INV2 authority: the BIGSERIAL is the only seq that matters.
+	// (The materialized-row rec.Seq was removed; the pull cursor uses the journal.)
 	syncRounds(ctx, t, []*nodeRef{{a}, {b}}, central, 2)
 
-	// A authored a1,a2 → pulled b1,b2 (those carry central seq on A.local).
-	assertPulledTopicHasSeq(t, a, "sdd/test/inv2-b1")
-	assertPulledTopicHasSeq(t, a, "sdd/test/inv2-b2")
-	// B authored b1,b2 → pulled a1,a2 (those carry central seq on B.local).
-	assertPulledTopicHasSeq(t, b, "sdd/test/inv2-a1")
-	assertPulledTopicHasSeq(t, b, "sdd/test/inv2-a2")
+	// A authored a1,a2 → pulled b1,b2 from central (journal has those mutations).
+	assertPulledTopicHasSeq(ctx, t, central, "sdd/test/inv2-b1")
+	assertPulledTopicHasSeq(ctx, t, central, "sdd/test/inv2-b2")
+	// B authored b1,b2 → pulled a1,a2 from central (journal has those mutations).
+	assertPulledTopicHasSeq(ctx, t, central, "sdd/test/inv2-a1")
+	assertPulledTopicHasSeq(ctx, t, central, "sdd/test/inv2-a2")
 
 	// Every topic exists live on both nodes regardless of who authored it.
 	for _, topic := range []string{"sdd/test/inv2-a1", "sdd/test/inv2-b1", "sdd/test/inv2-a2", "sdd/test/inv2-b2"} {
@@ -159,17 +154,27 @@ func TestConvergence_INV2_MonotonicSeq(t *testing.T) {
 	}
 }
 
-// assertPulledTopicHasSeq asserts a topic the node PULLED from central carries a
-// positive central seq on the node's local row (proves seq propagation on accept).
-func assertPulledTopicHasSeq(t *testing.T, n *spike.Node, topic string) {
+// assertPulledTopicHasSeq asserts that central_mutations contains a row for the
+// given topic identity with a positive journal seq (central_mutations.seq > 0).
+// This verifies INV2 at the journal level: the BIGSERIAL is the only seq
+// authority. The materialized-row rec.Seq was removed (dead field; pull cursor
+// uses sync_state.last_pulled_seq from Mutation.Seq / central_mutations.seq).
+func assertPulledTopicHasSeq(ctx context.Context, t *testing.T, c *centralStore, topic string) {
 	t.Helper()
-	rec := liveTopicOnNode(t, n, topic)
-	if rec == nil {
-		t.Errorf("INV2: node %s missing pulled topic %q", n.Name, topic)
-		return
+	var seq int64
+	err := c.Pool().QueryRow(ctx, `
+		SELECT COALESCE(MAX(cm.seq), 0)
+		FROM central_mutations cm
+		WHERE cm.entity_key IN (
+			SELECT sync_id FROM central_memories WHERE topic_key = $1
+		)`,
+		topic,
+	).Scan(&seq)
+	if err != nil {
+		t.Fatalf("assertPulledTopicHasSeq(%q): %v", topic, err)
 	}
-	if rec.Seq <= 0 {
-		t.Errorf("INV2: node %s pulled topic %q local seq=%d, want >0 (central seq propagated on accept)", n.Name, topic, rec.Seq)
+	if seq <= 0 {
+		t.Errorf("INV2: topic %q has no central_mutations row with seq > 0 (want journal seq > 0)", topic)
 	}
 }
 

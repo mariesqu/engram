@@ -101,7 +101,7 @@ func (s *Store) MutationApplied(mutationID string) (bool, error) {
 func findByTopicQ(ctx context.Context, q querier, topicKey, project, scope string) (*domain.Record, error) {
 	const sql = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
-		       project, scope, version, seq, writer_id, last_write_mutation_id,
+		       project, scope, version, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
 		FROM central_memories
@@ -116,7 +116,7 @@ func findByTopicQ(ctx context.Context, q querier, topicKey, project, scope strin
 func findBySyncIDQ(ctx context.Context, q querier, syncID string) (*domain.Record, error) {
 	const sql = `
 		SELECT sync_id, session_id, entity_type, type, title, content,
-		       project, scope, version, seq, writer_id, last_write_mutation_id,
+		       project, scope, version, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
 		FROM central_memories
@@ -215,15 +215,17 @@ func insertMutationQ(ctx context.Context, q querier, m domain.Mutation) (seq int
 // correct canonical row and avoids hitting central_memories_topic_uidx with a
 // second live row under a different sync_id.
 //
-// The caller (PR3b Decide-driven Apply) is responsible for running Decide()
-// and passing only winning mutations here.
+// The caller (Apply) is responsible for running Decide() and passing only
+// winning mutations here. The seq parameter is the journal seq from
+// central_mutations (returned by insertMutationQ) — it is no longer stored in
+// central_memories but is retained in the signature for caller compatibility.
 func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.Mutation, seq int64) error {
 	return upsertMemoryQ(ctx, s.pool, targetSyncID, m, seq)
 }
 
 // upsertMemoryQ is the ctx+querier core for UpsertMemory. Apply runs it on its
-// transaction so the canonical-state write commits atomically with the seq
-// assignment and the applied-marker.
+// transaction so the canonical-state write commits atomically with the mutation
+// journal entry and the applied-marker.
 func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation, seq int64) error {
 	// created_at is intentionally omitted from the INSERT column list so the
 	// server's DEFAULT now() applies. This makes created_at server-authoritative
@@ -231,12 +233,23 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 	// ON CONFLICT DO UPDATE SET list either (it stays immutable after first
 	// creation). updated_at IS updated — it is the client logical write time used
 	// by writeWins() as the LWW tiebreaker across writers.
+	//
+	// seq (the materialized-row copy of central_mutations.seq) was removed: it
+	// was dead weight — the pull cursor uses sync_state.last_pulled_seq from
+	// Mutation.Seq (central_mutations.seq) directly; no production code read it.
+	//
+	// Parameter order ($1..$15):
+	//   $1  targetSyncID  $2  session_id    $3  entity_type   $4  type
+	//   $5  status        $6  title         $7  content       $8  project
+	//   $9  scope         $10 topic_key     $11 parent_sync_id $12 version
+	//   $13 writer_id (used twice: writer_id column AND created_by column)
+	//   $14 updated_at    $15 last_write_mutation_id
 	const q = `
 		INSERT INTO central_memories
 		  (sync_id, session_id, entity_type, type, status, title, content,
-		   project, scope, topic_key, parent_sync_id, version, seq, writer_id,
+		   project, scope, topic_key, parent_sync_id, version, writer_id,
 		   created_by, updated_at, last_write_mutation_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$16)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15)
 		ON CONFLICT (sync_id) DO UPDATE SET
 		  session_id     = EXCLUDED.session_id,
 		  entity_type    = EXCLUDED.entity_type,
@@ -249,13 +262,12 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 		  topic_key      = EXCLUDED.topic_key,
 		  parent_sync_id = EXCLUDED.parent_sync_id,
 		  version        = EXCLUDED.version,
-		  seq            = EXCLUDED.seq,
 		  writer_id      = EXCLUDED.writer_id,
 		  updated_at     = EXCLUDED.updated_at,
 		  last_write_mutation_id = EXCLUDED.last_write_mutation_id,
 		  deleted_at     = NULL`
 	_, err := qr.Exec(ctx, q,
-		targetSyncID,         // $1 — canonical row identity (may differ from m.SyncID)
+		targetSyncID,         // $1  — canonical row identity (may differ from m.SyncID)
 		m.SessionID,          // $2
 		string(m.EntityType), // $3
 		m.Type,               // $4
@@ -267,10 +279,9 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 		m.TopicKey,           // $10 (nil → NULL)
 		m.ParentSyncID,       // $11 (nil → NULL)
 		m.Version,            // $12
-		seq,                  // $13
-		m.WriterID,           // $14 (used for both writer_id AND created_by on INSERT via $14 twice)
-		m.UpdatedAt.UTC(),    // $15 — client logical write time (LWW tiebreaker); NOT used for created_at
-		m.MutationID,         // $16 — winning write's content-addressed id; final LWW tiebreaker
+		m.WriterID,           // $13 — used for both writer_id AND created_by on INSERT
+		m.UpdatedAt.UTC(),    // $14 — client logical write time (LWW tiebreaker); NOT used for created_at
+		m.MutationID,         // $15 — winning write's content-addressed id; final LWW tiebreaker
 	)
 	if err != nil {
 		return fmt.Errorf("UpsertMemory: %w", err)
@@ -341,7 +352,7 @@ func scanRecord(row pgx.Row) (*domain.Record, error) {
 
 	err := row.Scan(
 		&r.SyncID, &r.SessionID, &r.EntityType, &r.Type, &r.Title, &r.Content,
-		&r.Project, &r.Scope, &r.Version, &r.Seq, &r.WriterID, &r.LastWriteMutationID,
+		&r.Project, &r.Scope, &r.Version, &r.WriterID, &r.LastWriteMutationID,
 		&topicKey, &status, &parentSyncID,
 		&createdAt, &updatedAt, &deletedAt,
 	)

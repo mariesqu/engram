@@ -55,10 +55,10 @@ func TestINV1_TopicConvergence_RealSQLite(t *testing.T) {
 	_, err := s.db.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
-		   project, scope, topic_key, version, seq, writer_id, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   project, scope, topic_key, version, writer_id, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		syncY, "sess-A", "memory", "manual", "A title", "A content",
-		project, scope, topic, 1, 1, "writer-A",
+		project, scope, topic, 1, "writer-A",
 		tOlder.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -168,10 +168,10 @@ func TestINV4_TombstoneUndelete_RealSQLite(t *testing.T) {
 	_, err := s.db.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
-		   project, scope, topic_key, version, seq, writer_id, updated_at, deleted_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   project, scope, topic_key, version, writer_id, updated_at, deleted_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		syncID, "sess-A", "memory", "manual", "A title", "A content",
-		project, scope, topic, 1, 1, "writer-A",
+		project, scope, topic, 1, "writer-A",
 		deletedAtStr, deletedAtStr,
 	)
 	if err != nil {
@@ -290,10 +290,10 @@ func TestApply_NormalSameSyncIDUpdate_StillWorks(t *testing.T) {
 	_, err := s.db.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
-		   project, scope, version, seq, writer_id, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   project, scope, version, writer_id, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		syncID, "sess-A", "memory", "manual", "Old", "Old content",
-		project, scope, 1, 1, "writer-A",
+		project, scope, 1, "writer-A",
 		tOld.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -526,10 +526,10 @@ func TestINV4_CrossWriterDelete_ConvergesToResolvedRow(t *testing.T) {
 	_, err := s.db.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
-		   project, scope, topic_key, version, seq, writer_id, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   project, scope, topic_key, version, writer_id, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		syncY, "sess-A", "memory", "manual", "A title", "A content",
-		project, scope, topic, 1, 1, "writer-A",
+		project, scope, topic, 1, "writer-A",
 		tWritten.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -1084,10 +1084,10 @@ func TestINV4_StaleUpsertAgainstTombstone_StaysDeleted(t *testing.T) {
 	_, err := s.db.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
-		   project, scope, version, seq, writer_id, updated_at, deleted_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   project, scope, version, writer_id, updated_at, deleted_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		syncID, "sess-A", "memory", "manual", "T", "C",
-		project, scope, 1, 1, "writer-A",
+		project, scope, 1, "writer-A",
 		deletedAtStr, deletedAtStr,
 	)
 	if err != nil {

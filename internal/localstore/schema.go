@@ -43,7 +43,16 @@ import (
 // central_tombstones_topic_uidx in the central store. CREATE UNIQUE INDEX IF NOT
 // EXISTS is idempotent so fresh DBs (where ApplySchema already created the index)
 // are a no-op.
-const currentSchemaVersion = 4
+//
+// v4 → v5: drop the memories.seq column. The seq was a materialized copy of the
+//   central journal seq in each row, but it is consumed by nothing in production:
+//   the LWW tiebreaker uses (updated_at, version, writer_id, last_write_mutation_id)
+//   only (see writeWins in domain/reconcile.go), and the pull cursor is
+//   sync_state.last_pulled_seq (the journal seq from Mutation.Seq / PullSince).
+//   modernc sqlite 3.43+ supports DROP COLUMN. The migration is guarded by
+//   PRAGMA table_info so a fresh DB (where ApplySchema never created the column)
+//   is a no-op.
+const currentSchemaVersion = 5
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -158,7 +167,6 @@ const memoriesTableDDL = `CREATE TABLE IF NOT EXISTS memories (
 	topic_key       TEXT,
 	parent_sync_id  TEXT,
 	version         INTEGER NOT NULL DEFAULT 1,
-	seq             INTEGER NOT NULL DEFAULT 0,
 	writer_id       TEXT    NOT NULL DEFAULT '',
 	last_write_mutation_id TEXT NOT NULL DEFAULT '',
 	normalized_hash TEXT,
@@ -238,9 +246,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 4
 	}
 
+	if ver < 5 {
+		if err := migrateV4ToV5(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 5
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes the
-	// final `ver = 4` assignment so it is not flagged as ineffectual (SA4006); the
-	// value stays in sync for any future `if ver < 5` migration block.
+	// final `ver = 5` assignment so it is not flagged as ineffectual (SA4006); the
+	// value stays in sync for any future `if ver < 6` migration block.
 	_ = ver
 	return nil
 }
@@ -522,20 +538,22 @@ func rebuildMemoriesTable(db *sql.DB) error {
 	}
 
 	// c. Copy all rows. BOTH the target and source column lists are explicit and
-	// enumerate the LEGACY v0 column set — last_write_mutation_id is intentionally
-	// OMITTED (it does not exist on a v0 DB; the new table's DEFAULT '' backfills
-	// it). Listing the target columns is REQUIRED: the new memories table has the
-	// extra last_write_mutation_id column, so a bare `INSERT INTO memories SELECT …`
-	// would mismatch the column count. The later migrateV2ToV3 is a no-op for this
-	// fresh-rebuilt table because ApplySchema already created the column.
+	// enumerate the LEGACY v0 column set — last_write_mutation_id and seq are
+	// intentionally OMITTED: last_write_mutation_id did not exist on a v0 DB
+	// (the new table's DEFAULT '' backfills it), and seq is removed as of v5
+	// (the materialized-row seq is dead; the pull cursor uses Mutation.Seq from
+	// the journal). Listing the target columns is REQUIRED: the new memories table
+	// has a different column set, so a bare `INSERT INTO memories SELECT …` would
+	// mismatch. The later migrateV2ToV3 is a no-op for this fresh-rebuilt table
+	// because ApplySchema already created last_write_mutation_id.
 	if _, err = tx.Exec(`INSERT INTO memories
 		(id, sync_id, session_id, entity_type, type, status, title, content,
-		 project, scope, topic_key, parent_sync_id, version, seq, writer_id,
+		 project, scope, topic_key, parent_sync_id, version, writer_id,
 		 normalized_hash, embedding, embedding_model, embedding_created_at,
 		 created_at, updated_at, deleted_at, review_after, expires_at)
 	SELECT
 		id, sync_id, session_id, entity_type, type, status, title, content,
-		project, scope, topic_key, parent_sync_id, version, seq, writer_id,
+		project, scope, topic_key, parent_sync_id, version, writer_id,
 		normalized_hash, embedding, embedding_model, embedding_created_at,
 		created_at, updated_at, deleted_at, review_after, expires_at
 	FROM memories_old`); err != nil {
@@ -679,6 +697,42 @@ func rebuildMemoryRelationsTable(db *sql.DB) error {
 
 	err = tx.Commit()
 	return err
+}
+
+// migrateV4ToV5 drops the memories.seq column (the materialized copy of the
+// central journal seq). The LWW tiebreaker uses (updated_at, version, writer_id,
+// last_write_mutation_id) only; the pull cursor advances via sync_state.last_pulled_seq
+// from Mutation.Seq (central_mutations.seq). The materialized copy served no
+// production purpose and is removed here.
+//
+// modernc sqlite bundles SQLite 3.43+ which supports DROP COLUMN natively.
+// The migration is guarded by PRAGMA table_info: a fresh DB created by
+// ApplySchema (which no longer has the seq column) is a no-op.
+//
+// All work runs inside ONE transaction with the unconditional defer tx.Rollback()
+// + return tx.Commit() pattern: Commit succeeds → deferred Rollback is a no-op;
+// any error → deferred Rollback reverts everything and user_version stays at 4.
+func migrateV4ToV5(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	exists, err := columnExists(tx, "memories", "seq")
+	if err != nil {
+		return err
+	}
+	if exists {
+		if _, err := tx.Exec(`ALTER TABLE memories DROP COLUMN seq`); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 5`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers

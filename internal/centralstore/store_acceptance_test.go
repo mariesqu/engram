@@ -545,8 +545,8 @@ func TestPartialUniqueIndex_RejectsSecondLiveRow(t *testing.T) {
 	_, err := store.Pool().Exec(ctx, `
 		INSERT INTO central_memories
 		  (sync_id, entity_type, type, title, content, project, scope, topic_key,
-		   version, seq, writer_id, created_by)
-		VALUES ($1,'memory','manual','title2','content2',$2,$3,$4,1,2,'w','w')`,
+		   version, writer_id, created_by)
+		VALUES ($1,'memory','manual','title2','content2',$2,$3,$4,1,'w','w')`,
 		m2.SyncID, m2.Project, m2.Scope, m2.TopicKey,
 	)
 	if err == nil {
@@ -822,8 +822,8 @@ func TestEntityTypeCheck_RejectsBogusValue(t *testing.T) {
 	_, err := store.Pool().Exec(ctx, `
 		INSERT INTO central_memories
 		  (sync_id, entity_type, type, title, content, project, scope,
-		   version, seq, writer_id, created_by)
-		VALUES ($1,$2,'manual','title','content','proj','project',1,1,'w','w')`,
+		   version, writer_id, created_by)
+		VALUES ($1,$2,'manual','title','content','proj','project',1,'w','w')`,
 		"sync-check-bogus", "bogus",
 	)
 	if err == nil {
@@ -877,6 +877,28 @@ func freePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// TestCentralMemories_HasNoSeqColumn verifies that central_memories does NOT
+// have a seq column after the v4→v5 close-out. The materialized-row seq was
+// removed: the pull cursor uses sync_state.last_pulled_seq / Mutation.Seq
+// (central_mutations.seq) directly; the LWW tiebreaker uses last_write_mutation_id.
+func TestCentralMemories_HasNoSeqColumn(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	var colCount int
+	err := store.Pool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name  = 'central_memories'
+		  AND column_name = 'seq'`,
+	).Scan(&colCount)
+	if err != nil {
+		t.Fatalf("query information_schema.columns for central_memories.seq: %v", err)
+	}
+	if colCount != 0 {
+		t.Errorf("central_memories must NOT have a seq column after the v4→v5 seq removal; found %d", colCount)
+	}
 }
 
 // cacheRoot returns the directory where embedded-postgres binaries are cached.
