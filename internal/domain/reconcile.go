@@ -14,11 +14,14 @@
 // UNIFORM LWW MODEL — applies to EVERY write (upsert or delete):
 //
 // The four-level total order  updated_at → version → writer_id → sync_id
-// governs ALL conflicts, including delete-vs-live-row. A delete supersedes the
-// current LIVE row only if it WINS that order; a stale or tie-losing delete is a
-// NoOp against a live row. When there is no live row (cur == nil) the gate is
-// skipped and the delete tombstones unconditionally (pure tombstone / cross-writer
-// re-tombstone paths are unchanged).
+// governs ALL conflicts, including delete-vs-live-row and delete-vs-tombstone.
+// A delete supersedes the current LIVE row only if it WINS that order; a stale
+// or tie-losing delete against a live row is a NoOp. When there is no live row
+// (cur == nil) but a tombstone exists (ts != nil), the delete competes via
+// writeWins against the tombstone: a losing delete is a NoOp that preserves the
+// newer tombstone's (deleted_at, version, deleted_by) metadata. Unconditional
+// tombstoning applies ONLY when there is NEITHER a live row NOR a tombstone (the
+// first delete of this identity).
 //
 // This symmetry is what makes every store converge regardless of push order or
 // which writer holds the higher identity: upserts and deletes compete on the
@@ -113,19 +116,41 @@ func Decide(tx Reader, m Mutation) Decision {
 
 	switch m.Op {
 	case OpDelete:
-		// A delete competes on the SAME total order as an upsert
-		// (updated_at → version → writer_id → sync_id). It supersedes the current
-		// LIVE row only if it WINS that order; a stale or tie-losing delete against
-		// a live row is a NoOp. This is what makes deletes symmetric with the pull
-		// side and with upsert-vs-upsert, so every store converges regardless of
-		// push order or which writer holds the higher identity.
+		// A delete competes on the SAME total order as an upsert:
+		// updated_at → version → writer_id → sync_id.
 		//
-		// When cur == nil (no live row) the gate is skipped — the delete still
-		// tombstones unconditionally: either it is the first delete of this identity
-		// (pure tombstone) or the canonical row was already soft-deleted by a prior
-		// writer and the INV-B re-tombstone hardening below is unchanged.
-		if cur != nil && !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
-			return noop
+		// The competition target depends on what currently exists for this identity:
+		//
+		//   cur != nil  — a live row exists: the delete must WIN writeWins against it
+		//                 or it is a NoOp (stale-delete-vs-live-row guard, closes the
+		//                 "delete at T1 must not tombstone live row at T2 > T1" split-brain).
+		//
+		//   cur == nil, ts != nil — no live row but a tombstone exists: the delete must
+		//                 WIN writeWins against the tombstone's (deleted_at, version,
+		//                 deleted_by, sync_id). A losing delete is a NoOp — it MUST NOT
+		//                 overwrite the newer tombstone's metadata via the adapter's
+		//                 INSERT OR REPLACE (last-applied-wins is not last-write-wins and
+		//                 causes metadata divergence → downstream resurrection split-brain).
+		//
+		//   cur == nil, ts == nil — first delete of this identity: tombstone unconditionally
+		//                 (pure tombstone path, no prior state to compete against).
+		//
+		// The target-SyncID resolution below (cur.SyncID → ts.SyncID → m.SyncID) is
+		// unchanged: a WINNING delete re-tombstones the canonical identity so no
+		// duplicate tombstone is minted; a LOSING delete is now a NoOp.
+		switch {
+		case cur != nil && cur.DeletedAt == nil:
+			// Live row exists: the delete must WIN writeWins against it, otherwise NoOp.
+			if !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+				return noop
+			}
+		case ts != nil:
+			// No live row (cur == nil, or FindBySyncID returned a soft-deleted row whose
+			// deletion is already captured by the tombstone). Compete against the tombstone:
+			// an incoming delete whose metadata would regress the existing tombstone is a NoOp.
+			if !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
+				return noop
+			}
 		}
 
 		// INV4 / INV-B: write tombstone atomically (adapter executes this).
