@@ -316,90 +316,136 @@ func TestDecide_INV6_IndependentTopicKeysNeverConflict(t *testing.T) {
 // writeWins tiebreaker priority order
 // ─────────────────────────────────────────────
 
-// TestWriteWins_Tiebreakers exercises all three priority levels of writeWins:
+// TestWriteWins_Tiebreakers exercises all four priority levels of writeWins:
 //  1. Wall-clock (updated_at) is the primary comparator.
 //  2. Version breaks ties when timestamps are equal.
-//  3. Seq breaks ties when timestamp AND version are equal.
+//  3. WriterID breaks ties when timestamp AND version are equal.
+//  4. last_write_mutation_id (the WINNING mutation's content-addressed id) breaks
+//     ties when timestamp, version AND writer_id are equal — replacing the old
+//     canonical-PK sync_id tier (which was divergent across replicas).
+//
+// The final tier compares the incoming mutation's MutationID against the stored
+// row/tombstone's LastWriteMutationID (the winner's id, NOT the row PK sync_id).
 func TestWriteWins_Tiebreakers(t *testing.T) {
 	cases := []struct {
-		name          string
-		mUpdatedAt    time.Time
-		mVersion      int
-		mSeq          int64
-		curUpdatedAt  time.Time
-		curVersion    int
-		curSeq        int64
-		wantWriteWins bool
+		name                   string
+		mUpdatedAt             time.Time
+		mVersion               int
+		mWriterID              string
+		mMutationID            string
+		curUpdatedAt           time.Time
+		curVersion             int
+		curWriterID            string
+		curLastWriteMutationID string
+		wantWriteWins          bool
 	}{
 		{
-			name:          "newer timestamp wins regardless of version/seq",
-			mUpdatedAt:    t100,
-			mVersion:      1,
-			mSeq:          1,
-			curUpdatedAt:  t50,
-			curVersion:    9,
-			curSeq:        99,
-			wantWriteWins: true,
+			name:                   "newer timestamp wins regardless of version/identity",
+			mUpdatedAt:             t100,
+			mVersion:               1,
+			mWriterID:              "writer-A",
+			mMutationID:            "mut-A",
+			curUpdatedAt:           t50,
+			curVersion:             9,
+			curWriterID:            "writer-Z",
+			curLastWriteMutationID: "mut-Z",
+			wantWriteWins:          true,
 		},
 		{
-			name:          "older timestamp loses regardless of version/seq",
-			mUpdatedAt:    t50,
-			mVersion:      9,
-			mSeq:          99,
-			curUpdatedAt:  t100,
-			curVersion:    1,
-			curSeq:        1,
-			wantWriteWins: false,
+			name:                   "older timestamp loses regardless of version/identity",
+			mUpdatedAt:             t50,
+			mVersion:               9,
+			mWriterID:              "writer-Z",
+			mMutationID:            "mut-Z",
+			curUpdatedAt:           t100,
+			curVersion:             1,
+			curWriterID:            "writer-A",
+			curLastWriteMutationID: "mut-A",
+			wantWriteWins:          false,
 		},
 		{
-			name:          "equal timestamp: higher version wins",
-			mUpdatedAt:    t100,
-			mVersion:      3,
-			mSeq:          1,
-			curUpdatedAt:  t100,
-			curVersion:    2,
-			curSeq:        99,
-			wantWriteWins: true,
+			name:                   "equal timestamp: higher version wins",
+			mUpdatedAt:             t100,
+			mVersion:               3,
+			mWriterID:              "writer-A",
+			mMutationID:            "mut-A",
+			curUpdatedAt:           t100,
+			curVersion:             2,
+			curWriterID:            "writer-Z",
+			curLastWriteMutationID: "mut-Z",
+			wantWriteWins:          true,
 		},
 		{
-			name:          "equal timestamp: lower version loses",
-			mUpdatedAt:    t100,
-			mVersion:      1,
-			mSeq:          99,
-			curUpdatedAt:  t100,
-			curVersion:    3,
-			curSeq:        1,
-			wantWriteWins: false,
+			name:                   "equal timestamp: lower version loses",
+			mUpdatedAt:             t100,
+			mVersion:               1,
+			mWriterID:              "writer-Z",
+			mMutationID:            "mut-Z",
+			curUpdatedAt:           t100,
+			curVersion:             3,
+			curWriterID:            "writer-A",
+			curLastWriteMutationID: "mut-A",
+			wantWriteWins:          false,
 		},
 		{
-			name:          "equal timestamp+version: higher seq wins",
-			mUpdatedAt:    t100,
-			mVersion:      2,
-			mSeq:          5,
-			curUpdatedAt:  t100,
-			curVersion:    2,
-			curSeq:        3,
-			wantWriteWins: true,
+			name:                   "equal timestamp+version: higher writer_id wins",
+			mUpdatedAt:             t100,
+			mVersion:               2,
+			mWriterID:              "writer-Z",
+			mMutationID:            "mut-A", // lower mutation_id — irrelevant; writer_id decides first
+			curUpdatedAt:           t100,
+			curVersion:             2,
+			curWriterID:            "writer-A",
+			curLastWriteMutationID: "mut-Z",
+			wantWriteWins:          true,
 		},
 		{
-			name:          "equal timestamp+version: lower seq loses",
-			mUpdatedAt:    t100,
-			mVersion:      2,
-			mSeq:          2,
-			curUpdatedAt:  t100,
-			curVersion:    2,
-			curSeq:        5,
-			wantWriteWins: false,
+			name:                   "equal timestamp+version: lower writer_id loses",
+			mUpdatedAt:             t100,
+			mVersion:               2,
+			mWriterID:              "writer-A",
+			mMutationID:            "mut-Z", // higher mutation_id — irrelevant; writer_id decides first
+			curUpdatedAt:           t100,
+			curVersion:             2,
+			curWriterID:            "writer-Z",
+			curLastWriteMutationID: "mut-A",
+			wantWriteWins:          false,
 		},
 		{
-			name:          "fully equal: mutation does not win (deterministic NoOp)",
-			mUpdatedAt:    t100,
-			mVersion:      2,
-			mSeq:          5,
-			curUpdatedAt:  t100,
-			curVersion:    2,
-			curSeq:        5,
-			wantWriteWins: false,
+			name:                   "equal timestamp+version+writer_id: higher mutation_id wins",
+			mUpdatedAt:             t100,
+			mVersion:               2,
+			mWriterID:              "writer-X",
+			mMutationID:            "mut-Z",
+			curUpdatedAt:           t100,
+			curVersion:             2,
+			curWriterID:            "writer-X",
+			curLastWriteMutationID: "mut-A",
+			wantWriteWins:          true,
+		},
+		{
+			name:                   "equal timestamp+version+writer_id: lower mutation_id loses",
+			mUpdatedAt:             t100,
+			mVersion:               2,
+			mWriterID:              "writer-X",
+			mMutationID:            "mut-A",
+			curUpdatedAt:           t100,
+			curVersion:             2,
+			curWriterID:            "writer-X",
+			curLastWriteMutationID: "mut-Z",
+			wantWriteWins:          false,
+		},
+		{
+			name:                   "fully equal: mutation does not win (deterministic NoOp)",
+			mUpdatedAt:             t100,
+			mVersion:               2,
+			mWriterID:              "writer-X",
+			mMutationID:            "mut-X",
+			curUpdatedAt:           t100,
+			curVersion:             2,
+			curWriterID:            "writer-X",
+			curLastWriteMutationID: "mut-X",
+			wantWriteWins:          false,
 		},
 	}
 
@@ -407,11 +453,12 @@ func TestWriteWins_Tiebreakers(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			mut := Mutation{
-				UpdatedAt: tc.mUpdatedAt,
-				Version:   tc.mVersion,
-				Seq:       tc.mSeq,
+				UpdatedAt:  tc.mUpdatedAt,
+				Version:    tc.mVersion,
+				WriterID:   tc.mWriterID,
+				MutationID: tc.mMutationID,
 			}
-			got := writeWins(mut, tc.curUpdatedAt, tc.curVersion, tc.curSeq)
+			got := writeWins(mut, tc.curUpdatedAt, tc.curVersion, tc.curWriterID, tc.curLastWriteMutationID)
 			if got != tc.wantWriteWins {
 				t.Errorf("writeWins() = %v; want %v", got, tc.wantWriteWins)
 			}
@@ -440,6 +487,271 @@ func TestDecide_DeleteWritesTombstone(t *testing.T) {
 	decision := Decide(r, mut)
 	if decision.Action != ActionWriteTombstone {
 		t.Fatalf("Delete op must return ActionWriteTombstone; got %v", decision.Action)
+	}
+}
+
+// TestDecide_Delete_NoLiveRowNoTombstone_TombstonesUnconditionally verifies that
+// when there is NEITHER a live row (cur == nil) NOR an existing tombstone (ts == nil),
+// OpDelete tombstones unconditionally — the first delete of an identity has no prior
+// state to compete against. NOTE: when cur == nil but a tombstone EXISTS, OpDelete
+// instead competes against it via writeWins and may NoOp (see
+// TestDecide_Delete_CurNilWithTombstone_LosingDelete_IsNoOp).
+func TestDecide_Delete_NoLiveRowNoTombstone_TombstonesUnconditionally(t *testing.T) {
+	syncID := "sync-del-nil"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Delete with a LOW updated_at — no live row AND no tombstone, so neither gate
+	// arm fires; the delete tombstones unconditionally (pure first-delete path).
+	mut := Mutation{
+		MutationID: "mut-del-nil",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        1,
+		UpdatedAt:  t0, // oldest possible — but there is nothing to lose against
+		WriterID:   "writer-A",
+	}
+	d := Decide(r, mut)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("OpDelete with no live row and no tombstone must tombstone unconditionally; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_CurNilWithTombstone_LosingDelete_IsNoOp pins the gate added for
+// the tombstone-metadata-regression split-brain: when cur == nil but a tombstone
+// EXISTS, an incoming delete that LOSES writeWins against the tombstone MUST be a
+// NoOp — it must NOT proceed to ActionWriteTombstone, because the adapter's
+// INSERT OR REPLACE would regress the newer tombstone's (deleted_at, version,
+// deleted_by) and let a later upsert that the newer tombstone should block resurrect
+// the topic. (The winning direction — a newer delete re-tombstoning the canonical
+// identity — is covered by TestDecide_CrossWriterReDelete_ReusesTombstoneIdentity.)
+func TestDecide_Delete_CurNilWithTombstone_LosingDelete_IsNoOp(t *testing.T) {
+	project, scope := "engram", "project"
+
+	// Stale delete: older updated_at than the existing tombstone → loses → NoOp.
+	t.Run("stale_delete_older_than_tombstone", func(t *testing.T) {
+		syncID := "sync-del-vs-tomb-stale"
+		r := newMockReader()
+		// Existing tombstone is NEWER (t100). No record seeded → cur == nil; ts != nil.
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: t100,
+			DeletedBy: "writer-Z",
+			Version:   2,
+		})
+		mut := Mutation{
+			MutationID: "mut-del-stale-vs-tomb",
+			Op:         OpDelete,
+			SyncID:     syncID,
+			Project:    project,
+			Scope:      scope,
+			Version:    1,
+			UpdatedAt:  t50, // older than the tombstone → loses writeWins
+			WriterID:   "writer-A",
+		}
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("cur==nil, stale delete vs newer tombstone must be NoOp (no metadata regression); got %v", d.Action)
+		}
+	})
+
+	// Tie-losing delete: exact (updated_at, version) tie, lower writer_id → NoOp.
+	t.Run("tie_losing_delete_lower_writer_id", func(t *testing.T) {
+		syncID := "sync-del-vs-tomb-tie"
+		r := newMockReader()
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: t100,
+			DeletedBy: "writer-Z", // higher writer_id → tombstone wins the tie
+			Version:   2,
+		})
+		mut := Mutation{
+			MutationID: "mut-del-tie-vs-tomb",
+			Op:         OpDelete,
+			SyncID:     syncID,
+			Project:    project,
+			Scope:      scope,
+			Version:    2,
+			UpdatedAt:  t100,       // exact (updated_at, version) tie
+			WriterID:   "writer-A", // lower writer_id → loses the identity tiebreaker
+		}
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("cur==nil, tie-losing delete (lower writer_id) vs tombstone must be NoOp; got %v", d.Action)
+		}
+	})
+}
+
+// TestDecide_Delete_StaleDelete_IsNoOp verifies that a delete with a strictly
+// OLDER updated_at than the live row is a NoOp (the uniform LWW gate).
+// This closes the stale-delete split-brain: a delete that loses the total order
+// must NOT tombstone a newer live row.
+func TestDecide_Delete_StaleDelete_IsNoOp(t *testing.T) {
+	syncID := "sync-del-stale"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Seed a live row at T+100 v=2.
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  t100,
+		Content:    "newer live content",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-Z",
+	})
+
+	// Delete at T+50 v=1 — strictly older in every dimension.
+	mut := Mutation{
+		MutationID: "mut-del-stale",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        2,
+		UpdatedAt:  t50, // older than the live row
+		WriterID:   "writer-A",
+	}
+	d := Decide(r, mut)
+	if d.Action != NoOp {
+		t.Fatalf("stale delete must be NoOp against a newer live row; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_NewerDelete_Tombstones verifies that a delete with a strictly
+// NEWER updated_at than the live row returns ActionWriteTombstone (wins LWW gate).
+func TestDecide_Delete_NewerDelete_Tombstones(t *testing.T) {
+	syncID := "sync-del-newer"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Seed a live row at T+50 v=1.
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    1,
+		Seq:        2,
+		UpdatedAt:  t50,
+		Content:    "older live content",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-A",
+	})
+
+	// Delete at T+100 v=2 — strictly newer.
+	mut := Mutation{
+		MutationID: "mut-del-newer",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        5,
+		UpdatedAt:  t100, // newer than the live row
+		WriterID:   "writer-B",
+	}
+	d := Decide(r, mut)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("newer delete must tombstone a live row; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_TieLoss_IsNoOp verifies that at the exact (updated_at,
+// version) tie where the incoming delete's writer_id is LOWER than the live
+// row's writer_id, the delete is a NoOp (it loses the identity tiebreaker).
+// This is the "upserter-higher, delete-loses" case that caused the split-brain.
+func TestDecide_Delete_TieLoss_IsNoOp(t *testing.T) {
+	syncID := "sync-del-tie-loss"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Live row at T+100 v=2, written by "writer-Z" (higher writer_id).
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        3,
+		UpdatedAt:  t100,
+		Content:    "live content writer-Z",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-Z",
+	})
+
+	// Delete at the SAME (updated_at, version) but LOWER writer_id — loses the
+	// identity tiebreaker.
+	mut := Mutation{
+		MutationID: "mut-del-tie-loss",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        4,
+		UpdatedAt:  t100,      // same timestamp
+		WriterID:   "writer-A", // lower than "writer-Z" → loses
+	}
+	d := Decide(r, mut)
+	if d.Action != NoOp {
+		t.Fatalf("tie-losing delete (writer-A < writer-Z) must be NoOp; got %v", d.Action)
+	}
+}
+
+// TestDecide_Delete_TieWin_Tombstones verifies that at the exact (updated_at,
+// version) tie where the incoming delete's writer_id is HIGHER than the live
+// row's writer_id, the delete wins and returns ActionWriteTombstone.
+func TestDecide_Delete_TieWin_Tombstones(t *testing.T) {
+	syncID := "sync-del-tie-win"
+	project, scope := "engram", "project"
+	r := newMockReader()
+
+	// Live row at T+100 v=2, written by "writer-A" (lower writer_id).
+	r.seedRecord(&Record{
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        3,
+		UpdatedAt:  t100,
+		Content:    "live content writer-A",
+		EntityType: EntityMemory,
+		Type:       "manual",
+		Title:      "test",
+		WriterID:   "writer-A",
+	})
+
+	// Delete at the SAME (updated_at, version) but HIGHER writer_id — wins.
+	mut := Mutation{
+		MutationID: "mut-del-tie-win",
+		Op:         OpDelete,
+		SyncID:     syncID,
+		Project:    project,
+		Scope:      scope,
+		Version:    2,
+		Seq:        4,
+		UpdatedAt:  t100,      // same timestamp
+		WriterID:   "writer-Z", // higher than "writer-A" → wins
+	}
+	d := Decide(r, mut)
+	if d.Action != ActionWriteTombstone {
+		t.Fatalf("tie-winning delete (writer-Z > writer-A) must tombstone; got %v", d.Action)
 	}
 }
 
@@ -618,76 +930,327 @@ func TestDecide_PureTombstoneUpsert_InsertsOwnIdentity(t *testing.T) {
 	}
 }
 
-// TestDecide_TombstoneTieBreak_SeqAuthority pins both directions of the
-// tombstone tie-break boundary where updated_at and version are EQUAL and seq
-// is the sole deciding factor (the final authoritative tiebreaker per INV4 spec).
+// TestDecide_TombstoneTieBreak_IdentityAuthority pins all three cases of the
+// tombstone identity tie-break boundary where updated_at and version are EQUAL
+// and (writer_id, last_write_mutation_id) are the sole deciding factor.
 //
-// Current implementation: Decide() passes curSeq=0 when checking against a
-// tombstone (reconcile.go line ~42). This is intentional for PR2: the local
-// SQLite store does not assign Postgres BIGSERIAL seqs. The full wiring of
-// ts.Seq will be done in PR4 when the Postgres central store is live and
-// Tombstone.Seq is populated. These tests pin the boundary at the effective
-// current value (0) and document the required semantics for PR4.
-func TestDecide_TombstoneTieBreak_SeqAuthority(t *testing.T) {
+// These are pure-domain unit tests (no Postgres): they directly exercise
+// writeWins through Decide with an exact (updated_at, version) tie.
+//
+// This test covers the tombstone-vs-upsert path; the upsert-vs-row path is
+// covered by TestDecide_UpsertVsRow_IdentityAuthority.
+// Scenarios:
+//   - different writer_id: incoming.writer_id > tombstone.deleted_by → supersede
+//   - equal writer_id, higher mutation_id: incoming.mutation_id >
+//     tombstone.last_write_mutation_id → supersede
+func TestDecide_TombstoneTieBreak_IdentityAuthority(t *testing.T) {
 	project, scope := "engram", "project"
-	tombstoneTs := t100
-	tombstoneVersion := 1
-	// Effective tombstone seq seen by writeWins in this PR slice = 0
-	// (Decide passes 0 as curSeq for tombstone checks until PR4 wires ts.Seq).
-	const effectiveTombstoneSeq int64 = 0
+	tieAt := t100
+	tieVersion := 2
 
-	// ── Direction 1: incoming seq > effective tombstone seq (0) → superseded ──
+	// ── Direction 1: incoming.writer_id > tombstone.deleted_by → supersede ──
 	//
-	// writeWins(mut @ T+100 v=1 seq=1, curUpdatedAt=T+100, curVersion=1, curSeq=0)
-	// → timestamps equal → versions equal → 1 > 0 → true → ActionInsert
-	t.Run("higher_seq_supersedes_tombstone", func(t *testing.T) {
-		syncID := "sync-tiebreak-higher"
+	// writeWins(mut @ tieAt v=2 writerID="writer-Z" mutationID="mut-t1-higher-writer",
+	//           curUpdatedAt=tieAt, curVersion=2, curWriterID="writer-A", curLastWriteMutationID="")
+	// → timestamps equal → versions equal → "writer-Z" > "writer-A" → true → supersede
+	//   (writer_id decides; the mutation_id tier is never reached)
+	t.Run("tombstone_higher_writer_id_supersedes", func(t *testing.T) {
+		syncID := "sync-tiebreak-t1"
 		r := newMockReader()
 		r.seedTombstone(&Tombstone{
 			SyncID:    syncID,
 			Project:   project,
 			Scope:     scope,
-			DeletedAt: tombstoneTs,
-			DeletedBy: "writer-A",
-			Version:   tombstoneVersion,
+			DeletedAt: tieAt,
+			DeletedBy: "writer-A", // lower writer_id
+			Version:   tieVersion,
 		})
 
-		// seq=1 > effectiveTombstoneSeq(0) → writeWins returns true → ActionInsert
-		mut := newUpsert(syncID, "mut-tiebreak-higher", nil, project, scope,
-			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq+1, "revived content")
+		// Incoming upsert: same sync_id, same (updated_at, version), but higher writer_id.
+		mut := Mutation{
+			MutationID: "mut-t1-higher-writer",
+			Op:         OpUpsert,
+			SyncID:     syncID,
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Content:    "revived content",
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-Z", // higher writer_id → supersedes
+		}
 		d := Decide(r, mut)
 		if d.Action != ActionInsert {
-			t.Fatalf("INV4 tie-break: seq(%d) > effective tombstone seq(%d) must supersede → ActionInsert; got %v",
-				effectiveTombstoneSeq+1, effectiveTombstoneSeq, d.Action)
+			t.Fatalf("tombstone tie: higher writer_id must supersede → ActionInsert; got %v", d.Action)
 		}
 		if !d.Undelete {
-			t.Errorf("INV4 tie-break: supersede must have Undelete=true; got false")
+			t.Errorf("tombstone tie: supersede must have Undelete=true; got false")
 		}
 	})
 
-	// ── Direction 2: incoming seq == effective tombstone seq (0) → blocked ──
+	// ── Direction 2: equal writer_id, incoming.mutation_id > tombstone.last_write_mutation_id → supersede ──
 	//
-	// writeWins(mut @ T+100 v=1 seq=0, curUpdatedAt=T+100, curVersion=1, curSeq=0)
-	// → timestamps equal → versions equal → 0 > 0 = false → NoOp
-	t.Run("equal_seq_blocked_by_tombstone", func(t *testing.T) {
-		syncID := "sync-tiebreak-equal"
+	// writeWins(mut @ tieAt v=2 writerID="writer-X" mutationID="mut-zzz",
+	//           curUpdatedAt=tieAt, curVersion=2, curWriterID="writer-X",
+	//           curLastWriteMutationID="mut-aaa")
+	// → timestamps equal → versions equal → writer_id equal → "mut-zzz" > "mut-aaa" → true
+	//
+	// Note: since the incoming sync_id ("sync-Z") differs from the tombstone's sync_id
+	// ("sync-A"), the tombstone must be found via topic_key — FindTombstone is called with
+	// m.SyncID first (no match), then falls back to topic_key (match). The DECIDER, though,
+	// is the mutation_id (NOT sync_id): the tombstone carries the winning delete's
+	// last_write_mutation_id, and the incoming write's mutation_id is compared against it.
+	t.Run("tombstone_equal_writer_higher_mutation_id_supersedes", func(t *testing.T) {
+		tk := strPtr("sdd/test/tie-sync-id")
+		syncIDTombstone := "sync-A" // tombstone identity (PK) — NOT the tiebreaker
+		r := newMockReader()
+		r.seedTombstone(&Tombstone{
+			SyncID:              syncIDTombstone,
+			TopicKey:            tk,
+			Project:             project,
+			Scope:               scope,
+			DeletedAt:           tieAt,
+			DeletedBy:           "writer-X",
+			Version:             tieVersion,
+			LastWriteMutationID: "mut-aaa", // lower → loses the final tier
+		})
+
+		// Incoming upsert: same writer_id but higher mutation_id — wins.
+		// Uses the same topic_key so FindTombstone finds the tombstone via topic fallback.
+		mut := Mutation{
+			MutationID: "mut-zzz", // higher mutation_id → supersedes
+			Op:         OpUpsert,
+			SyncID:     "sync-Z", // PK differs (forces topic fallback) — NOT the decider
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Content:    "revived content",
+			Project:    project,
+			Scope:      scope,
+			TopicKey:   tk,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-X", // equal writer_id
+		}
+		d := Decide(r, mut)
+		if d.Action != ActionInsert {
+			t.Fatalf("tombstone tie: equal writer + higher mutation_id must supersede → ActionInsert; got %v", d.Action)
+		}
+		if !d.Undelete {
+			t.Errorf("tombstone tie: supersede must have Undelete=true; got false")
+		}
+	})
+
+	// ── Direction 3: incoming.writer_id < tombstone.deleted_by → blocked ──
+	//
+	// writeWins(mut @ tieAt v=2 writerID="writer-A" mutationID="mut-t3-lower-writer",
+	//           curUpdatedAt=tieAt, curVersion=2, curWriterID="writer-Z", curLastWriteMutationID="")
+	// → timestamps equal → versions equal → "writer-A" < "writer-Z" → false → NoOp
+	//   (writer_id decides; the mutation_id tier is never reached)
+	t.Run("tombstone_lower_writer_id_blocked", func(t *testing.T) {
+		syncID := "sync-tiebreak-t3"
 		r := newMockReader()
 		r.seedTombstone(&Tombstone{
 			SyncID:    syncID,
 			Project:   project,
 			Scope:     scope,
-			DeletedAt: tombstoneTs,
-			DeletedBy: "writer-A",
-			Version:   tombstoneVersion,
+			DeletedAt: tieAt,
+			DeletedBy: "writer-Z", // higher writer_id (tombstone wins)
+			Version:   tieVersion,
 		})
 
-		// seq=0 == effectiveTombstoneSeq(0) → writeWins returns false → NoOp
-		mut := newUpsert(syncID, "mut-tiebreak-equal", nil, project, scope,
-			tombstoneTs, tombstoneVersion, effectiveTombstoneSeq, "equal-seq content")
+		mut := Mutation{
+			MutationID: "mut-t3-lower-writer",
+			Op:         OpUpsert,
+			SyncID:     syncID,
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Content:    "stale content",
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-A", // lower writer_id → blocked
+		}
 		d := Decide(r, mut)
 		if d.Action != NoOp {
-			t.Fatalf("INV4 tie-break: seq(%d) == effective tombstone seq(%d) must be blocked → NoOp; got %v",
-				effectiveTombstoneSeq, effectiveTombstoneSeq, d.Action)
+			t.Fatalf("tombstone tie: lower writer_id must be blocked → NoOp; got %v", d.Action)
+		}
+	})
+}
+
+// TestDecide_UpsertVsRow_IdentityAuthority covers the upsert-vs-row path (cur != nil)
+// at the exact (updated_at, version) tie, proving the same identity tiebreaker
+// applies symmetrically:
+//
+//   - different writer_id: higher writer_id wins
+//   - equal writer_id, higher mutation_id: higher last_write_mutation_id wins
+//   - full equality (same writer_id AND same mutation_id): deterministic no-op
+func TestDecide_UpsertVsRow_IdentityAuthority(t *testing.T) {
+	project, scope := "engram", "project"
+	tieAt := t100
+	tieVersion := 2
+
+	// ── Case A: incoming.writer_id > cur.writer_id → wins ──
+	t.Run("upsert_row_higher_writer_id_wins", func(t *testing.T) {
+		syncID := "sync-uvr-A"
+		r := newMockReader()
+		r.seedRecord(&Record{
+			SyncID:     syncID,
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-A", // lower writer_id (stored row)
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+		})
+
+		mut := Mutation{
+			MutationID: "mut-uvr-A",
+			Op:         OpUpsert,
+			SyncID:     syncID,
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-Z", // higher writer_id → wins
+		}
+		d := Decide(r, mut)
+		if d.Action != ActionUpdate {
+			t.Fatalf("upsert-vs-row tie: higher writer_id must win → ActionUpdate; got %v", d.Action)
+		}
+	})
+
+	// ── Case B: incoming.writer_id < cur.writer_id → blocked ──
+	t.Run("upsert_row_lower_writer_id_blocked", func(t *testing.T) {
+		syncID := "sync-uvr-B"
+		r := newMockReader()
+		r.seedRecord(&Record{
+			SyncID:     syncID,
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-Z", // higher writer_id (stored row wins)
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+		})
+
+		mut := Mutation{
+			MutationID: "mut-uvr-B",
+			Op:         OpUpsert,
+			SyncID:     syncID,
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-A", // lower writer_id → blocked
+		}
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("upsert-vs-row tie: lower writer_id must be blocked → NoOp; got %v", d.Action)
+		}
+	})
+
+	// ── Case C: equal writer_id, higher mutation_id → wins ──
+	// The stored row is found via topic_key so that Decide resolves cur != nil
+	// even though the incoming mutation has a different sync_id. This exercises the
+	// writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.LastWriteMutationID)
+	// call site where m.MutationID > cur.LastWriteMutationID with equal writer_id →
+	// ActionUpdate. The PK sync_id differs only to force the FindByTopic resolution;
+	// it is NOT the decider (that is the winning write's mutation_id).
+	t.Run("upsert_row_equal_writer_higher_mutation_id_wins", func(t *testing.T) {
+		tk := strPtr("sdd/test/uvr-sync-id")
+		curSyncID := "sync-A" // stored row PK — NOT the tiebreaker
+		r := newMockReader()
+		r.seedRecord(&Record{
+			SyncID:              curSyncID,
+			TopicKey:            tk,
+			Project:             project,
+			Scope:               scope,
+			Version:             tieVersion,
+			UpdatedAt:           tieAt,
+			WriterID:            "writer-X",
+			LastWriteMutationID: "mut-aaa", // lower → loses the final tier
+			EntityType:          EntityMemory,
+			Type:                "manual",
+			Title:               "test",
+		})
+
+		// Incoming mutation: same topic_key, same (updated_at, version, writer_id),
+		// but higher mutation_id → wins on the final tiebreaker.
+		mut := Mutation{
+			MutationID: "mut-zzz", // higher mutation_id → wins
+			Op:         OpUpsert,
+			SyncID:     "sync-Z", // PK differs (forces topic resolution) — NOT the decider
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Project:    project,
+			Scope:      scope,
+			TopicKey:   tk, // same topic → FindByTopic resolves cur = stored row
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-X", // equal writer_id — falls through to mutation_id
+		}
+		d := Decide(r, mut)
+		if d.Action != ActionUpdate {
+			t.Fatalf("upsert-vs-row tie: equal writer + higher mutation_id must win → ActionUpdate; got %v", d.Action)
+		}
+		// TargetSyncID must be the RESOLVED canonical row (curSyncID), not the incoming sync_id.
+		if d.TargetSyncID != curSyncID {
+			t.Errorf("upsert-vs-row tie: TargetSyncID = %q; want %q (canonical row)", d.TargetSyncID, curSyncID)
+		}
+	})
+
+	// ── Case D: full equality → no-op ──
+	// Same writer_id AND same mutation_id (the stored row's last_write_mutation_id
+	// equals the incoming mutation_id — i.e. an idempotent re-materialization of the
+	// SAME winning write) → the final tier returns false → deterministic NoOp.
+	t.Run("upsert_row_full_equality_noop", func(t *testing.T) {
+		syncID := "sync-uvr-D"
+		r := newMockReader()
+		r.seedRecord(&Record{
+			SyncID:              syncID,
+			Project:             project,
+			Scope:               scope,
+			Version:             tieVersion,
+			UpdatedAt:           tieAt,
+			WriterID:            "writer-X",
+			LastWriteMutationID: "mut-uvr-D", // equals incoming → final tier is false
+			EntityType:          EntityMemory,
+			Type:                "manual",
+			Title:               "test",
+		})
+
+		mut := Mutation{
+			MutationID: "mut-uvr-D", // same mutation_id as the stored winner
+			Op:         OpUpsert,
+			SyncID:     syncID, // same sync_id
+			EntityType: EntityMemory,
+			Type:       "manual",
+			Title:      "test",
+			Project:    project,
+			Scope:      scope,
+			Version:    tieVersion,
+			UpdatedAt:  tieAt,
+			WriterID:   "writer-X", // same writer_id
+		}
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("upsert-vs-row full equality must be NoOp; got %v", d.Action)
 		}
 	})
 }

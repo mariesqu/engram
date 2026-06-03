@@ -38,8 +38,19 @@ type Record struct {
 	Project   string     `db:"project"`
 	Scope     string     `db:"scope"`
 	Version   int        `db:"version"`
-	Seq       int64      `db:"seq"`
-	WriterID  string     `db:"writer_id"`
+	// Seq is the central journal seq of the last mutation that materialized this
+	// row (retained for pull-cursor ordering and INV2 seq-propagation assertions).
+	// NOT used by the LWW tiebreaker — the final (updated_at,version,writer_id) tie
+	// is resolved by LastWriteMutationID; see writeWins in reconcile.go.
+	Seq      int64      `db:"seq"`
+	WriterID string     `db:"writer_id"`
+	// LastWriteMutationID is the content-addressed mutation_id of the WINNING
+	// write that last materialized this row. Unlike SyncID (the canonical row PK,
+	// fixed at first-insert), this is overwritten on every in-place update/tombstone
+	// with the winning mutation's id, so it is REPLICA-IDENTICAL: every store that
+	// converges on the same winning write carries the same value. It is the final
+	// LWW tiebreaker — see writeWins in reconcile.go.
+	LastWriteMutationID string `db:"last_write_mutation_id"`
 	CreatedAt time.Time  `db:"created_at"`
 	UpdatedAt time.Time  `db:"updated_at"`
 
@@ -65,8 +76,15 @@ type Tombstone struct {
 	Scope     string    `db:"scope"`
 	TopicKey  *string   `db:"topic_key"`
 	DeletedAt time.Time `db:"deleted_at"`
-	DeletedBy string    `db:"deleted_by"` // writer_id
+	DeletedBy string    `db:"deleted_by"` // writer_id — used as tiebreaker by writeWins
 	Version   int       `db:"version"`
+	// LastWriteMutationID is the content-addressed mutation_id of the WINNING
+	// delete that wrote this tombstone. It is the final LWW tiebreaker when
+	// DeletedAt, Version, and DeletedBy all tie. Unlike SyncID (the canonical PK,
+	// which may differ across replicas for the same topic), it is overwritten with
+	// the winning delete's id on every tombstone write, so it is REPLICA-IDENTICAL
+	// — every store computes the same winner. See writeWins doc comment.
+	LastWriteMutationID string `db:"last_write_mutation_id"`
 }
 
 // Op is the mutation operation type.

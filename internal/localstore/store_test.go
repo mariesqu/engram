@@ -1017,7 +1017,7 @@ func createLegacyDB(t *testing.T) string {
 // It simulates an existing user DB that was created with the old FK-bearing schema,
 // then calls Open() (which must run the v0->v1 migration) and asserts:
 //
-//  1. user_version is upgraded to currentSchemaVersion (1)
+//  1. user_version is upgraded to currentSchemaVersion
 //  2. Out-of-order child insert SUCCEEDS (FK is gone) — FAILS before migration
 //  3. All original rows are preserved
 //  4. FTS search still returns a seeded row (FTS index rebuilt)
@@ -1378,6 +1378,249 @@ func TestMigration_V1ToV2_BuggyTriggerReplaced(t *testing.T) {
 	_, err = s.db.Exec(`UPDATE memories SET deleted_at=NULL WHERE sync_id='v1buggy-test'`)
 	if err != nil {
 		t.Errorf("BUG B: UPDATE to undelete returned error (expected none after trigger migration): %v", err)
+	}
+}
+
+// ── Schema version and tombstone identity tests ──────────────────────────────
+
+// TestFreshDB_SchemaVersionIsCurrent verifies that a fresh Open reaches
+// currentSchemaVersion (v3 — the v2→v3 migration adds last_write_mutation_id,
+// the content-addressed final LWW tiebreaker, to memories and memory_tombstones).
+func TestFreshDB_SchemaVersionIsCurrent(t *testing.T) {
+	s := openTempStore(t)
+
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("fresh DB user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+}
+
+// createV2DB builds a SQLite file at user_version=2 whose memories and
+// memory_tombstones tables LACK the last_write_mutation_id column — i.e. a DB
+// created before the v2→v3 migration. Returns the path. This is the precondition
+// for TestMigration_V2ToV3_LastWriteMutationIDAdded (existing-DB upgrade proof).
+func createV2DB(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v2.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("createV2DB: open: %v", err)
+	}
+	defer db.Close()
+
+	// memories WITHOUT last_write_mutation_id (the pre-v3 column set).
+	if _, err := db.Exec(`CREATE TABLE memories (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		sync_id         TEXT NOT NULL UNIQUE,
+		session_id      TEXT NOT NULL,
+		entity_type     TEXT NOT NULL DEFAULT 'memory',
+		type            TEXT NOT NULL,
+		status          TEXT,
+		title           TEXT NOT NULL,
+		content         TEXT NOT NULL DEFAULT '',
+		project         TEXT NOT NULL DEFAULT '',
+		scope           TEXT NOT NULL DEFAULT 'project',
+		topic_key       TEXT,
+		parent_sync_id  TEXT,
+		version         INTEGER NOT NULL DEFAULT 1,
+		seq             INTEGER NOT NULL DEFAULT 0,
+		writer_id       TEXT NOT NULL DEFAULT '',
+		normalized_hash TEXT,
+		embedding       BLOB,
+		embedding_model TEXT,
+		embedding_created_at TEXT,
+		created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+		updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+		deleted_at      TEXT,
+		review_after    TEXT,
+		expires_at      TEXT
+	)`); err != nil {
+		t.Fatalf("createV2DB: create memories: %v", err)
+	}
+
+	// memory_tombstones WITHOUT last_write_mutation_id (the pre-v3 column set).
+	if _, err := db.Exec(`CREATE TABLE memory_tombstones (
+		sync_id    TEXT PRIMARY KEY,
+		project    TEXT NOT NULL DEFAULT '',
+		scope      TEXT NOT NULL DEFAULT 'project',
+		topic_key  TEXT,
+		deleted_at TEXT NOT NULL,
+		deleted_by TEXT NOT NULL,
+		version    INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatalf("createV2DB: create memory_tombstones: %v", err)
+	}
+
+	// Seed one row in each so we can prove existing data survives the ALTER.
+	if _, err := db.Exec(`INSERT INTO memories
+		(sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('v2-mem-1', 'sess-v2', 'memory', 'manual', 'V2 Row', 'v2 content', 'eng', 'project', 'w-v2')`); err != nil {
+		t.Fatalf("createV2DB: seed memories: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO memory_tombstones
+		(sync_id, project, scope, deleted_at, deleted_by, version)
+		VALUES ('v2-tomb-1', 'eng', 'project', '2025-01-01T00:00:00Z', 'w-v2', 1)`); err != nil {
+		t.Fatalf("createV2DB: seed memory_tombstones: %v", err)
+	}
+
+	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatalf("createV2DB: set user_version: %v", err)
+	}
+	return path
+}
+
+// TestMigration_V2ToV3_LastWriteMutationIDAdded is the existing-DB upgrade proof
+// for the final-tiebreaker fix. A v2 DB (no last_write_mutation_id on either
+// table) is opened; the migration MUST add the column to BOTH memories and
+// memory_tombstones, bump user_version to 3, and PRESERVE pre-existing rows with
+// the column defaulted to ''.
+func TestMigration_V2ToV3_LastWriteMutationIDAdded(t *testing.T) {
+	path := createV2DB(t)
+
+	s, err := Open(path) // triggers runMigrations → migrateV2ToV3
+	if err != nil {
+		t.Fatalf("Open v2 DB: %v", err)
+	}
+	defer s.Close()
+
+	// 1. user_version upgraded to current (3).
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// 2. Both tables now have the column.
+	for _, table := range []string{"memories", "memory_tombstones"} {
+		has, err := columnExists(s.db, table, "last_write_mutation_id")
+		if err != nil {
+			t.Fatalf("columnExists(%s): %v", table, err)
+		}
+		if !has {
+			t.Errorf("%s: last_write_mutation_id column missing after v2→v3 migration", table)
+		}
+	}
+
+	// 3. Pre-existing rows preserved with the column defaulted to ''.
+	var memVal, tombVal string
+	if err := s.db.QueryRow(
+		`SELECT last_write_mutation_id FROM memories WHERE sync_id='v2-mem-1'`,
+	).Scan(&memVal); err != nil {
+		t.Fatalf("read migrated memories row: %v", err)
+	}
+	if memVal != "" {
+		t.Errorf("migrated memories row last_write_mutation_id = %q; want '' (backfill default)", memVal)
+	}
+	if err := s.db.QueryRow(
+		`SELECT last_write_mutation_id FROM memory_tombstones WHERE sync_id='v2-tomb-1'`,
+	).Scan(&tombVal); err != nil {
+		t.Fatalf("read migrated tombstone row: %v", err)
+	}
+	if tombVal != "" {
+		t.Errorf("migrated tombstone row last_write_mutation_id = %q; want '' (backfill default)", tombVal)
+	}
+
+	// 4. Re-running migrations on the now-v3 DB is a no-op (idempotent).
+	if err := runMigrations(s.db); err != nil {
+		t.Errorf("re-running migrations on v3 DB must be a no-op, got: %v", err)
+	}
+}
+
+// TestTombstone_MemoryTombstonesHasNoSeqColumn verifies that memory_tombstones
+// does NOT have a seq column — it was removed when the tiebreaker changed from
+// central seq to (writer_id, then the winning mutation_id via
+// last_write_mutation_id). Having no seq column prevents the old tombstone seq
+// roundtrip and proves the schema is clean.
+func TestTombstone_MemoryTombstonesHasNoSeqColumn(t *testing.T) {
+	s := openTempStore(t)
+
+	seqFound := false
+	rows, err := s.db.Query(`PRAGMA table_info(memory_tombstones)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			t.Fatalf("table_info scan: %v", err)
+		}
+		if name == "seq" {
+			seqFound = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows.Err: %v", err)
+	}
+	if seqFound {
+		t.Error("memory_tombstones must NOT have a seq column after the identity-tiebreaker change")
+	}
+}
+
+// TestTombstone_WriterIDRoundtrip verifies that a tombstone written via Apply
+// stores deleted_by (writer_id) AND last_write_mutation_id (the winning delete's
+// content-addressed id), and that FindTombstone returns both populated.
+// deleted_by is the penultimate tiebreaker field used by writeWins;
+// last_write_mutation_id is the FINAL tiebreaker field.
+func TestTombstone_WriterIDRoundtrip(t *testing.T) {
+	s := openTempStore(t)
+
+	// Seed the memories row that will be soft-deleted.
+	if _, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('sync-wid-rt', 'sess1', 'memory', 'manual', 'WriterID Roundtrip', 'content', 'eng', 'project', 'writer-X')
+	`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const wantWriter = "writer-X"
+	m := domain.Mutation{
+		MutationID: "mut-wid-rt",
+		Op:         domain.OpDelete,
+		SyncID:     "sync-wid-rt",
+		SessionID:  "sess1",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "WriterID Roundtrip",
+		Content:    "content",
+		Project:    "eng",
+		Scope:      "project",
+		Version:    1,
+		UpdatedAt:  time.Now().UTC(),
+		OccurredAt: time.Now().UTC(),
+		WriterID:   wantWriter,
+	}
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: m.SyncID}, m); err != nil {
+		t.Fatalf("Apply WriteTombstone: %v", err)
+	}
+
+	ts, err := s.FindTombstone("sync-wid-rt", nil, "eng", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone, got nil")
+	}
+	if ts.DeletedBy != wantWriter {
+		t.Errorf("ts.DeletedBy = %q; want %q (identity tiebreaker field)", ts.DeletedBy, wantWriter)
+	}
+	if ts.SyncID != m.SyncID {
+		t.Errorf("ts.SyncID = %q; want %q (tombstone identity / PK)", ts.SyncID, m.SyncID)
+	}
+	if ts.LastWriteMutationID != m.MutationID {
+		t.Errorf("ts.LastWriteMutationID = %q; want %q (final tiebreaker field — the winning delete's id)",
+			ts.LastWriteMutationID, m.MutationID)
 	}
 }
 

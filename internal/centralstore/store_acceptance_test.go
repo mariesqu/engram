@@ -418,6 +418,111 @@ func TestReaderRoundtrip_FindTombstone(t *testing.T) {
 	}
 }
 
+// TestReaderRoundtrip_TombstoneIdentityFields verifies that WriteTombstone
+// persists deleted_by (writer_id) and last_write_mutation_id (the winning delete's
+// content-addressed mutation_id) and that FindTombstone reads them back — these
+// are the identity tiebreaker fields used by writeWins when updated_at and version
+// tie. ts.SyncID is the tombstone's PK/identity, NOT a tiebreaker.
+func TestReaderRoundtrip_TombstoneIdentityFields(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	const wantWriter = "writer-identity-test"
+	const wantSyncID = "sync-identity-test"
+
+	m := testMutation("mut-ident-1", wantSyncID, "proj", domain.OpDelete)
+	m.WriterID = wantWriter
+
+	if err := store.WriteTombstone(ctx, m.SyncID, m); err != nil {
+		t.Fatalf("WriteTombstone with writer: %v", err)
+	}
+
+	ts, err := store.FindTombstone(wantSyncID, nil, "proj", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone, got nil")
+	}
+	if ts.DeletedBy != wantWriter {
+		t.Errorf("tombstone deleted_by roundtrip: ts.DeletedBy = %q; want %q", ts.DeletedBy, wantWriter)
+	}
+	if ts.SyncID != wantSyncID {
+		t.Errorf("tombstone sync_id roundtrip: ts.SyncID = %q; want %q", ts.SyncID, wantSyncID)
+	}
+	if ts.LastWriteMutationID != m.MutationID {
+		t.Errorf("tombstone last_write_mutation_id roundtrip: ts.LastWriteMutationID = %q; want %q", ts.LastWriteMutationID, m.MutationID)
+	}
+}
+
+// TestApply_TombstoneIdentityFieldsWired verifies the full Apply path: after a
+// push-apply delete, the central_tombstones row has deleted_by and
+// last_write_mutation_id (the winning delete's mutation_id) populated — the
+// identity tiebreaker fields used by writeWins. sync_id is the tombstone PK, not
+// a tiebreaker.
+func TestApply_TombstoneIdentityFieldsWired(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	const wantWriter = "writer-apply-wired"
+
+	// Step 1 — upsert so there is a live row to delete.
+	mUpsert := testMutation("mut-taw-up", "sync-taw-1", "proj", domain.OpUpsert)
+	mUpsert.UpdatedAt = time.Now().UTC()
+	mUpsert.WriterID = wantWriter
+	if err := store.Apply(ctx, mUpsert); err != nil {
+		t.Fatalf("Apply upsert: %v", err)
+	}
+
+	// Step 2 — delete; Apply writes the tombstone with deleted_by = writer_id.
+	mDelete := testMutation("mut-taw-del", "sync-taw-1", "proj", domain.OpDelete)
+	mDelete.UpdatedAt = mUpsert.UpdatedAt.Add(time.Second)
+	mDelete.WriterID = wantWriter
+	if err := store.Apply(ctx, mDelete); err != nil {
+		t.Fatalf("Apply delete: %v", err)
+	}
+
+	ts, err := store.FindTombstone("sync-taw-1", nil, "proj", "project")
+	if err != nil {
+		t.Fatalf("FindTombstone: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("FindTombstone: expected tombstone after Apply delete, got nil")
+	}
+	if ts.DeletedBy != wantWriter {
+		t.Errorf("tombstone deleted_by after Apply delete: ts.DeletedBy = %q; want %q", ts.DeletedBy, wantWriter)
+	}
+	if ts.SyncID != "sync-taw-1" {
+		t.Errorf("tombstone sync_id after Apply delete: ts.SyncID = %q; want %q", ts.SyncID, "sync-taw-1")
+	}
+	if ts.LastWriteMutationID != mDelete.MutationID {
+		t.Errorf("tombstone last_write_mutation_id after Apply delete: ts.LastWriteMutationID = %q; want %q", ts.LastWriteMutationID, mDelete.MutationID)
+	}
+}
+
+// TestCentralTombstone_HasNoSeqColumn verifies that central_tombstones does NOT
+// have a seq column — it was removed when the tiebreaker changed from central
+// seq to (writer_id, then the winning mutation_id via last_write_mutation_id).
+// Having no seq column prevents the old tombstone seq roundtrip and proves the
+// schema is clean.
+func TestCentralTombstone_HasNoSeqColumn(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	var colCount int
+	err := store.Pool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name  = 'central_tombstones'
+		  AND column_name = 'seq'`,
+	).Scan(&colCount)
+	if err != nil {
+		t.Fatalf("query information_schema.columns for seq: %v", err)
+	}
+	if colCount != 0 {
+		t.Errorf("central_tombstones must NOT have a seq column after the identity-tiebreaker change; found %d", colCount)
+	}
+}
+
 // TestPartialUniqueIndex_RejectsSecondLiveRow verifies the partial UNIQUE INDEX
 // central_memories_topic_uidx enforces INV-A at the DB level: inserting a
 // second LIVE row for the same (topic_key, project, scope) must fail with a
