@@ -1850,6 +1850,38 @@ func TestTombstone_TopicUniqueIndex_SchemaEnforcesOnePerTopic(t *testing.T) {
 	}
 }
 
+// TestTombstone_TopicUniqueIndex_NoTopicEmptyStringNotConstrained verifies the
+// partial index treats topic_key='' as "no topic" (matching the domain's
+// TopicKey != nil && *TopicKey != "" semantics) and does NOT constrain it. Two
+// genuine no-topic tombstones that round-trip as topic_key='' under different
+// sync_ids in the same (project, scope) must BOTH persist, since the '' exclusion
+// in the index predicate prevents spurious UNIQUE violations.
+func TestTombstone_TopicUniqueIndex_NoTopicEmptyStringNotConstrained(t *testing.T) {
+	s := openTempStore(t)
+
+	// Two no-topic tombstones with topic_key='' under DIFFERENT sync_ids, same
+	// (project, scope). With the '' exclusion they are both "no topic" and coexist.
+	for _, sync := range []string{"sync-empty-A", "sync-empty-B"} {
+		if _, err := s.db.Exec(`
+			INSERT INTO memory_tombstones
+			  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
+			VALUES (?, 'eng', 'project', '', datetime('now'), 'writer', 1, ?)
+		`, sync, "mut-"+sync); err != nil {
+			t.Fatalf("insert no-topic ('') tombstone %s must succeed (index must not constrain ''): %v", sync, err)
+		}
+	}
+
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memory_tombstones WHERE topic_key='' AND project='eng' AND scope='project'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count empty-topic tombstones: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 coexisting no-topic ('') tombstones, got %d — the index must treat '' as no-topic", count)
+	}
+}
+
 // TestTombstone_TopicUniqueIndex_ReDeleteUnaffected verifies that the normal
 // re-delete path (Decide re-targets to the existing tombstone's sync_id) is
 // completely unaffected by the unique index. execWriteTombstone uses ON CONFLICT

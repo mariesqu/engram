@@ -37,7 +37,7 @@ import (
 //
 // v3 → v4: add a partial UNIQUE index on memory_tombstones(topic_key, project,
 //
-//	scope) WHERE topic_key IS NOT NULL — schema-enforcing the ≤1-tombstone-per-topic
+//	scope) WHERE topic_key IS NOT NULL AND topic_key <> '' — schema-enforcing the ≤1-tombstone-per-topic
 //	invariant (INV-B) that was previously only logic-guaranteed by Decide's
 //	canonical re-targeting. Mirrors central_tombstones_topic_uidx in the central
 //	store. CREATE UNIQUE INDEX IF NOT EXISTS is idempotent so fresh DBs (where
@@ -237,7 +237,10 @@ func runMigrations(db *sql.DB) error {
 		ver = 4
 	}
 
-	_ = ver // silence "declared and not used" if no further cases are added
+	// ver is read by the `if ver < N` conditions above. This blank read consumes the
+	// final `ver = 4` assignment so it is not flagged as ineffectual (SA4006); the
+	// value stays in sync for any future `if ver < 5` migration block.
+	_ = ver
 	return nil
 }
 
@@ -429,7 +432,8 @@ func migrateV2ToV3(db *sql.DB) error {
 }
 
 // migrateV3ToV4 adds the memory_tombstones_topic_uidx partial UNIQUE index on
-// memory_tombstones(topic_key, project, scope) WHERE topic_key IS NOT NULL.
+// memory_tombstones(topic_key, project, scope) WHERE topic_key IS NOT NULL AND
+// topic_key <> '' (the domain treats both NULL and '' as "no topic").
 //
 // This is the defense-in-depth close-out for INV-B (≤1 tombstone per topic
 // identity). Previously the invariant was only logic-guaranteed by Decide's
@@ -458,7 +462,7 @@ func migrateV3ToV4(db *sql.DB) error {
 
 	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS memory_tombstones_topic_uidx
 		ON memory_tombstones(topic_key, project, scope)
-		WHERE topic_key IS NOT NULL`); err != nil {
+		WHERE topic_key IS NOT NULL AND topic_key <> ''`); err != nil {
 		return err
 	}
 
@@ -704,12 +708,14 @@ func ApplySchema(db *sql.DB) error {
 		// ── memory_tombstones_topic_uidx — INV-B schema enforcement ─────────────
 		// Partial UNIQUE: ≤1 tombstone per live topic identity (INV-B, defense-in-depth).
 		// Mirrors central_tombstones_topic_uidx in the central store.
-		// Allows topic_key IS NULL rows (non-topic records) to share NULL freely
-		// (SQLite treats each NULL as distinct for unique index purposes, but the
-		// WHERE topic_key IS NOT NULL filter excludes them from the constraint anyway).
+		// The predicate excludes BOTH NULL and '' topic_key: the domain treats both as
+		// "no topic" (Decide/FindByTopic use TopicKey != nil && *TopicKey != ""), so
+		// genuine no-topic records must NOT be constrained. Without the '' exclusion,
+		// multiple no-topic deletes that round-trip as topic_key='' in the same
+		// (project, scope) would collide and raise spurious UNIQUE violations.
 		`CREATE UNIQUE INDEX IF NOT EXISTS memory_tombstones_topic_uidx
 			ON memory_tombstones(topic_key, project, scope)
-			WHERE topic_key IS NOT NULL`,
+			WHERE topic_key IS NOT NULL AND topic_key <> ''`,
 
 		// ── memory_relations — reserved for future M:N promotion ─────────────
 		// REFERENCES clauses intentionally omitted — see memoriesTableDDL comment.
