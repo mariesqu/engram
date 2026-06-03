@@ -419,9 +419,10 @@ func TestReaderRoundtrip_FindTombstone(t *testing.T) {
 }
 
 // TestReaderRoundtrip_TombstoneIdentityFields verifies that WriteTombstone
-// persists deleted_by (writer_id) and that FindTombstone returns ts.DeletedBy
-// and ts.SyncID populated — these are the final tiebreaker fields used by
-// writeWins when updated_at and version tie (identity tiebreaker).
+// persists deleted_by (writer_id) and last_write_mutation_id (the winning delete's
+// content-addressed mutation_id) and that FindTombstone reads them back — these
+// are the identity tiebreaker fields used by writeWins when updated_at and version
+// tie. ts.SyncID is the tombstone's PK/identity, NOT a tiebreaker.
 func TestReaderRoundtrip_TombstoneIdentityFields(t *testing.T) {
 	store := newIsolatedStore(t)
 	ctx := context.Background()
@@ -449,11 +450,16 @@ func TestReaderRoundtrip_TombstoneIdentityFields(t *testing.T) {
 	if ts.SyncID != wantSyncID {
 		t.Errorf("tombstone sync_id roundtrip: ts.SyncID = %q; want %q", ts.SyncID, wantSyncID)
 	}
+	if ts.LastWriteMutationID != m.MutationID {
+		t.Errorf("tombstone last_write_mutation_id roundtrip: ts.LastWriteMutationID = %q; want %q", ts.LastWriteMutationID, m.MutationID)
+	}
 }
 
 // TestApply_TombstoneIdentityFieldsWired verifies the full Apply path: after a
-// push-apply delete, the central_tombstones row has deleted_by and sync_id
-// populated — the identity tiebreaker fields used by writeWins.
+// push-apply delete, the central_tombstones row has deleted_by and
+// last_write_mutation_id (the winning delete's mutation_id) populated — the
+// identity tiebreaker fields used by writeWins. sync_id is the tombstone PK, not
+// a tiebreaker.
 func TestApply_TombstoneIdentityFieldsWired(t *testing.T) {
 	store := newIsolatedStore(t)
 	ctx := context.Background()
@@ -488,6 +494,9 @@ func TestApply_TombstoneIdentityFieldsWired(t *testing.T) {
 	}
 	if ts.SyncID != "sync-taw-1" {
 		t.Errorf("tombstone sync_id after Apply delete: ts.SyncID = %q; want %q", ts.SyncID, "sync-taw-1")
+	}
+	if ts.LastWriteMutationID != mDelete.MutationID {
+		t.Errorf("tombstone last_write_mutation_id after Apply delete: ts.LastWriteMutationID = %q; want %q", ts.LastWriteMutationID, mDelete.MutationID)
 	}
 }
 

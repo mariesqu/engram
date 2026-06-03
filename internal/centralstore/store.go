@@ -297,8 +297,10 @@ func (s *Store) WriteTombstone(ctx context.Context, targetSyncID string, m domai
 // its transaction so the tombstone row and the deleted_at flag on
 // central_memories are set within one atomic unit.
 //
-// The tiebreaker fields are deleted_by (writer_id) and sync_id (targetSyncID) —
-// both stable and replica-identical so every store computes the same winner.
+// The identity tiebreaker fields are deleted_by (writer_id) and
+// last_write_mutation_id (the winning delete's content-addressed mutation_id) —
+// both replica-identical, so every store computes the same winner. sync_id is the
+// tombstone's PK/identity, NOT a tiebreaker (it diverges across replicas).
 // See writeWins doc comment in domain/reconcile.go.
 func writeTombstoneQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	const q = `
