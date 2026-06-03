@@ -607,6 +607,3 @@ func TestApplyPulled_EmptyTopicKey_StoresNULL(t *testing.T) {
 		t.Errorf("ApplyPulled topic_key = %q; want SQL NULL", *topicKey)
 	}
 }
-
-// Ensure the mutation package is imported (used for convergence test above).
-var _ = mutation.NewMutationID
