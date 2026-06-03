@@ -211,15 +211,35 @@ func execWriteTombstone(tx *sql.Tx, targetSyncID string, m domain.Mutation) erro
 		return fmt.Errorf("execWriteTombstone: update memories: %w", err)
 	}
 
-	// Insert tombstone row keyed by targetSyncID so FindTombstone by sync_id
-	// and by topic_key both resolve to the correct deleted identity.
+	// Insert-or-update the tombstone row keyed by targetSyncID.
+	//
+	// ON CONFLICT(sync_id) DO UPDATE SET ... mirrors central's writeTombstoneQ
+	// pattern exactly. Semantics:
+	//   - Same sync_id (normal re-delete / idempotent apply): the conflict fires on
+	//     the PK and updates all mutable fields in-place — no row replacement.
+	//   - Different sync_id, same (topic_key, project, scope): the new
+	//     memory_tombstones_topic_uidx raises SQLITE_CONSTRAINT_UNIQUE and the
+	//     error surfaces immediately (loud failure). In correct operation Decide
+	//     always re-targets to the existing tombstone's sync_id, so targetSyncID
+	//     equals the stored row's PK and the topic conflict is never reached. If it
+	//     IS reached, something bypassed Decide — we want the loud error (catches
+	//     future bugs, defense-in-depth).
+	//
 	// deleted_by (writer_id) and last_write_mutation_id (the winning delete's
 	// content-addressed id) are the identity tiebreaker fields used by writeWins;
 	// both are replica-identical (see writeWins doc comment), unlike sync_id (PK).
 	_, err = tx.Exec(`
-		INSERT OR REPLACE INTO memory_tombstones
+		INSERT INTO memory_tombstones
 		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
-		VALUES (?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(sync_id) DO UPDATE SET
+		  project    = excluded.project,
+		  scope      = excluded.scope,
+		  topic_key  = excluded.topic_key,
+		  deleted_at = excluded.deleted_at,
+		  deleted_by = excluded.deleted_by,
+		  version    = excluded.version,
+		  last_write_mutation_id = excluded.last_write_mutation_id`,
 		targetSyncID, m.Project, m.Scope, nullStr(m.TopicKey),
 		now, m.WriterID, m.Version, m.MutationID,
 	)
