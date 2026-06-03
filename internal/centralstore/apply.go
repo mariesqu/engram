@@ -63,6 +63,15 @@ import (
 // tiebreaker; it serves only as the pull-cursor / journal ordering authority
 // (see writeWins in domain/reconcile.go).
 func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
+	// Normalize TopicKey at store entry: fold &"" → nil so '' never reaches any
+	// central index. Every partial topic index uses `WHERE topic_key IS NOT NULL`,
+	// which is the complete no-topic exclusion once '' is normalised away here.
+	// This also ensures the content-addressed MutationID (already set by the
+	// local outbox) was derived from a normalized mutation, giving no-topic writes
+	// a single canonical representation regardless of whether the caller passed
+	// nil or &"".
+	m = domain.NormalizeTopicKey(m)
+
 	// Step 1 — INV5 idempotency: a mutation that already landed is a no-op.
 	// Checked on the pool before opening a transaction so re-pushes are cheap.
 	if applied, err := s.MutationApplied(m.MutationID); err != nil {

@@ -87,6 +87,19 @@ type Tombstone struct {
 	LastWriteMutationID string `db:"last_write_mutation_id"`
 }
 
+// NormalizeTopicKey canonicalizes a "no topic" mutation: an empty-string TopicKey
+// (&"") is treated identically to nil by the reconciliation logic, so it is folded
+// to nil here. This guarantees a single on-disk representation of "no topic" (NULL),
+// matching every partial topic index's `WHERE topic_key IS NOT NULL` predicate, and
+// gives no-topic writes a canonical content-addressed mutation_id regardless of
+// whether the caller passed nil or &"".
+func NormalizeTopicKey(m Mutation) Mutation {
+	if m.TopicKey != nil && *m.TopicKey == "" {
+		m.TopicKey = nil
+	}
+	return m
+}
+
 // Op is the mutation operation type.
 type Op string
 

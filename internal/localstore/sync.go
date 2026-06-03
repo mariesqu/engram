@@ -113,7 +113,14 @@ func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
 // when the caller left them unset, and defaults OccurredAt to now. It never
 // overrides values the caller already supplied (so re-applying a pulled mutation
 // keeps its central MutationID/Payload).
+//
+// NormalizeTopicKey runs FIRST so the canonical payload (and therefore the
+// content-addressed MutationID) always reflects nil for no-topic writes —
+// &"" and nil converge to the same mutation_id, and '' never reaches any index
+// (every partial topic index uses `WHERE topic_key IS NOT NULL`, which is the
+// complete no-topic exclusion once '' is normalised away at store entry).
 func normalizeMutation(m domain.Mutation) domain.Mutation {
+	m = domain.NormalizeTopicKey(m) // fold &"" → nil before payload/ID derivation
 	if len(m.Payload) == 0 {
 		m.Payload = mutation.CanonicalPayload(m)
 	}
@@ -324,6 +331,12 @@ func (s *Store) SetPullCursor(seq int64) error {
 // PullSince); those are preserved as-is. Decide's INV5 guard (MutationApplied)
 // plus applyTx's applied_mutations INSERT make a re-pulled mutation a no-op.
 func (s *Store) ApplyPulled(m domain.Mutation) error {
+	// Defensive normalisation: a well-behaved central store already sends nil for
+	// no-topic mutations, but fold &"" → nil here so '' never reaches any local
+	// index (every partial topic index uses `WHERE topic_key IS NOT NULL`, which
+	// is the complete no-topic exclusion once '' is normalised away at store entry).
+	m = domain.NormalizeTopicKey(m)
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("ApplyPulled: begin tx: %w", err)
