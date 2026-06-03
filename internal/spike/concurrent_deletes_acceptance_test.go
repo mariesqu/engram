@@ -4,6 +4,8 @@ package spike_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -49,10 +51,16 @@ func localTombstoneMeta(t *testing.T, n *spike.Node, topic string) (deletedAt ti
 	)
 	var da string
 	if err := row.Scan(&da, &version, &deletedBy); err != nil {
-		// No row → zero values.
-		return time.Time{}, 0, ""
+		if errors.Is(err, sql.ErrNoRows) {
+			// No tombstone for this topic on this node → zero values.
+			return time.Time{}, 0, ""
+		}
+		t.Fatalf("localTombstoneMeta: scan tombstone for topic %q: %v", topic, err)
 	}
-	parsed, _ := time.Parse(time.RFC3339Nano, da)
+	parsed, err := time.Parse(time.RFC3339Nano, da)
+	if err != nil {
+		t.Fatalf("localTombstoneMeta: parse deleted_at %q for topic %q: %v", da, topic, err)
+	}
 	return parsed, version, deletedBy
 }
 
