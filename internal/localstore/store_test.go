@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1384,8 +1385,9 @@ func TestMigration_V1ToV2_BuggyTriggerReplaced(t *testing.T) {
 // ── Schema version and tombstone identity tests ──────────────────────────────
 
 // TestFreshDB_SchemaVersionIsCurrent verifies that a fresh Open reaches
-// currentSchemaVersion (v3 — the v2→v3 migration adds last_write_mutation_id,
-// the content-addressed final LWW tiebreaker, to memories and memory_tombstones).
+// currentSchemaVersion (v4 — the v3→v4 migration adds the
+// memory_tombstones_topic_uidx partial UNIQUE index, schema-enforcing
+// ≤1-tombstone-per-topic).
 func TestFreshDB_SchemaVersionIsCurrent(t *testing.T) {
 	s := openTempStore(t)
 
@@ -1476,19 +1478,20 @@ func createV2DB(t *testing.T) string {
 
 // TestMigration_V2ToV3_LastWriteMutationIDAdded is the existing-DB upgrade proof
 // for the final-tiebreaker fix. A v2 DB (no last_write_mutation_id on either
-// table) is opened; the migration MUST add the column to BOTH memories and
-// memory_tombstones, bump user_version to 3, and PRESERVE pre-existing rows with
-// the column defaulted to ''.
+// table) is opened; the migration chain MUST add the column to BOTH memories and
+// memory_tombstones AND add memory_tombstones_topic_uidx, bump user_version to
+// currentSchemaVersion, and PRESERVE pre-existing rows with the column defaulted
+// to ''.
 func TestMigration_V2ToV3_LastWriteMutationIDAdded(t *testing.T) {
 	path := createV2DB(t)
 
-	s, err := Open(path) // triggers runMigrations → migrateV2ToV3
+	s, err := Open(path) // triggers runMigrations → migrateV2ToV3 → migrateV3ToV4
 	if err != nil {
 		t.Fatalf("Open v2 DB: %v", err)
 	}
 	defer s.Close()
 
-	// 1. user_version upgraded to current (3).
+	// 1. user_version upgraded to currentSchemaVersion.
 	var ver int
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
 		t.Fatalf("PRAGMA user_version: %v", err)
@@ -1527,9 +1530,9 @@ func TestMigration_V2ToV3_LastWriteMutationIDAdded(t *testing.T) {
 		t.Errorf("migrated tombstone row last_write_mutation_id = %q; want '' (backfill default)", tombVal)
 	}
 
-	// 4. Re-running migrations on the now-v3 DB is a no-op (idempotent).
+	// 4. Re-running migrations on the now-current DB is a no-op (idempotent).
 	if err := runMigrations(s.db); err != nil {
-		t.Errorf("re-running migrations on v3 DB must be a no-op, got: %v", err)
+		t.Errorf("re-running migrations on current DB must be a no-op, got: %v", err)
 	}
 }
 
@@ -1621,6 +1624,335 @@ func TestTombstone_WriterIDRoundtrip(t *testing.T) {
 	if ts.LastWriteMutationID != m.MutationID {
 		t.Errorf("ts.LastWriteMutationID = %q; want %q (final tiebreaker field — the winning delete's id)",
 			ts.LastWriteMutationID, m.MutationID)
+	}
+}
+
+// ── v3→v4 migration and topic-unique index enforcement tests ─────────────────
+
+// createV3DB builds a SQLite file at user_version=3 — i.e. a DB produced by the
+// v2→v3 migration (has last_write_mutation_id on both tables) but NOT yet migrated
+// to v4 (memory_tombstones_topic_uidx is absent). Returns the path.
+func createV3DB(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v3.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("createV3DB: open: %v", err)
+	}
+	defer db.Close()
+
+	// memories with last_write_mutation_id (post-v3, pre-v4 column set).
+	if _, err := db.Exec(`CREATE TABLE memories (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		sync_id         TEXT NOT NULL UNIQUE,
+		session_id      TEXT NOT NULL,
+		entity_type     TEXT NOT NULL DEFAULT 'memory',
+		type            TEXT NOT NULL,
+		status          TEXT,
+		title           TEXT NOT NULL,
+		content         TEXT NOT NULL DEFAULT '',
+		project         TEXT NOT NULL DEFAULT '',
+		scope           TEXT NOT NULL DEFAULT 'project',
+		topic_key       TEXT,
+		parent_sync_id  TEXT,
+		version         INTEGER NOT NULL DEFAULT 1,
+		seq             INTEGER NOT NULL DEFAULT 0,
+		writer_id       TEXT NOT NULL DEFAULT '',
+		last_write_mutation_id TEXT NOT NULL DEFAULT '',
+		normalized_hash TEXT,
+		embedding       BLOB,
+		embedding_model TEXT,
+		embedding_created_at TEXT,
+		created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+		updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+		deleted_at      TEXT,
+		review_after    TEXT,
+		expires_at      TEXT
+	)`); err != nil {
+		t.Fatalf("createV3DB: create memories: %v", err)
+	}
+
+	// memory_tombstones with last_write_mutation_id but NO topic unique index.
+	if _, err := db.Exec(`CREATE TABLE memory_tombstones (
+		sync_id    TEXT PRIMARY KEY,
+		project    TEXT NOT NULL DEFAULT '',
+		scope      TEXT NOT NULL DEFAULT 'project',
+		topic_key  TEXT,
+		deleted_at TEXT NOT NULL,
+		deleted_by TEXT NOT NULL,
+		version    INTEGER NOT NULL DEFAULT 0,
+		last_write_mutation_id TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("createV3DB: create memory_tombstones: %v", err)
+	}
+
+	// Seed one tombstone row so we can prove existing data survives migration.
+	if _, err := db.Exec(`INSERT INTO memory_tombstones
+		(sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
+		VALUES ('v3-tomb-1', 'eng', 'project', 'sdd/v3/topic', '2025-01-01T00:00:00Z', 'w-v3', 1, 'mut-v3')`); err != nil {
+		t.Fatalf("createV3DB: seed memory_tombstones: %v", err)
+	}
+
+	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatalf("createV3DB: set user_version: %v", err)
+	}
+	return path
+}
+
+// TestMigration_V3ToV4_TopicUniqueIndexAdded is the existing-DB upgrade proof
+// for the ≤1-tombstone-per-topic schema enforcement. A v3 DB (has
+// last_write_mutation_id, no topic unique index) is opened; migrateV3ToV4 MUST:
+//   - add memory_tombstones_topic_uidx
+//   - bump user_version to currentSchemaVersion (4)
+//   - preserve pre-existing tombstone rows
+//
+// Idempotency: a fresh DB (ApplySchema already has the index) re-opening also
+// succeeds (CREATE UNIQUE INDEX IF NOT EXISTS is a no-op).
+func TestMigration_V3ToV4_TopicUniqueIndexAdded(t *testing.T) {
+	path := createV3DB(t)
+
+	s, err := Open(path) // triggers runMigrations → migrateV3ToV4
+	if err != nil {
+		t.Fatalf("Open v3 DB: %v", err)
+	}
+	defer s.Close()
+
+	// 1. user_version upgraded to currentSchemaVersion.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+
+	// 2. The index now exists in sqlite_master.
+	var idxName string
+	if err := s.db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='index' AND name='memory_tombstones_topic_uidx'`,
+	).Scan(&idxName); err != nil {
+		t.Fatalf("memory_tombstones_topic_uidx missing from sqlite_master: %v", err)
+	}
+	if idxName != "memory_tombstones_topic_uidx" {
+		t.Errorf("index name = %q; want %q", idxName, "memory_tombstones_topic_uidx")
+	}
+
+	// 3. Pre-existing tombstone row is preserved.
+	var syncID string
+	if err := s.db.QueryRow(
+		`SELECT sync_id FROM memory_tombstones WHERE sync_id='v3-tomb-1'`,
+	).Scan(&syncID); err != nil {
+		t.Fatalf("pre-existing tombstone row missing after migration: %v", err)
+	}
+
+	// 4. Re-running migrations on the now-current DB is a no-op (idempotent).
+	if err := runMigrations(s.db); err != nil {
+		t.Errorf("re-running migrations on current DB must be a no-op, got: %v", err)
+	}
+
+	// 5. Idempotency for fresh DBs: open a brand-new store (ApplySchema creates
+	// the index) and confirm user_version == currentSchemaVersion, no error.
+	fresh := openTempStore(t)
+	var freshVer int
+	if err := fresh.db.QueryRow(`PRAGMA user_version`).Scan(&freshVer); err != nil {
+		t.Fatalf("fresh DB PRAGMA user_version: %v", err)
+	}
+	if freshVer != currentSchemaVersion {
+		t.Errorf("fresh DB user_version = %d; want %d", freshVer, currentSchemaVersion)
+	}
+}
+
+// TestTombstone_TopicUniqueIndex_SchemaEnforcesOnePerTopic is the enforcement
+// proof for INV-B. It demonstrates that the schema now REJECTS a second tombstone
+// for the same (topic_key, project, scope) under a DIFFERENT sync_id — a raw
+// INSERT that intentionally bypasses Decide's canonical re-targeting.
+//
+// Setup: write a tombstone for topic T under sync-X via execWriteTombstone (which
+// uses ON CONFLICT(sync_id) DO UPDATE, so it goes through the full store path).
+// Adversarial probe: attempt a raw INSERT of a second tombstone for T under
+// sync-Y (a different PK) — this simulates any future code path that forgets to
+// call Decide and tries to insert a duplicate topic tombstone directly.
+// Assert: the INSERT is REJECTED with a UNIQUE constraint error, proving the
+// index is active and the invariant is schema-enforced.
+func TestTombstone_TopicUniqueIndex_SchemaEnforcesOnePerTopic(t *testing.T) {
+	s := openTempStore(t)
+
+	tk := "sdd/test/topic-uidx-enforcement"
+	tptr := &tk
+
+	// Seed the memories row that will be soft-deleted.
+	if _, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, topic_key, writer_id)
+		VALUES ('sync-uidx-X', 'sess1', 'memory', 'manual', 'Topic Uidx X', 'content', 'eng', 'project', ?, 'writer-X')
+	`, tk); err != nil {
+		t.Fatalf("seed memories for sync-X: %v", err)
+	}
+
+	// Write the first tombstone for topic T under sync-X via the store path.
+	now := time.Now().UTC()
+	mX := domain.Mutation{
+		MutationID: "mut-uidx-X",
+		Op:         domain.OpDelete,
+		SyncID:     "sync-uidx-X",
+		SessionID:  "sess1",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "Topic Uidx X",
+		Content:    "content",
+		Project:    "eng",
+		Scope:      "project",
+		TopicKey:   tptr,
+		Version:    1,
+		UpdatedAt:  now,
+		OccurredAt: now,
+		WriterID:   "writer-X",
+	}
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: mX.SyncID}, mX); err != nil {
+		t.Fatalf("Apply WriteTombstone for sync-X: %v", err)
+	}
+
+	// Confirm exactly one tombstone for topic T exists.
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memory_tombstones WHERE topic_key=? AND project='eng' AND scope='project'`, tk,
+	).Scan(&count); err != nil {
+		t.Fatalf("count tombstones for T after first write: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 tombstone after first write, got %d", count)
+	}
+
+	// Adversarial probe: raw INSERT of a second tombstone under a different sync-Y.
+	// This bypasses Decide's re-targeting and hits the unique index directly.
+	_, insertErr := s.db.Exec(`
+		INSERT INTO memory_tombstones
+		  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
+		VALUES ('sync-uidx-Y', 'eng', 'project', ?, datetime('now'), 'writer-Y', 1, 'mut-uidx-Y')
+	`, tk)
+	if insertErr == nil {
+		t.Fatal("expected UNIQUE constraint error on second tombstone for same topic, got nil — index is NOT enforcing the invariant")
+	}
+	// Verify it is a constraint violation (not some other error).
+	if !strings.Contains(insertErr.Error(), "UNIQUE") && !strings.Contains(insertErr.Error(), "unique") {
+		t.Errorf("expected a UNIQUE constraint error, got: %v", insertErr)
+	}
+
+	// Assert still exactly one tombstone for T (the second INSERT was rejected).
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memory_tombstones WHERE topic_key=? AND project='eng' AND scope='project'`, tk,
+	).Scan(&count); err != nil {
+		t.Fatalf("count tombstones for T after failed second insert: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected still 1 tombstone after rejected insert, got %d", count)
+	}
+}
+
+// TestTombstone_TopicUniqueIndex_NoTopicEmptyStringNotConstrained verifies the
+// partial index treats topic_key='' as "no topic" (matching the domain's
+// TopicKey != nil && *TopicKey != "" semantics) and does NOT constrain it. Two
+// genuine no-topic tombstones that round-trip as topic_key='' under different
+// sync_ids in the same (project, scope) must BOTH persist, since the '' exclusion
+// in the index predicate prevents spurious UNIQUE violations.
+func TestTombstone_TopicUniqueIndex_NoTopicEmptyStringNotConstrained(t *testing.T) {
+	s := openTempStore(t)
+
+	// Two no-topic tombstones with topic_key='' under DIFFERENT sync_ids, same
+	// (project, scope). With the '' exclusion they are both "no topic" and coexist.
+	for _, sync := range []string{"sync-empty-A", "sync-empty-B"} {
+		if _, err := s.db.Exec(`
+			INSERT INTO memory_tombstones
+			  (sync_id, project, scope, topic_key, deleted_at, deleted_by, version, last_write_mutation_id)
+			VALUES (?, 'eng', 'project', '', datetime('now'), 'writer', 1, ?)
+		`, sync, "mut-"+sync); err != nil {
+			t.Fatalf("insert no-topic ('') tombstone %s must succeed (index must not constrain ''): %v", sync, err)
+		}
+	}
+
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memory_tombstones WHERE topic_key='' AND project='eng' AND scope='project'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count empty-topic tombstones: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 coexisting no-topic ('') tombstones, got %d — the index must treat '' as no-topic", count)
+	}
+}
+
+// TestTombstone_TopicUniqueIndex_ReDeleteUnaffected verifies that the normal
+// re-delete path (Decide re-targets to the existing tombstone's sync_id) is
+// completely unaffected by the unique index. execWriteTombstone uses ON CONFLICT
+// (sync_id) DO UPDATE, so a re-delete with the same targetSyncID simply updates
+// the mutable fields in-place — the topic unique index is never triggered.
+func TestTombstone_TopicUniqueIndex_ReDeleteUnaffected(t *testing.T) {
+	s := openTempStore(t)
+
+	tk := "sdd/test/topic-uidx-redelete"
+	tptr := &tk
+
+	// Seed the memories row.
+	if _, err := s.db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, topic_key, writer_id)
+		VALUES ('sync-redelete-X', 'sess1', 'memory', 'manual', 'ReDelete Test', 'content', 'eng', 'project', ?, 'writer-X')
+	`, tk); err != nil {
+		t.Fatalf("seed memories: %v", err)
+	}
+
+	now := time.Now().UTC()
+	mFirst := domain.Mutation{
+		MutationID: "mut-redelete-1",
+		Op:         domain.OpDelete,
+		SyncID:     "sync-redelete-X",
+		SessionID:  "sess1",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "ReDelete Test",
+		Content:    "content",
+		Project:    "eng",
+		Scope:      "project",
+		TopicKey:   tptr,
+		Version:    1,
+		UpdatedAt:  now,
+		OccurredAt: now,
+		WriterID:   "writer-X",
+	}
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: mFirst.SyncID}, mFirst); err != nil {
+		t.Fatalf("first Apply WriteTombstone: %v", err)
+	}
+
+	// Re-delete: same targetSyncID, different MutationID (idempotent re-apply
+	// or a newer delete that Decide re-targeted to the canonical sync_id).
+	mSecond := mFirst
+	mSecond.MutationID = "mut-redelete-2"
+	mSecond.UpdatedAt = now.Add(time.Second)
+	mSecond.Version = 2
+	if err := Apply(s.db, domain.Decision{Action: domain.ActionWriteTombstone, TargetSyncID: mFirst.SyncID}, mSecond); err != nil {
+		t.Fatalf("re-delete Apply WriteTombstone: %v (ON CONFLICT(sync_id) path must succeed)", err)
+	}
+
+	// Still exactly one tombstone for topic T.
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memory_tombstones WHERE topic_key=? AND project='eng' AND scope='project'`, tk,
+	).Scan(&count); err != nil {
+		t.Fatalf("count tombstones: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 tombstone after re-delete, got %d (must be idempotent)", count)
+	}
+
+	// The tombstone row reflects the SECOND delete's metadata.
+	var mutID string
+	if err := s.db.QueryRow(
+		`SELECT last_write_mutation_id FROM memory_tombstones WHERE sync_id='sync-redelete-X'`,
+	).Scan(&mutID); err != nil {
+		t.Fatalf("read tombstone last_write_mutation_id: %v", err)
+	}
+	if mutID != mSecond.MutationID {
+		t.Errorf("last_write_mutation_id = %q; want %q (second delete's id)", mutID, mSecond.MutationID)
 	}
 }
 

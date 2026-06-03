@@ -34,7 +34,16 @@ import (
 //	table_info so a fresh DB (where ApplySchema already created the column) is
 //	a no-op. Existing rows default to '' (yields to any incoming write at the
 //	astronomically-rare exact tie — see writeWins doc comment).
-const currentSchemaVersion = 3
+//
+// v3 → v4: add memory_tombstones_topic_uidx — a partial UNIQUE index on
+//   memory_tombstones(topic_key, project, scope)
+//   WHERE topic_key IS NOT NULL AND topic_key <> ''
+// schema-enforcing the ≤1-tombstone-per-topic invariant (INV-B) that was
+// previously only logic-guaranteed by Decide's canonical re-targeting. Mirrors
+// central_tombstones_topic_uidx in the central store. CREATE UNIQUE INDEX IF NOT
+// EXISTS is idempotent so fresh DBs (where ApplySchema already created the index)
+// are a no-op.
+const currentSchemaVersion = 4
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -221,6 +230,18 @@ func runMigrations(db *sql.DB) error {
 		ver = 3
 	}
 
+	if ver < 4 {
+		if err := migrateV3ToV4(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 4
+	}
+
+	// ver is read by the `if ver < N` conditions above. This blank read consumes the
+	// final `ver = 4` assignment so it is not flagged as ineffectual (SA4006); the
+	// value stays in sync for any future `if ver < 5` migration block.
+	_ = ver
 	return nil
 }
 
@@ -406,6 +427,47 @@ func migrateV2ToV3(db *sql.DB) error {
 	}
 
 	if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV3ToV4 adds the memory_tombstones_topic_uidx partial UNIQUE index on
+// memory_tombstones(topic_key, project, scope) WHERE topic_key IS NOT NULL AND
+// topic_key <> '' (the domain treats both NULL and '' as "no topic").
+//
+// This is the defense-in-depth close-out for INV-B (≤1 tombstone per topic
+// identity). Previously the invariant was only logic-guaranteed by Decide's
+// canonical re-targeting; this migration makes it SCHEMA-ENFORCED, mirroring
+// central_tombstones_topic_uidx in the central store.
+//
+// CREATE UNIQUE INDEX IF NOT EXISTS is idempotent: a fresh DB created by
+// ApplySchema already has the index, so this migration is a no-op there.
+//
+// IMPORTANT — pre-existing topic duplicates: if a v3 DB somehow accumulated two
+// tombstones for the same (topic_key, project, scope) (possible only through
+// direct DB writes or a bug that bypassed Decide), CREATE UNIQUE INDEX will fail
+// with SQLITE_CONSTRAINT. This is intentional — such a state violates INV-B and
+// must be repaired before the migration can succeed. In practice Decide never
+// produces duplicates, so legitimate DBs will always migrate cleanly.
+//
+// All work runs inside ONE transaction with the unconditional defer tx.Rollback()
+// + return tx.Commit() pattern: Commit succeeds → deferred Rollback is a no-op;
+// any error → deferred Rollback reverts everything and user_version stays at 3.
+func migrateV3ToV4(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS memory_tombstones_topic_uidx
+		ON memory_tombstones(topic_key, project, scope)
+		WHERE topic_key IS NOT NULL AND topic_key <> ''`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 4`); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -643,6 +705,18 @@ func ApplySchema(db *sql.DB) error {
 			version    INTEGER NOT NULL DEFAULT 0,
 			last_write_mutation_id TEXT NOT NULL DEFAULT ''
 		)`,
+
+		// ── memory_tombstones_topic_uidx — INV-B schema enforcement ─────────────
+		// Partial UNIQUE: ≤1 tombstone per live topic identity (INV-B, defense-in-depth).
+		// Mirrors central_tombstones_topic_uidx in the central store.
+		// The predicate excludes BOTH NULL and '' topic_key: the domain treats both as
+		// "no topic" (Decide/FindByTopic use TopicKey != nil && *TopicKey != ""), so
+		// genuine no-topic records must NOT be constrained. Without the '' exclusion,
+		// multiple no-topic deletes that round-trip as topic_key='' in the same
+		// (project, scope) would collide and raise spurious UNIQUE violations.
+		`CREATE UNIQUE INDEX IF NOT EXISTS memory_tombstones_topic_uidx
+			ON memory_tombstones(topic_key, project, scope)
+			WHERE topic_key IS NOT NULL AND topic_key <> ''`,
 
 		// ── memory_relations — reserved for future M:N promotion ─────────────
 		// REFERENCES clauses intentionally omitted — see memoriesTableDDL comment.
