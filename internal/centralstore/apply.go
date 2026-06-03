@@ -66,10 +66,9 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 	// Normalize TopicKey at store entry: fold &"" → nil so '' never reaches any
 	// central index. Every partial topic index uses `WHERE topic_key IS NOT NULL`,
 	// which is the complete no-topic exclusion once '' is normalised away here.
-	// This also ensures the content-addressed MutationID (already set by the
-	// local outbox) was derived from a normalized mutation, giving no-topic writes
-	// a single canonical representation regardless of whether the caller passed
-	// nil or &"".
+	// Note: Apply does not recompute Payload/MutationID; localstore.LocalWrite is
+	// responsible for normalizing before CanonicalPayload/NewMutationID. This is
+	// defense-in-depth to keep '' out of central topic indexes for imperfect callers.
 	m = domain.NormalizeTopicKey(m)
 
 	// Step 1 — INV5 idempotency: a mutation that already landed is a no-op.
