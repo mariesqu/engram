@@ -21,8 +21,9 @@ import (
 //   - central_memories:  canonical materialized state; partial UNIQUE on topic
 //     identity enforces INV-A at the DB level.
 //   - central_tombstones: records every soft-delete; partial UNIQUE on topic
-//     prevents duplicate tombstones (INV-B). deleted_by+sync_id are the final
-//     tiebreaker fields used by writeWins (writer_id→sync_id, replica-identical).
+//     prevents duplicate tombstones (INV-B). deleted_by + last_write_mutation_id
+//     are the final tiebreaker fields used by writeWins (writer_id → winning
+//     mutation_id, replica-identical — NOT the canonical PK sync_id).
 //   - cloud_sync_audit:  push/pull audit trail (written by PR3b onwards).
 func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 	stmts := []string{
@@ -64,6 +65,7 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			version        INT          NOT NULL DEFAULT 1,
 			seq            BIGINT       NOT NULL DEFAULT 0,
 			writer_id      TEXT         NOT NULL DEFAULT '',
+			last_write_mutation_id TEXT NOT NULL DEFAULT '',
 			created_by     TEXT         NOT NULL DEFAULT '',
 			embedding      BYTEA,
 			created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -98,9 +100,12 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		// One row per soft-deleted identity.  sync_id PK prevents duplicate rows
 		// for the same sync_id.  The partial UNIQUE on topic identity (INV-B)
 		// ensures FindTombstone-by-topic is deterministic (≤1 result).
-		// deleted_by (writer_id) and sync_id are the final tiebreaker fields used
-		// by writeWins when updated_at and version tie — both are stable and
-		// replica-identical (see writeWins doc comment in domain/reconcile.go).
+		// deleted_by (writer_id) is a tiebreaker used by writeWins when updated_at
+		// and version tie; last_write_mutation_id (the winning delete's content-
+		// addressed id) is the FINAL tiebreaker when deleted_by also ties. Unlike
+		// sync_id (the canonical PK, divergent across replicas for the same topic),
+		// deleted_by and last_write_mutation_id are replica-identical (see writeWins
+		// doc comment in domain/reconcile.go).
 		`CREATE TABLE IF NOT EXISTS central_tombstones (
 			sync_id    TEXT         PRIMARY KEY,
 			project    TEXT         NOT NULL DEFAULT '',
@@ -108,7 +113,8 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			topic_key  TEXT,
 			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
 			deleted_by TEXT         NOT NULL DEFAULT '',
-			version    INT          NOT NULL DEFAULT 0
+			version    INT          NOT NULL DEFAULT 0,
+			last_write_mutation_id TEXT NOT NULL DEFAULT ''
 		)`,
 
 		// Partial UNIQUE: ≤1 tombstone per live topic identity (INV-B).
@@ -116,6 +122,19 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS central_tombstones_topic_uidx
 			ON central_tombstones(topic_key, project, scope)
 			WHERE topic_key IS NOT NULL`,
+
+		// ── Existing-DB upgrade: last_write_mutation_id ──────────────────────────
+		// ADD COLUMN IF NOT EXISTS makes this idempotent on both fresh DBs (the
+		// CREATE TABLE above already declared the column) and pre-existing central
+		// DBs created before this column existed. It carries the WINNING write's
+		// content-addressed mutation_id and is the FINAL LWW tiebreaker (replacing
+		// the canonical PK sync_id, which is divergent across replicas for the same
+		// topic_key). Existing rows default to '' (yield to any incoming write at
+		// the exact tie). This mirrors the local store's migrateV2ToV3.
+		`ALTER TABLE central_memories
+			ADD COLUMN IF NOT EXISTS last_write_mutation_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE central_tombstones
+			ADD COLUMN IF NOT EXISTS last_write_mutation_id TEXT NOT NULL DEFAULT ''`,
 
 		// ── cloud_sync_audit ─────────────────────────────────────────────────────
 		// Push/pull audit trail.  Populated by PR3b push-apply; created here so the

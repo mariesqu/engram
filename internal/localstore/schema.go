@@ -24,7 +24,17 @@ import (
 //	trigger (VALUES form without the WHERE OLD.deleted_at IS NULL guard) that
 //	causes SQLITE_CORRUPT_VTAB (267) on any undelete sequence. The migration
 //	is a cheap drop+recreate of all three FTS triggers; no data is touched.
-const currentSchemaVersion = 2
+//
+// v2 → v3: add the last_write_mutation_id column to BOTH memories and
+//
+//	memory_tombstones. It carries the WINNING write's content-addressed
+//	mutation_id and becomes the FINAL LWW tiebreaker (replacing the canonical
+//	PK sync_id, which is divergent across replicas for the same topic). The
+//	migration ALTER TABLE ADD COLUMNs on both tables, guarded by PRAGMA
+//	table_info so a fresh DB (where ApplySchema already created the column) is
+//	a no-op. Existing rows default to '' (yields to any incoming write at the
+//	astronomically-rare exact tie — see writeWins doc comment).
+const currentSchemaVersion = 3
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -141,6 +151,7 @@ const memoriesTableDDL = `CREATE TABLE IF NOT EXISTS memories (
 	version         INTEGER NOT NULL DEFAULT 1,
 	seq             INTEGER NOT NULL DEFAULT 0,
 	writer_id       TEXT    NOT NULL DEFAULT '',
+	last_write_mutation_id TEXT NOT NULL DEFAULT '',
 	normalized_hash TEXT,
 	embedding       BLOB,
 	embedding_model TEXT,
@@ -199,6 +210,15 @@ func runMigrations(db *sql.DB) error {
 		// Keep ver in sync (migrateV1ToV2 also persists PRAGMA user_version = 2) so a
 		// future `if ver < 3` block evaluates against the correct version.
 		ver = 2
+	}
+
+	if ver < 3 {
+		if err := migrateV2ToV3(db); err != nil {
+			return err
+		}
+		// Keep ver in sync (migrateV2ToV3 also persists PRAGMA user_version = 3) so a
+		// future `if ver < 4` block evaluates against the correct version.
+		ver = 3
 	}
 
 	return nil
@@ -320,6 +340,77 @@ func migrateV1ToV2(db *sql.DB) error {
 	return err
 }
 
+// columnExists reports whether table already has a column named col, via
+// PRAGMA table_info. Used by migrateV2ToV3 to make the ADD COLUMN idempotent:
+// a fresh DB where ApplySchema already created the column must NOT be re-altered
+// (SQLite ADD COLUMN of a duplicate name errors).
+func columnExists(q rowScanner, table, col string) (bool, error) {
+	rows, err := q.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// rowScanner is the minimal query surface columnExists needs (satisfied by both
+// *sql.DB and *sql.Tx).
+type rowScanner interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// migrateV2ToV3 adds the last_write_mutation_id column to BOTH memories and
+// memory_tombstones. The column carries the WINNING write's content-addressed
+// mutation_id and is the FINAL LWW tiebreaker (replacing the canonical PK
+// sync_id, which is divergent across replicas for the same topic_key).
+//
+// Each ADD COLUMN is guarded by PRAGMA table_info: on a FRESH DB, ApplySchema
+// already created the column with the new DDL, so the migration must skip it
+// (SQLite errors on a duplicate ADD COLUMN). On an EXISTING DB at user_version=2
+// the column is absent and gets added with DEFAULT '' so existing rows are
+// backfilled to empty (which yields to any incoming write at the exact tie).
+//
+// All steps run in ONE transaction with the robust UNCONDITIONAL
+// defer tx.Rollback() + return tx.Commit() pattern: Commit succeeds → the
+// deferred Rollback is a harmless no-op; any error → the deferred Rollback
+// reverts everything and user_version stays at 2.
+func migrateV2ToV3(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	for _, table := range []string{"memories", "memory_tombstones"} {
+		exists, err := columnExists(tx, table, "last_write_mutation_id")
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue // fresh DB — ApplySchema already added the column
+		}
+		if _, err := tx.Exec(
+			`ALTER TABLE ` + table + ` ADD COLUMN last_write_mutation_id TEXT NOT NULL DEFAULT ''`,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // rebuildMemoriesTable performs the SQLite table-rebuild to drop the legacy FK:
 //
 //  1. `PRAGMA foreign_keys = OFF` — required during the rename/create/copy cycle.
@@ -368,8 +459,19 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		return err
 	}
 
-	// c. Copy all rows (column list explicit — same set in old and new table).
-	if _, err = tx.Exec(`INSERT INTO memories SELECT
+	// c. Copy all rows. BOTH the target and source column lists are explicit and
+	// enumerate the LEGACY v0 column set — last_write_mutation_id is intentionally
+	// OMITTED (it does not exist on a v0 DB; the new table's DEFAULT '' backfills
+	// it). Listing the target columns is REQUIRED: the new memories table has the
+	// extra last_write_mutation_id column, so a bare `INSERT INTO memories SELECT …`
+	// would mismatch the column count. The later migrateV2ToV3 is a no-op for this
+	// fresh-rebuilt table because ApplySchema already created the column.
+	if _, err = tx.Exec(`INSERT INTO memories
+		(id, sync_id, session_id, entity_type, type, status, title, content,
+		 project, scope, topic_key, parent_sync_id, version, seq, writer_id,
+		 normalized_hash, embedding, embedding_model, embedding_created_at,
+		 created_at, updated_at, deleted_at, review_after, expires_at)
+	SELECT
 		id, sync_id, session_id, entity_type, type, status, title, content,
 		project, scope, topic_key, parent_sync_id, version, seq, writer_id,
 		normalized_hash, embedding, embedding_model, embedding_created_at,
@@ -526,9 +628,11 @@ func ApplySchema(db *sql.DB) error {
 		memoriesTableDDL,
 
 		// ── memory_tombstones — prevent soft-delete resurrection (INV 4) ────
-		// deleted_by (writer_id) and sync_id (primary key) are the final
-		// tiebreakers used by writeWins when updated_at and version tie.
-		// Both fields are stable and replica-identical — see writeWins doc comment.
+		// deleted_by (writer_id) is a tiebreaker used by writeWins when updated_at
+		// and version tie; last_write_mutation_id (the winning delete's content-
+		// addressed id) is the FINAL tiebreaker when deleted_by also ties. Unlike
+		// sync_id (the canonical PK, divergent across replicas), deleted_by and
+		// last_write_mutation_id are replica-identical — see writeWins doc comment.
 		`CREATE TABLE IF NOT EXISTS memory_tombstones (
 			sync_id    TEXT    PRIMARY KEY,
 			project    TEXT    NOT NULL DEFAULT '',
@@ -536,7 +640,8 @@ func ApplySchema(db *sql.DB) error {
 			topic_key  TEXT,
 			deleted_at TEXT    NOT NULL,
 			deleted_by TEXT    NOT NULL,
-			version    INTEGER NOT NULL DEFAULT 0
+			version    INTEGER NOT NULL DEFAULT 0,
+			last_write_mutation_id TEXT NOT NULL DEFAULT ''
 		)`,
 
 		// ── memory_relations — reserved for future M:N promotion ─────────────
