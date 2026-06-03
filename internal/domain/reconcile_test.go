@@ -485,15 +485,19 @@ func TestDecide_DeleteWritesTombstone(t *testing.T) {
 	}
 }
 
-// TestDecide_Delete_CurNil_TombstonesUnconditionally verifies that when there is
-// no live row (cur == nil) the LWW gate is skipped and OpDelete always tombstones.
-// This covers the pure-tombstone and cross-writer re-tombstone paths.
-func TestDecide_Delete_CurNil_TombstonesUnconditionally(t *testing.T) {
+// TestDecide_Delete_NoLiveRowNoTombstone_TombstonesUnconditionally verifies that
+// when there is NEITHER a live row (cur == nil) NOR an existing tombstone (ts == nil),
+// OpDelete tombstones unconditionally — the first delete of an identity has no prior
+// state to compete against. NOTE: when cur == nil but a tombstone EXISTS, OpDelete
+// instead competes against it via writeWins and may NoOp (see
+// TestDecide_Delete_CurNilWithTombstone_LosingDelete_IsNoOp).
+func TestDecide_Delete_NoLiveRowNoTombstone_TombstonesUnconditionally(t *testing.T) {
 	syncID := "sync-del-nil"
 	project, scope := "engram", "project"
 	r := newMockReader()
 
-	// Delete with a LOW updated_at — there is no live cur, so the gate does not fire.
+	// Delete with a LOW updated_at — no live row AND no tombstone, so neither gate
+	// arm fires; the delete tombstones unconditionally (pure first-delete path).
 	mut := Mutation{
 		MutationID: "mut-del-nil",
 		Op:         OpDelete,
@@ -502,13 +506,82 @@ func TestDecide_Delete_CurNil_TombstonesUnconditionally(t *testing.T) {
 		Scope:      scope,
 		Version:    1,
 		Seq:        1,
-		UpdatedAt:  t0, // oldest possible — would lose any LWW comparison
+		UpdatedAt:  t0, // oldest possible — but there is nothing to lose against
 		WriterID:   "writer-A",
 	}
 	d := Decide(r, mut)
 	if d.Action != ActionWriteTombstone {
-		t.Fatalf("OpDelete with no live row must tombstone unconditionally; got %v", d.Action)
+		t.Fatalf("OpDelete with no live row and no tombstone must tombstone unconditionally; got %v", d.Action)
 	}
+}
+
+// TestDecide_Delete_CurNilWithTombstone_LosingDelete_IsNoOp pins the gate added for
+// the tombstone-metadata-regression split-brain: when cur == nil but a tombstone
+// EXISTS, an incoming delete that LOSES writeWins against the tombstone MUST be a
+// NoOp — it must NOT proceed to ActionWriteTombstone, because the adapter's
+// INSERT OR REPLACE would regress the newer tombstone's (deleted_at, version,
+// deleted_by) and let a later upsert that the newer tombstone should block resurrect
+// the topic. (The winning direction — a newer delete re-tombstoning the canonical
+// identity — is covered by TestDecide_CrossWriterReDelete_ReusesTombstoneIdentity.)
+func TestDecide_Delete_CurNilWithTombstone_LosingDelete_IsNoOp(t *testing.T) {
+	project, scope := "engram", "project"
+
+	// Stale delete: older updated_at than the existing tombstone → loses → NoOp.
+	t.Run("stale_delete_older_than_tombstone", func(t *testing.T) {
+		syncID := "sync-del-vs-tomb-stale"
+		r := newMockReader()
+		// Existing tombstone is NEWER (t100). No record seeded → cur == nil; ts != nil.
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: t100,
+			DeletedBy: "writer-Z",
+			Version:   2,
+		})
+		mut := Mutation{
+			MutationID: "mut-del-stale-vs-tomb",
+			Op:         OpDelete,
+			SyncID:     syncID,
+			Project:    project,
+			Scope:      scope,
+			Version:    1,
+			UpdatedAt:  t50, // older than the tombstone → loses writeWins
+			WriterID:   "writer-A",
+		}
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("cur==nil, stale delete vs newer tombstone must be NoOp (no metadata regression); got %v", d.Action)
+		}
+	})
+
+	// Tie-losing delete: exact (updated_at, version) tie, lower writer_id → NoOp.
+	t.Run("tie_losing_delete_lower_writer_id", func(t *testing.T) {
+		syncID := "sync-del-vs-tomb-tie"
+		r := newMockReader()
+		r.seedTombstone(&Tombstone{
+			SyncID:    syncID,
+			Project:   project,
+			Scope:     scope,
+			DeletedAt: t100,
+			DeletedBy: "writer-Z", // higher writer_id → tombstone wins the tie
+			Version:   2,
+		})
+		mut := Mutation{
+			MutationID: "mut-del-tie-vs-tomb",
+			Op:         OpDelete,
+			SyncID:     syncID,
+			Project:    project,
+			Scope:      scope,
+			Version:    2,
+			UpdatedAt:  t100,       // exact (updated_at, version) tie
+			WriterID:   "writer-A", // lower writer_id → loses the identity tiebreaker
+		}
+		d := Decide(r, mut)
+		if d.Action != NoOp {
+			t.Fatalf("cur==nil, tie-losing delete (lower writer_id) vs tombstone must be NoOp; got %v", d.Action)
+		}
+	})
 }
 
 // TestDecide_Delete_StaleDelete_IsNoOp verifies that a delete with a strictly
