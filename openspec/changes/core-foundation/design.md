@@ -14,7 +14,7 @@ A single polymorphic `memories` table (discriminated by `entity_type`) backs eve
 |---|----------|--------|----------|-----------|
 | 1 | Schema shape | Single polymorphic table + `entity_type` + CHECK | Typed tables per entity | One FTS index, one apply path, additive migrations, 1:1 engram retrofit. Typed tables only if type-specific NOT-NULL enforcement provably blocks (V2). |
 | 2 | Local driver | `modernc.org/sqlite` (pure Go) | `mattn/go-sqlite3` (CGO) | FTS5 is all core needs; clean single Windows binary. CGO unlocks `sqlite-vec` but breaks cross-compile; deferred to semantic-search change. |
-| 3 | Canonical order | `updated_at` (wall-clock) → `version` → `writer_id` → `sync_id` | Client timestamp LWW alone | Clock-skew-proof. `updated_at` is primary LWW key; `version` then `writer_id`/`sync_id` are deterministic tiebreakers. This total order governs ALL conflicts — upsert-vs-row, upsert-vs-tombstone, AND delete-vs-live-row. A delete supersedes a live row only if it wins the same `writeWins` comparison; a stale or tie-losing delete is a NoOp. This symmetric treatment eliminates both the stale-delete split-brain and the exact-tie-upserter-higher split-brain. Central `seq` is the pull-cursor/journal ordering authority only — NOT used for LWW tiebreaking (seq is asymmetric: a node's own rows keep seq=0 until the central-assigned value is pulled, which creates split-brain at the exact tie). |
+| 3 | Canonical order | `updated_at` (wall-clock) → `version` → `writer_id` → `sync_id` | Client timestamp LWW alone | Clock-skew-proof. `updated_at` is primary LWW key; `version` then `writer_id`/`sync_id` are deterministic tiebreakers. This total order governs ALL conflicts — upsert-vs-row, upsert-vs-tombstone, delete-vs-live-row, AND delete-vs-existing-tombstone. A delete supersedes a live row only if it wins the same `writeWins` comparison; a stale or tie-losing delete against a live row is a NoOp. When no live row exists but a tombstone does, the delete ALSO competes against the tombstone via `writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID)` — a losing delete is a NoOp that preserves the newer tombstone's metadata. Unconditional tombstoning applies ONLY when neither a live row nor a tombstone exists (first delete of the identity). This symmetric treatment eliminates the stale-delete split-brain, the exact-tie-upserter-higher split-brain, AND the tombstone-metadata-regression split-brain caused by unconditional `INSERT OR REPLACE` on an existing tombstone. Central `seq` is the pull-cursor/journal ordering authority only — NOT used for LWW tiebreaking (seq is asymmetric: a node's own rows keep seq=0 until the central-assigned value is pulled, which creates split-brain at the exact tie). |
 | 4 | Idempotency key | Content-addressed `mutation_id` (SHA-256 of canonical payload) | DB unique on payload | Reuses `chunkcodec.ChunkID` pattern (`old_code/.../chunkcodec.go:13`); re-apply is a cheap seen-set lookup, no row churn. |
 | 5 | Apply purity | Pure `Reconciler.Decide()` returns an `Action`; adapters execute | Apply logic inside SQL handlers | Same decision function runs local + central + mock → invariants are unit-provable without Postgres. |
 | 6 | Writer identity | Per-writer ID + HMAC-signed token; `writer_id` audit column | Full JWT/RBAC | Spike needs distinct attributed writers only. Full auth is a later change. |
@@ -221,12 +221,31 @@ func Decide(tx Reader, m Mutation) Action {
 
     switch m.Op {
     case Delete:
-        // Uniform LWW gate: a delete supersedes the live row only if it wins the
-        // total order. When cur != nil and the delete loses writeWins, it is a NoOp
-        // (prevents stale-delete split-brain). When cur == nil the gate is skipped
-        // (pure tombstone or cross-writer re-tombstone paths).
-        if cur != nil && !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
-            return Action{Kind: NoOp, Reason: "stale delete, live row newer"}
+        // Uniform LWW gate: a delete competes on the same total order as an upsert.
+        // Competition target depends on what currently exists for the topic identity:
+        //
+        //   cur != nil (live) — delete must WIN writeWins against the live row or NoOp.
+        //   cur == nil, ts != nil — no live row but a tombstone exists (prior delete):
+        //     delete must WIN writeWins against the tombstone's (deleted_at, version,
+        //     deleted_by, sync_id). A stale or tie-losing delete is a NoOp — it MUST
+        //     NOT overwrite the newer tombstone's metadata via INSERT OR REPLACE (that
+        //     would be last-applied-wins, not last-write-wins, causing metadata divergence
+        //     and downstream live/deleted split-brain on subsequent upserts).
+        //   cur == nil, ts == nil — first delete of this identity: tombstone unconditionally.
+        //
+        // NOTE: FindBySyncID may return a soft-deleted row (deleted_at != nil). In that
+        //   case the authoritative deletion metadata is in the tombstone, not in the
+        //   memories row's updated_at. The gate treats soft-deleted rows (cur.DeletedAt != nil)
+        //   the same as cur == nil: compete against the tombstone.
+        switch {
+        case cur != nil && cur.DeletedAt == nil:
+            if !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+                return Action{Kind: NoOp, Reason: "stale delete, live row newer"}
+            }
+        case ts != nil:
+            if !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
+                return Action{Kind: NoOp, Reason: "stale delete, newer tombstone wins"}
+            }
         }
         return Action{Kind: WriteTombstone, Mutation: m} // sets deleted_at + tombstone row; INV 4
     case Upsert:

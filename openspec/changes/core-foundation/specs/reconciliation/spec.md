@@ -104,12 +104,22 @@ This is identical to the `writeWins(incoming, tombstone.deleted_at, tombstone.ve
 
 **Uniform LWW model — deletes compete on the same total order as upserts:**
 
-The `updated_at → version → writer_id → sync_id` total order governs ALL conflicts, including delete-vs-live-row. A delete supersedes the current LIVE row ONLY if it wins that order; a stale or tie-losing delete against a live row is a NoOp. This closes two permanent split-brain cases the unconditional `OpDelete` left open:
+The `updated_at → version → writer_id → sync_id` total order governs ALL conflicts, including delete-vs-live-row AND delete-vs-existing-tombstone. A delete supersedes the current LIVE row ONLY if it wins that order; a stale or tie-losing delete against a live row is a NoOp. This closes two permanent split-brain cases the unconditional `OpDelete` left open:
 
 - **Stale delete vs newer upsert**: a delete at `updated_at=T1` must NOT tombstone a live row at `updated_at=T2` when `T2 > T1`, regardless of push order or application order.
 - **Exact-tie, upserter-higher**: at identical `(updated_at, version)`, a delete from a writer with a LOWER `writer_id` than the live row's writer must NOT tombstone it (the delete loses `writeWins`).
 
-When there is no live row (`cur == nil`) the gate is skipped: the delete tombstones unconditionally (pure tombstone or cross-writer re-tombstone paths — see INV-B hardening).
+When there is no live row (`cur == nil`) BUT an existing tombstone for the topic identity is present (`ts != nil`), the delete ALSO competes via `writeWins` against the tombstone's `(deleted_at, version, deleted_by, sync_id)`. A delete that LOSES this comparison is a NoOp — it MUST NOT overwrite the newer tombstone's metadata via the adapter's `INSERT OR REPLACE`, which would be last-applied-wins rather than last-write-wins and would cause order-dependent tombstone metadata divergence. A downstream upsert whose `updated_at` falls between the stale and the newer delete would then resolve to different liveness on different nodes — a live/deleted split-brain.
+
+Unconditional tombstoning applies ONLY when there is NEITHER a live row NOR a tombstone (the first delete of this identity — pure tombstone path).
+
+#### Scenario: Stale delete arriving after a newer tombstone → NoOp (tombstone metadata preserved)
+
+- GIVEN a topic T has been deleted by writer-B at `deleted_at=T2, version=3, deleted_by='writer-B'` (tombstone written, no live row)
+- WHEN a second delete for the same topic arrives with `updated_at=T1, version=2, writer_id='writer-A'` where `T1 < T2`
+- THEN `writeWins({T1, 2, 'writer-A'} vs tombstone {T2, 3, 'writer-B'})` returns false
+- AND the incoming delete MUST be a NoOp — the existing tombstone's `(deleted_at, version, deleted_by)` is PRESERVED as `(T2, 3, 'writer-B')`
+- AND a subsequent upsert at `updated_at = Tmid` where `T1 < Tmid < T2` is BLOCKED on all stores (the preserved newer tombstone correctly wins)
 
 This symmetric treatment is what guarantees every store computes the same outcome from the same mutation payload fields: no central back-channel, no seq asymmetry, no split-brain.
 
