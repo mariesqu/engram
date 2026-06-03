@@ -493,8 +493,9 @@ func TestApply_TombstoneIdentityFieldsWired(t *testing.T) {
 
 // TestCentralTombstone_HasNoSeqColumn verifies that central_tombstones does NOT
 // have a seq column — it was removed when the tiebreaker changed from central
-// seq to (writer_id, sync_id). Having no seq column prevents the old tombstone
-// seq roundtrip and proves the schema is clean.
+// seq to (writer_id, then the winning mutation_id via last_write_mutation_id).
+// Having no seq column prevents the old tombstone seq roundtrip and proves the
+// schema is clean.
 func TestCentralTombstone_HasNoSeqColumn(t *testing.T) {
 	store := newIsolatedStore(t)
 	ctx := context.Background()

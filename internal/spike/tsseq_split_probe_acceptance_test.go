@@ -20,16 +20,20 @@ import (
 // authored pulls are INV5 NoOps). So the authoring node and central computed
 // DIFFERENT winners → permanent divergence.
 //
-// THE FIX (Path Z): resolve the (updated_at, version) tie by (writer_id, sync_id)
-// — both STABLE and REPLICA-IDENTICAL (derived from the mutation payload; no
-// central back-channel). Every store computes the SAME winner from the SAME
-// inputs. Divergence at the exact tie is STRUCTURALLY IMPOSSIBLE.
+// THE FIX (Path Z, refined): resolve the (updated_at, version) tie by
+// (writer_id, then the WINNING mutation's content-addressed mutation_id, carried
+// by last_write_mutation_id) — both payload-derived and REPLICA-IDENTICAL (no
+// central back-channel). The final tier is NOT the canonical PK sync_id: that is
+// fixed at first-insert and diverges across replicas for the same topic, which
+// would reintroduce exact-tie divergence. Every store computes the SAME winner
+// from the SAME inputs. Divergence at the exact tie is STRUCTURALLY IMPOSSIBLE.
 //
 // KEY TIEBREAKER INVARIANT:
-//   writeWins(m, ..., curWriterID, curSyncID) is applied whenever an UPSERT
-//   contests a tombstone or a live row. When both stores have identical field
-//   values, they compute identical outcomes. The winner is the mutation with the
-//   lexicographically HIGHER writer_id (then sync_id as final fallback).
+//   writeWins(m, ..., curWriterID, curLastWriteMutationID) is applied whenever an
+//   UPSERT contests a tombstone or a live row. When both stores have identical
+//   field values, they compute identical outcomes. The winner is the mutation with
+//   the lexicographically HIGHER writer_id (then the winning mutation_id as the
+//   final fallback). These probes use distinct writer_ids so writer_id decides.
 //
 // Two probes are provided:
 //
@@ -205,7 +209,7 @@ func TestEqualTie_UpsertVsUpsert_Converges(t *testing.T) {
 	if aRec.Content != bRec.Content || bRec.Content != cRec.Content {
 		t.Errorf("upsert-vs-upsert tie: stores disagree on content — "+
 			"A=%q  B=%q  central=%q. "+
-			"Identity tiebreaker (writer_id→sync_id) must pick the SAME winner everywhere.",
+			"Identity tiebreaker (writer_id → winning mutation_id) must pick the SAME winner everywhere.",
 			aRec.Content, bRec.Content, cRec.Content)
 	} else {
 		t.Logf("CONVERGED: all three stores agree on content=%q (winner: writer-B via writer_id tiebreaker)",

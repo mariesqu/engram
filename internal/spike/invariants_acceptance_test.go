@@ -220,8 +220,8 @@ func TestConvergence_INV3_NoLostUpdate(t *testing.T) {
 // (deleted_at cleared on A.local, B.local AND central; FindByTopic returns it).
 //
 // All scenarios here use DISTINCT UpdatedAt values, so wall-clock (updated_at)
-// decides the outcome. The identity tiebreaker (writer_id→sync_id) is not
-// exercised — these results are independent of the final tiebreaker field.
+// decides the outcome. The identity tiebreaker (writer_id → winning mutation_id)
+// is not exercised — these results are independent of the final tiebreaker field.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestConvergence_INV4_NoResurrection(t *testing.T) {
 	ctx := context.Background()

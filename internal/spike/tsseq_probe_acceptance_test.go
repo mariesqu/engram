@@ -13,17 +13,21 @@ import (
 //
 // Path Z rule (writeWins final tiebreaker):
 //   When updated_at and version are EQUAL, the winner is determined by
-//   (writer_id, then sync_id) — higher string wins. Both fields are STABLE and
-//   REPLICA-IDENTICAL: every store derives them from the same mutation payload,
-//   with no central back-channel. This makes the exact tie STRUCTURALLY
-//   CONVERGENT: every store computes the same winner.
+//   (writer_id, then the WINNING mutation's content-addressed mutation_id, carried
+//   by last_write_mutation_id) — higher string wins. Both are payload-derived and
+//   REPLICA-IDENTICAL: every store derives them from the same mutation, with no
+//   central back-channel. This makes the exact tie STRUCTURALLY CONVERGENT: every
+//   store computes the same winner. (The final tier is NOT the canonical PK
+//   sync_id — that is fixed at first-insert and diverges across replicas for the
+//   same topic; this probe uses distinct writer_ids so writer_id decides here.)
 //
-// Why identity fields and not central seq:
+// Why payload-derived fields and not central seq:
 //   Central seq is ASYMMETRIC — a node's own tombstones keep seq=0 (AckMutation
 //   never back-patches it; self-authored mutations pulled back are INV5 NoOps),
 //   so seq cannot safely break a tie between the authoring node and central.
-//   writer_id and sync_id are derived from the mutation payload, are identical
-//   on every replica that has the same mutation, and require no central coordination.
+//   writer_id and the winning mutation_id are derived from the mutation payload,
+//   are identical on every replica that has the same mutation, and require no
+//   central coordination.
 //
 // This probe manufactures an exact (updated_at, version) tie between a delete
 // and a competing upsert, choosing writer names so the UPSERT's writer wins

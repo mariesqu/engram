@@ -13,28 +13,35 @@
 //
 // UNIFORM LWW MODEL — applies to EVERY write (upsert or delete):
 //
-// The four-level total order  updated_at → version → writer_id → sync_id
+// The four-level total order  updated_at → version → writer_id → mutation_id
 // governs ALL conflicts, including delete-vs-live-row and delete-vs-tombstone.
 // A delete supersedes the current LIVE row only if it WINS that order; a stale
 // or tie-losing delete against a live row is a NoOp. When there is no live row
 // (cur == nil) but a tombstone exists (ts != nil), the delete competes via
 // writeWins against the tombstone: a losing delete is a NoOp that preserves the
-// newer tombstone's (deleted_at, version, deleted_by) metadata. Unconditional
-// tombstoning applies ONLY when there is NEITHER a live row NOR a tombstone (the
-// first delete of this identity).
+// newer tombstone's (deleted_at, version, deleted_by, last_write_mutation_id)
+// metadata. Unconditional tombstoning applies ONLY when there is NEITHER a live
+// row NOR a tombstone (the first delete of this identity).
 //
 // This symmetry is what makes every store converge regardless of push order or
 // which writer holds the higher identity: upserts and deletes compete on the
 // same inputs, so every store computes the same winner from the same payload
 // fields — no central back-channel is needed.
 //
-// Tiebreaker rationale — identity fields, NOT central seq:
+// Tiebreaker rationale — replica-identical payload fields, NOT central seq and
+// NOT the canonical PK sync_id:
 // Central seq is ASYMMETRIC — a node's own authored rows/tombstones keep seq=0
 // until the central-assigned seq is pulled back, so the authoring node and
 // central would compute different seq-based tie winners → permanent split-brain.
-// writer_id and sync_id are derived from the mutation payload and are
-// REPLICA-IDENTICAL: every store derives them from the same data. Divergence at
-// the exact (updated_at, version) tie is STRUCTURALLY IMPOSSIBLE.
+// The canonical sync_id is the ROW PRIMARY KEY, fixed at first-insert and never
+// changed on in-place updates/tombstones, so the SAME topic can be stored under
+// DIFFERENT sync_ids across replicas (topic_key is the convergence key) — using
+// it as the tiebreaker reintroduces exact-tie divergence. The FINAL tiebreaker is
+// instead the WINNING mutation's content-addressed mutation_id, carried by
+// last_write_mutation_id (the winner's id, overwritten on every winning write):
+// it is derived from the mutation payload, so it is truly REPLICA-IDENTICAL AND
+// distinct for any distinct write. Divergence at the exact
+// (updated_at, version, writer_id) tie is STRUCTURALLY IMPOSSIBLE.
 package domain
 
 import "time"
@@ -98,16 +105,17 @@ func Decide(tx Reader, m Mutation) Decision {
 	// identity from it when cur == nil (cross-writer convergence).
 	//
 	// Tiebreaker: when updated_at and version are both equal, writeWins falls
-	// through to (writer_id, then sync_id) — both stable, replica-identical fields
-	// so every store computes the same winner (see package-level comment).
-	// ts.DeletedBy is the tombstone writer_id; ts.SyncID is the tombstone identity.
+	// through to (writer_id, then last_write_mutation_id) — both replica-identical
+	// payload-derived fields so every store computes the same winner (see
+	// package-level comment). ts.DeletedBy is the tombstone writer_id;
+	// ts.LastWriteMutationID is the winning delete's content-addressed id.
 	var ts *Tombstone
 	if t, err := tx.FindTombstone(m.SyncID, m.TopicKey, m.Project, m.Scope); err == nil {
 		ts = t
 	}
 	tombstoneSuperseded := false
 	if ts != nil {
-		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
+		if m.Op == OpUpsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.LastWriteMutationID) {
 			return noop // tombstoned and the incoming write is not newer
 		}
 		// writeWins against the tombstone: adapter must clear it on supersede.
@@ -117,7 +125,7 @@ func Decide(tx Reader, m Mutation) Decision {
 	switch m.Op {
 	case OpDelete:
 		// A delete competes on the SAME total order as an upsert:
-		// updated_at → version → writer_id → sync_id.
+		// updated_at → version → writer_id → mutation_id (last_write_mutation_id).
 		//
 		// The competition target depends on what currently exists for this identity:
 		//
@@ -127,8 +135,8 @@ func Decide(tx Reader, m Mutation) Decision {
 		//
 		//   cur == nil, ts != nil — no live row but a tombstone exists: the delete must
 		//                 WIN writeWins against the tombstone's (deleted_at, version,
-		//                 deleted_by, sync_id). A losing delete is a NoOp — it MUST NOT
-		//                 overwrite the newer tombstone's metadata via the adapter's
+		//                 deleted_by, last_write_mutation_id). A losing delete is a NoOp —
+		//                 it MUST NOT overwrite the newer tombstone's metadata via the adapter's
 		//                 INSERT OR REPLACE (last-applied-wins is not last-write-wins and
 		//                 causes metadata divergence → downstream resurrection split-brain).
 		//
@@ -141,14 +149,14 @@ func Decide(tx Reader, m Mutation) Decision {
 		switch {
 		case cur != nil && cur.DeletedAt == nil:
 			// Live row exists: the delete must WIN writeWins against it, otherwise NoOp.
-			if !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+			if !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.LastWriteMutationID) {
 				return noop
 			}
 		case ts != nil:
 			// No live row (cur == nil, or FindBySyncID returned a soft-deleted row whose
 			// deletion is already captured by the tombstone). Compete against the tombstone:
 			// an incoming delete whose metadata would regress the existing tombstone is a NoOp.
-			if !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
+			if !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.LastWriteMutationID) {
 				return noop
 			}
 		}
@@ -202,7 +210,7 @@ func Decide(tx Reader, m Mutation) Decision {
 			}
 		}
 		// INV3: version-guarded LWW — newer write wins.
-		if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+		if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.LastWriteMutationID) {
 			// INV1: update converges to one row.
 			// TargetSyncID is the RESOLVED row's sync_id (may differ from m.SyncID
 			// when resolved via FindByTopic — the P1-a convergence fix).
@@ -226,35 +234,55 @@ func Decide(tx Reader, m Mutation) Decision {
 //
 //  1. updated_at (wall-clock) — primary comparator.
 //  2. version    — monotonic counter; tiebreaker when timestamps equal.
-//  3. writer_id  — stable, replica-identical string; final tiebreaker on the
-//     exact (updated_at, version) tie. Higher string wins (arbitrary but consistent).
-//  4. sync_id    — stable, content-addressed identity; resolved only when writer_id
-//     is also equal. Higher string wins; full equality returns false (deterministic
-//     no-op).
+//  3. writer_id  — stable, replica-identical string; tiebreaker on the exact
+//     (updated_at, version) tie. Higher string wins (arbitrary but consistent).
+//  4. last_write_mutation_id — the WINNING mutation's content-addressed
+//     mutation_id; the FINAL tiebreaker, resolved only when writer_id is also
+//     equal. Higher string wins; full equality returns false (deterministic no-op).
+//
+// Why the WINNING mutation's mutation_id and NOT the canonical sync_id: sync_id is
+// the row's PRIMARY KEY, set at first-insert and NEVER changed on in-place
+// updates/tombstones — only writer_id/updated_at/version get overwritten with the
+// winning write's values. Because topic_key (not sync_id) is the convergence key,
+// two replicas can hold the SAME topic with the SAME converged content under
+// DIFFERENT stored PK sync_ids, so comparing m.SyncID against each replica's
+// divergent stored sync_id decides the tie DIFFERENTLY per replica → split-brain.
+// The mutation_id is content-addressed (SHA-256 of the canonical payload): it is
+// truly REPLICA-IDENTICAL (the same winning write hashes to the same value on
+// every store) AND distinct for any distinct write. Stored as last_write_mutation_id
+// — the WINNER's id, overwritten on every winning write — it makes the exact tie
+// converge identically everywhere with no central back-channel.
 //
 // Why identity fields and not central seq: central seq is ASYMMETRIC — a node's
 // own authored rows/tombstones keep seq=0 (AckMutation never back-patches it;
 // self-authored mutations pulled back are INV5 NoOps), so the author and central
-// compute different tie winners → permanent split-brain. writer_id and sync_id are
-// derived from the mutation payload and are REPLICA-IDENTICAL: every store computes
-// the same winner from the same inputs, making split-brain at the tie structurally
-// impossible with no central back-channel required.
-func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, curSyncID string) bool {
+// compute different tie winners → permanent split-brain. writer_id and
+// last_write_mutation_id are derived from the mutation payload and are
+// REPLICA-IDENTICAL: every store computes the same winner from the same inputs,
+// making split-brain at the tie structurally impossible with no central
+// back-channel required.
+//
+// Legacy note: a pre-migration row/tombstone carries last_write_mutation_id='' .
+// At the exact (updated_at, version, writer_id) tie, '' < any real hash, so an
+// incoming write supersedes a legacy row — acceptable, and only reachable at the
+// astronomically-rare exact tie against a not-yet-rematerialized legacy row.
+func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, curLastWriteMutationID string) bool {
 	if !m.UpdatedAt.Equal(curUpdatedAt) {
 		return m.UpdatedAt.After(curUpdatedAt)
 	}
 	if m.Version != curVersion {
 		return m.Version > curVersion
 	}
-	// Final tiebreaker: deterministic on STABLE, replica-identical fields (writer_id
-	// then sync_id) so EVERY store computes the same winner from the same inputs.
-	// This makes the exact (updated_at,version) tie converge with NO central seq
-	// back-channel. "Higher wins" is arbitrary but consistent; full equality returns
-	// false (deterministic no-op).
+	// writer_id tiebreaker: deterministic on a STABLE, replica-identical field.
 	if m.WriterID != curWriterID {
 		return m.WriterID > curWriterID
 	}
-	return m.SyncID > curSyncID
+	// Final tiebreaker: the WINNING mutation's content-addressed mutation_id —
+	// truly replica-identical (same write → same hash on every store) AND distinct
+	// for any distinct write. This makes the exact (updated_at,version,writer_id)
+	// tie converge with NO central seq back-channel. "Higher wins" is arbitrary but
+	// consistent; full equality returns false (deterministic no-op).
+	return m.MutationID > curLastWriteMutationID
 }
 
 // String returns a human-readable label for the Action constant.

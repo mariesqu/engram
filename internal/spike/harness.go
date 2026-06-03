@@ -103,7 +103,8 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 // re-pulled mutation a no-op.
 //
 // LWW tiebreaker: at the exact (updated_at, version) tie, writeWins resolves by
-// (writer_id, then sync_id) — both stable and replica-identical fields so every
+// (writer_id, then the winning mutation's content-addressed mutation_id carried
+// by last_write_mutation_id) — replica-identical payload-derived fields so every
 // store computes the same winner (no central seq back-channel required). The INV4
 // acceptance tests use DISTINCT UpdatedAt values so wall-clock decides convergence;
 // the identity tiebreaker is the final authority only when updated_at and version

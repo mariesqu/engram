@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/mariesqu/engram/internal/domain"
+	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/spike"
 )
 
@@ -559,16 +560,19 @@ func TestConvergence_ThreeNodeTie_DifferentPullOrders(t *testing.T) {
 	}
 }
 
-// ── Probe: same-writer delete-vs-upsert at the exact tie (sync_id decides) ───
+// ── Probe: same-writer delete-vs-upsert at the exact tie (mutation_id decides) ─
 
-// TestConvergence_SameWriterDeleteVsUpsert_SyncIDTiebreaker tests the final
-// sync_id tiebreaker level: the same writer_id issues BOTH a delete (sync-DEL)
+// TestConvergence_SameWriterDeleteVsUpsert_MutationIDTiebreaker tests the FINAL
+// mutation_id tiebreaker level: the same writer_id issues BOTH a delete (sync-DEL)
 // and an upsert (sync-UP) for the same topic at the EXACT same (updated_at,
-// version). writer_id ties, so the FINAL tiebreaker is sync_id. "sync-UP" >
-// "sync-DEL" lexically, so the UPSERT wins → the topic must be LIVE everywhere.
-// The central ordering is forced: delete pushes FIRST (central tombstones), then
-// the upsert arrives and must supersede the tombstone via the sync_id tiebreaker.
-func TestConvergence_SameWriterDeleteVsUpsert_SyncIDTiebreaker(t *testing.T) {
+// version). writer_id ties, so the FINAL tiebreaker is the WINNING mutation's
+// content-addressed mutation_id (NOT the canonical PK sync_id). The two
+// mutation_ids are computed deterministically and the winner is whichever is
+// lexically higher — so the test asserts convergence AND the mutation_id-decided
+// outcome, regardless of which way the hashes happen to sort. The central
+// ordering is forced: delete pushes FIRST (central tombstones), then the upsert
+// arrives and supersedes the tombstone iff its mutation_id is higher.
+func TestConvergence_SameWriterDeleteVsUpsert_MutationIDTiebreaker(t *testing.T) {
 	ctx := context.Background()
 	central := newCentral(t)
 	a := newNode(t, "A")
@@ -580,8 +584,9 @@ func TestConvergence_SameWriterDeleteVsUpsert_SyncIDTiebreaker(t *testing.T) {
 	tie := base.Add(40 * time.Second)
 
 	const writer = "writer-S"
-	const upSync = "sync-UP"   // higher sync_id → upsert wins
-	const delSync = "sync-DEL" // lower sync_id
+	const upSync = "sync-UP"
+	const delSync = "sync-DEL"
+	const upContent = "UP contests the tie"
 
 	// Establish a live row first (so the delete has something to tombstone on central).
 	mustWrite(t, a, upsert(writer, delSync, topic, "initial", 1, tInit))
@@ -590,9 +595,20 @@ func TestConvergence_SameWriterDeleteVsUpsert_SyncIDTiebreaker(t *testing.T) {
 		t.Fatalf("precondition: central must have live T")
 	}
 
-	// Author the two contesting writes (same writer, exact tie, different sync_id).
-	mustWrite(t, b, upsert(writer, upSync, topic, "UP wins via sync_id", 2, tie))
-	mustWrite(t, a, del(writer, delSync, topic, 2, tie))
+	// Build the two contesting writes (same writer, exact tie, different sync_id).
+	upMut := upsert(writer, upSync, topic, upContent, 2, tie)
+	delMut := del(writer, delSync, topic, 2, tie)
+
+	// Compute the deciding mutation_ids (content-addressed) so the assertion is
+	// exact regardless of how the hashes sort.
+	upID := mutation.NewMutationID(mutation.CanonicalPayload(upMut))
+	delID := mutation.NewMutationID(mutation.CanonicalPayload(delMut))
+	upsertWins := upID > delID
+	t.Logf("mutation_ids: upsert=%s delete=%s → upsert %s win",
+		upID, delID, map[bool]string{true: "SHOULD", false: "must NOT"}[upsertWins])
+
+	mustWrite(t, b, upMut)
+	mustWrite(t, a, delMut)
 
 	// Force ordering: delete pushes FIRST (central tombstones), upsert SECOND.
 	if _, err := spike.Push(ctx, a, central); err != nil {
@@ -624,28 +640,30 @@ func TestConvergence_SameWriterDeleteVsUpsert_SyncIDTiebreaker(t *testing.T) {
 	}
 
 	if !(aLive == bLive && bLive == cLive) {
-		t.Errorf("SPLIT-BRAIN: A=%v B=%v central=%v (same-writer tie, sync_id must decide identically)",
+		t.Errorf("SPLIT-BRAIN: A=%v B=%v central=%v (same-writer tie, mutation_id must decide identically)",
 			aLive, bLive, cLive)
 	}
-	// "sync-UP" > "sync-DEL" → upsert wins → LIVE everywhere.
-	if !(aLive && bLive && cLive) {
-		t.Errorf("WRONG STATE: upsert (sync-UP > sync-DEL) must win the same-writer tie → all LIVE; got A=%v B=%v central=%v",
-			aLive, bLive, cLive)
+	// The winner is decided by the replica-identical mutation_id order.
+	if aLive != upsertWins || bLive != upsertWins || cLive != upsertWins {
+		t.Errorf("WRONG STATE: higher mutation_id must decide the same-writer tie (upsertWins=%v); "+
+			"got live A=%v B=%v central=%v", upsertWins, aLive, bLive, cLive)
 	}
-	if cLive && ctrRec.Content != "UP wins via sync_id" {
-		t.Errorf("central content=%q, want upsert content", ctrRec.Content)
+	if upsertWins && cLive && ctrRec.Content != upContent {
+		t.Errorf("central content=%q, want upsert content %q", ctrRec.Content, upContent)
 	}
 }
 
 // ── Probe: equal-writer-id, different-sync_id tie, canonical under third sync_id ─
 
-// TestConvergence_EqualWriterSyncIDTiebreak_CanonicalUnderThirdSyncID stacks
-// cross-writer topic convergence with equal-writer sync_id tiebreaking. Three
+// TestConvergence_EqualWriterMutationIDTiebreak_CanonicalUnderThirdSyncID stacks
+// cross-writer topic convergence with equal-writer FINAL-tier tiebreaking. Three
 // nodes use the SAME writer_id but DIFFERENT sync_ids, contesting the same topic
 // at an exact (updated_at, version) tie. The canonical central row is under a
-// THIRD sync_id (the first pushed). The highest sync_id wins: "sync-M2". All
-// stores must converge to M2's content.
-func TestConvergence_EqualWriterSyncIDTiebreak_CanonicalUnderThirdSyncID(t *testing.T) {
+// THIRD sync_id (the first pushed). With writer_id tied, the FINAL tiebreaker is
+// the WINNING mutation's content-addressed mutation_id (NOT the canonical PK
+// sync_id): the three mutation_ids are computed deterministically and ALL stores
+// must converge to the content of whichever write has the highest mutation_id.
+func TestConvergence_EqualWriterMutationIDTiebreak_CanonicalUnderThirdSyncID(t *testing.T) {
 	ctx := context.Background()
 	central := newCentral(t)
 	a := newNode(t, "A")
@@ -657,9 +675,32 @@ func TestConvergence_EqualWriterSyncIDTiebreak_CanonicalUnderThirdSyncID(t *test
 
 	const writer = "writer-EQ" // identical writer_id across all three
 
-	mustWrite(t, a, upsert(writer, "sync-M0", topic, "M0 content (canonical, loses)", 2, tie))
-	mustWrite(t, b, upsert(writer, "sync-M1", topic, "M1 content (loses)", 2, tie))
-	mustWrite(t, c, upsert(writer, "sync-M2", topic, "M2 content (highest sync_id, wins)", 2, tie))
+	// Three contesting writes (same writer, exact tie, distinct sync_id + content).
+	m0 := upsert(writer, "sync-M0", topic, "M0 content", 2, tie)
+	m1 := upsert(writer, "sync-M1", topic, "M1 content", 2, tie)
+	m2 := upsert(writer, "sync-M2", topic, "M2 content", 2, tie)
+
+	// The replica-identical winner is the highest mutation_id, NOT the highest sync_id.
+	type cand struct {
+		id, content string
+	}
+	cands := []cand{
+		{mutation.NewMutationID(mutation.CanonicalPayload(m0)), m0.Content},
+		{mutation.NewMutationID(mutation.CanonicalPayload(m1)), m1.Content},
+		{mutation.NewMutationID(mutation.CanonicalPayload(m2)), m2.Content},
+	}
+	winner := cands[0]
+	for _, cd := range cands[1:] {
+		if cd.id > winner.id {
+			winner = cd
+		}
+	}
+	t.Logf("mutation_ids: M0=%s M1=%s M2=%s → winner content=%q",
+		cands[0].id, cands[1].id, cands[2].id, winner.content)
+
+	mustWrite(t, a, m0)
+	mustWrite(t, b, m1)
+	mustWrite(t, c, m2)
 
 	// A pushes first → sync-M0 canonical. Then B, then C.
 	for _, n := range []*spike.Node{a, b, c} {
@@ -683,15 +724,14 @@ func TestConvergence_EqualWriterSyncIDTiebreak_CanonicalUnderThirdSyncID(t *test
 	t.Logf("FINAL content: A=%q B=%q C=%q central=%q",
 		aRec.Content, bRec.Content, cRec.Content, ctrRec.Content)
 
-	want := "M2 content (highest sync_id, wins)"
 	for _, tc := range []struct {
 		name, rec string
 	}{
 		{"A", aRec.Content}, {"B", bRec.Content}, {"C", cRec.Content}, {"central", ctrRec.Content},
 	} {
-		if tc.rec != want {
-			t.Errorf("CONTENT DIVERGENCE on %s: %q; want %q (equal-writer → highest sync_id wins)",
-				tc.name, tc.rec, want)
+		if tc.rec != winner.content {
+			t.Errorf("CONTENT DIVERGENCE on %s: %q; want %q (equal-writer → highest mutation_id wins)",
+				tc.name, tc.rec, winner.content)
 		}
 	}
 	if ctrRec.SyncID != "sync-M0" {
