@@ -35,13 +35,14 @@ import (
 //	a no-op. Existing rows default to '' (yields to any incoming write at the
 //	astronomically-rare exact tie — see writeWins doc comment).
 //
-// v3 → v4: add a partial UNIQUE index on memory_tombstones(topic_key, project,
-//
-//	scope) WHERE topic_key IS NOT NULL AND topic_key <> '' — schema-enforcing the ≤1-tombstone-per-topic
-//	invariant (INV-B) that was previously only logic-guaranteed by Decide's
-//	canonical re-targeting. Mirrors central_tombstones_topic_uidx in the central
-//	store. CREATE UNIQUE INDEX IF NOT EXISTS is idempotent so fresh DBs (where
-//	ApplySchema already created the index) are a no-op.
+// v3 → v4: add memory_tombstones_topic_uidx — a partial UNIQUE index on
+//   memory_tombstones(topic_key, project, scope)
+//   WHERE topic_key IS NOT NULL AND topic_key <> ''
+// schema-enforcing the ≤1-tombstone-per-topic invariant (INV-B) that was
+// previously only logic-guaranteed by Decide's canonical re-targeting. Mirrors
+// central_tombstones_topic_uidx in the central store. CREATE UNIQUE INDEX IF NOT
+// EXISTS is idempotent so fresh DBs (where ApplySchema already created the index)
+// are a no-op.
 const currentSchemaVersion = 4
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
