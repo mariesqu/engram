@@ -393,3 +393,217 @@ func TestLocalWrite_IdempotentReenqueue(t *testing.T) {
 		t.Errorf("PendingCount after duplicate LocalWrite=%d, want 1 (idempotent enqueue)", n)
 	}
 }
+
+// ── Normalize empty-topic tests ───────────────────────────────────────────────
+
+// noTopicMut builds a no-topic upsert mutation. topicVal is passed as a *string
+// so the test can supply nil, &"" or a non-empty pointer to explore all cases.
+func noTopicMut(syncID string, topicKey *string, version int, at time.Time) domain.Mutation {
+	return domain.Mutation{
+		Op:         domain.OpUpsert,
+		SyncID:     syncID,
+		SessionID:  "sess-notopic",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "no-topic title",
+		Content:    "no-topic content",
+		Project:    "engram",
+		Scope:      "project",
+		TopicKey:   topicKey,
+		Version:    version,
+		UpdatedAt:  at,
+		WriterID:   "writer-notopic",
+	}
+}
+
+// noTopicDeleteMut builds a no-topic delete mutation.
+func noTopicDeleteMut(syncID string, topicKey *string, version int, at time.Time) domain.Mutation {
+	return domain.Mutation{
+		Op:         domain.OpDelete,
+		SyncID:     syncID,
+		SessionID:  "sess-notopic-del",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "no-topic title",
+		Content:    "no-topic content",
+		Project:    "engram",
+		Scope:      "project",
+		TopicKey:   topicKey,
+		Version:    version,
+		UpdatedAt:  at,
+		WriterID:   "writer-notopic",
+	}
+}
+
+// TestNormalizeTopicKey_MutationID_NilAndEmptyConverge proves that a no-topic
+// mutation built with TopicKey=&"" and the same one with TopicKey=nil produce
+// the SAME MutationID after normalizeMutation, confirming that the
+// normalisation runs BEFORE CanonicalPayload/NewMutationID.
+func TestNormalizeTopicKey_MutationID_NilAndEmptyConverge(t *testing.T) {
+	at := baseT.Add(1 * time.Second)
+	empty := ""
+
+	// Confirm &"" is folded to nil after normalisation.
+	mEmpty := normalizeMutation(noTopicMut("sync-empty", &empty, 1, at))
+	if mEmpty.TopicKey != nil {
+		t.Errorf("normalizeMutation(&\"\"): TopicKey not nil after normalisation, got %q", *mEmpty.TopicKey)
+	}
+
+	// The content-addressed IDs must be equal: &"" and nil converge.
+	// Use the SAME SyncID so the only difference is the TopicKey input value.
+	mNil2 := normalizeMutation(noTopicMut("sync-same", nil, 1, at))
+	mEmpty2 := normalizeMutation(noTopicMut("sync-same", &empty, 1, at))
+
+	if mNil2.MutationID != mEmpty2.MutationID {
+		t.Errorf("mutation_id mismatch: nil=%q, &\"\"=%q — normalize must run before NewMutationID",
+			mNil2.MutationID, mEmpty2.MutationID)
+	}
+	// Payload must also be identical (the canonical JSON has null not "").
+	if string(mNil2.Payload) != string(mEmpty2.Payload) {
+		t.Errorf("payload mismatch: nil=%s, &\"\"=%s", mNil2.Payload, mEmpty2.Payload)
+	}
+}
+
+// TestLocalWrite_EmptyTopicKey_StoresNULL verifies that LocalWrite (upsert) with
+// TopicKey=&"" stores the memories.topic_key column as SQL NULL, not as ''.
+func TestLocalWrite_EmptyTopicKey_StoresNULL(t *testing.T) {
+	s := openTempStore(t)
+	empty := ""
+	m := noTopicMut("sync-null-upsert", &empty, 1, baseT.Add(1*time.Second))
+
+	if _, err := s.LocalWrite(m); err != nil {
+		t.Fatalf("LocalWrite: %v", err)
+	}
+
+	var topicKey *string
+	err := s.db.QueryRow(
+		`SELECT topic_key FROM memories WHERE sync_id = 'sync-null-upsert'`,
+	).Scan(&topicKey)
+	if err != nil {
+		t.Fatalf("SELECT topic_key: %v", err)
+	}
+	if topicKey != nil {
+		t.Errorf("topic_key = %q; want SQL NULL (not empty string)", *topicKey)
+	}
+}
+
+// TestLocalWrite_EmptyTopicKeyDelete_StoresTombstoneNULL verifies that
+// LocalWrite (delete) with TopicKey=&"" stores memory_tombstones.topic_key as
+// SQL NULL, not as ''.
+func TestLocalWrite_EmptyTopicKeyDelete_StoresTombstoneNULL(t *testing.T) {
+	s := openTempStore(t)
+	at := baseT.Add(1 * time.Second)
+	empty := ""
+
+	// Seed a live row first.
+	if _, err := s.LocalWrite(noTopicMut("sync-null-del", &empty, 1, at)); err != nil {
+		t.Fatalf("LocalWrite upsert: %v", err)
+	}
+	// Now delete it.
+	del := noTopicDeleteMut("sync-null-del", &empty, 2, at.Add(1*time.Second))
+	if _, err := s.LocalWrite(del); err != nil {
+		t.Fatalf("LocalWrite delete: %v", err)
+	}
+
+	var topicKey *string
+	err := s.db.QueryRow(
+		`SELECT topic_key FROM memory_tombstones WHERE sync_id = 'sync-null-del'`,
+	).Scan(&topicKey)
+	if err != nil {
+		t.Fatalf("SELECT tombstone topic_key: %v", err)
+	}
+	if topicKey != nil {
+		t.Errorf("tombstone topic_key = %q; want SQL NULL (not empty string)", *topicKey)
+	}
+}
+
+// TestLocalWrite_TwoNoTopicWrites_NoCollision verifies that two independent
+// no-topic upserts (different sync_ids, &"" TopicKey) coexist without a
+// UNIQUE violation on idx_mem_topic or any other index.
+func TestLocalWrite_TwoNoTopicWrites_NoCollision(t *testing.T) {
+	s := openTempStore(t)
+	empty := ""
+	at := baseT.Add(1 * time.Second)
+
+	m1 := noTopicMut("sync-nt-1", &empty, 1, at)
+	m2 := noTopicMut("sync-nt-2", &empty, 1, at.Add(1*time.Second))
+
+	if _, err := s.LocalWrite(m1); err != nil {
+		t.Fatalf("LocalWrite m1: %v", err)
+	}
+	if _, err := s.LocalWrite(m2); err != nil {
+		t.Fatalf("LocalWrite m2 (second no-topic write): %v", err)
+	}
+
+	// Both rows must be live.
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memories WHERE topic_key IS NULL AND project = 'engram' AND scope = 'project' AND deleted_at IS NULL`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count no-topic live rows: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("live no-topic rows = %d; want 2 (no UNIQUE collision)", count)
+	}
+}
+
+// TestLocalWrite_TwoNoTopicDeletes_NoCollision verifies that two independent
+// no-topic deletes (different sync_ids, &"" TopicKey) produce two tombstone
+// rows without a UNIQUE violation on memory_tombstones_topic_uidx or idx_mem_topic.
+func TestLocalWrite_TwoNoTopicDeletes_NoCollision(t *testing.T) {
+	s := openTempStore(t)
+	empty := ""
+	at := baseT.Add(1 * time.Second)
+
+	// Seed two live rows, then delete both.
+	for i, syncID := range []string{"sync-nd-1", "sync-nd-2"} {
+		m := noTopicMut(syncID, &empty, 1, at.Add(time.Duration(i)*time.Second))
+		if _, err := s.LocalWrite(m); err != nil {
+			t.Fatalf("LocalWrite upsert %s: %v", syncID, err)
+		}
+	}
+	for i, syncID := range []string{"sync-nd-1", "sync-nd-2"} {
+		del := noTopicDeleteMut(syncID, &empty, 2, at.Add(time.Duration(2+i)*time.Second))
+		if _, err := s.LocalWrite(del); err != nil {
+			t.Fatalf("LocalWrite delete %s: %v", syncID, err)
+		}
+	}
+
+	// Both tombstones must exist with NULL topic_key.
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM memory_tombstones WHERE topic_key IS NULL AND project = 'engram' AND scope = 'project'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count no-topic tombstones: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("no-topic tombstone rows = %d; want 2 (no UNIQUE collision)", count)
+	}
+}
+
+// TestApplyPulled_EmptyTopicKey_StoresNULL verifies that ApplyPulled with
+// TopicKey=&"" also stores topic_key as SQL NULL (defensive normalisation path).
+func TestApplyPulled_EmptyTopicKey_StoresNULL(t *testing.T) {
+	s := openTempStore(t)
+	empty := ""
+	m := noTopicMut("sync-pulled-null", &empty, 1, baseT.Add(1*time.Second))
+	m = normalizeMutation(m) // simulate: a central store already normalised, but caller passed &""
+
+	// Overwrite TopicKey back to &"" to simulate an imperfect caller.
+	m.TopicKey = &empty
+
+	if err := s.ApplyPulled(m); err != nil {
+		t.Fatalf("ApplyPulled: %v", err)
+	}
+
+	var topicKey *string
+	err := s.db.QueryRow(
+		`SELECT topic_key FROM memories WHERE sync_id = 'sync-pulled-null'`,
+	).Scan(&topicKey)
+	if err != nil {
+		t.Fatalf("SELECT topic_key: %v", err)
+	}
+	if topicKey != nil {
+		t.Errorf("ApplyPulled topic_key = %q; want SQL NULL", *topicKey)
+	}
+}
