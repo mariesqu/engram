@@ -943,7 +943,6 @@ func TestDecide_PureTombstoneUpsert_InsertsOwnIdentity(t *testing.T) {
 //   - different writer_id: incoming.writer_id > tombstone.deleted_by → supersede
 //   - equal writer_id, higher mutation_id: incoming.mutation_id >
 //     tombstone.last_write_mutation_id → supersede
-//   - full equality → blocked (NoOp)
 func TestDecide_TombstoneTieBreak_IdentityAuthority(t *testing.T) {
 	project, scope := "engram", "project"
 	tieAt := t100
