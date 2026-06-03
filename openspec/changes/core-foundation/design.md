@@ -14,7 +14,7 @@ A single polymorphic `memories` table (discriminated by `entity_type`) backs eve
 |---|----------|--------|----------|-----------|
 | 1 | Schema shape | Single polymorphic table + `entity_type` + CHECK | Typed tables per entity | One FTS index, one apply path, additive migrations, 1:1 engram retrofit. Typed tables only if type-specific NOT-NULL enforcement provably blocks (V2). |
 | 2 | Local driver | `modernc.org/sqlite` (pure Go) | `mattn/go-sqlite3` (CGO) | FTS5 is all core needs; clean single Windows binary. CGO unlocks `sqlite-vec` but breaks cross-compile; deferred to semantic-search change. |
-| 3 | Canonical order | `updated_at` (wall-clock) → `version` → `writer_id` → `sync_id` | Client timestamp LWW alone | Clock-skew-proof. `updated_at` is primary LWW key; `version` then `writer_id`/`sync_id` are deterministic tiebreakers. This total order governs ALL conflicts — upsert-vs-row, upsert-vs-tombstone, delete-vs-live-row, AND delete-vs-existing-tombstone. A delete supersedes a live row only if it wins the same `writeWins` comparison; a stale or tie-losing delete against a live row is a NoOp. When no live row exists but a tombstone does, the delete ALSO competes against the tombstone via `writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID)` — a losing delete is a NoOp that preserves the newer tombstone's metadata. Unconditional tombstoning applies ONLY when neither a live row nor a tombstone exists (first delete of the identity). This symmetric treatment eliminates the stale-delete split-brain, the exact-tie-upserter-higher split-brain, AND the tombstone-metadata-regression split-brain caused by unconditional `INSERT OR REPLACE` on an existing tombstone. Central `seq` is the pull-cursor/journal ordering authority only — NOT used for LWW tiebreaking (seq is asymmetric: a node's own rows keep seq=0 until the central-assigned value is pulled, which creates split-brain at the exact tie). |
+| 3 | Canonical order | `updated_at` (wall-clock) → `version` → `writer_id` → `mutation_id` | Client timestamp LWW alone | Clock-skew-proof. `updated_at` is primary LWW key; `version` then `writer_id` then the WINNING mutation's content-addressed `mutation_id` are deterministic tiebreakers. The final tier is the winner's `mutation_id` (carried by `last_write_mutation_id`), NOT the canonical PK `sync_id`: `sync_id` is fixed at first-insert and never changed on in-place updates/tombstones, so because `topic_key` (not `sync_id`) is the convergence key the SAME topic can be stored under DIFFERENT `sync_id`s across replicas — a `sync_id` final tier reintroduces exact-tie divergence. `mutation_id` is content-addressed (SHA-256 of the canonical payload): truly replica-identical AND distinct for any distinct write. This total order governs ALL conflicts — upsert-vs-row, upsert-vs-tombstone, delete-vs-live-row, AND delete-vs-existing-tombstone. A delete supersedes a live row only if it wins the same `writeWins` comparison; a stale or tie-losing delete against a live row is a NoOp. When no live row exists but a tombstone does, the delete ALSO competes against the tombstone via `writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.LastWriteMutationID)` — a losing delete is a NoOp that preserves the newer tombstone's metadata. Unconditional tombstoning applies ONLY when neither a live row nor a tombstone exists (first delete of the identity). This symmetric treatment eliminates the stale-delete split-brain, the exact-tie-upserter-higher split-brain, AND the tombstone-metadata-regression split-brain caused by unconditional `INSERT OR REPLACE` on an existing tombstone. Central `seq` is the pull-cursor/journal ordering authority only — NOT used for LWW tiebreaking (seq is asymmetric: a node's own rows keep seq=0 until the central-assigned value is pulled, which creates split-brain at the exact tie). |
 | 4 | Idempotency key | Content-addressed `mutation_id` (SHA-256 of canonical payload) | DB unique on payload | Reuses `chunkcodec.ChunkID` pattern (`old_code/.../chunkcodec.go:13`); re-apply is a cheap seen-set lookup, no row churn. |
 | 5 | Apply purity | Pure `Reconciler.Decide()` returns an `Action`; adapters execute | Apply logic inside SQL handlers | Same decision function runs local + central + mock → invariants are unit-provable without Postgres. |
 | 6 | Writer identity | Per-writer ID + HMAC-signed token; `writer_id` audit column | Full JWT/RBAC | Spike needs distinct attributed writers only. Full auth is a later change. |
@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS memories (
   version         INTEGER NOT NULL DEFAULT 1,           -- bumped per update (LWW guard)
   seq             INTEGER NOT NULL DEFAULT 0,           -- last central seq applied (0 = local-only)
   writer_id       TEXT NOT NULL,                        -- audit: who wrote last
+  last_write_mutation_id TEXT NOT NULL DEFAULT '',      -- winning write's content-addressed id; FINAL LWW tiebreaker
   normalized_hash TEXT,                                 -- dedupe/idempotency aid
   embedding       BLOB,                                 -- RESERVED, not populated this change
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -75,8 +76,9 @@ CREATE TABLE IF NOT EXISTS memory_tombstones (
   scope       TEXT,
   topic_key   TEXT,
   deleted_at  TEXT NOT NULL,
-  deleted_by  TEXT NOT NULL,    -- writer_id
-  version     INTEGER NOT NULL DEFAULT 0
+  deleted_by  TEXT NOT NULL,    -- writer_id (penultimate tiebreaker)
+  version     INTEGER NOT NULL DEFAULT 0,
+  last_write_mutation_id TEXT NOT NULL DEFAULT ''  -- winning delete's content-addressed id; FINAL tiebreaker
 );
 
 -- Optional single-parent relations promoted to a table for future M:N (out of scope to use)
@@ -166,6 +168,7 @@ CREATE TABLE IF NOT EXISTS central_memories (
   parent_sync_id TEXT,
   version      INTEGER NOT NULL DEFAULT 1,
   writer_id    TEXT NOT NULL,                   -- last writer (audit)
+  last_write_mutation_id TEXT NOT NULL DEFAULT '', -- winning write's content-addressed id; FINAL LWW tiebreaker
   created_by   TEXT NOT NULL,                   -- first writer (audit)
   embedding    BYTEA,                           -- pgvector-ready; NOT used this change (note below)
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -182,7 +185,8 @@ CREATE TABLE IF NOT EXISTS central_tombstones (
   topic_key  TEXT, project TEXT, scope TEXT,
   deleted_at TIMESTAMPTZ NOT NULL,
   deleted_by TEXT NOT NULL,
-  version    INTEGER NOT NULL DEFAULT 0
+  version    INTEGER NOT NULL DEFAULT 0,
+  last_write_mutation_id TEXT NOT NULL DEFAULT ''  -- winning delete's content-addressed id; FINAL tiebreaker
 );
 ```
 
@@ -214,7 +218,7 @@ func Decide(tx Reader, m Mutation) Action {
 
     // (4) Tombstone guard BEFORE any upsert: a delete at >= write time blocks resurrection.
     if ts := tx.FindTombstone(m.SyncID, m.TopicKey, m.Project, m.Scope); ts != nil { // INV 4
-        if m.Op == Upsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
+        if m.Op == Upsert && !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.LastWriteMutationID) {
             return Action{Kind: NoOp, Reason: "tombstoned, stale write"}
         }
     }
@@ -227,8 +231,8 @@ func Decide(tx Reader, m Mutation) Action {
         //   cur != nil (live) — delete must WIN writeWins against the live row or NoOp.
         //   cur == nil, ts != nil — no live row but a tombstone exists (prior delete):
         //     delete must WIN writeWins against the tombstone's (deleted_at, version,
-        //     deleted_by, sync_id). A stale or tie-losing delete is a NoOp — it MUST
-        //     NOT overwrite the newer tombstone's metadata via INSERT OR REPLACE (that
+        //     deleted_by, last_write_mutation_id). A stale or tie-losing delete is a NoOp
+        //     — it MUST NOT overwrite the newer tombstone's metadata via INSERT OR REPLACE (that
         //     would be last-applied-wins, not last-write-wins, causing metadata divergence
         //     and downstream live/deleted split-brain on subsequent upserts).
         //   cur == nil, ts == nil — first delete of this identity: tombstone unconditionally.
@@ -239,11 +243,11 @@ func Decide(tx Reader, m Mutation) Action {
         //   the same as cur == nil: compete against the tombstone.
         switch {
         case cur != nil && cur.DeletedAt == nil:
-            if !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {
+            if !writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.LastWriteMutationID) {
                 return Action{Kind: NoOp, Reason: "stale delete, live row newer"}
             }
         case ts != nil:
-            if !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.SyncID) {
+            if !writeWins(m, ts.DeletedAt, ts.Version, ts.DeletedBy, ts.LastWriteMutationID) {
                 return Action{Kind: NoOp, Reason: "stale delete, newer tombstone wins"}
             }
         }
@@ -252,8 +256,8 @@ func Decide(tx Reader, m Mutation) Action {
         if cur == nil {
             return Action{Kind: Insert, Mutation: m}     // first write; INV 1, 6
         }
-        // (3) Version-guarded LWW: newer-by-(updated_at, version, writer_id, sync_id) wins.
-        if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.SyncID) {  // INV 3
+        // (3) Version-guarded LWW: newer-by-(updated_at, version, writer_id, mutation_id) wins.
+        if writeWins(m, cur.UpdatedAt, cur.Version, cur.WriterID, cur.LastWriteMutationID) {  // INV 3
             return Action{Kind: Update, Target: cur.SyncID, Mutation: m} // INV 1 converges to one row
         }
         return Action{Kind: NoOp, Reason: "stale, local newer"}                // INV 3 no lost update
@@ -261,11 +265,14 @@ func Decide(tx Reader, m Mutation) Action {
     return Action{Kind: NoOp}
 }
 
-// Deterministic ordering — clock-skew safe. Final tiebreaker uses stable, replica-identical
-// fields (writer_id then sync_id) so every store computes the same winner from the same
-// inputs. Central seq is NOT used: a node's own rows keep seq=0 until the pull back-patches
-// it, making seq ASYMMETRIC and unsafe as a tie-break (causes split-brain at the exact tie).
-func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, curSyncID string) bool {
+// Deterministic ordering — clock-skew safe. Final tiebreaker is the WINNING mutation's
+// content-addressed mutation_id (carried by last_write_mutation_id), NOT the canonical PK
+// sync_id: sync_id is fixed at first-insert and diverges across replicas for the same topic
+// (topic_key, not sync_id, is the convergence key), so it would reintroduce exact-tie
+// divergence. mutation_id is truly replica-identical (same write → same SHA-256 on every
+// store) AND distinct for any distinct write. Central seq is NOT used: a node's own rows keep
+// seq=0 until the pull back-patches it, making seq ASYMMETRIC and unsafe as a tie-break.
+func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, curLastWriteMutationID string) bool {
     if !m.UpdatedAt.Equal(curUpdatedAt) {          // primary: wall-clock LWW
         return m.UpdatedAt.After(curUpdatedAt)
     }
@@ -275,7 +282,7 @@ func writeWins(m Mutation, curUpdatedAt time.Time, curVersion int, curWriterID, 
     if m.WriterID != curWriterID {                  // tertiary: writer identity
         return m.WriterID > curWriterID
     }
-    return m.SyncID > curSyncID                     // final: sync_id (full equality → false)
+    return m.MutationID > curLastWriteMutationID     // final: winning mutation_id (full equality → false)
 }
 ```
 
