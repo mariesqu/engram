@@ -937,8 +937,8 @@ func TestDecide_PureTombstoneUpsert_InsertsOwnIdentity(t *testing.T) {
 // These are pure-domain unit tests (no Postgres): they directly exercise
 // writeWins through Decide with an exact (updated_at, version) tie.
 //
-// Both the tombstone-vs-upsert and the upsert-vs-row paths are covered.
-//
+// This test covers the tombstone-vs-upsert path; the upsert-vs-row path is
+// covered by TestDecide_UpsertVsRow_IdentityAuthority.
 // Scenarios:
 //   - different writer_id: incoming.writer_id > tombstone.deleted_by → supersede
 //   - equal writer_id, higher mutation_id: incoming.mutation_id >
