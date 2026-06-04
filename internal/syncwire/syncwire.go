@@ -105,11 +105,16 @@ func ToWire(m domain.Mutation) WireMutation {
 //   - m.OccurredAt ← parsed from w.OccurredAt (RFC3339Nano UTC)
 //   - m.Seq        ← w.Seq (0 on push; positive on pull)
 //
-// An error is returned when the payload is malformed, or occurred_at is empty,
-// cannot be parsed, or is not UTC (Z suffix).
+// An error is returned when payload or mutation_id is empty, the payload is
+// malformed, or occurred_at is empty, unparseable, or not UTC (Z suffix).
+// FromWire does NOT verify mutation_id against the payload — that content-address
+// integrity check is VerifyMutationID's job (the server calls it separately).
 func FromWire(w WireMutation) (domain.Mutation, error) {
 	if len(w.Payload) == 0 {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: payload is empty")
+	}
+	if w.MutationID == "" {
+		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: mutation_id is empty")
 	}
 
 	m, err := mutation.FromCanonicalPayload([]byte(w.Payload))

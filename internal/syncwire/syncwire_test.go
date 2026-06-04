@@ -612,3 +612,19 @@ func TestFromWire_RejectsNonUTCOccurredAt(t *testing.T) {
 		t.Errorf("FromWire(canonical Z occurred_at): unexpected error: %v", err)
 	}
 }
+
+// TestFromWire_RejectsEmptyMutationID proves FromWire rejects a WireMutation with
+// an empty mutation_id — it is a required, content-addressed wire field, so a
+// missing value is a malformed wire mutation (not a decode-to-empty-id success).
+func TestFromWire_RejectsEmptyMutationID(t *testing.T) {
+	w := syncwire.ToWire(makeMutation(t, nil)) // valid: mutation_id is set
+	w.MutationID = ""
+	if _, err := syncwire.FromWire(w); err == nil {
+		t.Error("FromWire(mutation_id=\"\"): expected error, got nil")
+	}
+
+	// Sanity: the unmodified WireMutation still decodes.
+	if _, err := syncwire.FromWire(syncwire.ToWire(makeMutation(t, nil))); err != nil {
+		t.Errorf("FromWire(valid mutation_id): unexpected error: %v", err)
+	}
+}
