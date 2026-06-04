@@ -97,7 +97,7 @@ func New(baseURL string, httpClient *http.Client) *Client {
 // Apply pushes one mutation to the central server.
 //
 // It calls [syncwire.ToWire] on m, wraps it in a [syncwire.PushRequest],
-// marshals to JSON, and POSTs to baseURL+"/v1/push". On HTTP 200 the optional
+// marshals to JSON, and POSTs to baseURL+"/v1/push". On any 2xx response the optional
 // [syncwire.PushResponse] body is decoded but its contents are not used (the
 // server echoes the mutation_id, which the client already knows). On any
 // non-2xx status a [*StatusError] is returned with the server's status code and
