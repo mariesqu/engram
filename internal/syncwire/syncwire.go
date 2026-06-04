@@ -19,8 +19,10 @@
 //
 //   OUTSIDE the payload (siblings on the wire):
 //     mutation_id  — SHA-256 of the payload bytes.
-//     occurred_at  — RFC3339Nano UTC string; assigned by the central store,
-//                    not part of the payload.
+//     occurred_at  — RFC3339Nano UTC string; the SENDER's local write time
+//                    (set by LocalWrite/normalizeMutation), not part of the
+//                    payload. Required on the wire: ToWire always emits it and
+//                    FromWire rejects an empty value.
 //     seq          — central_mutations BIGSERIAL; 0 / omitted on push,
 //                    positive on pull.
 //     payload      — the raw canonical JSON bytes (embedded as a JSON sub-object).

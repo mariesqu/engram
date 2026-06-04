@@ -10,9 +10,6 @@ import (
 	"github.com/mariesqu/engram/internal/syncwire"
 )
 
-// mustPtr returns a pointer to s — keeps table literals concise.
-func mustPtr(s string) *string { return &s }
-
 // mustEmptyPtr returns a pointer to an empty string — distinct from nil.
 func mustEmptyPtr() *string { s := ""; return &s }
 
@@ -509,9 +506,14 @@ func TestTopicKeyNilVsEmptyWireDistinction(t *testing.T) {
 
 	// nil round-trip.
 	wNil := syncwire.ToWire(mNil)
-	rawNil, _ := json.Marshal(wNil)
+	rawNil, err := json.Marshal(wNil)
+	if err != nil {
+		t.Fatalf("marshal nil-topic wire: %v", err)
+	}
 	var wNil2 syncwire.WireMutation
-	json.Unmarshal(rawNil, &wNil2)
+	if err := json.Unmarshal(rawNil, &wNil2); err != nil {
+		t.Fatalf("unmarshal nil-topic wire: %v", err)
+	}
 	gotNil, err := syncwire.FromWire(wNil2)
 	if err != nil {
 		t.Fatalf("FromWire nil-topic: %v", err)
@@ -522,9 +524,14 @@ func TestTopicKeyNilVsEmptyWireDistinction(t *testing.T) {
 
 	// &"" round-trip.
 	wEmpty := syncwire.ToWire(mEmpty)
-	rawEmpty, _ := json.Marshal(wEmpty)
+	rawEmpty, err := json.Marshal(wEmpty)
+	if err != nil {
+		t.Fatalf("marshal empty-topic wire: %v", err)
+	}
 	var wEmpty2 syncwire.WireMutation
-	json.Unmarshal(rawEmpty, &wEmpty2)
+	if err := json.Unmarshal(rawEmpty, &wEmpty2); err != nil {
+		t.Fatalf("unmarshal empty-topic wire: %v", err)
+	}
 	gotEmpty, err := syncwire.FromWire(wEmpty2)
 	if err != nil {
 		t.Fatalf("FromWire empty-topic: %v", err)
@@ -535,9 +542,3 @@ func TestTopicKeyNilVsEmptyWireDistinction(t *testing.T) {
 		t.Errorf("&\"\" TopicKey round-trip: expected &\"\", got &%q", *gotEmpty.TopicKey)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Unused import guard — mustPtr is used in overrides above; silence linter.
-// ---------------------------------------------------------------------------
-
-var _ = mustPtr
