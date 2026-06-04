@@ -588,3 +588,27 @@ func TestToWire_FromWire_NoPayloadAliasing(t *testing.T) {
 		}
 	})
 }
+
+// TestFromWire_RejectsNonUTCOccurredAt proves FromWire enforces the wire contract:
+// occurred_at must be UTC with a Z suffix. A non-UTC offset (or the non-canonical
+// +00:00 form) is rejected loudly rather than silently normalized to UTC.
+func TestFromWire_RejectsNonUTCOccurredAt(t *testing.T) {
+	w := syncwire.ToWire(makeMutation(t, nil)) // valid: occurred_at is "...Z"
+
+	for _, bad := range []string{
+		"2026-01-02T03:04:05.123456789+05:00", // explicit non-UTC offset
+		"2026-01-02T03:04:05.123456789+00:00", // zero offset but NOT the canonical Z form
+		"2026-01-02T03:04:05.123456789-08:00", // negative offset
+	} {
+		w2 := w
+		w2.OccurredAt = bad
+		if _, err := syncwire.FromWire(w2); err == nil {
+			t.Errorf("FromWire(occurred_at=%q): expected UTC/Z enforcement error, got nil", bad)
+		}
+	}
+
+	// Sanity: the canonical Z form still decodes without error.
+	if _, err := syncwire.FromWire(w); err != nil {
+		t.Errorf("FromWire(canonical Z occurred_at): unexpected error: %v", err)
+	}
+}

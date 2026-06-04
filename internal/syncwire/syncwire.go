@@ -45,9 +45,11 @@ import (
 // compares it to w.MutationID — the bytes must be identical to the ones the
 // sender hashed.
 //
-// occurred_at is an RFC3339Nano UTC string (never empty after ToWire; a zero
-// OccurredAt encodes as the Go zero instant "0001-01-01T00:00:00Z"). Receivers
-// that require a non-zero OccurredAt should validate before calling FromWire.
+// occurred_at is an RFC3339Nano UTC string with a Z suffix — the canonical form
+// ToWire emits (never empty after ToWire; a zero OccurredAt encodes as the Go
+// zero instant "0001-01-01T00:00:00Z"). FromWire ENFORCES the UTC/Z form and
+// rejects an explicit offset rather than silently normalizing it. Receivers that
+// also require a non-zero OccurredAt should validate that separately.
 //
 // seq is 0 on push (client → server) and a positive central BIGSERIAL on pull
 // (server → client). It is omitted from JSON when zero (omitempty).
@@ -103,8 +105,8 @@ func ToWire(m domain.Mutation) WireMutation {
 //   - m.OccurredAt ← parsed from w.OccurredAt (RFC3339Nano UTC)
 //   - m.Seq        ← w.Seq (0 on push; positive on pull)
 //
-// An error is returned when the payload is malformed or occurred_at cannot be
-// parsed.
+// An error is returned when the payload is malformed, or occurred_at is empty,
+// cannot be parsed, or is not UTC (Z suffix).
 func FromWire(w WireMutation) (domain.Mutation, error) {
 	if len(w.Payload) == 0 {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: payload is empty")
@@ -115,13 +117,21 @@ func FromWire(w WireMutation) (domain.Mutation, error) {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: decode payload: %w", err)
 	}
 
-	// Parse occurred_at — it must be a valid RFC3339Nano timestamp.
+	// Parse occurred_at — it must be a valid RFC3339Nano timestamp in UTC (Z suffix).
 	if w.OccurredAt == "" {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: occurred_at is empty")
 	}
 	occurredAt, err := time.Parse(time.RFC3339Nano, w.OccurredAt)
 	if err != nil {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: parse occurred_at %q: %w", w.OccurredAt, err)
+	}
+	// Enforce the wire contract: occurred_at must be UTC with a Z suffix (what
+	// ToWire emits). time.Parse maps a "Z" suffix to the time.UTC location; any
+	// explicit offset (even +00:00) yields a fixed zone instead. Reject non-UTC
+	// loudly rather than silently normalizing — that would hide a client that sent
+	// the wrong zone.
+	if occurredAt.Location() != time.UTC {
+		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: occurred_at %q must be UTC RFC3339Nano with a Z suffix", w.OccurredAt)
 	}
 
 	m.MutationID = w.MutationID
