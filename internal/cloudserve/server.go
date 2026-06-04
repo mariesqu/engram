@@ -196,13 +196,20 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorBody{Error: msg})
 }
 
-// writeJSON marshals v as JSON and writes it with the given status. On marshal
-// failure it falls back to a plain 500 text response (should never happen with
-// our controlled response types).
+// writeJSON marshals v as JSON and writes it with the given status and
+// Content-Type: application/json. If marshaling v fails (should never happen with
+// our controlled response types), it still emits a JSON {"error":...} body with a
+// 500 status — never a text/plain response — so every response honors the wire
+// contract.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		// The value failed to marshal — write a pre-baked constant body (NOT
+		// json.Marshal, which just failed) so this path can never itself fail to
+		// encode, while keeping the JSON shape + Content-Type the contract promises.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"internal error: response encoding failed"}`))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
