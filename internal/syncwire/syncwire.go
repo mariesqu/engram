@@ -68,10 +68,10 @@ type WireMutation struct {
 // payload bytes are COPIED into the WireMutation so it never aliases the
 // caller's m.Payload (a later mutation of m.Payload must not change the DTO).
 //
-// mutation_id is content-addressed. When m.MutationID is empty (the caller did
-// not run normalizeMutation), it is derived as NewMutationID(payload) so a
-// WireMutation produced by ToWire ALWAYS passes VerifyMutationID. A non-empty
-// m.MutationID is forwarded as-is (it is the content hash by construction).
+// mutation_id is content-addressed. To guarantee wire integrity, ToWire always
+// derives mutation_id from the payload bytes (NewMutationID(payload)), ignoring
+// any pre-populated m.MutationID. This ensures a WireMutation produced by ToWire
+// always passes VerifyMutationID.
 // OccurredAt is the sender's local write time, formatted RFC3339Nano UTC.
 func ToWire(m domain.Mutation) WireMutation {
 	payload := m.Payload
@@ -81,10 +81,7 @@ func ToWire(m domain.Mutation) WireMutation {
 	// Copy so the DTO never aliases the caller's m.Payload.
 	payloadCopy := append([]byte(nil), payload...)
 
-	mutationID := m.MutationID
-	if mutationID == "" {
-		mutationID = mutation.NewMutationID(payloadCopy)
-	}
+	mutationID := mutation.NewMutationID(payloadCopy)
 	return WireMutation{
 		MutationID: mutationID,
 		OccurredAt: m.OccurredAt.UTC().Format(time.RFC3339Nano),
