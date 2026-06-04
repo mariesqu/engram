@@ -38,11 +38,6 @@ type Record struct {
 	Project   string     `db:"project"`
 	Scope     string     `db:"scope"`
 	Version   int        `db:"version"`
-	// Seq is the central journal seq of the last mutation that materialized this
-	// row (retained for pull-cursor ordering and INV2 seq-propagation assertions).
-	// NOT used by the LWW tiebreaker — the final (updated_at,version,writer_id) tie
-	// is resolved by LastWriteMutationID; see writeWins in reconcile.go.
-	Seq      int64      `db:"seq"`
 	WriterID string     `db:"writer_id"`
 	// LastWriteMutationID is the content-addressed mutation_id of the WINNING
 	// write that last materialized this row. Unlike SyncID (the canonical row PK,
@@ -125,6 +120,12 @@ type Mutation struct {
 	ParentSyncID *string
 	Status     *string
 	Version    int
+	// Seq is the JOURNAL seq assigned by central_mutations (BIGSERIAL). It is set
+	// by PullSince from the central_mutations row and used by the pull cursor
+	// (sync_state.last_pulled_seq) and the harness to advance the pull position.
+	// It is NOT a materialized-row field and is NOT stored in memories/central_memories.
+	// The LWW tiebreaker uses (updated_at, version, writer_id, MutationID) only;
+	// see writeWins in reconcile.go.
 	Seq        int64
 	UpdatedAt  time.Time
 	OccurredAt time.Time

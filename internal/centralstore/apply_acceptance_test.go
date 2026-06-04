@@ -35,16 +35,15 @@ type liveRow struct {
 	syncID  string
 	content string
 	version int
-	seq     int64
 }
 
 // queryLiveTopicRows returns every live (deleted_at IS NULL) central_memories
 // row for the given topic identity, ordered by sync_id. Used to assert INV-A
-// (≤1 live row per topic) and to read the surviving content/version/seq.
+// (≤1 live row per topic) and to read the surviving content/version.
 func queryLiveTopicRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, tk, project, scope string) []liveRow {
 	t.Helper()
 	rows, err := pool.Query(ctx, `
-		SELECT sync_id, content, version, seq
+		SELECT sync_id, content, version
 		FROM central_memories
 		WHERE topic_key = $1 AND project = $2 AND scope = $3 AND deleted_at IS NULL
 		ORDER BY sync_id`,
@@ -58,7 +57,7 @@ func queryLiveTopicRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, t
 	var out []liveRow
 	for rows.Next() {
 		var r liveRow
-		if err := rows.Scan(&r.syncID, &r.content, &r.version, &r.seq); err != nil {
+		if err := rows.Scan(&r.syncID, &r.content, &r.version); err != nil {
 			t.Fatalf("queryLiveTopicRows scan: %v", err)
 		}
 		out = append(out, r)
@@ -172,26 +171,9 @@ func TestApply_INV2_MonotonicSeq(t *testing.T) {
 		t.Errorf("INV2: mutation seqs not in apply order: %+v", seqByMut)
 	}
 
-	// central_memories.seq must carry the same monotonic seq the mutation got.
-	for _, sid := range []string{"sync-inv2-1", "sync-inv2-2", "sync-inv2-3"} {
-		var memSeq int64
-		if err := store.Pool().QueryRow(ctx,
-			`SELECT seq FROM central_memories WHERE sync_id = $1`, sid,
-		).Scan(&memSeq); err != nil {
-			t.Fatalf("query central_memories.seq for %s: %v", sid, err)
-		}
-		if memSeq <= 0 {
-			t.Errorf("INV2: central_memories.seq for %s = %d, want > 0", sid, memSeq)
-		}
-	}
-
-	var mem1, mem2, mem3 int64
-	store.Pool().QueryRow(ctx, `SELECT seq FROM central_memories WHERE sync_id='sync-inv2-1'`).Scan(&mem1) //nolint:errcheck
-	store.Pool().QueryRow(ctx, `SELECT seq FROM central_memories WHERE sync_id='sync-inv2-2'`).Scan(&mem2) //nolint:errcheck
-	store.Pool().QueryRow(ctx, `SELECT seq FROM central_memories WHERE sync_id='sync-inv2-3'`).Scan(&mem3) //nolint:errcheck
-	if !(mem1 < mem2 && mem2 < mem3) {
-		t.Errorf("INV2: central_memories.seq not strictly increasing across rows: %d,%d,%d", mem1, mem2, mem3)
-	}
+	// central_memories.seq is removed (the materialized-row copy was dead;
+	// the pull cursor uses sync_state.last_pulled_seq / Mutation.Seq directly).
+	// The only seq authority is central_mutations.seq (BIGSERIAL), asserted above.
 }
 
 // ── INV3 — no lost update ─────────────────────────────────────────────────────

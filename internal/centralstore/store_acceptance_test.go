@@ -309,7 +309,7 @@ func TestReaderRoundtrip_FindByTopic(t *testing.T) {
 	tk := "sdd/test/topic"
 	m := testMutationWithTopic("mut-fbt-1", "sync-fbt-1", "proj", "scp", tk, domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -336,7 +336,7 @@ func TestReaderRoundtrip_FindBySyncID(t *testing.T) {
 
 	m := testMutation("mut-fbs-1", "sync-fbs-1", "proj", domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -535,7 +535,7 @@ func TestPartialUniqueIndex_RejectsSecondLiveRow(t *testing.T) {
 	m1 := testMutationWithTopic("mut-uniq-1", "sync-uniq-1", "proj", "scp", tk, domain.OpUpsert)
 	m2 := testMutationWithTopic("mut-uniq-2", "sync-uniq-2", "proj", "scp", tk, domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m1.SyncID, m1, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m1.SyncID, m1); err != nil {
 		t.Fatalf("UpsertMemory first live row: %v", err)
 	}
 
@@ -545,8 +545,8 @@ func TestPartialUniqueIndex_RejectsSecondLiveRow(t *testing.T) {
 	_, err := store.Pool().Exec(ctx, `
 		INSERT INTO central_memories
 		  (sync_id, entity_type, type, title, content, project, scope, topic_key,
-		   version, seq, writer_id, created_by)
-		VALUES ($1,'memory','manual','title2','content2',$2,$3,$4,1,2,'w','w')`,
+		   version, writer_id, created_by)
+		VALUES ($1,'memory','manual','title2','content2',$2,$3,$4,1,'w','w')`,
 		m2.SyncID, m2.Project, m2.Scope, m2.TopicKey,
 	)
 	if err == nil {
@@ -600,7 +600,7 @@ func TestUpsertMemory_CrossWriterConvergence(t *testing.T) {
 		OccurredAt: time.Now().Add(-10 * time.Second).UTC(),
 		Payload:    []byte(`{}`),
 	}
-	if err := store.UpsertMemory(ctx, mY.SyncID, mY, 1); err != nil {
+	if err := store.UpsertMemory(ctx, mY.SyncID, mY); err != nil {
 		t.Fatalf("seed canonical row Y: %v", err)
 	}
 
@@ -628,7 +628,7 @@ func TestUpsertMemory_CrossWriterConvergence(t *testing.T) {
 	}
 	// targetSyncID = "sync-cw-Y" (the canonical row resolved by Decide).
 	// This must NOT fail with central_memories_topic_uidx violation.
-	if err := store.UpsertMemory(ctx, "sync-cw-Y", mX, 2); err != nil {
+	if err := store.UpsertMemory(ctx, "sync-cw-Y", mX); err != nil {
 		t.Fatalf("UpsertMemory cross-writer (targetSyncID=Y, m.SyncID=X): %v", err)
 	}
 
@@ -782,7 +782,7 @@ func TestUpsertMemory_CreatedAtIsServerTime(t *testing.T) {
 	m := testMutation("mut-creat-1", "sync-creat-1", "proj", domain.OpUpsert)
 	m.UpdatedAt = staleTime
 
-	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -822,8 +822,8 @@ func TestEntityTypeCheck_RejectsBogusValue(t *testing.T) {
 	_, err := store.Pool().Exec(ctx, `
 		INSERT INTO central_memories
 		  (sync_id, entity_type, type, title, content, project, scope,
-		   version, seq, writer_id, created_by)
-		VALUES ($1,$2,'manual','title','content','proj','project',1,1,'w','w')`,
+		   version, writer_id, created_by)
+		VALUES ($1,$2,'manual','title','content','proj','project',1,'w','w')`,
 		"sync-check-bogus", "bogus",
 	)
 	if err == nil {
@@ -877,6 +877,28 @@ func freePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// TestCentralMemories_HasNoSeqColumn verifies that central_memories does NOT
+// have a seq column after the v4→v5 close-out. The materialized-row seq was
+// removed: the pull cursor uses sync_state.last_pulled_seq / Mutation.Seq
+// (central_mutations.seq) directly; the LWW tiebreaker uses last_write_mutation_id.
+func TestCentralMemories_HasNoSeqColumn(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	var colCount int
+	err := store.Pool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name  = 'central_memories'
+		  AND column_name = 'seq'`,
+	).Scan(&colCount)
+	if err != nil {
+		t.Fatalf("query information_schema.columns for central_memories.seq: %v", err)
+	}
+	if colCount != 0 {
+		t.Errorf("central_memories must NOT have a seq column after the v4→v5 seq removal; found %d", colCount)
+	}
 }
 
 // cacheRoot returns the directory where embedded-postgres binaries are cached.

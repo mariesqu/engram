@@ -29,9 +29,10 @@ import (
 //  2. Begin a transaction. Every subsequent read and write runs on this tx so
 //     Decide sees a consistent snapshot and the whole reconciliation is atomic.
 //  3. Assign seq — InsertMutation on the tx returns the BIGSERIAL seq (INV2,
-//     the canonical monotonic order for pull cursors / journal ordering). m.Seq
-//     is set to this value so the materialized memory row records the last
-//     mutation seq that touched it.
+//     the canonical monotonic order for pull cursors / journal ordering). The seq
+//     is the central_mutations.seq journal value; it is NOT stored in
+//     central_memories (the materialized-row copy was removed). It is passed to
+//     applyDecision for signature compatibility only.
 //     central_mutations.mutation_id is UNIQUE: a concurrent duplicate push that
 //     races past step 1 surfaces here as SQLSTATE 23505 — treated as an
 //     idempotent no-op (rollback, return nil). This UNIQUE is the durable
@@ -91,10 +92,13 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 		}
 	}()
 
-	// Step 3 — assign the authoritative central seq. The UNIQUE(mutation_id) on
-	// central_mutations is the durable applied-marker; a concurrent duplicate push
-	// that races past step 1 hits 23505 here and is treated as an idempotent no-op.
-	seq, err := insertMutationQ(ctx, tx, m)
+	// Step 3 — record the mutation in the journal. The INSERT assigns the BIGSERIAL
+	// journal seq (central_mutations.seq) — the ordering authority, read later by
+	// PullSince — and the UNIQUE(mutation_id) is the durable applied-marker; a
+	// concurrent duplicate push that races past step 1 hits 23505 here and is
+	// treated as an idempotent no-op. Apply does not need the returned seq value
+	// (it is never materialized onto central_memories), so it is discarded.
+	_, err = insertMutationQ(ctx, tx, m)
 	if err != nil {
 		if isUniqueViolation(err) {
 			// Duplicate mutation_id — another push already recorded it. Roll back
@@ -104,16 +108,13 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 		}
 		return fmt.Errorf("Apply: insert mutation: %w", err)
 	}
-	// Record the central seq on the local copy so the reconciliation + the
-	// materialized row carry the authoritative monotonic order (INV2).
-	m.Seq = seq
 
 	// Step 4 — run the pure Decide against this tx's snapshot. decideReader forces
 	// MutationApplied=false so the just-inserted mutation does not make Decide NoOp.
 	d := domain.Decide(&decideReader{ctx: ctx, q: tx}, m)
 
 	// Step 5 — materialize the Decision atomically on the tx.
-	if err = applyDecision(ctx, tx, d, m, seq); err != nil {
+	if err = applyDecision(ctx, tx, d, m); err != nil {
 		return err
 	}
 
@@ -128,7 +129,7 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 // applyDecision dispatches the Decision onto the central tables using the tx.
 // It mirrors localstore.Apply's switch so the local and central adapters stay
 // structurally identical (same Decision contract, same dispatch).
-func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.Mutation, seq int64) error {
+func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.Mutation) error {
 	switch d.Action {
 	case domain.NoOp:
 		// Stored state already correct (INV3 older write discarded, or INV4
@@ -142,7 +143,7 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 		// the canonical row Y, not the incoming sync_id X). The upsert's
 		// ON CONFLICT (sync_id) DO UPDATE ... SET deleted_at = NULL already revives
 		// a soft-deleted row, so Undelete needs no extra deleted_at clear here.
-		if err := upsertMemoryQ(ctx, tx, d.TargetSyncID, m, seq); err != nil {
+		if err := upsertMemoryQ(ctx, tx, d.TargetSyncID, m); err != nil {
 			return err
 		}
 		if d.Undelete {
@@ -182,10 +183,7 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 // authoritative deletion context), matching localstore.execWriteTombstone's
 // UPDATE of the memories row. last_write_mutation_id MUST be stamped here so the
 // soft-deleted row carries the same final-tiebreaker value as the tombstone — a
-// later delete-vs-live-row comparison reads cur.LastWriteMutationID. seq on the
-// central_memories row is retained at the upsert-assigned value — it is the last
-// central journal seq that materialized this row and is used only for cursor
-// ordering, NOT for LWW tiebreaking (see writeWins in domain/reconcile.go).
+// later delete-vs-live-row comparison reads cur.LastWriteMutationID.
 //
 // The WHERE clause is intentionally unconditional on deleted_at: if the row is
 // already soft-deleted (cross-writer re-delete), this refreshes the deletion
