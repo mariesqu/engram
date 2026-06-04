@@ -15,8 +15,11 @@ import (
 //
 //	memories(sync_id)` FK that was present before PR #6. The FK is enforced
 //	immediately by SQLite (not deferred), which would reject out-of-order
-//	children during sync pull. Referential integrity is enforced at the
-//	application level via defer-and-replay (PR3/PR4).
+//	children during sync pull. parent_sync_id is therefore a SOFT (unvalidated)
+//	reference: an out-of-order child is accepted as-is and its parent arrives
+//	later via its own mutation (eventual consistency, no replay). No
+//	application-level referential enforcement exists or is currently needed —
+//	nothing dereferences parent_sync_id at apply time.
 //
 // v1 → v2: drop and recreate FTS maintenance triggers from the shared constants
 //
@@ -185,9 +188,11 @@ const memoriesTableDDL = `CREATE TABLE IF NOT EXISTS memories (
 	-- NOTE: parent_sync_id carries NO REFERENCES clause. A REFERENCES clause with
 	-- PRAGMA foreign_keys = ON is enforced immediately (not deferred), which would
 	-- reject out-of-order mutations during sync pull (child arrives before parent).
-	-- Referential integrity is enforced at the application level via defer-and-replay
-	-- (see PR3/PR4). The non-null CHECK below ensures spec/task/plan rows always
-	-- declare a parent, but the referenced parent may not yet be present locally.
+	-- parent_sync_id is a SOFT (unvalidated) reference: no FK, and nothing
+	-- dereferences it at apply time. An out-of-order child (parent not yet present)
+	-- is accepted; the parent arrives later via its own mutation (eventual
+	-- consistency, no replay). The non-null CHECK below only ensures spec/task/plan
+	-- rows DECLARE a parent — it does not require the referenced row to exist.
 	CHECK(entity_type IN ('memory','change','standard') OR parent_sync_id IS NOT NULL)
 )`
 
