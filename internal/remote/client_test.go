@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -299,17 +300,16 @@ func TestClient_PullSince_ContextCancellation(t *testing.T) {
 	}
 }
 
-// TestStatusError_ErrorMessage ensures the error message is human-readable
-// and includes status code.
+// TestStatusError_ErrorMessage ensures the error message is human-readable and
+// includes both the status code and the server's body text.
 func TestStatusError_ErrorMessage(t *testing.T) {
 	se := &remote.StatusError{Code: 503, Body: "service unavailable"}
 	got := se.Error()
-	if got == "" {
-		t.Fatal("StatusError.Error() must not be empty")
+	if !strings.Contains(got, "503") {
+		t.Errorf("StatusError.Error() = %q; want it to contain the status code 503", got)
 	}
-	// Should contain the code somewhere.
-	if len(got) < 3 {
-		t.Errorf("StatusError.Error() = %q; want a non-trivial message", got)
+	if !strings.Contains(got, "service unavailable") {
+		t.Errorf("StatusError.Error() = %q; want it to contain the body text", got)
 	}
 }
 
@@ -380,5 +380,24 @@ func TestClient_Apply_TruncatedBody_ReturnsError(t *testing.T) {
 	m := testMutation(t, "sdd/test/truncated", "hello")
 	if err := c.Apply(context.Background(), m); err == nil {
 		t.Error("Apply returned nil on a truncated response body; want a read error")
+	}
+}
+
+// TestClient_Apply_OversizedBody_ReturnsError proves the client rejects a response
+// body larger than maxResponseBytes with an explicit error (fail-fast) instead of
+// silently truncating it. The server returns 200 with a body one byte over the cap.
+func TestClient_Apply_OversizedBody_ReturnsError(t *testing.T) {
+	const oversized = (4 << 20) + 1 // maxResponseBytes (4 MiB) + 1
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, oversized))
+	}))
+	defer srv.Close()
+
+	c := remote.New(srv.URL, nil)
+	m := testMutation(t, "sdd/test/oversized", "hello")
+	if err := c.Apply(context.Background(), m); err == nil {
+		t.Error("Apply returned nil on an oversized response body; want an explicit overflow error")
 	}
 }

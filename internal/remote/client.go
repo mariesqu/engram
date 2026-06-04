@@ -34,10 +34,13 @@ import (
 // start in CI without masking genuine hangs.
 const defaultTimeout = 30 * time.Second
 
-// maxResponseBytes caps how many bytes the client reads from a response body.
-// A full PullResponse with the default 100-mutation limit is well under 1 MiB;
-// the server already rejects oversized request bodies — this mirrors that
-// discipline on the response side.
+// maxResponseBytes is the maximum response body the client accepts. A full
+// PullResponse with the default 100-mutation limit is well under 1 MiB; the server
+// already rejects oversized request bodies — this mirrors that discipline on the
+// response side. A larger response is rejected with an explicit error: the client
+// reads maxResponseBytes+1 and fails fast if the body exceeds the cap, rather than
+// silently truncating it (which would also leave the connection undrained and
+// unreusable).
 const maxResponseBytes = 4 << 20 // 4 MiB
 
 // StatusError is returned whenever the server responds with a non-2xx status.
@@ -120,9 +123,12 @@ func (c *Client) Apply(ctx context.Context, m domain.Mutation) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return fmt.Errorf("remote.Apply: read response body: %w", err)
+	}
+	if len(respBody) > maxResponseBytes {
+		return fmt.Errorf("remote.Apply: response body exceeds cap of %d bytes", maxResponseBytes)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -170,9 +176,12 @@ func (c *Client) PullSince(ctx context.Context, project string, sinceSeq int64, 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("remote.PullSince: read response body: %w", err)
+	}
+	if len(respBody) > maxResponseBytes {
+		return nil, fmt.Errorf("remote.PullSince: response body exceeds cap of %d bytes", maxResponseBytes)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
