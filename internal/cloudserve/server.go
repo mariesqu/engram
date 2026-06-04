@@ -172,7 +172,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 // handlePull processes a POST /v1/pull request.
 //
 // Pipeline:
-//  1. Decode JSON body into [syncwire.PullRequest]. Decode error → 400.
+//  1. Decode JSON body into [syncwire.PullRequest]. Decode error → 400 (malformed JSON) or 413 (body too large).
 //  2. Validate: Project non-empty → else 400.
 //  3. Clamp Limit: ≤0 → pullDefaultLimit; >pullMaxLimit → pullMaxLimit.
 //  4. central.PullSince → error → 500. Success → 200 with [syncwire.PullResponse].
