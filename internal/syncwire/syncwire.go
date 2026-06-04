@@ -68,10 +68,12 @@ type WireMutation struct {
 // payload bytes are COPIED into the WireMutation so it never aliases the
 // caller's m.Payload (a later mutation of m.Payload must not change the DTO).
 //
-// mutation_id is content-addressed. To guarantee wire integrity, ToWire always
-// derives mutation_id from the payload bytes (NewMutationID(payload)), ignoring
-// any pre-populated m.MutationID. This ensures a WireMutation produced by ToWire
-// always passes VerifyMutationID.
+// mutation_id is CARRIED from m.MutationID, not recomputed. It is the authoritative
+// content hash — set by normalizeMutation on push (where the payload IS canonical) and
+// read from the central_mutations.mutation_id column by PullSince on pull (where the
+// payload has been JSONB-normalized and would hash differently). ToWire derives it from
+// the payload ONLY when m.MutationID is empty. On push this still passes VerifyMutationID
+// because the pushed payload is the exact canonical bytes the id hashes.
 // OccurredAt is the sender's local write time, formatted RFC3339Nano UTC.
 func ToWire(m domain.Mutation) WireMutation {
 	payload := m.Payload
@@ -81,7 +83,19 @@ func ToWire(m domain.Mutation) WireMutation {
 	// Copy so the DTO never aliases the caller's m.Payload.
 	payloadCopy := append([]byte(nil), payload...)
 
-	mutationID := mutation.NewMutationID(payloadCopy)
+	// CARRY m.MutationID — do NOT recompute from the payload. m.MutationID is the
+	// authoritative content hash: set by normalizeMutation on the push path (where
+	// m.Payload IS the canonical bytes) and read from the authoritative
+	// central_mutations.mutation_id COLUMN by PullSince on the pull path. On pull the
+	// payload has been round-tripped through Postgres JSONB, which normalizes the
+	// bytes (key order, whitespace) — so NewMutationID(payloadCopy) would NOT equal the
+	// original hash. Recomputing here would emit a divergent mutation_id on every pull,
+	// breaking the replica-identical last_write_mutation_id tiebreaker. Derive only when
+	// the caller left it empty (best-effort for a non-normalized push).
+	mutationID := m.MutationID
+	if mutationID == "" {
+		mutationID = mutation.NewMutationID(payloadCopy)
+	}
 	return WireMutation{
 		MutationID: mutationID,
 		OccurredAt: m.OccurredAt.UTC().Format(time.RFC3339Nano),
@@ -151,9 +165,11 @@ func FromWire(w WireMutation) (domain.Mutation, error) {
 // (SHA-256 of the canonical JSON), any byte-level change to the payload
 // produces a different hash and this function returns an error.
 //
-// A WireMutation produced by ToWire always passes this check: ToWire preserves
-// the exact canonical bytes and derives mutation_id from them when m.MutationID
-// is unset, so the hash is always stable.
+// A WireMutation on the PUSH path always passes this check: the pushed payload is the
+// exact canonical bytes the sender hashed. VerifyMutationID is PUSH-ONLY — do NOT call it
+// on a PULLED WireMutation, whose payload was JSONB-normalized by Postgres and whose
+// mutation_id is the authoritative central column value (not a hash of the normalized
+// bytes), so it would (correctly) not match.
 func VerifyMutationID(w WireMutation) error {
 	if len(w.Payload) == 0 {
 		return fmt.Errorf("syncwire.VerifyMutationID: payload is empty")
@@ -175,14 +191,17 @@ type PushRequest struct {
 	Mutation WireMutation `json:"mutation"`
 }
 
-// PushResponse is the body returned by the server after a push.
+// PushResponse is the body returned by the cloud-serve server after a SUCCESSFUL
+// push (failures are signaled by a non-2xx HTTP status, not this body).
 //
-//   - Status     — "ok" on success, "duplicate" when the mutation_id was already
-//                  present (idempotent re-push), "rejected" for validation failure.
-//   - MutationID — the mutation_id the server stored (echoes the request's).
-//   - Applied    — true when the server ran domain.Decide and wrote the mutation;
-//                  false when the mutation was a duplicate (already in
-//                  applied_mutations) and was skipped.
+//   - Status     — always "ok". The server cannot distinguish a fresh apply from an
+//                  idempotent re-push or a version-guard NoOp, because
+//                  centralstore.Apply returns nil for all of them. Surfacing that
+//                  distinction would require an additive ApplyWithOutcome on
+//                  centralstore (the deferred 409; see package cloudserve).
+//   - MutationID — the mutation_id the server processed (echoes the request's).
+//   - Applied    — always true on success, meaning "the server accepted and
+//                  processed the mutation" — NOT "this write won the LWW merge".
 type PushResponse struct {
 	Status     string `json:"status"`
 	MutationID string `json:"mutation_id"`

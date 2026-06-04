@@ -613,6 +613,28 @@ func TestFromWire_RejectsNonUTCOccurredAt(t *testing.T) {
 	}
 }
 
+// TestToWire_CarriesMutationID_NotRecomputed proves ToWire carries the authoritative
+// m.MutationID instead of recomputing it from the payload — critical for the PULL path,
+// where PullSince sets m.MutationID from the central_mutations.mutation_id column while
+// m.Payload has been JSONB-normalized (bytes differ from the original), so a recomputed
+// hash would diverge and break the replica-identical last_write_mutation_id tiebreaker.
+func TestToWire_CarriesMutationID_NotRecomputed(t *testing.T) {
+	m := makeMutation(t, nil)
+	// Simulate the pull case: an authoritative id that does NOT match the payload hash.
+	authoritativeID := "authoritative-central-column-id-not-the-payload-hash"
+	m.MutationID = authoritativeID
+	payloadHash := mutation.NewMutationID(m.Payload)
+	if authoritativeID == payloadHash {
+		t.Fatal("test setup: authoritative id must differ from the payload hash")
+	}
+
+	w := syncwire.ToWire(m)
+	if w.MutationID != authoritativeID {
+		t.Errorf("ToWire recomputed mutation_id: got %q, want carried %q (payload hash %q)",
+			w.MutationID, authoritativeID, payloadHash)
+	}
+}
+
 // TestFromWire_RejectsEmptyMutationID proves FromWire rejects a WireMutation with
 // an empty mutation_id — it is a required, content-addressed wire field, so a
 // missing value is a malformed wire mutation (not a decode-to-empty-id success).
