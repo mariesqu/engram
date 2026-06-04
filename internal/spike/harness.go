@@ -21,19 +21,15 @@ import (
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/localstore"
+	"github.com/mariesqu/engram/internal/transport"
 )
 
-// Central is the minimal central-store surface the harness needs. The real
-// *centralstore.Store satisfies it:
-//
-//   - Apply assigns the authoritative BIGSERIAL seq and reconciles the pushed
-//     mutation via the SAME domain.Decide the local store uses.
-//   - PullSince returns mutations with seq > sinceSeq for the project, in strict
-//     ascending seq order, each carrying its central seq.
-type Central interface {
-	Apply(ctx context.Context, m domain.Mutation) error
-	PullSince(ctx context.Context, project string, sinceSeq int64, limit int) ([]domain.Mutation, error)
-}
+// Central is the central-store port this harness drives. It is an alias of
+// transport.Central so the spike acceptance tests continue to reference
+// spike.Central without change while the canonical definition lives in the
+// transport package — available to the future HTTP client and autosync loop
+// without importing the test-flavored spike package.
+type Central = transport.Central
 
 // Node is one sync participant: a local SQLite store plus its own outbox and
 // pull cursor (both persisted inside the store's sync_mutations / sync_state
