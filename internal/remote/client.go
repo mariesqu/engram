@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mariesqu/engram/internal/domain"
@@ -77,15 +78,15 @@ type Client struct {
 // (e.g. "http://localhost:8080"). If httpClient is nil a default client
 // with a 30-second timeout is used.
 //
-// baseURL must NOT have a trailing slash; route paths are appended verbatim
-// (e.g. "/v1/push"). The caller is responsible for removing the trailing slash
-// if present — or accepting a double-slash redirect that most HTTP servers handle
-// transparently.
+// baseURL may include or omit a trailing slash: New trims any trailing slashes so
+// route paths (e.g. "/v1/push") are appended cleanly, never producing "//v1/push"
+// (which some servers answer with a redirect that net/http would follow by
+// downgrading POST to GET, silently breaking sync).
 func New(baseURL string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultTimeout}
 	}
-	return &Client{baseURL: baseURL, httpClient: httpClient}
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}
 }
 
 // Apply pushes one mutation to the central server.
@@ -119,7 +120,10 @@ func (c *Client) Apply(ctx context.Context, m domain.Mutation) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return fmt.Errorf("remote.Apply: read response body: %w", err)
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return &StatusError{Code: resp.StatusCode, Body: string(respBody)}
@@ -166,7 +170,10 @@ func (c *Client) PullSince(ctx context.Context, project string, sinceSeq int64, 
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("remote.PullSince: read response body: %w", err)
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, &StatusError{Code: resp.StatusCode, Body: string(respBody)}

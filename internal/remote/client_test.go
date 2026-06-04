@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // ── Apply tests ──────────────────────────────────────────────────────────────
 
 func TestClient_Apply_200_ReturnsNil(t *testing.T) {
-	var gotReq syncwire.PushRequest
+	gotReqCh := make(chan syncwire.PushRequest, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/push" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
@@ -65,14 +66,16 @@ func TestClient_Apply_200_ReturnsNil(t *testing.T) {
 			t.Errorf("unexpected method: %s", r.Method)
 		}
 		b, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(b, &gotReq); err != nil {
+		var req syncwire.PushRequest
+		if err := json.Unmarshal(b, &req); err != nil {
 			t.Errorf("decode PushRequest: %v", err)
 		}
 		writeJSON(w, http.StatusOK, syncwire.PushResponse{
 			Status:     "ok",
-			MutationID: gotReq.Mutation.MutationID,
+			MutationID: req.Mutation.MutationID,
 			Applied:    true,
 		})
+		gotReqCh <- req
 	}))
 	defer srv.Close()
 
@@ -84,6 +87,7 @@ func TestClient_Apply_200_ReturnsNil(t *testing.T) {
 	}
 
 	// Assert the request body was a valid PushRequest with correct mutation_id.
+	gotReq := <-gotReqCh
 	if gotReq.Mutation.MutationID != m.MutationID {
 		t.Errorf("PushRequest mutation_id = %q; want %q", gotReq.Mutation.MutationID, m.MutationID)
 	}
@@ -312,9 +316,9 @@ func TestStatusError_ErrorMessage(t *testing.T) {
 // TestNew_NilHttpClient verifies that passing nil results in a working client
 // (the default timeout client is used).
 func TestNew_NilHttpClient(t *testing.T) {
-	called := false
+	var called atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
+		called.Store(true)
 		writeJSON(w, http.StatusOK, syncwire.PullResponse{Mutations: nil})
 	}))
 	defer srv.Close()
@@ -324,7 +328,57 @@ func TestNew_NilHttpClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !called {
+	if !called.Load() {
 		t.Error("server was never called with nil httpClient")
+	}
+}
+
+// TestNew_TrimsTrailingSlash proves New trims trailing slashes so route paths are
+// appended cleanly (no "//v1/push", which could trigger a POST→GET redirect).
+func TestNew_TrimsTrailingSlash(t *testing.T) {
+	gotPathCh := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPathCh <- r.URL.Path
+		writeJSON(w, http.StatusOK, syncwire.PushResponse{Status: "ok", Applied: true})
+	}))
+	defer srv.Close()
+
+	// Pass a baseURL WITH a trailing slash; New must trim it.
+	c := remote.New(srv.URL+"/", nil)
+	m := testMutation(t, "sdd/test/trailing-slash", "hello")
+	if err := c.Apply(context.Background(), m); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if path := <-gotPathCh; path != "/v1/push" {
+		t.Errorf("request path = %q; want %q (trailing slash not trimmed → double slash)", path, "/v1/push")
+	}
+}
+
+// TestClient_Apply_TruncatedBody_ReturnsError proves Apply returns the body-read
+// error instead of silently treating a truncated response as success: the server
+// promises Content-Length 1000 but writes a few bytes then closes the connection,
+// so the client's io.ReadAll fails with an unexpected EOF.
+func TestClient_Apply_TruncatedBody_ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("ResponseWriter is not a Hijacker")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		// Promise 1000 bytes, send 5, then close → truncated body.
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nshort"))
+	}))
+	defer srv.Close()
+
+	c := remote.New(srv.URL, nil)
+	m := testMutation(t, "sdd/test/truncated", "hello")
+	if err := c.Apply(context.Background(), m); err == nil {
+		t.Error("Apply returned nil on a truncated response body; want a read error")
 	}
 }
