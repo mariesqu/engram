@@ -22,13 +22,21 @@ type mockCentral struct {
 	applyErr   error
 	pullResult []domain.Mutation
 	pullErr    error
+
+	// Captured arguments from the last PullSince call (for clamp assertions).
+	gotProject  string
+	gotSinceSeq int64
+	gotLimit    int
 }
 
 func (m *mockCentral) Apply(_ context.Context, _ domain.Mutation) error {
 	return m.applyErr
 }
 
-func (m *mockCentral) PullSince(_ context.Context, _ string, _ int64, _ int) ([]domain.Mutation, error) {
+func (m *mockCentral) PullSince(_ context.Context, project string, sinceSeq int64, limit int) ([]domain.Mutation, error) {
+	m.gotProject = project
+	m.gotSinceSeq = sinceSeq
+	m.gotLimit = limit
 	return m.pullResult, m.pullErr
 }
 

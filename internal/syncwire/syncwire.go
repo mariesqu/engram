@@ -191,14 +191,17 @@ type PushRequest struct {
 	Mutation WireMutation `json:"mutation"`
 }
 
-// PushResponse is the body returned by the server after a push.
+// PushResponse is the body returned by the cloud-serve server after a SUCCESSFUL
+// push (failures are signaled by a non-2xx HTTP status, not this body).
 //
-//   - Status     — "ok" on success, "duplicate" when the mutation_id was already
-//                  present (idempotent re-push), "rejected" for validation failure.
-//   - MutationID — the mutation_id the server stored (echoes the request's).
-//   - Applied    — true when the server ran domain.Decide and wrote the mutation;
-//                  false when the mutation was a duplicate (already in
-//                  applied_mutations) and was skipped.
+//   - Status     — always "ok". The server cannot distinguish a fresh apply from an
+//                  idempotent re-push or a version-guard NoOp, because
+//                  centralstore.Apply returns nil for all of them. Surfacing that
+//                  distinction would require an additive ApplyWithOutcome on
+//                  centralstore (the deferred 409; see package cloudserve).
+//   - MutationID — the mutation_id the server processed (echoes the request's).
+//   - Applied    — always true on success, meaning "the server accepted and
+//                  processed the mutation" — NOT "this write won the LWW merge".
 type PushResponse struct {
 	Status     string `json:"status"`
 	MutationID string `json:"mutation_id"`

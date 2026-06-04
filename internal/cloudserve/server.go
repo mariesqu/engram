@@ -16,6 +16,7 @@ package cloudserve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -30,6 +31,11 @@ const (
 	pullDefaultLimit = 100
 	pullMaxLimit     = 1000
 )
+
+// maxRequestBytes bounds the request body size both handlers will parse, capping
+// CPU/memory spent on JSON decoding (DoS guard). One mutation's canonical payload
+// is far smaller than this.
+const maxRequestBytes = 1 << 20 // 1 MiB
 
 // Server is a net/http handler that exposes a [transport.Central] over HTTP.
 // Construct it with [New]; call [Server.Handler] to obtain the routed mux.
@@ -112,8 +118,7 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 // A 409 for version-guard NoOp is intentionally deferred (see package doc).
 func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	var req syncwire.PushRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	if !decodeBody(w, r, &req) {
 		return
 	}
 
@@ -150,8 +155,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 //  4. central.PullSince → error → 500. Success → 200 with [syncwire.PullResponse].
 func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 	var req syncwire.PullRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	if !decodeBody(w, r, &req) {
 		return
 	}
 
@@ -215,6 +219,24 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
+}
+
+// decodeBody reads and JSON-decodes the request body into dst, enforcing
+// maxRequestBytes via http.MaxBytesReader (DoS guard). On failure it writes the
+// appropriate error — 413 when the body exceeds the cap, 400 when it is malformed
+// — and returns false so the caller can return immediately.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		}
+		return false
+	}
+	return true
 }
 
 // methodGuard returns a handler that calls next only when the request method
