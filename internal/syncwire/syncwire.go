@@ -62,20 +62,32 @@ type WireMutation struct {
 // marshaling.
 //
 // If m.Payload is already set (e.g. reconstructed from the outbox by
-// DrainOutbox) it is used directly so the exact canonical bytes are preserved.
-// Otherwise CanonicalPayload(m) is called to derive them. MutationID and
-// OccurredAt are taken from the mutation's identity fields (not recomputed from
-// the payload here — the caller is responsible for having those fields set).
+// DrainOutbox) it is used; otherwise CanonicalPayload(m) derives the bytes. The
+// payload bytes are COPIED into the WireMutation so it never aliases the
+// caller's m.Payload (a later mutation of m.Payload must not change the DTO).
+//
+// mutation_id is content-addressed. When m.MutationID is empty (the caller did
+// not run normalizeMutation), it is derived as NewMutationID(payload) so a
+// WireMutation produced by ToWire ALWAYS passes VerifyMutationID. A non-empty
+// m.MutationID is forwarded as-is (it is the content hash by construction).
+// OccurredAt is the sender's local write time, formatted RFC3339Nano UTC.
 func ToWire(m domain.Mutation) WireMutation {
 	payload := m.Payload
 	if len(payload) == 0 {
 		payload = mutation.CanonicalPayload(m)
 	}
+	// Copy so the DTO never aliases the caller's m.Payload.
+	payloadCopy := append([]byte(nil), payload...)
+
+	mutationID := m.MutationID
+	if mutationID == "" {
+		mutationID = mutation.NewMutationID(payloadCopy)
+	}
 	return WireMutation{
-		MutationID: m.MutationID,
+		MutationID: mutationID,
 		OccurredAt: m.OccurredAt.UTC().Format(time.RFC3339Nano),
 		Seq:        m.Seq,
-		Payload:    json.RawMessage(payload),
+		Payload:    json.RawMessage(payloadCopy),
 	}
 }
 
@@ -87,7 +99,7 @@ func ToWire(m domain.Mutation) WireMutation {
 // in the sibling fields that live outside the payload:
 //
 //   - m.MutationID ← w.MutationID
-//   - m.Payload    ← the raw payload bytes (preserved for downstream re-apply)
+//   - m.Payload    ← a COPY of the raw payload bytes (does not alias w.Payload)
 //   - m.OccurredAt ← parsed from w.OccurredAt (RFC3339Nano UTC)
 //   - m.Seq        ← w.Seq (0 on push; positive on pull)
 //
@@ -113,7 +125,7 @@ func FromWire(w WireMutation) (domain.Mutation, error) {
 	}
 
 	m.MutationID = w.MutationID
-	m.Payload = []byte(w.Payload)
+	m.Payload = append([]byte(nil), w.Payload...) // copy: never alias w.Payload
 	m.OccurredAt = occurredAt.UTC()
 	m.Seq = w.Seq
 
@@ -127,8 +139,9 @@ func FromWire(w WireMutation) (domain.Mutation, error) {
 // (SHA-256 of the canonical JSON), any byte-level change to the payload
 // produces a different hash and this function returns an error.
 //
-// A valid WireMutation produced by ToWire always passes this check: ToWire
-// preserves the exact canonical bytes so the hash is stable.
+// A WireMutation produced by ToWire always passes this check: ToWire preserves
+// the exact canonical bytes and derives mutation_id from them when m.MutationID
+// is unset, so the hash is always stable.
 func VerifyMutationID(w WireMutation) error {
 	if len(w.Payload) == 0 {
 		return fmt.Errorf("syncwire.VerifyMutationID: payload is empty")

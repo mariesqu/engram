@@ -542,3 +542,49 @@ func TestTopicKeyNilVsEmptyWireDistinction(t *testing.T) {
 		t.Errorf("&\"\" TopicKey round-trip: expected &\"\", got &%q", *gotEmpty.TopicKey)
 	}
 }
+
+// TestToWire_DerivesMutationID_WhenEmpty proves ToWire derives mutation_id from
+// the payload when m.MutationID is empty (caller forgot normalizeMutation), so a
+// ToWire-produced WireMutation always passes VerifyMutationID.
+func TestToWire_DerivesMutationID_WhenEmpty(t *testing.T) {
+	m := makeMutation(t, nil)
+	m.MutationID = "" // simulate a caller that did not normalize
+
+	w := syncwire.ToWire(m)
+	if w.MutationID == "" {
+		t.Fatal("ToWire must derive mutation_id when m.MutationID is empty; got empty")
+	}
+	if want := mutation.NewMutationID(m.Payload); w.MutationID != want {
+		t.Errorf("derived mutation_id = %q; want NewMutationID(payload) = %q", w.MutationID, want)
+	}
+	if err := syncwire.VerifyMutationID(w); err != nil {
+		t.Errorf("ToWire output (derived id) must pass VerifyMutationID: %v", err)
+	}
+}
+
+// TestToWire_FromWire_NoPayloadAliasing proves the codec COPIES the payload bytes
+// in both directions: mutating the source after conversion must not corrupt the
+// result (no shared-slice surprises), while still preserving the exact bytes.
+func TestToWire_FromWire_NoPayloadAliasing(t *testing.T) {
+	t.Run("ToWire does not alias m.Payload", func(t *testing.T) {
+		m := makeMutation(t, nil)
+		w := syncwire.ToWire(m)
+		snapshot := append([]byte(nil), w.Payload...)
+		m.Payload[0] ^= 0xFF // mutate the source after ToWire
+		if string(w.Payload) != string(snapshot) {
+			t.Error("ToWire aliased m.Payload: mutating m.Payload changed w.Payload")
+		}
+	})
+	t.Run("FromWire does not alias w.Payload", func(t *testing.T) {
+		w := syncwire.ToWire(makeMutation(t, nil))
+		m, err := syncwire.FromWire(w)
+		if err != nil {
+			t.Fatalf("FromWire: %v", err)
+		}
+		snapshot := append([]byte(nil), m.Payload...)
+		w.Payload[0] ^= 0xFF // mutate the wire payload after FromWire
+		if string(m.Payload) != string(snapshot) {
+			t.Error("FromWire aliased w.Payload: mutating w.Payload changed m.Payload")
+		}
+	})
+}
