@@ -33,3 +33,23 @@ func TestWriteJSON_MarshalFailure_StillJSON(t *testing.T) {
 		t.Error("fallback body: error field is empty, want a message")
 	}
 }
+
+// TestHTTPServer_HasTimeouts asserts Run's server is constructed with the hardened
+// read/write/idle timeouts (Slowloris defense), so they can't be silently dropped
+// in a future refactor.
+func TestHTTPServer_HasTimeouts(t *testing.T) {
+	srv := New(nil).httpServer(":0")
+
+	if srv.ReadHeaderTimeout != readHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, readHeaderTimeout)
+	}
+	if srv.ReadTimeout != readTimeout {
+		t.Errorf("ReadTimeout = %v, want %v", srv.ReadTimeout, readTimeout)
+	}
+	if srv.WriteTimeout != writeTimeout {
+		t.Errorf("WriteTimeout = %v, want %v", srv.WriteTimeout, writeTimeout)
+	}
+	if srv.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", srv.IdleTimeout, idleTimeout)
+	}
+}

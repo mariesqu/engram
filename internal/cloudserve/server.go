@@ -38,6 +38,17 @@ const (
 // is far smaller than this.
 const maxRequestBytes = 1 << 20 // 1 MiB
 
+// HTTP server timeouts used by Run. They bound how long a single connection can
+// hold server resources, defending an Internet-facing deployment against
+// Slowloris-style slow-client attacks (clients that trickle headers/body or never
+// read the response).
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 120 * time.Second
+)
+
 // Server is a net/http handler that exposes a [transport.Central] over HTTP.
 // Construct it with [New]; call [Server.Handler] to obtain the routed mux.
 type Server struct {
@@ -77,13 +88,11 @@ func (s *Server) Handler() http.Handler {
 
 // Run starts an http.Server on addr using s.Handler() and blocks until ctx is
 // cancelled. On cancellation it calls Shutdown with a 10-second drain timeout.
-// Run is a convenience helper for PR7 — tests use Handler() directly with
-// httptest.NewServer.
+// The server carries read/write/idle timeouts (see httpServer) to bound slow-client
+// resource use. Run is a convenience helper for PR7 — tests use Handler() directly
+// with httptest.NewServer.
 func (s *Server) Run(ctx context.Context, addr string) error {
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: s.Handler(),
-	}
+	srv := s.httpServer(addr)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -100,6 +109,19 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutCtx)
+	}
+}
+
+// httpServer builds the *http.Server for Run with hardened read/write/idle
+// timeouts. Separated from Run so the timeout configuration is unit-testable.
+func (s *Server) httpServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
 }
 
