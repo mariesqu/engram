@@ -130,7 +130,7 @@ func (s *Server) httpServer(addr string) *http.Server {
 // handlePush processes a POST /v1/push request.
 //
 // Pipeline:
-//  1. Decode JSON body into [syncwire.PushRequest]. Decode error → 400.
+//  1. Decode JSON body into [syncwire.PushRequest]. Decode error → 400 (malformed JSON) or 413 (body too large).
 //  2. [syncwire.VerifyMutationID] — tampered payload → 400.
 //  3. [syncwire.FromWire] — malformed payload / bad occurred_at → 400.
 //  4. central.Apply — DB/internal error → 500. nil → 200.
