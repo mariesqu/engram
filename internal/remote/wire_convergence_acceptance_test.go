@@ -109,9 +109,8 @@ func TestMain(m *testing.M) {
 
 // ── Per-test wire setup ───────────────────────────────────────────────────────
 
-// wireStore opens a fresh isolated centralstore.Store on a new Postgres schema,
-// returning the store and a cleanup func. Pattern mirrors spike_test.newCentral.
-func wireStore(t *testing.T) *centralstore.Store {
+// wireStore opens a fresh isolated centralstore.Store on a new Postgres schema.
+// The store is closed and its schema is dropped via t.Cleanup.
 	t.Helper()
 	schemaName := wireSchemaFor(t)
 	ctx := context.Background()
