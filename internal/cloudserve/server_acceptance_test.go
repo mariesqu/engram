@@ -290,17 +290,14 @@ func TestAcceptance_PushThenPull_RoundTrip(t *testing.T) {
 		t.Fatalf("FromWire: %v", err)
 	}
 
-	// mutation_id note: central_mutations.payload is JSONB, which PostgreSQL
-	// normalizes (key ordering, whitespace). ToWire recomputes mutation_id from
-	// those JSONB bytes, so the pulled mutation_id WILL differ from the locally-
-	// computed mutID (which was hashed from the original canonical bytes). This is
-	// a known and accepted asymmetry: the stored mutation_id column (the ground
-	// truth, used for idempotency) differs from what ToWire emits on the pull path.
-	// PR4 (HTTP client) will need to apply FromWire mutations using the column
-	// mutation_id, not the wire mutation_id, for idempotency checks. For now, we
-	// assert the pulled mutation_id is non-empty (parseable).
-	if got.MutationID == "" {
-		t.Error("pulled mutation has empty mutation_id")
+	// ToWire now CARRIES m.MutationID (the authoritative central_mutations.mutation_id
+	// column value) rather than recomputing from the JSONB-normalized payload bytes.
+	// The pulled mutation_id must therefore equal the one we originally pushed — this
+	// is the red→green proof: under always-recompute the pulled id was the JSONB-
+	// normalized payload hash (differing from mutID); under carry-original it matches.
+	if got.MutationID != mutID {
+		t.Errorf("pulled mutation_id = %q, want pushed id %q (carry-original regression)",
+			got.MutationID, mutID)
 	}
 
 	// Verify the STORED mutation_id (the original hash, from the DB column)
