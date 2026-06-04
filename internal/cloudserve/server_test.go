@@ -362,6 +362,18 @@ func TestUnknownPath_Returns404(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode 404 JSON body: %v", err)
+	}
+	if body.Error == "" {
+		t.Error("404 body: error field is empty, want a message")
+	}
 }
 
 // ── error body shape ──────────────────────────────────────────────────────────

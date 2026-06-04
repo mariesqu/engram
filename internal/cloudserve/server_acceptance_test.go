@@ -211,7 +211,6 @@ func TestAcceptance_Push_LandsInCentral(t *testing.T) {
 	}
 
 	// Verify the mutation landed in central: FindByTopic must return the record.
-	ctx := context.Background()
 	rec, err := store.FindByTopic(topicKey, "acc-project", "project")
 	if err != nil {
 		t.Fatalf("FindByTopic: %v", err)
@@ -225,7 +224,6 @@ func TestAcceptance_Push_LandsInCentral(t *testing.T) {
 	if rec.Title != m.Title {
 		t.Errorf("record Title = %q, want %q", rec.Title, m.Title)
 	}
-	_ = ctx // ctx used above
 }
 
 // TestAcceptance_PushThenPull_RoundTrip pushes a mutation, then pulls it back
@@ -302,7 +300,6 @@ func TestAcceptance_PushThenPull_RoundTrip(t *testing.T) {
 
 	// Verify the STORED mutation_id (the original hash, from the DB column)
 	// is the one we pushed — MutationApplied checks central_mutations by this ID.
-	ctx := context.Background()
 	applied, err := store.MutationApplied(mutID)
 	if err != nil {
 		t.Fatalf("MutationApplied: %v", err)
@@ -310,7 +307,6 @@ func TestAcceptance_PushThenPull_RoundTrip(t *testing.T) {
 	if !applied {
 		t.Errorf("MutationApplied(%q) = false after push; want true", mutID)
 	}
-	_ = ctx
 
 	// Content fields must survive the round-trip exactly.
 	if got.Title != m.Title {

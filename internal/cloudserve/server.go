@@ -38,8 +38,8 @@ type Server struct {
 	logger  *slog.Logger
 }
 
-// New constructs a Server wrapping c. A nil logger falls back to the default
-// slog handler.
+// New constructs a Server wrapping c. Internal (5xx) errors are logged via
+// slog.Default(); configure process-wide logging with slog.SetDefault.
 func New(c transport.Central) *Server {
 	return &Server{
 		central: c,
@@ -56,11 +56,15 @@ func New(c transport.Central) *Server {
 //	POST /v1/push  → [Server.handlePush]
 //	POST /v1/pull  → [Server.handlePull]
 //
-// Wrong method on a known path → 405. Unknown path → 404 (ServeMux default).
+// Wrong method on a known path → 405. Unknown path → 404 with the JSON
+// {"error":...} shape (via the "/" catch-all, not the text/plain ServeMux default).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/push", s.methodGuard(http.MethodPost, s.handlePush))
 	mux.HandleFunc("/v1/pull", s.methodGuard(http.MethodPost, s.handlePull))
+	// Catch-all: any path not matched by the exact /v1/* routes above gets a JSON
+	// 404 instead of net/http's default text/plain "404 page not found".
+	mux.HandleFunc("/", s.handleNotFound)
 	return mux
 }
 
@@ -217,4 +221,11 @@ func (s *Server) methodGuard(allowed string, next http.HandlerFunc) http.Handler
 		}
 		next(w, r)
 	}
+}
+
+// handleNotFound returns a JSON 404 for any path not matched by a specific route,
+// keeping every error response in the {"error":...} shape. Registered on "/" so it
+// catches all unmatched paths (the more specific /v1/* routes take precedence).
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusNotFound, "not found: "+r.URL.Path)
 }
