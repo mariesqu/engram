@@ -836,7 +836,8 @@ func TestFTSRoundtrip_Insert(t *testing.T) {
 
 // TestParentCheck_OutOfOrderChildAccepted verifies that a spec/task/plan whose
 // parent_sync_id references a sync_id that does NOT yet exist in memories is
-// accepted (out-of-order child arrives first; defer-and-replay reconciles later).
+// accepted: parent_sync_id is a soft (unvalidated) reference, so the child inserts
+// and its parent arrives later via its own mutation (eventual consistency, no replay).
 //
 // With `REFERENCES memories(sync_id)` + `PRAGMA foreign_keys = ON` this INSERT
 // would fail with "FOREIGN KEY constraint failed" — that is the P1 bug.
