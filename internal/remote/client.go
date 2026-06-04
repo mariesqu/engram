@@ -52,7 +52,9 @@ const maxResponseBytes = 4 << 20 // 4 MiB
 type StatusError struct {
 	// Code is the HTTP status code returned by the server (e.g. 400, 500).
 	Code int
-	// Body is the response body text (truncated at maxResponseBytes).
+	// Body is the full response body text. It is never truncated: a response that
+	// exceeds maxResponseBytes is rejected with a separate overflow error before any
+	// StatusError is constructed, so Body always holds the complete (≤ cap) body.
 	Body string
 }
 

@@ -88,7 +88,12 @@ func TestClient_Apply_200_ReturnsNil(t *testing.T) {
 	}
 
 	// Assert the request body was a valid PushRequest with correct mutation_id.
-	gotReq := <-gotReqCh
+	var gotReq syncwire.PushRequest
+	select {
+	case gotReq = <-gotReqCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was never invoked: no PushRequest received within 5s")
+	}
 	if gotReq.Mutation.MutationID != m.MutationID {
 		t.Errorf("PushRequest mutation_id = %q; want %q", gotReq.Mutation.MutationID, m.MutationID)
 	}
@@ -349,7 +354,13 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	if err := c.Apply(context.Background(), m); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if path := <-gotPathCh; path != "/v1/push" {
+	var path string
+	select {
+	case path = <-gotPathCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was never invoked: no request path received within 5s")
+	}
+	if path != "/v1/push" {
 		t.Errorf("request path = %q; want %q (trailing slash not trimmed → double slash)", path, "/v1/push")
 	}
 }
