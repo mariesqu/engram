@@ -216,17 +216,17 @@ func insertMutationQ(ctx context.Context, q querier, m domain.Mutation) (seq int
 // second live row under a different sync_id.
 //
 // The caller (Apply) is responsible for running Decide() and passing only
-// winning mutations here. The seq parameter is the journal seq from
-// central_mutations (returned by insertMutationQ) — it is no longer stored in
-// central_memories but is retained in the signature for caller compatibility.
-func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.Mutation, seq int64) error {
-	return upsertMemoryQ(ctx, s.pool, targetSyncID, m, seq)
+// winning mutations here. central_memories carries no seq column — the LWW
+// tiebreaker is last_write_mutation_id, and the journal/ordering seq lives in
+// central_mutations (with the client's local sync_state pull cursor).
+func (s *Store) UpsertMemory(ctx context.Context, targetSyncID string, m domain.Mutation) error {
+	return upsertMemoryQ(ctx, s.pool, targetSyncID, m)
 }
 
 // upsertMemoryQ is the ctx+querier core for UpsertMemory. Apply runs it on its
 // transaction so the canonical-state write commits atomically with the mutation
 // journal entry and the applied-marker.
-func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation, seq int64) error {
+func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domain.Mutation) error {
 	// created_at is intentionally omitted from the INSERT column list so the
 	// server's DEFAULT now() applies. This makes created_at server-authoritative
 	// and immune to client clock skew. created_at must NOT appear in the
@@ -234,9 +234,10 @@ func upsertMemoryQ(ctx context.Context, qr querier, targetSyncID string, m domai
 	// creation). updated_at IS updated — it is the client logical write time used
 	// by writeWins() as the LWW tiebreaker across writers.
 	//
-	// seq (the materialized-row copy of central_mutations.seq) was removed: it
-	// was dead weight — the pull cursor uses sync_state.last_pulled_seq from
-	// Mutation.Seq (central_mutations.seq) directly; no production code read it.
+	// seq (the materialized-row copy of central_mutations.seq) was removed: it was
+	// dead weight — the journal/ordering authority is central_mutations.seq, and the
+	// pull cursor is the CLIENT's local sync_state.last_pulled_seq (a local SQLite
+	// table) advanced via Mutation.Seq; no production code read the materialized copy.
 	//
 	// Parameter order ($1..$15):
 	//   $1  targetSyncID  $2  session_id    $3  entity_type   $4  type

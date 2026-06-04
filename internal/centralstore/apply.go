@@ -92,12 +92,13 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 		}
 	}()
 
-	// Step 3 — assign the authoritative central seq. The UNIQUE(mutation_id) on
-	// central_mutations is the durable applied-marker; a concurrent duplicate push
-	// that races past step 1 hits 23505 here and is treated as an idempotent no-op.
-	// seq is the BIGSERIAL journal seq (central_mutations.seq). It is passed to
-	// applyDecision for compatibility but is no longer stored in central_memories.
-	seq, err := insertMutationQ(ctx, tx, m)
+	// Step 3 — record the mutation in the journal. The INSERT assigns the BIGSERIAL
+	// journal seq (central_mutations.seq) — the ordering authority, read later by
+	// PullSince — and the UNIQUE(mutation_id) is the durable applied-marker; a
+	// concurrent duplicate push that races past step 1 hits 23505 here and is
+	// treated as an idempotent no-op. Apply does not need the returned seq value
+	// (it is never materialized onto central_memories), so it is discarded.
+	_, err = insertMutationQ(ctx, tx, m)
 	if err != nil {
 		if isUniqueViolation(err) {
 			// Duplicate mutation_id — another push already recorded it. Roll back
@@ -113,7 +114,7 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 	d := domain.Decide(&decideReader{ctx: ctx, q: tx}, m)
 
 	// Step 5 — materialize the Decision atomically on the tx.
-	if err = applyDecision(ctx, tx, d, m, seq); err != nil {
+	if err = applyDecision(ctx, tx, d, m); err != nil {
 		return err
 	}
 
@@ -128,7 +129,7 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 // applyDecision dispatches the Decision onto the central tables using the tx.
 // It mirrors localstore.Apply's switch so the local and central adapters stay
 // structurally identical (same Decision contract, same dispatch).
-func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.Mutation, seq int64) error {
+func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.Mutation) error {
 	switch d.Action {
 	case domain.NoOp:
 		// Stored state already correct (INV3 older write discarded, or INV4
@@ -142,7 +143,7 @@ func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.M
 		// the canonical row Y, not the incoming sync_id X). The upsert's
 		// ON CONFLICT (sync_id) DO UPDATE ... SET deleted_at = NULL already revives
 		// a soft-deleted row, so Undelete needs no extra deleted_at clear here.
-		if err := upsertMemoryQ(ctx, tx, d.TargetSyncID, m, seq); err != nil {
+		if err := upsertMemoryQ(ctx, tx, d.TargetSyncID, m); err != nil {
 			return err
 		}
 		if d.Undelete {

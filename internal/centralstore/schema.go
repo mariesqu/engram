@@ -20,8 +20,9 @@ import (
 //     (used for pull cursors and journal ordering only, NOT for LWW tiebreaking).
 //   - central_memories:  canonical materialized state; partial UNIQUE on topic
 //     identity enforces INV-A at the DB level. Does NOT carry a seq column —
-//     the materialized-row seq was removed (dead field; pull cursor uses
-//     sync_state.last_pulled_seq / Mutation.Seq from central_mutations directly).
+//     the materialized-row seq was removed (dead field). Ordering authority is
+//     central_mutations.seq; the pull cursor is the CLIENT's local
+//     sync_state.last_pulled_seq (a local SQLite table), advanced via Mutation.Seq.
 //   - central_tombstones: records every soft-delete; partial UNIQUE on topic
 //     prevents duplicate tombstones (INV-B). deleted_by + last_write_mutation_id
 //     are the final tiebreaker fields used by writeWins (writer_id → winning
@@ -50,9 +51,10 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		// ── central_memories ─────────────────────────────────────────────────────
 		// Canonical materialized read model. sync_id is the portable identity.
 		// embedding is BYTEA reserved for pgvector (not populated in this change).
-		// Note: seq was removed in the v4→v5 close-out (the materialized-row copy
-		// was dead; the pull cursor uses sync_state.last_pulled_seq / Mutation.Seq
-		// from central_mutations). The LWW tiebreaker uses last_write_mutation_id.
+		// Note: seq was removed in the v4→v5 close-out (the materialized-row copy was
+		// dead). Ordering authority is central_mutations.seq; the pull cursor is the
+		// CLIENT's local sync_state.last_pulled_seq (a local SQLite table). The LWW
+		// tiebreaker uses last_write_mutation_id.
 		`CREATE TABLE IF NOT EXISTS central_memories (
 			sync_id        TEXT         PRIMARY KEY,
 			session_id     TEXT         NOT NULL DEFAULT '',

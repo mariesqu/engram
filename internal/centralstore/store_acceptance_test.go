@@ -309,7 +309,7 @@ func TestReaderRoundtrip_FindByTopic(t *testing.T) {
 	tk := "sdd/test/topic"
 	m := testMutationWithTopic("mut-fbt-1", "sync-fbt-1", "proj", "scp", tk, domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -336,7 +336,7 @@ func TestReaderRoundtrip_FindBySyncID(t *testing.T) {
 
 	m := testMutation("mut-fbs-1", "sync-fbs-1", "proj", domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 
@@ -535,7 +535,7 @@ func TestPartialUniqueIndex_RejectsSecondLiveRow(t *testing.T) {
 	m1 := testMutationWithTopic("mut-uniq-1", "sync-uniq-1", "proj", "scp", tk, domain.OpUpsert)
 	m2 := testMutationWithTopic("mut-uniq-2", "sync-uniq-2", "proj", "scp", tk, domain.OpUpsert)
 
-	if err := store.UpsertMemory(ctx, m1.SyncID, m1, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m1.SyncID, m1); err != nil {
 		t.Fatalf("UpsertMemory first live row: %v", err)
 	}
 
@@ -600,7 +600,7 @@ func TestUpsertMemory_CrossWriterConvergence(t *testing.T) {
 		OccurredAt: time.Now().Add(-10 * time.Second).UTC(),
 		Payload:    []byte(`{}`),
 	}
-	if err := store.UpsertMemory(ctx, mY.SyncID, mY, 1); err != nil {
+	if err := store.UpsertMemory(ctx, mY.SyncID, mY); err != nil {
 		t.Fatalf("seed canonical row Y: %v", err)
 	}
 
@@ -628,7 +628,7 @@ func TestUpsertMemory_CrossWriterConvergence(t *testing.T) {
 	}
 	// targetSyncID = "sync-cw-Y" (the canonical row resolved by Decide).
 	// This must NOT fail with central_memories_topic_uidx violation.
-	if err := store.UpsertMemory(ctx, "sync-cw-Y", mX, 2); err != nil {
+	if err := store.UpsertMemory(ctx, "sync-cw-Y", mX); err != nil {
 		t.Fatalf("UpsertMemory cross-writer (targetSyncID=Y, m.SyncID=X): %v", err)
 	}
 
@@ -782,7 +782,7 @@ func TestUpsertMemory_CreatedAtIsServerTime(t *testing.T) {
 	m := testMutation("mut-creat-1", "sync-creat-1", "proj", domain.OpUpsert)
 	m.UpdatedAt = staleTime
 
-	if err := store.UpsertMemory(ctx, m.SyncID, m, 1); err != nil {
+	if err := store.UpsertMemory(ctx, m.SyncID, m); err != nil {
 		t.Fatalf("UpsertMemory: %v", err)
 	}
 

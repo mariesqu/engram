@@ -157,8 +157,8 @@ func TestConvergence_INV2_MonotonicSeq(t *testing.T) {
 // assertPulledTopicHasSeq asserts that central_mutations contains a row for the
 // given topic identity with a positive journal seq (central_mutations.seq > 0).
 // This verifies INV2 at the journal level: the BIGSERIAL is the only seq
-// authority. The materialized-row rec.Seq was removed (dead field; pull cursor
-// uses sync_state.last_pulled_seq from Mutation.Seq / central_mutations.seq).
+// authority. The materialized-row rec.Seq was removed (dead field; the pull
+// cursor is the CLIENT's local sync_state.last_pulled_seq, advanced via Mutation.Seq).
 func assertPulledTopicHasSeq(ctx context.Context, t *testing.T, c *centralStore, topic string) {
 	t.Helper()
 	var seq int64
@@ -166,9 +166,10 @@ func assertPulledTopicHasSeq(ctx context.Context, t *testing.T, c *centralStore,
 		SELECT COALESCE(MAX(cm.seq), 0)
 		FROM central_mutations cm
 		WHERE cm.entity_key IN (
-			SELECT sync_id FROM central_memories WHERE topic_key = $1
+			SELECT sync_id FROM central_memories
+			WHERE topic_key = $1 AND project = $2 AND scope = $3
 		)`,
-		topic,
+		topic, project, scope,
 	).Scan(&seq)
 	if err != nil {
 		t.Fatalf("assertPulledTopicHasSeq(%q): %v", topic, err)
