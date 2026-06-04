@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -227,13 +228,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // — and returns false so the caller can return immediately.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		} else {
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		}
+		return false
+	}
+	// Enforce a single JSON document per request: a second value or any trailing
+	// non-whitespace (anything other than EOF) violates the wire contract.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "request body must contain a single JSON document")
 		return false
 	}
 	return true

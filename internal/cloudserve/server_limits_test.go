@@ -103,3 +103,29 @@ func TestHandlePush_BodyTooLarge_Returns413(t *testing.T) {
 		t.Errorf("status = %d, want 413", resp.StatusCode)
 	}
 }
+
+// TestHandlePush_TrailingData_Returns400 proves the server enforces a single JSON
+// document per request: a second JSON value, or trailing non-whitespace junk, after
+// the first document is rejected with 400 (not silently ignored).
+func TestHandlePush_TrailingData_Returns400(t *testing.T) {
+	central := &mockCentral{}
+	ts := newTestServer(t, central)
+
+	valid, _ := validPushBody(t)
+	cases := map[string][]byte{
+		"second_json_object": append(append([]byte{}, valid...), []byte(`{"extra":"junk"}`)...),
+		"trailing_garbage":   append(append([]byte{}, valid...), []byte("garbage")...),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp, err := http.Post(ts.URL+"/v1/push", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("POST /v1/push: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400 for trailing data", resp.StatusCode)
+			}
+		})
+	}
+}

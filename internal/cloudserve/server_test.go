@@ -211,10 +211,10 @@ func TestHandlePush_NonUTCOccurredAt_Returns400(t *testing.T) {
 	}
 	req.Mutation.OccurredAt = "2024-01-15T10:00:00+05:00" // non-UTC — must be rejected
 
-	// We also need to recompute mutation_id because OccurredAt is a sibling field
-	// outside the payload — the mutation_id is still based on the payload bytes,
-	// so VerifyMutationID will pass. FromWire then rejects the non-UTC timestamp.
-	// (mutation_id hashes only the payload, not occurred_at — so no need to tamper it.)
+	// OccurredAt is a sibling field OUTSIDE the canonical payload, so changing it
+	// leaves the payload bytes (and thus mutation_id) untouched — VerifyMutationID
+	// still passes, so the request reaches FromWire, which rejects the non-UTC
+	// timestamp (→ 400). No mutation_id recompute or tamper needed.
 	tampered, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("re-marshal: %v", err)

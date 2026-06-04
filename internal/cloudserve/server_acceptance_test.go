@@ -363,20 +363,13 @@ func TestAcceptance_IdempotentPush(t *testing.T) {
 
 	// Exactly one live row in central.
 	ctx := context.Background()
-	rows, err := store.Pool().Query(ctx,
+	var count int
+	if err := store.Pool().QueryRow(ctx,
 		`SELECT COUNT(*) FROM central_memories
 		 WHERE topic_key=$1 AND project=$2 AND scope=$3 AND deleted_at IS NULL`,
 		topicKey, "idem-project", "project",
-	)
-	if err != nil {
+	).Scan(&count); err != nil {
 		t.Fatalf("count query: %v", err)
-	}
-	defer rows.Close()
-	var count int
-	if rows.Next() {
-		if err := rows.Scan(&count); err != nil {
-			t.Fatalf("scan count: %v", err)
-		}
 	}
 	if count != 1 {
 		t.Errorf("expected exactly 1 live row after idempotent push, got %d", count)
