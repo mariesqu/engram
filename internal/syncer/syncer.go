@@ -55,7 +55,7 @@ func (n *Node) Write(m domain.Mutation) (domain.Mutation, error) {
 	return out, nil
 }
 
-// pullLimit bounds a single PullSince call. Large enough that the spike's small
+// pullLimit bounds a single PullSince call. Large enough that the acceptance tests'
 // mutation counts always come back in one round.
 const pullLimit = 1000
 
