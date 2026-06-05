@@ -1,5 +1,5 @@
 // Package syncer is the production home of the local↔central sync orchestration:
-// Node, NewNode, Push, Pull, Sync, and SyncAll. These primitives drive one full
+// Node, NewNode, (*Node).Write, Push, Pull, Sync, and SyncAll. These primitives drive one full
 // push/pull round for a local SQLite node against any transport.Central peer —
 // whether that is an in-process *centralstore.Store or a *remote.Client.
 //
