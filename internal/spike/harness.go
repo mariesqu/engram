@@ -1,6 +1,6 @@
 // Package spike is a compatibility shim for the convergence-proof acceptance
-// tests. The sync orchestration (Node, NewNode, Push, Pull, Sync, SyncAll, and
-// the Central type alias) has moved to internal/syncer — its production home,
+// tests. The sync orchestration (Node, NewNode, (*Node).Write, Push, Pull, Sync, SyncAll,
+// and the Central type alias) has moved to internal/syncer — its production home,
 // where the PR5b autosync Loop will also live. This file re-exports every
 // identifier so the existing acceptance tests in internal/spike and
 // internal/remote continue to compile and pass unchanged.
