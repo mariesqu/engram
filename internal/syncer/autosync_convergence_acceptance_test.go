@@ -142,12 +142,16 @@ func autoStore(t *testing.T) *centralstore.Store {
 	return store
 }
 
-// autoTestKey returns a deterministic 32-byte HMAC key for the given writerID.
-// Matches the pattern in wire_convergence_acceptance_test.go.
+// autoTestKey returns a deterministic 32-byte HMAC key for the given writerID,
+// DISTINCT per writer (derived from the full writerID, not just its length, so
+// equal-length IDs don't collide). Matches wire_convergence_acceptance_test.go.
 func autoTestKey(writerID string) []byte {
 	key := make([]byte, 32)
 	for i := range key {
-		key[i] = byte(len(writerID)+i+1) & 0xFF
+		key[i] = byte(i + 1)
+	}
+	for i := 0; i < len(writerID); i++ {
+		key[i%len(key)] ^= writerID[i]
 	}
 	return key
 }

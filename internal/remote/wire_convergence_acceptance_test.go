@@ -161,11 +161,18 @@ func wireStore(t *testing.T) *centralstore.Store {
 
 // wireTestKey returns a deterministic 32-byte HMAC key for a given writer name.
 // Using deterministic keys (not wireauth.NewKey) keeps test logs reproducible.
-// Each writer gets a distinct key so one writer cannot forge another's requests.
+// Each writer gets a DISTINCT key derived from the full writerID (not just its
+// length) — so equal-length writer IDs like "writer-A"/"writer-B" do NOT collide.
+// This matters: distinct per-writer keys make the convergence proof genuinely
+// exercise per-writer key lookup on the server (a wrong-key lookup would fail
+// verification, not silently pass because every writer shares one key).
 func wireTestKey(writerID string) []byte {
 	key := make([]byte, 32)
 	for i := range key {
-		key[i] = byte(len(writerID)+i+1) & 0xFF
+		key[i] = byte(i + 1)
+	}
+	for i := 0; i < len(writerID); i++ {
+		key[i%len(key)] ^= writerID[i]
 	}
 	return key
 }
