@@ -5,7 +5,7 @@
 //
 // Each test creates an isolated schema using the same withSearchPath + schema-
 // per-test pattern as internal/centralstore. The HTTP server is driven via
-// httptest.NewServer(cloudserve.New(store).Handler()) — no network ports, fully
+// httptest.NewServer(cloudserve.New(store, cloudserve.AllowAllVerifier()).Handler()) — no network ports, fully
 // hermetic.
 package cloudserve_test
 
@@ -140,7 +140,7 @@ func newIsolatedStore(t *testing.T) *centralstore.Store {
 // newTestHTTPServer returns an httptest.Server backed by a real centralstore.
 func newTestHTTPServer(t *testing.T, store *centralstore.Store) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(cloudserve.New(store).Handler())
+	ts := httptest.NewServer(cloudserve.New(store, cloudserve.AllowAllVerifier()).Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }

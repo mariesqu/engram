@@ -38,7 +38,7 @@ func TestWriteJSON_MarshalFailure_StillJSON(t *testing.T) {
 // read/write/idle timeouts (Slowloris defense), so they can't be silently dropped
 // in a future refactor.
 func TestHTTPServer_HasTimeouts(t *testing.T) {
-	srv := New(nil).httpServer(":0")
+	srv := New(nil, AllowAllVerifier()).httpServer(":0")
 
 	if srv.ReadHeaderTimeout != readHeaderTimeout {
 		t.Errorf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, readHeaderTimeout)
