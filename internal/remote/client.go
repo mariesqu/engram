@@ -128,9 +128,11 @@ func (c *Client) buildRequest(ctx context.Context, method, path string, body []b
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	sig := wireauth.Sign(c.key, method, path, body)
-	req.Header.Set(wireauth.HeaderWriterID, c.writerID)
-	req.Header.Set(wireauth.HeaderSignature, sig)
+	if c.writerID != "" && len(c.key) > 0 {
+		sig := wireauth.Sign(c.key, method, path, body)
+		req.Header.Set(wireauth.HeaderWriterID, c.writerID)
+		req.Header.Set(wireauth.HeaderSignature, sig)
+	}
 
 	return req, nil
 }
