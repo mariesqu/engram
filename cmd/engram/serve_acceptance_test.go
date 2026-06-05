@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,6 +23,7 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/remote"
+	"github.com/mariesqu/engram/internal/wireauth"
 )
 
 // ── Package-level embedded-postgres harness (mirrors centralstore pattern) ───
@@ -312,6 +314,28 @@ func TestAcceptance_ServeE2E(t *testing.T) {
 	if err := client.Apply(ctx, m); err != nil {
 		cancelServe()
 		t.Fatalf("client.Apply: %v (server must accept a signed request from writer-A)", err)
+	}
+
+	// Step 5b — NEGATIVE: a client signing with the WRONG key must be rejected (401).
+	// This proves the binary's serve genuinely ENFORCES auth (NewKeyVerifier): a
+	// signed-request-succeeds check alone would also pass under an open AllowAll
+	// server, so this guards against a serve.go → AllowAll regression.
+	wrongKey, err := wireauth.NewKey()
+	if err != nil {
+		cancelServe()
+		t.Fatalf("wireauth.NewKey: %v", err)
+	}
+	badClient := remote.New("http://"+addr, nil, "writer-A", wrongKey)
+	badM := testMutation("sync-serve-e2e-bad", "engram-test", "writer-A")
+	if applyErr := badClient.Apply(ctx, badM); applyErr == nil {
+		cancelServe()
+		t.Fatal("wrong-key Apply: got nil; want 401 (serve must ENFORCE auth, not run open)")
+	} else {
+		var se *remote.StatusError
+		if !errors.As(applyErr, &se) || se.Code != http.StatusUnauthorized {
+			cancelServe()
+			t.Fatalf("wrong-key Apply: got %v; want *remote.StatusError with Code 401", applyErr)
+		}
 	}
 
 	// Step 6 — cancel the context and assert graceful shutdown within 5 seconds.
