@@ -6,8 +6,11 @@
 // It is the companion of cloudserve (PR3) and together they form the
 // push/pull transport layer tested end-to-end by the PR4 convergence proof.
 //
-// Authentication (HMAC shared secret) is deferred to PR6; the client
-// currently sends unauthenticated requests, matching the server.
+// Authentication: every request is HMAC-signed with the writer's key (PR6b-2).
+// The server authenticates via cloudserve's Verifier (NewKeyVerifier). Pass a
+// non-empty writerID and a non-nil key to enable signing. The client signs the
+// URL path ("/v1/push" or "/v1/pull"), not the full URL, matching exactly what
+// the server's withAuth middleware receives in r.URL.Path.
 //
 // Retry / backoff is deferred to PR5; the client surfaces errors as
 // [StatusError] so the caller can distinguish retryable 5xx from
@@ -26,6 +29,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/wireauth"
 )
 
 // defaultTimeout is used when the caller passes a nil *http.Client.
@@ -77,27 +81,65 @@ func (e *StatusError) Retryable() bool {
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	writerID   string
+	key        []byte
 }
 
 // New constructs a Client targeting the cloudserve server at baseURL
-// (e.g. "http://localhost:8080"). If httpClient is nil a default client
-// with a 30-second timeout is used.
+// (e.g. "http://localhost:8080") with per-writer HMAC signing.
+//
+// writerID and key are used to sign every request:
+//   - X-Writer-Id header is set to writerID.
+//   - X-Signature header is set to wireauth.Sign(key, method, path, body).
+//
+// The path signed is the URL path only (e.g. "/v1/push"), never the full URL,
+// matching exactly what the server's withAuth middleware receives in r.URL.Path.
+//
+// If httpClient is nil a default client with a 30-second timeout is used.
 //
 // baseURL may include or omit a trailing slash: New trims any trailing slashes so
 // route paths (e.g. "/v1/push") are appended cleanly, never producing "//v1/push"
 // (which some servers answer with a redirect that net/http would follow by
 // downgrading POST to GET, silently breaking sync).
-func New(baseURL string, httpClient *http.Client) *Client {
+func New(baseURL string, httpClient *http.Client, writerID string, key []byte) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultTimeout}
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}
+	return &Client{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: httpClient,
+		writerID:   writerID,
+		key:        key,
+	}
+}
+
+// buildRequest constructs a signed POST request for the given path and body.
+//
+// It sets Content-Type: application/json and then signs the request:
+//   - X-Writer-Id: c.writerID
+//   - X-Signature: wireauth.Sign(c.key, method, path, body)
+//
+// The path (e.g. "/v1/push") is signed directly — NOT the full URL — so the
+// signature matches what the server's withAuth middleware computes from r.URL.Path.
+func (c *Client) buildRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	sig := wireauth.Sign(c.key, method, path, body)
+	req.Header.Set(wireauth.HeaderWriterID, c.writerID)
+	req.Header.Set(wireauth.HeaderSignature, sig)
+
+	return req, nil
 }
 
 // Apply pushes one mutation to the central server.
 //
 // It calls [syncwire.ToWire] on m, wraps it in a [syncwire.PushRequest],
-// marshals to JSON, and POSTs to baseURL+"/v1/push". On any 2xx response the optional
+// marshals to JSON, and POSTs to baseURL+"/v1/push". The request is signed with
+// the writer's HMAC key via [wireauth.Sign]. On any 2xx response the optional
 // [syncwire.PushResponse] body is decoded but its contents are not used (the
 // server echoes the mutation_id, which the client already knows). On any
 // non-2xx status a [*StatusError] is returned with the server's status code and
@@ -113,11 +155,10 @@ func (c *Client) Apply(ctx context.Context, m domain.Mutation) error {
 		return fmt.Errorf("remote.Apply: marshal PushRequest: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/push", bytes.NewReader(body))
+	req, err := c.buildRequest(ctx, http.MethodPost, "/v1/push", body)
 	if err != nil {
 		return fmt.Errorf("remote.Apply: build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -149,6 +190,7 @@ func (c *Client) Apply(ctx context.Context, m domain.Mutation) error {
 // for the given project, up to limit rows (0 means server default).
 //
 // It marshals a [syncwire.PullRequest] and POSTs to baseURL+"/v1/pull".
+// The request is signed with the writer's HMAC key via [wireauth.Sign].
 // On success it decodes the [syncwire.PullResponse] and calls
 // [syncwire.FromWire] on each [syncwire.WireMutation], returning the
 // reconstructed []domain.Mutation in seq-ascending order (the server
@@ -166,11 +208,10 @@ func (c *Client) PullSince(ctx context.Context, project string, sinceSeq int64, 
 		return nil, fmt.Errorf("remote.PullSince: marshal PullRequest: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/pull", bytes.NewReader(body))
+	req, err := c.buildRequest(ctx, http.MethodPost, "/v1/pull", body)
 	if err != nil {
 		return nil, fmt.Errorf("remote.PullSince: build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

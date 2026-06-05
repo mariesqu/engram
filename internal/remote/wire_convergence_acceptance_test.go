@@ -17,6 +17,11 @@
 //     last_write_mutation_id) converges over the wire.
 //   - Concurrent-delete tombstone metadata converges over the wire.
 //
+// PR6b-2: All convergence proofs run under REAL per-writer HMAC auth
+// (cloudserve.NewKeyVerifier). Each writer's key is provisioned via
+// store.UpsertWriterKey before use. The server authenticates every request;
+// converge means auth is NOT breaking reconciliation.
+//
 // Test isolation follows the proven spike_test pattern: one embedded-postgres
 // instance per package (TestMain), each test on a fresh schema (withSearchPath),
 // each node on a fresh SQLite file (t.TempDir). The httptest.Server is per-test
@@ -55,6 +60,7 @@ import (
 	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/spike"
+	"github.com/mariesqu/engram/internal/wireauth"
 )
 
 // ── Package-level embedded-postgres harness ───────────────────────────────────
@@ -153,15 +159,45 @@ func wireStore(t *testing.T) *centralstore.Store {
 	return store
 }
 
+// wireTestKey returns a deterministic 32-byte HMAC key for a given writer name.
+// Using deterministic keys (not wireauth.NewKey) keeps test logs reproducible.
+// Each writer gets a distinct key so one writer cannot forge another's requests.
+func wireTestKey(writerID string) []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(len(writerID)+i+1) & 0xFF
+	}
+	return key
+}
+
+// wireProvisionKey provisions a writer's HMAC key in the store so the
+// NewKeyVerifier can authenticate that writer's requests.
+func wireProvisionKey(t *testing.T, ctx context.Context, store *centralstore.Store, writerID string) []byte {
+	t.Helper()
+	key := wireTestKey(writerID)
+	if err := store.UpsertWriterKey(ctx, writerID, key); err != nil {
+		t.Fatalf("wireProvisionKey %q: %v", writerID, err)
+	}
+	return key
+}
+
 // newWireCentral starts a cloudserve httptest.Server backed by a real store
-// and returns a *remote.Client implementing transport.Central over HTTP.
+// with REAL per-writer HMAC auth (NewKeyVerifier). Returns a function
+// newClient(writerID) that constructs a signed *remote.Client for that writer.
+// Each writer used in the test must be provisioned via wireProvisionKey first.
 // The server is closed (and store connection returned) on test cleanup.
-func newWireCentral(t *testing.T) (*remote.Client, *centralstore.Store) {
+//
+// PR6b-2: AllowAllVerifier() replaced with cloudserve.NewKeyVerifier(store.WriterKey)
+// so every request is authenticated end-to-end.
+func newWireCentral(t *testing.T) (func(writerID string) *remote.Client, *centralstore.Store) {
 	t.Helper()
 	store := wireStore(t)
-	srv := httptest.NewServer(cloudserve.New(store, cloudserve.AllowAllVerifier()).Handler())
+	srv := httptest.NewServer(cloudserve.New(store, cloudserve.NewKeyVerifier(store.WriterKey)).Handler())
 	t.Cleanup(srv.Close)
-	return remote.New(srv.URL, nil), store
+	newClient := func(writerID string) *remote.Client {
+		return remote.New(srv.URL, nil, writerID, wireTestKey(writerID))
+	}
+	return newClient, store
 }
 
 // newWireNode opens a fresh local SQLite store in a temp dir and wraps it as a
@@ -226,6 +262,14 @@ func wireDel(writer, syncID, topic string, version int, at time.Time) domain.Mut
 	}
 }
 
+// wireNC pairs a spike.Node with its dedicated signed remote.Client.
+// With real HMAC auth each node must use the client signed for its writer_id;
+// a shared central client would be rejected by the forgery check.
+type wireNC struct {
+	node    *spike.Node
+	central spike.Central
+}
+
 // wireMustWrite applies a local write on a node, failing the test on error.
 func wireMustWrite(t *testing.T, n *spike.Node, m domain.Mutation) {
 	t.Helper()
@@ -234,22 +278,28 @@ func wireMustWrite(t *testing.T, n *spike.Node, m domain.Mutation) {
 	}
 }
 
-// wireSyncRounds runs `rounds` full bidirectional sync rounds across all given
-// nodes against the wire central, failing the test on the first error.
-func wireSyncRounds(ctx context.Context, t *testing.T, nodes []*spike.Node, central spike.Central, rounds int) {
+// wireSyncRounds runs `rounds` full bidirectional sync rounds. Each entry in
+// pairs provides the node's own signed central client; this is required for
+// real HMAC auth because each node's writer_id must match the authenticated
+// writer on the server side.
+func wireSyncRounds(ctx context.Context, t *testing.T, pairs []wireNC, rounds int) {
 	t.Helper()
-	if err := spike.SyncAll(ctx, nodes, central, wireProject, rounds); err != nil {
-		t.Fatalf("wireSyncRounds(%d): %v", rounds, err)
+	for i := 0; i < rounds; i++ {
+		for _, p := range pairs {
+			if _, _, err := spike.Sync(ctx, p.node, p.central, wireProject); err != nil {
+				t.Fatalf("wireSyncRounds round %d node %s: %v", i+1, p.node.Name, err)
+			}
+		}
 	}
 }
 
-// wirePush pushes a node's outbox to the wire central.
+// wirePush pushes a node's outbox to the wire central using that node's signed client.
 func wirePush(ctx context.Context, t *testing.T, n *spike.Node, central spike.Central) (int, error) {
 	t.Helper()
 	return spike.Push(ctx, n, central)
 }
 
-// wirePull pulls central mutations to a node.
+// wirePull pulls central mutations to a node using that node's signed client.
 func wirePull(ctx context.Context, t *testing.T, n *spike.Node, central spike.Central) (int, error) {
 	t.Helper()
 	return spike.Pull(ctx, n, central, wireProject)
@@ -546,14 +596,23 @@ func wireTopicKeys(m map[string]wireLiveSnap) []string {
 
 // ────────────────────────────────────────────────────────────────────────────
 // WIRE CONVERGENCE PROOF — 6 invariants + exact-tie + concurrent deletes
+// (PR6b-2: ALL tests run under real per-writer HMAC auth via NewKeyVerifier)
 // ────────────────────────────────────────────────────────────────────────────
 
 // TestWire_INV1_TopicConvergence: A writes older, B writes newer same topic.
 // A pushes first (canonical identity), B pushes second (newer content wins).
 // After sync all three stores hold one live row with B's content.
+//
+// PR6b-2: writer-A and writer-B are provisioned; each uses its own signed client.
 func TestWire_INV1_TopicConvergence(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	// Provision HMAC keys for both writers — NewKeyVerifier will look these up.
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	topic := "wire/test/inv1-topic"
@@ -561,14 +620,14 @@ func TestWire_INV1_TopicConvergence(t *testing.T) {
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", topic, "A content (older)", 1, wireBase.Add(10*time.Second)))
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-B", topic, "B content (newer winner)", 2, wireBase.Add(20*time.Second)))
 
-	if _, err := wirePush(ctx, t, a, central); err != nil {
+	if _, err := wirePush(ctx, t, a, cA); err != nil {
 		t.Fatalf("push A: %v", err)
 	}
-	if _, err := wirePush(ctx, t, b, central); err != nil {
+	if _, err := wirePush(ctx, t, b, cB); err != nil {
 		t.Fatalf("push B: %v", err)
 	}
 
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	wireAssertOneLiveEverywhere(t, a, b, store, topic, "sync-A", "B content (newer winner)")
 	wireAssertCentralLiveCount(ctx, t, store, topic, 1)
@@ -583,26 +642,33 @@ func TestWire_INV1_TopicConvergence(t *testing.T) {
 }
 
 // TestWire_INV2_MonotonicSeq: interleaved pushes produce strictly increasing seqs.
+//
+// PR6b-2: each node uses its own signed client matching its writer_id.
 func TestWire_INV2_MonotonicSeq(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-2a1", "wire/test/inv2-a1", "a1", 1, wireBase.Add(1*time.Second)))
-	if _, err := wirePush(ctx, t, a, central); err != nil {
+	if _, err := wirePush(ctx, t, a, cA); err != nil {
 		t.Fatalf("push A1: %v", err)
 	}
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-2b1", "wire/test/inv2-b1", "b1", 1, wireBase.Add(2*time.Second)))
-	if _, err := wirePush(ctx, t, b, central); err != nil {
+	if _, err := wirePush(ctx, t, b, cB); err != nil {
 		t.Fatalf("push B1: %v", err)
 	}
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-2a2", "wire/test/inv2-a2", "a2", 1, wireBase.Add(3*time.Second)))
-	if _, err := wirePush(ctx, t, a, central); err != nil {
+	if _, err := wirePush(ctx, t, a, cA); err != nil {
 		t.Fatalf("push A2: %v", err)
 	}
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-2b2", "wire/test/inv2-b2", "b2", 1, wireBase.Add(4*time.Second)))
-	if _, err := wirePush(ctx, t, b, central); err != nil {
+	if _, err := wirePush(ctx, t, b, cB); err != nil {
 		t.Fatalf("push B2: %v", err)
 	}
 
@@ -631,7 +697,7 @@ func TestWire_INV2_MonotonicSeq(t *testing.T) {
 		}
 	}
 
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	for _, topic := range []string{"wire/test/inv2-a1", "wire/test/inv2-b1", "wire/test/inv2-a2", "wire/test/inv2-b2"} {
 		for _, nd := range []*spike.Node{a, b} {
@@ -643,22 +709,29 @@ func TestWire_INV2_MonotonicSeq(t *testing.T) {
 }
 
 // TestWire_INV3_NoLostUpdate: older write must not clobber newer after convergence.
+//
+// PR6b-2: each node uses its own signed client.
 func TestWire_INV3_NoLostUpdate(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	topic := "wire/test/inv3-nolost"
 
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-B", topic, "B content (newer, must survive)", 2, wireBase.Add(50*time.Second)))
-	if _, err := wirePush(ctx, t, b, central); err != nil {
+	if _, err := wirePush(ctx, t, b, cB); err != nil {
 		t.Fatalf("push B: %v", err)
 	}
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", topic, "A content (older, must lose)", 1, wireBase.Add(10*time.Second)))
-	if _, err := wirePush(ctx, t, a, central); err != nil {
+	if _, err := wirePush(ctx, t, a, cA); err != nil {
 		t.Fatalf("push A: %v", err)
 	}
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	wireAssertOneLiveEverywhere(t, a, b, store, topic, "sync-B", "B content (newer, must survive)")
 	wireAssertCentralLiveCount(ctx, t, store, topic, 1)
@@ -666,47 +739,61 @@ func TestWire_INV3_NoLostUpdate(t *testing.T) {
 
 // TestWire_INV4_NoResurrection: stale upsert must not revive a deleted topic;
 // strictly newer upsert DOES revive it.
+//
+// PR6b-2: each node uses its own signed client.
 func TestWire_INV4_NoResurrection(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	topic := "wire/test/inv4-resurrect"
 
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", topic, "A original", 1, wireBase.Add(10*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 	wireAssertOneLiveEverywhere(t, a, b, store, topic, "sync-A", "A original")
 
 	wireMustWrite(t, a, wireDel("writer-A", "sync-A", topic, 2, wireBase.Add(50*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 	wireAssertDeletedEverywhere(ctx, t, a, b, store, topic)
 
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-B", topic, "B STALE revive attempt", 1, wireBase.Add(30*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 3)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 3)
 	wireAssertDeletedEverywhere(ctx, t, a, b, store, topic) // still deleted
 
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", topic, "A revived (newer than delete)", 3, wireBase.Add(90*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 3)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 3)
 	wireAssertOneLiveEverywhere(t, a, b, store, topic, "sync-A", "A revived (newer than delete)")
 	wireAssertCentralLiveCount(ctx, t, store, topic, 1)
 }
 
 // TestWire_INV5_Idempotent: repeated sync rounds do not double-apply or grow seq.
+//
+// PR6b-2: each node uses its own signed client.
 func TestWire_INV5_Idempotent(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	topic := "wire/test/inv5-idem"
 
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", topic, "A idem", 1, wireBase.Add(10*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	seqAfterFirst := wireMaxCentralSeq(ctx, t, store)
 	mutCountFirst := wireCentralMutationCount(ctx, t, store)
 	verAfterFirst := wireLiveTopicOnCentral(t, store, topic).Version
 
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 3)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 3)
 
 	if got := wireMaxCentralSeq(ctx, t, store); got != seqAfterFirst {
 		t.Errorf("INV5 wire: central max seq grew on no-op rounds: %d → %d", seqAfterFirst, got)
@@ -731,16 +818,23 @@ func TestWire_INV5_Idempotent(t *testing.T) {
 }
 
 // TestWire_INV6_IndependentWrites: different topics both survive on all stores.
+//
+// PR6b-2: each node uses its own signed client.
 func TestWire_INV6_IndependentWrites(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	t1, t2 := "wire/test/inv6-t1", "wire/test/inv6-t2"
 
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", t1, "A's T1", 1, wireBase.Add(10*time.Second)))
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-B", t2, "B's T2", 1, wireBase.Add(20*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	wireAssertOneLiveEverywhere(t, a, b, store, t1, "sync-A", "A's T1")
 	wireAssertOneLiveEverywhere(t, a, b, store, t2, "sync-B", "B's T2")
@@ -750,9 +844,16 @@ func TestWire_INV6_IndependentWrites(t *testing.T) {
 
 // TestWire_FullBidirectionalSettles: after a full bidirectional sync, A.local ==
 // B.local == central for every live record (full snapshot equality).
+//
+// PR6b-2: each node uses its own signed client.
 func TestWire_FullBidirectionalSettles(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 
@@ -764,10 +865,10 @@ func TestWire_FullBidirectionalSettles(t *testing.T) {
 	wireMustWrite(t, b, wireUpsert("writer-B", "sync-B2", t3, "B T3", 1, wireBase.Add(25*time.Second)))
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A4", t4, "A T4 (will delete)", 1, wireBase.Add(30*time.Second)))
 
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	wireMustWrite(t, a, wireDel("writer-A", "sync-A4", t4, 2, wireBase.Add(60*time.Second)))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 
 	wireAssertOneLiveEverywhere(t, a, b, store, t1, "sync-A1", "B T1 newer")
 	wireAssertOneLiveEverywhere(t, a, b, store, t2, "sync-A2", "A T2")
@@ -799,10 +900,15 @@ func TestWire_FullBidirectionalSettles(t *testing.T) {
 // causing split-brain at the exact-tie boundary — the root cause the PR3
 // carry-original fix addressed.
 //
-// This test DIRECTLY validates that fix survives the full HTTP + JSONB path.
+// PR6b-2: runs under real HMAC auth; convergence must still hold.
 func TestWire_ExactTie_MutationIDConverges(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	topic := "wire/test/final-tiebreaker-jsonb"
@@ -818,7 +924,7 @@ func TestWire_ExactTie_MutationIDConverges(t *testing.T) {
 
 	// Phase 1a: A inserts sync-A (older), push so sync-A is central canonical.
 	wireMustWrite(t, a, wireUpsert("writer-A", syncA, topic, "A content (older)", 1, tOlder))
-	if _, err := wirePush(ctx, t, a, central); err != nil {
+	if _, err := wirePush(ctx, t, a, cA); err != nil {
 		t.Fatalf("push A (sync-A): %v", err)
 	}
 
@@ -826,7 +932,7 @@ func TestWire_ExactTie_MutationIDConverges(t *testing.T) {
 	wireMustWrite(t, b, wireUpsert("writer-B", syncB, topic, "B content (winner)", 2, tWinner))
 
 	// Settle: writer-B's newer write wins; A stored PK = sync-A, B stored PK = sync-B.
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 3)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 3)
 
 	aPK := wireLocalCanonicalSyncID(t, a, topic)
 	bPK := wireLocalCanonicalSyncID(t, b, topic)
@@ -880,7 +986,7 @@ func TestWire_ExactTie_MutationIDConverges(t *testing.T) {
 		winnerMut.MutationID, probeID,
 		map[bool]string{true: "SHOULD", false: "must NOT"}[probeShouldWin])
 
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 4)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 4)
 
 	aFinal := wireLiveTopicOnNode(t, a, topic)
 	bFinal := wireLiveTopicOnNode(t, b, topic)
@@ -913,9 +1019,20 @@ func TestWire_ExactTie_MutationIDConverges(t *testing.T) {
 // TestWire_ConcurrentDeletes_TombstoneMetadataConverges: two deletes at different
 // updated_at values applied in opposite orders on the two nodes must converge
 // to the NEWER delete's metadata everywhere.
+//
+// PR6b-2: writer-A, writer-B, and writer-C are all provisioned; each uses its
+// own signed client. One-writer-per-node invariant confirmed: no node submits
+// mutations under a different writer_id than its own key.
 func TestWire_ConcurrentDeletes_TombstoneMetadataConverges(t *testing.T) {
 	ctx := context.Background()
-	central, store := newWireCentral(t)
+	newClient, store := newWireCentral(t)
+	wireProvisionKey(t, ctx, store, "writer-A")
+	wireProvisionKey(t, ctx, store, "writer-B")
+	wireProvisionKey(t, ctx, store, "writer-C")
+	cA := newClient("writer-A")
+	cB := newClient("writer-B")
+	cC := newClient("writer-C")
+
 	a := newWireNode(t, "A")
 	b := newWireNode(t, "B")
 	topic := "wire/test/concurrent-deletes-tombstone"
@@ -927,7 +1044,7 @@ func TestWire_ConcurrentDeletes_TombstoneMetadataConverges(t *testing.T) {
 
 	// Establish live row on all stores.
 	wireMustWrite(t, a, wireUpsert("writer-A", "sync-A", topic, "initial content", 1, tInit))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 2)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 2)
 	if wireLiveTopicOnNode(t, a, topic) == nil {
 		t.Fatalf("precondition: topic not live on A")
 	}
@@ -940,12 +1057,12 @@ func TestWire_ConcurrentDeletes_TombstoneMetadataConverges(t *testing.T) {
 	wireMustWrite(t, b, wireDel("writer-B", "sync-B", topic, 3, tB))
 
 	// Push in order: A's older delete first.
-	if _, err := wirePush(ctx, t, a, central); err != nil {
+	if _, err := wirePush(ctx, t, a, cA); err != nil {
 		t.Fatalf("push A (older delete): %v", err)
 	}
 	sA := wireMaxCentralSeq(ctx, t, store)
 
-	if _, err := wirePush(ctx, t, b, central); err != nil {
+	if _, err := wirePush(ctx, t, b, cB); err != nil {
 		t.Fatalf("push B (newer delete): %v", err)
 	}
 	sB := wireMaxCentralSeq(ctx, t, store)
@@ -955,13 +1072,13 @@ func TestWire_ConcurrentDeletes_TombstoneMetadataConverges(t *testing.T) {
 	}
 
 	// Pull in order: A pulls B's newer delete; B pulls A's older delete.
-	if _, err := wirePull(ctx, t, a, central); err != nil {
+	if _, err := wirePull(ctx, t, a, cA); err != nil {
 		t.Fatalf("pull A: %v", err)
 	}
-	if _, err := wirePull(ctx, t, b, central); err != nil {
+	if _, err := wirePull(ctx, t, b, cB); err != nil {
 		t.Fatalf("pull B: %v", err)
 	}
-	wireSyncRounds(ctx, t, []*spike.Node{a, b}, central, 3)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}}, 3)
 
 	// Tombstone metadata must converge to the NEWER delete's values.
 	aDA, aVer, aBy := wireLocalTombstoneMeta(t, a, topic)
@@ -998,7 +1115,7 @@ func TestWire_ConcurrentDeletes_TombstoneMetadataConverges(t *testing.T) {
 	// on all stores — the winning tombstone at tB is newer.
 	c := newWireNode(t, "C")
 	wireMustWrite(t, c, wireUpsert("writer-C", "sync-C", topic, "C resurrection attempt", 4, tBetween))
-	wireSyncRounds(ctx, t, []*spike.Node{a, b, c}, central, 4)
+	wireSyncRounds(ctx, t, []wireNC{{a, cA}, {b, cB}, {c, cC}}, 4)
 
 	aLive := wireLiveTopicOnNode(t, a, topic) != nil
 	bLive := wireLiveTopicOnNode(t, b, topic) != nil
@@ -1013,6 +1130,96 @@ func TestWire_ConcurrentDeletes_TombstoneMetadataConverges(t *testing.T) {
 	if aLive || bLive || cLive || ctrLive {
 		t.Errorf("WRONG STATE wire: upsert at tBetween must be BLOCKED by winning tombstone at tB")
 	}
+}
+
+// ── NEGATIVE AUTH TESTS ───────────────────────────────────────────────────────
+
+// wireAuthServer starts a cloudserve server with real NewKeyVerifier and
+// returns (serverURL, store) so negative tests can build clients directly
+// with arbitrary keys without going through the newWireCentral factory.
+func wireAuthServer(t *testing.T) (serverURL string, store *centralstore.Store) {
+	t.Helper()
+	store = wireStore(t)
+	srv := httptest.NewServer(cloudserve.New(store, cloudserve.NewKeyVerifier(store.WriterKey)).Handler())
+	t.Cleanup(srv.Close)
+	return srv.URL, store
+}
+
+// TestWire_Auth_UnprovisionedWriter_Returns401 proves that auth is actually
+// enforced end-to-end — not silently bypassed. A client constructed with an
+// UNPROVISIONED writer (no UpsertWriterKey called) must receive a 401 from
+// Apply. The error must be a *remote.StatusError with Code == 401 and
+// Retryable() == false (auth failures are non-retryable 4xx).
+//
+// This test prevents the silent-bypass failure mode: if AllowAllVerifier were
+// accidentally left in place, every request would succeed and this test fails.
+func TestWire_Auth_UnprovisionedWriter_Returns401(t *testing.T) {
+	ctx := context.Background()
+	serverURL, _ := wireAuthServer(t)
+	// Do NOT provision "writer-unprovisioned" — no row in cloud_writer_keys.
+	badClient := remote.New(serverURL, nil, "writer-unprovisioned", wireTestKey("writer-unprovisioned"))
+
+	m := testMutation(t, "wire/test/auth-reject", "should be rejected")
+	m.WriterID = "writer-unprovisioned"
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+
+	err := badClient.Apply(ctx, m)
+	if err == nil {
+		t.Fatal("Apply: expected 401 error for unprovisioned writer, got nil — auth may be bypassed")
+	}
+
+	var se *remote.StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("Apply: error is %T (%v), want *remote.StatusError", err, err)
+	}
+	if se.Code != 401 {
+		t.Errorf("Apply: StatusError.Code = %d; want 401 (unprovisioned writer must be rejected)", se.Code)
+	}
+	if se.Retryable() {
+		t.Error("Apply: 401 must NOT be retryable (auth failure is a permanent client error)")
+	}
+	t.Logf("auth enforcement confirmed: unprovisioned writer got StatusError{Code:%d}", se.Code)
+}
+
+// TestWire_Auth_WrongKey_Returns401 proves that a client signing with the
+// WRONG key (different from the provisioned key) also gets 401.
+func TestWire_Auth_WrongKey_Returns401(t *testing.T) {
+	ctx := context.Background()
+	serverURL, store := wireAuthServer(t)
+
+	// Provision writer-A with the standard deterministic key.
+	wireProvisionKey(t, ctx, store, "writer-A")
+
+	// Build a client that uses "writer-A" as the writer_id but signs with a
+	// DIFFERENT key — the HMAC verification must fail on the server side.
+	wrongKey, err := wireauth.NewKey()
+	if err != nil {
+		t.Fatalf("wireauth.NewKey: %v", err)
+	}
+	badClient := remote.New(serverURL, nil, "writer-A", wrongKey)
+
+	m := testMutation(t, "wire/test/wrong-key", "should be rejected")
+	m.WriterID = "writer-A"
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+
+	applyErr := badClient.Apply(ctx, m)
+	if applyErr == nil {
+		t.Fatal("Apply: expected 401 for wrong key, got nil — HMAC verification may be bypassed")
+	}
+
+	var se *remote.StatusError
+	if !errors.As(applyErr, &se) {
+		t.Fatalf("Apply: error is %T (%v), want *remote.StatusError", applyErr, applyErr)
+	}
+	if se.Code != 401 {
+		t.Errorf("Apply: StatusError.Code = %d; want 401 (wrong key must be rejected)", se.Code)
+	}
+	if se.Retryable() {
+		t.Error("Apply: 401 must NOT be retryable")
+	}
+	t.Logf("auth enforcement confirmed: wrong key got StatusError{Code:%d}", se.Code)
 }
 
 // ── Infrastructure helpers ────────────────────────────────────────────────────
