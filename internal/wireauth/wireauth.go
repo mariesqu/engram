@@ -67,9 +67,9 @@ const (
 // body. The component Writes never return a meaningful error (hash.Hash.Write
 // never errors; bytes.Buffer.Write never errors), so the results are ignored.
 func writeCanonical(w io.Writer, method, path string, body []byte) {
-	_, _ = w.Write([]byte(method))
+	_, _ = io.WriteString(w, method)
 	_, _ = w.Write([]byte{'\n'})
-	_, _ = w.Write([]byte(path))
+	_, _ = io.WriteString(w, path)
 	_, _ = w.Write([]byte{'\n'})
 	_, _ = w.Write(body)
 }
