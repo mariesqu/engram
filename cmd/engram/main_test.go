@@ -72,9 +72,9 @@ func TestRun_KeysProvisionMissingWriterID(t *testing.T) {
 	}
 }
 
-// TestRun_KeysRevokesMissingWriterID verifies that 'keys revoke' with a DSN
+// TestRun_KeysRevokeMissingWriterID verifies that 'keys revoke' with a DSN
 // but no writer-id returns exit code 1.
-func TestRun_KeysRevokesMissingWriterID(t *testing.T) {
+func TestRun_KeysRevokeMissingWriterID(t *testing.T) {
 	t.Setenv("ENGRAM_DSN", "")
 	code := run([]string{"keys", "revoke", "--dsn", "postgres://fake/db"})
 	if code != 1 {

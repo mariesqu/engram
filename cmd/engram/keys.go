@@ -54,9 +54,13 @@ func runProvisionCmd(args []string) error {
 	fs := flag.NewFlagSet("keys provision", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: engram keys provision <writer-id> [--dsn <dsn>]")
+		fs.PrintDefaults()
 	}
 	dsn := fs.String("dsn", envOr("ENGRAM_DSN", ""), "Postgres DSN (required)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // --help printed usage; successful early-exit (exit 0)
+		}
 		return err
 	}
 	if *dsn == "" {
@@ -85,9 +89,13 @@ func runRevokeCmd(args []string) error {
 	fs := flag.NewFlagSet("keys revoke", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: engram keys revoke <writer-id> [--dsn <dsn>]")
+		fs.PrintDefaults()
 	}
 	dsn := fs.String("dsn", envOr("ENGRAM_DSN", ""), "Postgres DSN (required)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // --help printed usage; successful early-exit (exit 0)
+		}
 		return err
 	}
 	if *dsn == "" {

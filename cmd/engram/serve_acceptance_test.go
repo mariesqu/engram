@@ -342,8 +342,9 @@ func TestAcceptance_ServeE2E(t *testing.T) {
 	cancelServe()
 	select {
 	case err := <-serveErrCh:
-		// nil means clean shutdown (Shutdown returned nil); http.ErrServerClosed
-		// is also acceptable (it can surface on some platforms).
+		// runServe → cloudserve.Run returns Shutdown's result on ctx cancel: nil on a
+		// clean graceful shutdown. (Run filters http.ErrServerClosed from
+		// ListenAndServe internally, so it never surfaces here.)
 		if err != nil {
 			t.Errorf("runServe after cancel: got error %v, want nil (graceful shutdown)", err)
 		}

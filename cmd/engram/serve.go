@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -38,6 +39,9 @@ func runServeCmd(args []string) error {
 	dsn := fs.String("dsn", envOr("ENGRAM_DSN", ""), "Postgres DSN (required)")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // --help printed usage; successful early-exit (exit 0)
+		}
 		return err
 	}
 	if *dsn == "" {
