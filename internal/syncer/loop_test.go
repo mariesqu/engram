@@ -140,9 +140,8 @@ func openNode(t *testing.T, name string) *syncer.Node {
 
 // ── fast config ──────────────────────────────────────────────────────────────
 
-// fastCfg returns a Config with sub-millisecond durations so tests complete in
+// fastCfg returns a Config with millisecond-scale durations so tests complete in
 // tens of milliseconds.
-func fastCfg() syncer.Config {
 	return syncer.Config{
 		Interval:   5 * time.Millisecond,
 		Debounce:   2 * time.Millisecond,
