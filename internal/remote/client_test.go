@@ -16,6 +16,7 @@ import (
 	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/wireauth"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -55,6 +56,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(b)
 }
 
+// testKey returns a fixed 32-byte key for use in unit tests.
+// Using a fixed key (not wireauth.NewKey) keeps tests deterministic.
+func testKey() []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	return key
+}
+
 // ── Apply tests ──────────────────────────────────────────────────────────────
 
 func TestClient_Apply_200_ReturnsNil(t *testing.T) {
@@ -80,7 +91,7 @@ func TestClient_Apply_200_ReturnsNil(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/apply-200", "hello")
 
 	if err := c.Apply(context.Background(), m); err != nil {
@@ -113,7 +124,7 @@ func TestClient_Apply_400_ReturnsStatusError_NonRetryable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/apply-400", "content")
 
 	err := c.Apply(context.Background(), m)
@@ -139,7 +150,7 @@ func TestClient_Apply_500_ReturnsStatusError_Retryable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/apply-500", "content")
 
 	err := c.Apply(context.Background(), m)
@@ -172,7 +183,7 @@ func TestClient_Apply_ContextCancellation(t *testing.T) {
 	defer srv.Close()
 	defer close(unblock)
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/apply-cancel", "content")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -217,7 +228,7 @@ func TestClient_PullSince_200_DecodesMutations(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	got, err := c.PullSince(context.Background(), "engram", 0, 100)
 	if err != nil {
 		t.Fatalf("PullSince returned error: %v", err)
@@ -254,7 +265,7 @@ func TestClient_PullSince_500_ReturnsStatusError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	_, err := c.PullSince(context.Background(), "engram", 0, 100)
 	if err == nil {
 		t.Fatal("PullSince: expected error on 500, got nil")
@@ -284,7 +295,7 @@ func TestClient_PullSince_ContextCancellation(t *testing.T) {
 	defer srv.Close()
 	defer close(unblock)
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	ctx, cancel := context.WithCancel(context.Background())
 
 	errCh := make(chan error, 1)
@@ -328,7 +339,7 @@ func TestNew_NilHttpClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	_, err := c.PullSince(context.Background(), "engram", 0, 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -349,7 +360,7 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	defer srv.Close()
 
 	// Pass a baseURL WITH a trailing slash; New must trim it.
-	c := remote.New(srv.URL+"/", nil)
+	c := remote.New(srv.URL+"/", nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/trailing-slash", "hello")
 	if err := c.Apply(context.Background(), m); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -387,7 +398,7 @@ func TestClient_Apply_TruncatedBody_ReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/truncated", "hello")
 	if err := c.Apply(context.Background(), m); err == nil {
 		t.Error("Apply returned nil on a truncated response body; want a read error")
@@ -406,9 +417,109 @@ func TestClient_Apply_OversizedBody_ReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := remote.New(srv.URL, nil)
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/oversized", "hello")
 	if err := c.Apply(context.Background(), m); err == nil {
 		t.Error("Apply returned nil on an oversized response body; want an explicit overflow error")
+	}
+}
+
+// ── Signing correctness tests ────────────────────────────────────────────────
+
+// TestClient_Apply_SendsCorrectSignatureHeaders proves that Apply sends
+// X-Writer-Id and X-Signature headers that pass wireauth.Verify for the
+// exact body and path ("/v1/push") the server will receive.
+func TestClient_Apply_SendsCorrectSignatureHeaders(t *testing.T) {
+	const writerID = "writer-signing-test"
+	key := testKey()
+
+	type capture struct {
+		writerID string
+		sig      string
+		body     []byte
+	}
+	capCh := make(chan capture, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		capCh <- capture{
+			writerID: r.Header.Get(wireauth.HeaderWriterID),
+			sig:      r.Header.Get(wireauth.HeaderSignature),
+			body:     body,
+		}
+		writeJSON(w, http.StatusOK, syncwire.PushResponse{Status: "ok", Applied: true})
+	}))
+	defer srv.Close()
+
+	c := remote.New(srv.URL, nil, writerID, key)
+	m := testMutation(t, "sdd/test/sign-apply", "signing content")
+	if err := c.Apply(context.Background(), m); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	var cap capture
+	select {
+	case cap = <-capCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never invoked")
+	}
+
+	if cap.writerID != writerID {
+		t.Errorf("X-Writer-Id = %q; want %q", cap.writerID, writerID)
+	}
+
+	// The signed path must be "/v1/push" (URL path only, not the full URL).
+	if !wireauth.Verify(key, http.MethodPost, "/v1/push", cap.body, cap.sig) {
+		t.Errorf("wireauth.Verify failed for Apply: sig=%q body=%s — "+
+			"client may be signing the full URL instead of just the path", cap.sig, cap.body)
+	}
+}
+
+// TestClient_PullSince_SendsCorrectSignatureHeaders proves that PullSince sends
+// X-Writer-Id and X-Signature headers that pass wireauth.Verify for the
+// exact body and path ("/v1/pull") the server will receive.
+func TestClient_PullSince_SendsCorrectSignatureHeaders(t *testing.T) {
+	const writerID = "writer-signing-pull"
+	key := testKey()
+
+	type capture struct {
+		writerID string
+		sig      string
+		body     []byte
+	}
+	capCh := make(chan capture, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		capCh <- capture{
+			writerID: r.Header.Get(wireauth.HeaderWriterID),
+			sig:      r.Header.Get(wireauth.HeaderSignature),
+			body:     body,
+		}
+		writeJSON(w, http.StatusOK, syncwire.PullResponse{Mutations: nil})
+	}))
+	defer srv.Close()
+
+	c := remote.New(srv.URL, nil, writerID, key)
+	_, err := c.PullSince(context.Background(), "engram", 0, 10)
+	if err != nil {
+		t.Fatalf("PullSince: %v", err)
+	}
+
+	var cap capture
+	select {
+	case cap = <-capCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never invoked")
+	}
+
+	if cap.writerID != writerID {
+		t.Errorf("X-Writer-Id = %q; want %q", cap.writerID, writerID)
+	}
+
+	// The signed path must be "/v1/pull" (URL path only, not the full URL).
+	if !wireauth.Verify(key, http.MethodPost, "/v1/pull", cap.body, cap.sig) {
+		t.Errorf("wireauth.Verify failed for PullSince: sig=%q body=%s — "+
+			"client may be signing the full URL instead of just the path", cap.sig, cap.body)
 	}
 }

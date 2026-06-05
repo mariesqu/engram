@@ -142,15 +142,36 @@ func autoStore(t *testing.T) *centralstore.Store {
 	return store
 }
 
+// autoTestKey returns a deterministic 32-byte HMAC key for the given writerID,
+// DISTINCT per writer (derived from the full writerID, not just its length, so
+// equal-length IDs don't collide). Matches wire_convergence_acceptance_test.go.
+func autoTestKey(writerID string) []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	for i := 0; i < len(writerID); i++ {
+		key[i%len(key)] ^= writerID[i]
+	}
+	return key
+}
+
 // autoHTTPCentral starts a cloudserve httptest.Server backed by a real
-// centralstore.Store and returns a *remote.Client implementing transport.Central
-// over HTTP. The server is closed on test cleanup.
-func autoHTTPCentral(t *testing.T) (*remote.Client, *centralstore.Store) {
+// centralstore.Store with REAL per-writer HMAC auth (NewKeyVerifier) and
+// returns a factory function newClient(writerID) plus the store.
+//
+// PR6b-2: AllowAllVerifier() replaced with cloudserve.NewKeyVerifier(store.WriterKey)
+// so every request is authenticated end-to-end. Each writer used in the test
+// must be provisioned via store.UpsertWriterKey before the Loop starts pushing.
+func autoHTTPCentral(t *testing.T) (func(writerID string) *remote.Client, *centralstore.Store) {
 	t.Helper()
 	store := autoStore(t)
-	srv := httptest.NewServer(cloudserve.New(store, cloudserve.AllowAllVerifier()).Handler())
+	srv := httptest.NewServer(cloudserve.New(store, cloudserve.NewKeyVerifier(store.WriterKey)).Handler())
 	t.Cleanup(srv.Close)
-	return remote.New(srv.URL, nil), store
+	newClient := func(writerID string) *remote.Client {
+		return remote.New(srv.URL, nil, writerID, autoTestKey(writerID))
+	}
+	return newClient, store
 }
 
 // autoNode opens a fresh localstore in t.TempDir and wraps it as a syncer.Node.
@@ -182,10 +203,27 @@ const (
 //     call — purely driven by the autosync Loop.
 //  3. After the Loops are stopped cleanly (Stop() blocks until goroutine exits),
 //     A.local, B.local, and central all converge on the same content.
+//
+// PR6b-2: runs under real per-writer HMAC auth (NewKeyVerifier). Each node
+// uses its own signed remote.Client. writers provisioned: "writer-A", "writer-B".
+// One writer per node — nodeA writes as "writer-A", nodeB writes as "writer-B".
 func TestAutoSync_WriteOnA_ReachesB(t *testing.T) {
 	ctx := context.Background()
 
-	central, store := autoHTTPCentral(t)
+	newClient, store := autoHTTPCentral(t)
+
+	// Provision HMAC keys for both writers before the loops start pushing.
+	if err := store.UpsertWriterKey(ctx, "writer-A", autoTestKey("writer-A")); err != nil {
+		t.Fatalf("UpsertWriterKey writer-A: %v", err)
+	}
+	if err := store.UpsertWriterKey(ctx, "writer-B", autoTestKey("writer-B")); err != nil {
+		t.Fatalf("UpsertWriterKey writer-B: %v", err)
+	}
+
+	// Each node gets its own signed remote.Client matching its writer_id.
+	centralA := newClient("writer-A")
+	centralB := newClient("writer-B")
+
 	nodeA := autoNode(t, "A")
 	nodeB := autoNode(t, "B")
 
@@ -195,8 +233,8 @@ func TestAutoSync_WriteOnA_ReachesB(t *testing.T) {
 		Debounce: 10 * time.Millisecond,
 	}
 
-	loopA := syncer.NewLoop(nodeA, central, autoProject, loopCfg)
-	loopB := syncer.NewLoop(nodeB, central, autoProject, loopCfg)
+	loopA := syncer.NewLoop(nodeA, centralA, autoProject, loopCfg)
+	loopB := syncer.NewLoop(nodeB, centralB, autoProject, loopCfg)
 
 	loopA.Start(ctx)
 	loopB.Start(ctx)
