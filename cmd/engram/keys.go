@@ -56,12 +56,18 @@ func runProvisionCmd(args []string) error {
 		fmt.Fprintln(os.Stderr, "Usage: engram keys provision <writer-id> [--dsn <dsn>]")
 		fs.PrintDefaults()
 	}
-	dsn := fs.String("dsn", envOr("ENGRAM_DSN", ""), "Postgres DSN (required)")
+	// --dsn defaults to EMPTY (not envOr): a Postgres DSN carries credentials and
+	// PrintDefaults prints the flag's default value, so baking ENGRAM_DSN into the
+	// default would leak the secret via --help. ENGRAM_DSN is resolved after Parse.
+	dsn := fs.String("dsn", "", "Postgres DSN (required; or set ENGRAM_DSN)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil // --help printed usage; successful early-exit (exit 0)
 		}
 		return err
+	}
+	if *dsn == "" {
+		*dsn = envOr("ENGRAM_DSN", "") // resolve env AFTER parse so the secret never enters the flag default
 	}
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")
@@ -91,12 +97,18 @@ func runRevokeCmd(args []string) error {
 		fmt.Fprintln(os.Stderr, "Usage: engram keys revoke <writer-id> [--dsn <dsn>]")
 		fs.PrintDefaults()
 	}
-	dsn := fs.String("dsn", envOr("ENGRAM_DSN", ""), "Postgres DSN (required)")
+	// --dsn defaults to EMPTY (not envOr): a Postgres DSN carries credentials and
+	// PrintDefaults prints the flag's default value, so baking ENGRAM_DSN into the
+	// default would leak the secret via --help. ENGRAM_DSN is resolved after Parse.
+	dsn := fs.String("dsn", "", "Postgres DSN (required; or set ENGRAM_DSN)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil // --help printed usage; successful early-exit (exit 0)
 		}
 		return err
+	}
+	if *dsn == "" {
+		*dsn = envOr("ENGRAM_DSN", "") // resolve env AFTER parse so the secret never enters the flag default
 	}
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")

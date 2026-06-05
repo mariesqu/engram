@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -79,6 +83,51 @@ func TestRun_KeysRevokeMissingWriterID(t *testing.T) {
 	code := run([]string{"keys", "revoke", "--dsn", "postgres://fake/db"})
 	if code != 1 {
 		t.Errorf("run([keys revoke --dsn ...]): got exit code %d, want 1", code)
+	}
+}
+
+// captureStderr runs f with os.Stderr redirected to a pipe and returns what was
+// written. Tests are sequential, so swapping the global os.Stderr is safe here.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	f()
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return buf.String()
+}
+
+// TestRun_KeysProvisionHelp_DoesNotLeakDSN proves `keys provision --help` never
+// prints the ENGRAM_DSN secret (a Postgres DSN carries DB credentials). Regression
+// guard for the credential-leak: --dsn must default to "" with ENGRAM_DSN resolved
+// AFTER Parse, so PrintDefaults has no secret default value to print.
+func TestRun_KeysProvisionHelp_DoesNotLeakDSN(t *testing.T) {
+	const secret = "postgres://user:topsecret@db.internal:5432/engram"
+	t.Setenv("ENGRAM_DSN", secret)
+
+	out := captureStderr(t, func() {
+		if code := run([]string{"keys", "provision", "--help"}); code != 0 {
+			t.Errorf("keys provision --help: exit code %d, want 0", code)
+		}
+	})
+
+	if strings.Contains(out, "topsecret") || strings.Contains(out, secret) {
+		t.Errorf("keys provision --help leaked the ENGRAM_DSN secret:\n%s", out)
+	}
+	// Sanity: the dsn flag is still listed (the point of PrintDefaults).
+	if !strings.Contains(out, "dsn") {
+		t.Errorf("keys provision --help should still list the dsn flag; got:\n%s", out)
 	}
 }
 

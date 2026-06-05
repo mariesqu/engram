@@ -36,13 +36,20 @@ func runServeCmd(args []string) error {
 	fs.Usage = func() { fmt.Print(serveUsage) }
 
 	addr := fs.String("addr", envOr("ENGRAM_ADDR", ":8080"), "listen address")
-	dsn := fs.String("dsn", envOr("ENGRAM_DSN", ""), "Postgres DSN (required)")
+	// --dsn defaults to EMPTY (not envOr): a Postgres DSN carries credentials, and
+	// flag error output / PrintDefaults print a flag's default value. Resolving
+	// ENGRAM_DSN here would bake the secret into the flag default and leak it via
+	// --help. ENGRAM_DSN is resolved after Parse instead.
+	dsn := fs.String("dsn", "", "Postgres DSN (required; or set ENGRAM_DSN)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil // --help printed usage; successful early-exit (exit 0)
 		}
 		return err
+	}
+	if *dsn == "" {
+		*dsn = envOr("ENGRAM_DSN", "") // resolve env AFTER parse so the secret never enters the flag default
 	}
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")
