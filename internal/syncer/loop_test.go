@@ -78,6 +78,19 @@ func (m *mockCentral) setErrFn(fn func(n int64) error) {
 	m.mu.Unlock()
 }
 
+// drain discards any buffered sync signals so a subsequent waitN counts only
+// syncs that occur after this point (used by the backoff-recovery test to ignore
+// signals buffered during the error window).
+func (m *mockCentral) drain() {
+	for {
+		select {
+		case <-m.syncCh:
+		default:
+			return
+		}
+	}
+}
+
 // waitN waits for exactly n sync signals with a generous bounded timeout.
 // Returns the number received; < n means timeout.
 func (m *mockCentral) waitN(n int, timeout time.Duration) int {
@@ -255,11 +268,13 @@ func TestLoop_BackoffRetryable(t *testing.T) {
 			t.Errorf("backoff: got %d syncs during backoff window; expected ≤4 (backoff should throttle)", retryCount)
 		}
 
-		// Phase 3: clear error → cadence should resume.
+		// Phase 3: clear error → the loop must resume syncing.
 		central.setStaticErr(nil)
-		// Wait for at least 2 more syncs at fast cadence.
-		got := central.waitN(int(central.callN.Load())+2, 2*time.Second)
-		_ = got
+		central.drain() // discard backoff-window signals so waitN counts only post-recovery syncs
+		// waitN counts from now: prove ≥3 fresh syncs land after the error clears.
+		if got := central.waitN(3, 2*time.Second); got < 3 {
+			t.Errorf("recovery: loop did not resume syncing after error cleared (got %d/3 syncs)", got)
+		}
 		l.Stop()
 	}
 }

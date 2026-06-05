@@ -50,7 +50,8 @@ type Config struct {
 	BackoffMin time.Duration
 
 	// BackoffMax caps the exponential backoff so a failing server is never
-	// starved indefinitely. Default: 2min.
+	// starved indefinitely. Default: 2min. Normalized up to BackoffMin if a caller
+	// configures it lower, so the cap is never below the floor.
 	BackoffMax time.Duration
 
 	// Logger is used for debug/warn messages. Default: slog.Default().
@@ -70,6 +71,12 @@ func applyDefaults(c Config) Config {
 	}
 	if c.BackoffMax <= 0 {
 		c.BackoffMax = 2 * time.Minute
+	}
+	// Normalize: the cap must never be below the floor. If a caller sets
+	// BackoffMin > BackoffMax, raise the cap to the floor so the first backoff
+	// (= BackoffMin) never exceeds the documented cap.
+	if c.BackoffMax < c.BackoffMin {
+		c.BackoffMax = c.BackoffMin
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
