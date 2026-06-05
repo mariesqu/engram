@@ -146,9 +146,17 @@ func (l *Loop) Trigger() {
 	}
 }
 
-// Stop signals the goroutine to exit and blocks until it does. It is
-// idempotent and safe to call after ctx cancellation.
+// Stop signals the goroutine to exit and blocks until it does. It is idempotent
+// and safe to call after ctx cancellation. Start and Stop must not race each
+// other — call Stop sequentially after Start (the normal lifecycle).
+//
+// If the Loop was never Started, Stop is a no-op and returns immediately (rather
+// than blocking forever on the never-closed done channel) — so a caller can put
+// Stop in a cleanup path even when Start was conditional.
 func (l *Loop) Stop() {
+	if !l.started.Load() {
+		return // never started: nothing to cancel, and done is never closed
+	}
 	l.stopOnce.Do(func() {
 		if l.cancel != nil {
 			l.cancel()
@@ -201,6 +209,11 @@ func (l *Loop) run(ctx context.Context) {
 
 			pushed, pulled, err := Sync(ctx, l.node, l.central, l.project)
 			if err != nil {
+				if ctx.Err() != nil {
+					// Context cancelled (Stop or parent shutdown) mid-sync: exit
+					// cleanly without logging the cancellation as a sync failure.
+					return
+				}
 				if isRetryable(err) {
 					// Exponential backoff: first failure → BackoffMin; subsequent → *2 up to max.
 					if backoff == 0 {

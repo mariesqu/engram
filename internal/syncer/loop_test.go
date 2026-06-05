@@ -532,3 +532,23 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 		})
 	}
 }
+
+// TestLoop_StopBeforeStart_NoDeadlock proves Stop() is a safe no-op when the Loop
+// was never Started — it must return immediately, not block forever on the
+// never-closed done channel.
+func TestLoop_StopBeforeStart_NoDeadlock(t *testing.T) {
+	l := syncer.NewLoop(nil, nil, "proj", syncer.Config{})
+
+	done := make(chan struct{})
+	go func() {
+		l.Stop() // never Started: must return immediately, not deadlock
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Stop returned promptly — correct.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() before Start() deadlocked")
+	}
+}
