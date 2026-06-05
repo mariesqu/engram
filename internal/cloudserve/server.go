@@ -73,15 +73,20 @@ const (
 // signature in the X-Signature header was produced with the key registered for
 // the writer identified by the X-Writer-Id header.
 //
+// On success Verify returns the AUTHENTICATED writer_id and a nil error. The
+// returned writer_id — NOT the raw X-Writer-Id header — is what the push forgery
+// check compares against: a verifier that establishes no identity (e.g.
+// AllowAllVerifier) returns "" so the forgery check is skipped, while a real
+// verifier returns the header writer_id it just authenticated.
+//
 // Verify must return a non-nil error if authentication fails for any reason —
-// missing writer_id, unknown writer_id, revoked key, or bad signature. It must
-// return nil if and only if the request is authentically signed.
+// missing writer_id, unknown writer_id, revoked key, or bad signature.
 //
 // The error value is only logged (WARN level); it is never sent to the client.
 // Use opaque sentinel errors or simple string messages — do NOT include key
 // material or DB details.
 type Verifier interface {
-	Verify(ctx context.Context, writerID, method, path string, body []byte, sig string) error
+	Verify(ctx context.Context, writerID, method, path string, body []byte, sig string) (authWriterID string, err error)
 }
 
 // errAuthFailed is the sentinel error for HMAC verification failures. It is
@@ -109,33 +114,37 @@ type keyVerifier struct {
 	lookup func(ctx context.Context, writerID string) ([]byte, error)
 }
 
-func (v *keyVerifier) Verify(ctx context.Context, writerID, method, path string, body []byte, sig string) error {
+func (v *keyVerifier) Verify(ctx context.Context, writerID, method, path string, body []byte, sig string) (string, error) {
 	key, err := v.lookup(ctx, writerID)
 	if err != nil {
 		// Includes ErrWriterKeyNotFound and any DB error — both are auth rejections.
-		return errAuthFailed
+		return "", errAuthFailed
 	}
 	if !wireauth.Verify(key, method, path, body, sig) {
-		return errAuthFailed
+		return "", errAuthFailed
 	}
-	return nil
+	// Authenticated: the signature was produced with writerID's key, so writerID
+	// is the confirmed identity.
+	return writerID, nil
 }
 
-// AllowAllVerifier returns a [Verifier] that always returns nil — every request
-// is accepted regardless of headers. Use this as an explicit opt-out from auth
-// in functional tests, acceptance harnesses, and local development. Passing
-// AllowAllVerifier() is required; passing nil panics.
+// AllowAllVerifier returns a [Verifier] that accepts every request and
+// establishes NO authenticated identity (it returns "" as the authenticated
+// writer_id). Use this as an explicit opt-out from auth in functional tests,
+// acceptance harnesses, and local development. Passing AllowAllVerifier() is
+// required; passing nil panics.
 //
 // When AllowAllVerifier is in use:
-//   - Auth headers are read but ignored (Verify is never called for the HMAC).
-//   - The authenticated writer_id stashed in context is empty.
-//   - The push forgery check is skipped (see handlePush).
+//   - The HMAC is never checked; any X-Writer-Id/X-Signature headers are ignored.
+//   - The authenticated writer_id stashed in context is ALWAYS "" — even if the
+//     request carries an X-Writer-Id header.
+//   - The push forgery check is therefore always skipped (see handlePush).
 func AllowAllVerifier() Verifier { return allowAllVerifier{} }
 
 type allowAllVerifier struct{}
 
-func (allowAllVerifier) Verify(_ context.Context, _, _, _ string, _ []byte, _ string) error {
-	return nil
+func (allowAllVerifier) Verify(_ context.Context, _, _, _ string, _ []byte, _ string) (string, error) {
+	return "", nil
 }
 
 // ── context key for authenticated writer_id ───────────────────────────────────
@@ -271,7 +280,8 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if err := s.verifier.Verify(r.Context(), writerID, r.Method, r.URL.Path, body, sig); err != nil {
+		authWriterID, err := s.verifier.Verify(r.Context(), writerID, r.Method, r.URL.Path, body, sig)
+		if err != nil {
 			s.logger.WarnContext(r.Context(), "cloudserve: auth failed",
 				"writer_id", writerID,
 				"method", r.Method,
@@ -285,8 +295,10 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		// Reset the body so downstream handlers can read the buffered bytes normally.
 		r.Body = io.NopCloser(bytes.NewReader(body))
 
-		// Stash the authenticated writer_id in context for the push forgery check.
-		ctx := context.WithValue(r.Context(), writerIDKey{}, writerID)
+		// Stash the AUTHENTICATED writer_id (what the verifier confirmed, NOT the raw
+		// header) in context for the push forgery check. AllowAllVerifier returns ""
+		// so the forgery check is skipped; a real verifier returns the verified id.
+		ctx := context.WithValue(r.Context(), writerIDKey{}, authWriterID)
 		next(w, r.WithContext(ctx))
 	}
 }
