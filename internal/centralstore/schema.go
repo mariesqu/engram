@@ -161,6 +161,26 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 
 		`CREATE INDEX IF NOT EXISTS idx_audit_project_created
 			ON cloud_sync_audit(project, created_at DESC)`,
+
+		// ── cloud_writer_keys ─────────────────────────────────────────────────────
+		// Per-writer HMAC keys used for request signing (PR6a).  One row per
+		// writer_id; writer_id is the PRIMARY KEY so there is at most one active key
+		// per writer at a time.
+		//
+		// secret is BYTEA, not a hash: HMAC verification requires the raw key, so
+		// storing it reversibly is intentional.  The DB is the trust boundary; key
+		// wrapping via envelope encryption (e.g. AWS KMS) is a future enhancement.
+		//
+		// active = false revokes a key without deleting the audit trail.  WriterKey
+		// returns ErrWriterKeyNotFound when active = false, preventing the revoked
+		// key from being used for new requests.
+		`CREATE TABLE IF NOT EXISTS cloud_writer_keys (
+			writer_id  TEXT        PRIMARY KEY,
+			secret     BYTEA       NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			active     BOOLEAN     NOT NULL DEFAULT true
+		)`,
 	}
 
 	for i, stmt := range stmts {
