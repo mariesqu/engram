@@ -18,9 +18,9 @@ type retryabler interface {
 
 // isRetryable classifies a sync error without importing internal/remote.
 //
-//   - nil            → not applicable (no error)
-//   - *StatusError   → delegates to its Retryable() method (5xx → true, 4xx → false)
-//   - any other err  → true  (network/IO/local errors are transient by default)
+//   - nil                        → not applicable (no error)
+//   - any error with Retryable() → delegates to its Retryable method (e.g. remote.StatusError: 5xx → true, 4xx → false)
+//   - any other err              → true  (network/IO/local errors are transient by default)
 func isRetryable(err error) bool {
 	if err == nil {
 		return false
