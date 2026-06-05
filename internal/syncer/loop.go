@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -104,13 +103,16 @@ type Loop struct {
 	// as N pending signals — one sync drains all local writes.
 	triggerCh chan struct{}
 
-	// started guards against double-Start.
-	started atomic.Bool
+	// mu serializes Start/Stop lifecycle state. It guards started, stopped, and
+	// cancel so that a concurrent Stop cannot observe started==true while cancel
+	// is still nil (which would be a data race).
+	mu      sync.Mutex
+	started bool
+	stopped bool
 
-	// stopOnce ensures Stop() is idempotent.
-	stopOnce sync.Once
-
-	// cancel is set by Start to cancel the run goroutine's context.
+	// cancel is set by Start under mu to cancel the run goroutine's context.
+	// Safe to read in Stop because Stop checks started==true under the same mu
+	// before reading cancel, guaranteeing it is non-nil.
 	cancel context.CancelFunc
 
 	// done is closed by the run goroutine just before it exits, allowing Stop()
@@ -133,10 +135,16 @@ func NewLoop(node *Node, central Central, project string, cfg Config) *Loop {
 // Start launches the background sync goroutine and returns immediately.
 // The goroutine exits when ctx is cancelled or Stop() is called.
 // Calling Start more than once panics.
+//
+// Start and Stop are safe to call concurrently: the mutex serializes lifecycle
+// transitions so cancel is always published before started becomes visible.
 func (l *Loop) Start(ctx context.Context) {
-	if !l.started.CompareAndSwap(false, true) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.started {
 		panic("syncer.Loop: Start called more than once")
 	}
+	l.started = true
 	runCtx, cancel := context.WithCancel(ctx)
 	l.cancel = cancel
 	go l.run(runCtx)
@@ -153,34 +161,44 @@ func (l *Loop) Trigger() {
 	}
 }
 
-// Stop signals the goroutine to exit and blocks until it does. It is idempotent
-// and safe to call after ctx cancellation. Start and Stop must not race each
-// other — call Stop sequentially after Start (the normal lifecycle).
+// Stop signals the goroutine to exit and blocks until it does.
 //
-// If the Loop was never Started, Stop is a no-op and returns immediately (rather
-// than blocking forever on the never-closed done channel) — so a caller can put
-// Stop in a cleanup path even when Start was conditional.
+// Stop is idempotent and safe to call concurrently with Start, with itself, or
+// after ctx cancellation.
+//
+// If the Loop was never Started, Stop is a no-op and returns immediately (so a
+// caller can put Stop in a cleanup path even when Start was conditional).
+//
+// The done-channel wait happens outside the mutex so that the lock is not held
+// while blocking — avoiding a deadlock if run() ever tries to acquire mu
+// (it does not, but the pattern is correct regardless).
 func (l *Loop) Stop() {
-	if !l.started.Load() {
-		return // never started: nothing to cancel, and done is never closed
+	l.mu.Lock()
+	if !l.started {
+		l.mu.Unlock()
+		return // never started: nothing to cancel, done is never closed
 	}
-	l.stopOnce.Do(func() {
-		if l.cancel != nil {
-			l.cancel()
-		}
-	})
-	// Block until the goroutine reports done, regardless of how many times Stop
-	// is called (the done channel is only ever closed once).
+	if !l.stopped {
+		l.stopped = true
+		l.cancel() // safe: started==true guarantees cancel is set (both under mu)
+	}
+	l.mu.Unlock()
+
+	// Wait for the goroutine to fully exit outside the lock.
 	<-l.done
 }
 
 // run is the goroutine body. It exits when runCtx is cancelled.
+// run reads only immutable fields (node, central, project, cfg, triggerCh, done)
+// and the runCtx it receives as a parameter. It never reads mu-guarded fields
+// (started, stopped, cancel), keeping it entirely mutex-free.
 func (l *Loop) run(ctx context.Context) {
 	defer close(l.done)
 
 	var (
-		backoff   time.Duration // 0 = no active backoff
-		triggered bool          // a Trigger() arrived but we haven't synced yet
+		backoff       time.Duration // 0 = no active backoff
+		triggered     bool          // a Trigger() arrived but we haven't synced yet
+		intervalFloor bool          // true → next wait is floored at Interval (non-retryable error)
 	)
 
 	// Drain any trigger that was fired before Start (harmless, but tidy).
@@ -190,7 +208,7 @@ func (l *Loop) run(ctx context.Context) {
 	default:
 	}
 
-	timer := time.NewTimer(l.waitDuration(triggered, backoff))
+	timer := time.NewTimer(l.waitDuration(triggered, backoff, intervalFloor))
 	defer timer.Stop()
 
 	for {
@@ -200,7 +218,7 @@ func (l *Loop) run(ctx context.Context) {
 
 		case <-l.triggerCh:
 			// A trigger arrived. Set the flag; reset the timer to use the shorter
-			// debounce wait (but never shorter than any active backoff floor).
+			// debounce wait (but never shorter than any active backoff or interval floor).
 			triggered = true
 			if !timer.Stop() {
 				select {
@@ -208,7 +226,7 @@ func (l *Loop) run(ctx context.Context) {
 				default:
 				}
 			}
-			timer.Reset(l.waitDuration(triggered, backoff))
+			timer.Reset(l.waitDuration(triggered, backoff, intervalFloor))
 
 		case <-timer.C:
 			// Timer fired — run one sync.
@@ -231,23 +249,27 @@ func (l *Loop) run(ctx context.Context) {
 							backoff = l.cfg.BackoffMax
 						}
 					}
+					intervalFloor = false
 					l.cfg.Logger.Warn("syncer.Loop: sync failed (retryable), backing off",
 						"error", err,
 						"backoff", backoff,
 						"node", l.node.Name,
 					)
 				} else {
-					// Non-retryable (4xx): clear backoff, log, resume normal cadence.
-					// Do NOT hot-loop — the next sync waits a full Interval.
+					// Non-retryable (4xx): clear exponential backoff but floor the next
+					// wait (and any Trigger before it) at Interval so a persistent 4xx is
+					// not hammered. One Interval cooldown, then normal cadence resumes.
 					backoff = 0
-					l.cfg.Logger.Warn("syncer.Loop: sync failed (non-retryable), resuming normal cadence",
+					intervalFloor = true
+					l.cfg.Logger.Warn("syncer.Loop: sync failed (non-retryable), cooling down for one Interval",
 						"error", err,
 						"node", l.node.Name,
 					)
 				}
 			} else {
-				// Success: clear backoff, resume normal cadence.
+				// Success: clear backoff and interval floor, resume normal cadence.
 				backoff = 0
+				intervalFloor = false
 				l.cfg.Logger.Debug("syncer.Loop: sync ok",
 					"pushed", pushed,
 					"pulled", pulled,
@@ -256,7 +278,7 @@ func (l *Loop) run(ctx context.Context) {
 			}
 
 			// Re-arm the timer for the next cycle.
-			timer.Reset(l.waitDuration(triggered, backoff))
+			timer.Reset(l.waitDuration(triggered, backoff, intervalFloor))
 		}
 	}
 }
@@ -267,14 +289,20 @@ func (l *Loop) run(ctx context.Context) {
 //  1. If a trigger is pending, use Debounce (respond quickly to local writes).
 //  2. Otherwise use Interval (periodic cadence).
 //  3. Backoff is always a FLOOR: never sync sooner than backoff, even when
-//     triggered (so a failing server is never hammered).
-func (l *Loop) waitDuration(triggered bool, backoff time.Duration) time.Duration {
+//     triggered (so a failing server is never hammered on retryable errors).
+//  4. intervalFloor is an additional one-cycle floor at Interval: applied after
+//     a non-retryable error so a persistent 4xx is not hammered even via Trigger.
+func (l *Loop) waitDuration(triggered bool, backoff time.Duration, intervalFloor bool) time.Duration {
 	base := l.cfg.Interval
 	if triggered {
 		base = l.cfg.Debounce
 	}
-	if backoff > base {
-		return backoff
+	floor := backoff
+	if intervalFloor && l.cfg.Interval > floor {
+		floor = l.cfg.Interval
+	}
+	if floor > base {
+		return floor
 	}
 	return base
 }
