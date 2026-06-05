@@ -133,3 +133,19 @@ func TestWriterKey_UpsertReactivatesAfterDeactivate(t *testing.T) {
 		t.Errorf("WriterKey after reactivate: got %q, want %q", got, secret2)
 	}
 }
+
+// TestWriterKey_DeactivateUnknownID_ReturnsNotFound verifies that revoking a
+// writer_id that was never provisioned returns ErrWriterKeyNotFound (0 rows
+// affected) rather than silently succeeding.
+func TestWriterKey_DeactivateUnknownID_ReturnsNotFound(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	err := store.DeactivateWriterKey(ctx, "never-provisioned-writer")
+	if err == nil {
+		t.Fatal("DeactivateWriterKey for unknown ID: expected ErrWriterKeyNotFound, got nil")
+	}
+	if err != centralstore.ErrWriterKeyNotFound {
+		t.Errorf("DeactivateWriterKey for unknown ID: got %v, want ErrWriterKeyNotFound", err)
+	}
+}

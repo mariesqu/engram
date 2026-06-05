@@ -60,8 +60,14 @@ func (s *Store) DeactivateWriterKey(ctx context.Context, writerID string) error 
 		SET active     = false,
 		    updated_at = now()
 		WHERE writer_id = $1`
-	if _, err := s.pool.Exec(ctx, sql, writerID); err != nil {
+	tag, err := s.pool.Exec(ctx, sql, writerID)
+	if err != nil {
 		return fmt.Errorf("DeactivateWriterKey %q: %w", writerID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		// No row matched writerID — nothing was revoked. Surface this so callers
+		// don't mistake a no-op for a successful revocation.
+		return ErrWriterKeyNotFound
 	}
 	return nil
 }
