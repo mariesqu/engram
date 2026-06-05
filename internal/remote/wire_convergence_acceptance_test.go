@@ -111,6 +111,7 @@ func TestMain(m *testing.M) {
 
 // wireStore opens a fresh isolated centralstore.Store on a new Postgres schema.
 // The store is closed and its schema is dropped via t.Cleanup.
+func wireStore(t *testing.T) *centralstore.Store {
 	t.Helper()
 	schemaName := wireSchemaFor(t)
 	ctx := context.Background()
