@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/syncer"
-	"github.com/mariesqu/engram/internal/domain"
 )
 
 // ── mock Central ─────────────────────────────────────────────────────────────
@@ -21,9 +21,9 @@ import (
 //   - returns the configured error on each call
 //   - optionally switches error after N calls (for backoff-recovery tests)
 type mockCentral struct {
-	mu      sync.Mutex
-	syncCh  chan struct{} // buffered; receives one signal per PullSince call
-	callN   atomic.Int64 // total calls to PullSince
+	mu     sync.Mutex
+	syncCh chan struct{} // buffered; receives one signal per PullSince call
+	callN  atomic.Int64  // total calls to PullSince
 
 	// errFn, if set, is called with the call index and returns the error for
 	// that call. Overrides staticErr when set.
@@ -116,7 +116,7 @@ type retryableErr struct {
 	msg       string
 }
 
-func (e *retryableErr) Error() string    { return e.msg }
+func (e *retryableErr) Error() string   { return e.msg }
 func (e *retryableErr) Retryable() bool { return e.retryable }
 
 var (
@@ -178,7 +178,7 @@ func TestLoop_TriggerDebounce(t *testing.T) {
 	defer cancel()
 
 	cfg := fastCfg()
-	cfg.Interval = 10 * time.Second  // long interval → periodic syncs won't interfere
+	cfg.Interval = 10 * time.Second // long interval → periodic syncs won't interfere
 	cfg.Debounce = 5 * time.Millisecond
 
 	central := newMockCentral(20)
@@ -198,25 +198,14 @@ func TestLoop_TriggerDebounce(t *testing.T) {
 		t.Fatal("debounce: no sync fired after Trigger() burst")
 	}
 
-	// Allow a bit more time, then assert the sync count is still exactly 1
-	// (no periodic sync should fire for 10s).
-	time.Sleep(20 * time.Millisecond)
-
-	// Drain any additional signals to count total.
-	total := 1
-drain:
-	for {
-		select {
-		case <-central.syncCh:
-			total++
-		default:
-			break drain
-		}
-	}
-	if total > 2 {
-		// Tolerate 2 to account for one potential timer rearm race on slow CI,
-		// but more than that means debounce is broken.
-		t.Errorf("debounce: trigger burst resulted in %d syncs; want 1 (±1 for timer race)", total)
+	// No periodic sync should fire for 10s — assert deterministically.
+	// If a second sync arrives within this quiet window, debounce is broken.
+	const quietWindow = 30 * time.Millisecond
+	select {
+	case <-central.syncCh:
+		t.Errorf("debounce: trigger burst resulted in >1 syncs; want 1 (Interval=10s guards periodic)")
+	case <-time.After(quietWindow):
+		// ok: no extra sync fired in the quiet window
 	}
 
 	l.Stop()
@@ -228,7 +217,7 @@ drain:
 func TestLoop_BackoffRetryable(t *testing.T) {
 	cfg := fastCfg()
 	cfg.Interval = 3 * time.Millisecond
-	cfg.BackoffMin = 30 * time.Millisecond  // noticeable relative to Interval
+	cfg.BackoffMin = 30 * time.Millisecond // noticeable relative to Interval
 	cfg.BackoffMax = 200 * time.Millisecond
 
 	// Phase 1: success baseline — count syncs in 30ms.
@@ -401,15 +390,15 @@ func TestLoop_NoSyncsAfterStop(t *testing.T) {
 	central.waitN(2, 2*time.Second)
 	l.Stop()
 
-	// Capture count after stop.
-	countAtStop := central.callN.Load()
-
-	// Wait a bit longer — if the goroutine is still running it would add more.
-	time.Sleep(50 * time.Millisecond)
-
-	countAfter := central.callN.Load()
-	if countAfter != countAtStop {
-		t.Errorf("syncs continued after Stop(): %d → %d", countAtStop, countAfter)
+	// After Stop() returns the goroutine is fully exited. Assert no further syncs
+	// arrive — deterministic: if the goroutine were still running it would send
+	// within the quiet window.
+	const quietWindow = 50 * time.Millisecond
+	select {
+	case <-central.syncCh:
+		t.Errorf("syncs continued after Stop()")
+	case <-time.After(quietWindow):
+		// ok: goroutine is confirmed stopped
 	}
 }
 
@@ -470,6 +459,63 @@ func TestLoop_BackoffIsFloorForTrigger(t *testing.T) {
 	l.Stop()
 }
 
+// TestLoop_NonRetryableIntervalFloor: a non-retryable (4xx) error floors the next
+// wait at Interval so a Trigger burst cannot shorten it to Debounce and hammer
+// a persistently-failing server.
+func TestLoop_NonRetryableIntervalFloor(t *testing.T) {
+	cfg := syncer.Config{
+		Interval:   60 * time.Millisecond,
+		Debounce:   1 * time.Millisecond, // very short — would fire immediately without the floor
+		BackoffMin: 1 * time.Millisecond, // tiny — must NOT be used for non-retryable
+		BackoffMax: 5 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	central := newMockCentral(20)
+	// First call returns non-retryable; subsequent calls succeed.
+	central.setErrFn(func(n int64) error {
+		if n == 1 {
+			return errNonRetryable
+		}
+		return nil
+	})
+
+	node := openNode(t, "nonretryable-floor")
+	l := syncer.NewLoop(node, central, "testproject", cfg)
+	l.Start(ctx)
+
+	// Trigger the first sync (Interval=60ms, too long to wait for periodic).
+	l.Trigger()
+	// Wait for the first sync (non-retryable failure — engages the interval floor).
+	if got := central.waitN(1, 2*time.Second); got < 1 {
+		t.Fatal("first sync never fired")
+	}
+
+	// Now fire a burst of Triggers. Without the interval floor these would fire in
+	// ~Debounce (1ms). With the floor the next sync must wait at least Interval.
+	start := time.Now()
+	for i := 0; i < 10; i++ {
+		l.Trigger()
+	}
+
+	// Wait for the second sync (floored at Interval=60ms, not Debounce=1ms).
+	if got := central.waitN(1, 2*time.Second); got < 1 {
+		t.Fatal("post-non-retryable sync never fired")
+	}
+	elapsed := time.Since(start)
+
+	// Must be floored at Interval (allow 10ms scheduling jitter).
+	if elapsed < cfg.Interval-10*time.Millisecond {
+		t.Errorf("non-retryable interval floor not respected: triggered sync fired %v after triggers; want ≥%v",
+			elapsed, cfg.Interval-10*time.Millisecond)
+	}
+	t.Logf("non-retryable interval floor: second sync fired %v after triggers (Interval=%v)", elapsed, cfg.Interval)
+
+	l.Stop()
+}
+
 // TestLoop_IsRetryable_Classification: verify the duck-typed error classifier
 // without importing internal/remote. We use our own retryableErr type which
 // mirrors remote.StatusError's interface.
@@ -482,7 +528,7 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 	cases := []struct {
 		name        string
 		firstErr    error
-		wantBackoff bool // true → second sync should be delayed by BackoffMin
+		wantBackoff bool // true → second sync delayed by BackoffMin; false → delayed by Interval floor
 	}{
 		{"retryable_5xx", errRetryable, true},
 		{"non-retryable_4xx", errNonRetryable, false},
@@ -493,7 +539,17 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			const backoffMin = 40 * time.Millisecond
 			cfg := fastCfg()
-			cfg.Interval = 10 * time.Second // long — periodic syncs won't interfere
+			// Use a short Interval for all cases so the test completes quickly.
+			// For retryable (wantBackoff=true): Interval=5s won't fire periodically
+			// and BackoffMin=40ms gates the triggered sync.
+			// For non-retryable (wantBackoff=false): the intervalFloor gates at
+			// Interval=50ms (longer than Debounce=1ms, shorter than BackoffMin=40ms
+			// in absolute terms but the key property is: floor=Interval, not backoff).
+			if tc.wantBackoff {
+				cfg.Interval = 5 * time.Second // retryable: long interval, backoff gates
+			} else {
+				cfg.Interval = 50 * time.Millisecond // non-retryable: interval floor gates
+			}
 			cfg.Debounce = 1 * time.Millisecond
 			cfg.BackoffMin = backoffMin
 			cfg.BackoffMax = 200 * time.Millisecond
@@ -514,7 +570,7 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 			l := syncer.NewLoop(node, central, "testproject", cfg)
 			l.Start(ctx)
 
-			// Trigger the first sync (Interval=10s so periodic won't fire in time).
+			// Trigger the first sync.
 			l.Trigger()
 			// Wait for the first sync (will return tc.firstErr).
 			if got := central.waitN(1, 2*time.Second); got < 1 {
@@ -530,16 +586,17 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 			elapsed := time.Since(start)
 
 			if tc.wantBackoff {
-				// Retryable: backoff floor must delay the triggered sync.
+				// Retryable: backoff floor (BackoffMin=40ms) must delay the triggered sync.
 				if elapsed < backoffMin-10*time.Millisecond {
 					t.Errorf("%s: expected backoff ≥%v, triggered sync fired in %v",
 						tc.name, backoffMin, elapsed)
 				}
 			} else {
-				// Non-retryable: no backoff, Trigger fires in ~Debounce (well under BackoffMin).
-				if elapsed > backoffMin {
-					t.Errorf("%s: unexpected delay %v — non-retryable should not engage backoff (want < %v)",
-						tc.name, elapsed, backoffMin)
+				// Non-retryable: intervalFloor (Interval=50ms) must gate the triggered sync.
+				// It should NOT fire in ~Debounce (1ms). Assert ≥ Interval - jitter.
+				if elapsed < cfg.Interval-10*time.Millisecond {
+					t.Errorf("%s: expected intervalFloor ≥%v, triggered sync fired in %v",
+						tc.name, cfg.Interval-10*time.Millisecond, elapsed)
 				}
 			}
 			t.Logf("%s: triggered sync after first error in %v (wantBackoff=%v)", tc.name, elapsed, tc.wantBackoff)
@@ -565,5 +622,55 @@ func TestLoop_StopBeforeStart_NoDeadlock(t *testing.T) {
 		// Stop returned promptly — correct.
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop() before Start() deadlocked")
+	}
+}
+
+// TestLoop_ConcurrentStartStop_NoDeadlock proves that racing Start and Stop
+// (launched as concurrent goroutines) never deadlocks. The mutex serializes
+// lifecycle transitions so cancel is always published before started is visible
+// to Stop. This is a -race regression guard; -race cannot run in this CGO_ENABLED=0
+// environment but the mutex makes the race impossible BY CONSTRUCTION.
+func TestLoop_ConcurrentStartStop_NoDeadlock(t *testing.T) {
+	const iterations = 20
+
+	for i := range iterations {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		central := newMockCentral(10)
+		node := openNode(t, "concurrent-startstop")
+
+		l := syncer.NewLoop(node, central, "testproject", fastCfg())
+
+		startDone := make(chan struct{})
+		stopDone := make(chan struct{})
+
+		go func() {
+			defer close(startDone)
+			l.Start(ctx)
+		}()
+		go func() {
+			defer close(stopDone)
+			l.Stop()
+		}()
+
+		// Both goroutines must finish within the watchdog.
+		const watchdog = 2 * time.Second
+		bothDone := make(chan struct{})
+		go func() {
+			<-startDone
+			<-stopDone
+			close(bothDone)
+		}()
+
+		select {
+		case <-bothDone:
+			// good — no deadlock
+		case <-time.After(watchdog):
+			t.Fatalf("iteration %d: concurrent Start/Stop deadlocked", i)
+		}
+
+		// Ensure the loop is fully cleaned up before the next iteration.
+		cancel()
+		l.Stop()
 	}
 }
