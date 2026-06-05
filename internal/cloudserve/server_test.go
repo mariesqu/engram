@@ -45,7 +45,7 @@ func (m *mockCentral) PullSince(_ context.Context, project string, sinceSeq int6
 // newTestServer returns an httptest.Server backed by a mock central.
 func newTestServer(t *testing.T, central *mockCentral) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(cloudserve.New(central).Handler())
+	ts := httptest.NewServer(cloudserve.New(central, cloudserve.AllowAllVerifier()).Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }

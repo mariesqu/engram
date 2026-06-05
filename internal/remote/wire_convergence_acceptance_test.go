@@ -159,7 +159,7 @@ func wireStore(t *testing.T) *centralstore.Store {
 func newWireCentral(t *testing.T) (*remote.Client, *centralstore.Store) {
 	t.Helper()
 	store := wireStore(t)
-	srv := httptest.NewServer(cloudserve.New(store).Handler())
+	srv := httptest.NewServer(cloudserve.New(store, cloudserve.AllowAllVerifier()).Handler())
 	t.Cleanup(srv.Close)
 	return remote.New(srv.URL, nil), store
 }
