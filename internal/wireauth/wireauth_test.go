@@ -122,18 +122,19 @@ func TestVerify_MalformedSig_ReturnsFalse(t *testing.T) {
 
 // ── Constant-time comparison: hmac.Equal is used, not == ─────────────────────
 
-// TestVerify_UsesConstantTimeCompare asserts behavioral correctness of the
-// constant-time path: a signature that differs only in the last byte must still
-// return false, just as one that differs in the first byte does. If == were used
-// instead of hmac.Equal, both would return false too — but this test documents
-// the intent and catches any accidental hex-string comparison.
+// TestVerify_UsesHmacEqual_ConstantTimeSemantics asserts the behavioral contract
+// of Verify: a signature that differs in any byte (first or last) returns false,
+// and the correct signature returns true.
 //
-// We cannot directly measure timing from a unit test, so we assert behavior:
+// NOTE: this does NOT prove constant-time behavior — a naive string == on the hex
+// would pass it identically. It documents intent and guards the behavioral
+// contract; the actual constant-time guarantee comes from hmac.Equal in the
+// stdlib (used by Verify) and is established by code review, not by this test.
+//
+// We cannot measure timing from a unit test, so we assert behavior only:
 //   - sig with last byte flipped → false
 //   - sig with first byte flipped → false
 //   - correct sig → true
-//
-// The real timing guarantee comes from the hmac.Equal implementation in stdlib.
 func TestVerify_UsesHmacEqual_ConstantTimeSemantics(t *testing.T) {
 	key := testKey()
 	body := []byte("timing test body")

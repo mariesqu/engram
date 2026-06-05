@@ -38,10 +38,12 @@
 package wireauth
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 )
 
 // Header name constants used by both the signing client and the verifying server.
@@ -56,7 +58,23 @@ const (
 	HeaderSignature = "X-Signature"
 )
 
-// Canonical assembles the byte slice that Sign and Verify hash. It concatenates:
+// writeCanonical streams the canonical signing bytes —
+//
+//	method + "\n" + path + "\n" + body
+//
+// — directly to w. Sign and Verify pass the HMAC as w so the bytes are hashed
+// without allocating an intermediate buffer or copying the (potentially large)
+// body. The component Writes never return a meaningful error (hash.Hash.Write
+// never errors; bytes.Buffer.Write never errors), so the results are ignored.
+func writeCanonical(w io.Writer, method, path string, body []byte) {
+	_, _ = w.Write([]byte(method))
+	_, _ = w.Write([]byte{'\n'})
+	_, _ = w.Write([]byte(path))
+	_, _ = w.Write([]byte{'\n'})
+	_, _ = w.Write(body)
+}
+
+// Canonical assembles and returns the byte slice that the signing scheme hashes:
 //
 //	method + "\n" + path + "\n" + body
 //
@@ -64,31 +82,31 @@ const (
 // body is appended last without a trailing separator; any body length (including
 // zero) produces a distinct canonical string because the preceding separators
 // fix the method and path boundaries.
+//
+// Sign and Verify do NOT call Canonical — they stream the same bytes straight
+// into the HMAC via writeCanonical to avoid copying the body. Canonical is kept
+// for callers and tests that need the assembled bytes.
 func Canonical(method, path string, body []byte) []byte {
-	// Pre-size: len(method) + 1 + len(path) + 1 + len(body).
-	size := len(method) + 1 + len(path) + 1 + len(body)
-	b := make([]byte, 0, size)
-	b = append(b, method...)
-	b = append(b, '\n')
-	b = append(b, path...)
-	b = append(b, '\n')
-	b = append(b, body...)
-	return b
+	var buf bytes.Buffer
+	buf.Grow(len(method) + 1 + len(path) + 1 + len(body))
+	writeCanonical(&buf, method, path, body)
+	return buf.Bytes()
 }
 
 // Sign returns the hex-encoded HMAC-SHA256 of Canonical(method, path, body)
 // under key. The returned string is lowercase hex (64 characters for SHA-256).
 func Sign(key []byte, method, path string, body []byte) string {
 	mac := hmac.New(sha256.New, key)
-	mac.Write(Canonical(method, path, body)) //nolint:errcheck // hash.Write never errors
+	writeCanonical(mac, method, path, body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // Verify recomputes the HMAC-SHA256 of Canonical(method, path, body) under key
 // and compares it to sig in constant time.
 //
-// sig must be a lowercase-hex string. Verify returns false on any hex-decode
-// error (e.g. non-hex characters, odd length) and on any MAC mismatch.
+// sig is a hex string; hex.DecodeString accepts upper or lower case, and Sign
+// emits lowercase. Verify returns false on any hex-decode error (non-hex
+// characters, odd length) and on any MAC mismatch.
 //
 // The comparison uses hmac.Equal (constant time over raw bytes) — NOT == on the
 // hex strings, which would short-circuit and leak timing information.
@@ -99,7 +117,7 @@ func Verify(key []byte, method, path string, body []byte, sig string) bool {
 	}
 
 	mac := hmac.New(sha256.New, key)
-	mac.Write(Canonical(method, path, body)) //nolint:errcheck // hash.Write never errors
+	writeCanonical(mac, method, path, body)
 	expected := mac.Sum(nil)
 
 	// hmac.Equal compares two MACs in constant time, preventing timing side-channels.
