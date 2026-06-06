@@ -301,6 +301,15 @@ func TestAcceptance_ServeE2E(t *testing.T) {
 			cancelServe()
 			t.Fatal("timed out waiting for server to accept connections")
 		}
+		// Fail fast if runServe exited early (e.g. centralstore.Open or
+		// ListenAndServe failed) instead of waiting out the full deadline. The read
+		// is non-blocking: during normal startup serveErrCh is empty, so it is not
+		// consumed and the Step 7 graceful-shutdown read still observes the value.
+		select {
+		case err := <-serveErrCh:
+			t.Fatalf("runServe exited before accepting connections: %v", err)
+		default:
+		}
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 		if err == nil {
 			conn.Close()
