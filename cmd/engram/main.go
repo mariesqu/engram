@@ -35,8 +35,9 @@ Environment:
 Subcommands:
   serve   Run the central HTTP server (plain HTTP — terminate TLS upstream).
   keys    Provision or revoke per-writer HMAC keys.
+  keys    Provision or revoke per-writer HMAC keys.
 
-Run 'engram serve --help' or 'engram keys --help' for subcommand flags.
+Run 'engram serve --help', 'engram keys provision --help', or 'engram keys revoke --help' for flags.
 `
 
 func main() {
