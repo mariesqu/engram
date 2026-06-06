@@ -31,8 +31,7 @@ Usage:
 
 Environment:
   ENGRAM_ADDR  default listen address for 'serve' (default ":8080")
-  ENGRAM_DSN   Postgres DSN (required for all subcommands)
-
+  ENGRAM_DSN   Postgres DSN (required for 'serve' and 'keys provision/revoke')
 Subcommands:
   serve   Run the central HTTP server (plain HTTP — terminate TLS upstream).
   keys    Provision or revoke per-writer HMAC keys.
