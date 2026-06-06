@@ -12,7 +12,7 @@ import (
 	"github.com/mariesqu/engram/internal/wireauth"
 )
 
-const keysUsage = `Usage: engram keys <subcommand> [flags]
+const keysUsage = `Usage: engram keys <subcommand>
 
 Manage per-writer HMAC keys used for request authentication.
 
@@ -26,8 +26,7 @@ Subcommands:
       DB for audit purposes but will no longer authenticate requests. Use
       'provision' to issue a new key for the same writer-id.
 
-Flags:
-  --dsn   Postgres DSN (default: ENGRAM_DSN env; REQUIRED)
+Run 'engram keys provision --help' or 'engram keys revoke --help' for flags.
 `
 
 // runKeysCmd parses the keys subcommand and dispatches to provision or revoke.
