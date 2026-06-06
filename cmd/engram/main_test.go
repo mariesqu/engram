@@ -132,6 +132,28 @@ func TestRun_KeysProvisionHelp_DoesNotLeakDSN(t *testing.T) {
 	}
 }
 
+// TestRun_KeysRevokeHelp_DoesNotLeakDSN is the revoke counterpart of the provision
+// no-leak guard: `keys revoke --help` uses the same --dsn + PrintDefaults pattern,
+// so it must equally never print the ENGRAM_DSN secret.
+func TestRun_KeysRevokeHelp_DoesNotLeakDSN(t *testing.T) {
+	const secret = "postgres://user:topsecret@db.internal:5432/engram"
+	t.Setenv("ENGRAM_DSN", secret)
+
+	out := captureStderr(t, func() {
+		if code := run([]string{"keys", "revoke", "--help"}); code != 0 {
+			t.Errorf("keys revoke --help: exit code %d, want 0", code)
+		}
+	})
+
+	if strings.Contains(out, "topsecret") || strings.Contains(out, secret) {
+		t.Errorf("keys revoke --help leaked the ENGRAM_DSN secret:\n%s", out)
+	}
+	// Sanity: the dsn flag is still listed (the point of PrintDefaults).
+	if !strings.Contains(out, "dsn") {
+		t.Errorf("keys revoke --help should still list the dsn flag; got:\n%s", out)
+	}
+}
+
 // TestRun_KeysUnknownSubcommand verifies that 'keys <unknown>' returns exit
 // code 1 (the dispatch returns an error, not usage).
 func TestRun_KeysUnknownSubcommand(t *testing.T) {
