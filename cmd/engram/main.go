@@ -12,8 +12,8 @@
 //	engram keys revoke [--dsn <dsn>] <writer-id>
 //	    Deactivate the HMAC key for <writer-id>.
 //
-// All subcommands accept --dsn (or the ENGRAM_DSN environment variable).
-// The serve subcommand additionally accepts --addr (or ENGRAM_ADDR; default ":8080").
+// The serve command and the keys provision/revoke subcommands accept --dsn (or the ENGRAM_DSN environment variable).
+// The serve command additionally accepts --addr (or ENGRAM_ADDR; default ":8080").
 package main
 
 import (
