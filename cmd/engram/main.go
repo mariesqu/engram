@@ -46,8 +46,9 @@ func main() {
 
 // run is the testable dispatch entry-point. It returns an OS exit code:
 //   - 0  success
-//   - 1  runtime error (logged via log.Printf, then this code is returned)
-//   - 2  usage error
+//   - 1  a subcommand returned an error — runtime OR validation (missing --dsn,
+//        missing/extra writer-id, unknown keys subcommand) — logged via log.Printf
+//   - 2  top-level usage error (no args, top-level --help, or unknown subcommand)
 func run(args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprint(os.Stderr, usage)

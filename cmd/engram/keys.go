@@ -72,8 +72,8 @@ func runProvisionCmd(args []string) error {
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")
 	}
-	if fs.NArg() == 0 {
-		return fmt.Errorf("writer-id is required: engram keys provision [--dsn <dsn>] <writer-id>")
+	if fs.NArg() != 1 {
+		return fmt.Errorf("exactly one writer-id is required: engram keys provision [--dsn <dsn>] <writer-id>")
 	}
 	writerID := fs.Arg(0)
 
@@ -113,8 +113,8 @@ func runRevokeCmd(args []string) error {
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")
 	}
-	if fs.NArg() == 0 {
-		return fmt.Errorf("writer-id is required: engram keys revoke [--dsn <dsn>] <writer-id>")
+	if fs.NArg() != 1 {
+		return fmt.Errorf("exactly one writer-id is required: engram keys revoke [--dsn <dsn>] <writer-id>")
 	}
 	writerID := fs.Arg(0)
 

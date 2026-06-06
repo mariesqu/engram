@@ -48,6 +48,9 @@ func runServeCmd(args []string) error {
 		}
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("serve takes no positional arguments; unexpected: %v", fs.Args())
+	}
 	if *dsn == "" {
 		*dsn = envOr("ENGRAM_DSN", "") // resolve env AFTER parse so the secret never enters the flag default
 	}

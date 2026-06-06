@@ -261,12 +261,13 @@ func TestAcceptance_RevokeUnprovisioned(t *testing.T) {
 
 // TestAcceptance_ServeE2E is the end-to-end acceptance test for the serve
 // subcommand. It:
-//  1. Picks a free TCP port.
-//  2. Provisions a writer key via provisionKey.
+//  1. Provisions a writer key via provisionKey.
+//  2. Picks a free TCP port.
 //  3. Starts runServe in a goroutine with a cancellable context.
 //  4. Polls until the port accepts connections.
 //  5. Builds a signed remote.Client and calls Apply → asserts nil (200).
-//  6. Cancels the context and asserts runServe returns within a bounded time
+//  6. Asserts a WRONG-key client gets 401 (proves serve enforces real auth).
+//  7. Cancels the context and asserts runServe returns within a bounded time
 //     (graceful shutdown).
 func TestAcceptance_ServeE2E(t *testing.T) {
 	dsn := newIsolatedDSN(t)

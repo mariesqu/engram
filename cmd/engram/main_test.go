@@ -141,6 +141,27 @@ func TestRun_KeysUnknownSubcommand(t *testing.T) {
 	}
 }
 
+// TestRun_ServeExtraPositional verifies that 'serve' with an unexpected positional
+// argument returns exit code 1 (rejected by the NArg check before opening the store).
+func TestRun_ServeExtraPositional(t *testing.T) {
+	t.Setenv("ENGRAM_DSN", "")
+	code := run([]string{"serve", "--dsn", "postgres://fake/db", "unexpected"})
+	if code != 1 {
+		t.Errorf("run([serve ... unexpected]): got exit code %d, want 1", code)
+	}
+}
+
+// TestRun_KeysProvisionExtraPositional verifies that 'keys provision' with more than
+// one positional (two writer-ids) returns exit code 1 rather than silently
+// provisioning the first — guards against operator typos.
+func TestRun_KeysProvisionExtraPositional(t *testing.T) {
+	t.Setenv("ENGRAM_DSN", "")
+	code := run([]string{"keys", "provision", "--dsn", "postgres://fake/db", "writer-a", "writer-b"})
+	if code != 1 {
+		t.Errorf("run([keys provision a b]): got exit code %d, want 1", code)
+	}
+}
+
 // TestEnvOr_EnvSet verifies that envOr returns the env value when set.
 func TestEnvOr_EnvSet(t *testing.T) {
 	t.Setenv("ENGRAM_TEST_VAR", "from-env")
