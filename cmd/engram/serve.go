@@ -33,7 +33,7 @@ Flags:
 // It installs OS signal handling so SIGINT/SIGTERM trigger graceful shutdown.
 func runServeCmd(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	fs.Usage = func() { fmt.Print(serveUsage) }
+	fs.Usage = func() { fmt.Fprint(fs.Output(), serveUsage) }
 
 	addr := fs.String("addr", envOr("ENGRAM_ADDR", ":8080"), "listen address")
 	// --dsn defaults to EMPTY (not envOr): a Postgres DSN carries credentials, and

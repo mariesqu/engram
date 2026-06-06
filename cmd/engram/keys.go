@@ -33,7 +33,7 @@ Flags:
 // runKeysCmd parses the keys subcommand and dispatches to provision or revoke.
 func runKeysCmd(args []string) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		fmt.Print(keysUsage)
+		fmt.Fprint(os.Stderr, keysUsage)
 		return nil
 	}
 
@@ -44,7 +44,7 @@ func runKeysCmd(args []string) error {
 		return runRevokeCmd(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "engram keys: unknown subcommand %q\n\n", args[0])
-		fmt.Print(keysUsage)
+		fmt.Fprint(os.Stderr, keysUsage)
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
 }

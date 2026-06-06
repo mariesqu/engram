@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -405,15 +406,26 @@ func cacheRoot() string {
 	return filepath.Join(home, ".cache", "embeddedpg")
 }
 
-// withSearchPath appends search_path=<schema> to a Postgres DSN.
-// Handles both keyword=value and postgres://... URL forms.
+// withSearchPath returns a DSN with its PostgreSQL search_path set to
+// "<schema>,public" (mirrors internal/centralstore/dsn_acceptance_test.go).
+//
+// Two DSN forms are handled:
+//   - URL-form (scheme "postgres://" / "postgresql://"): the "options" query
+//     parameter is set to "-c search_path=<schema>,public" (URL-encoded).
+//   - Keyword/value form (everything else): the options string is appended as a
+//     space-separated key=value pair — the format embedded-postgres produces.
+//
+// An error is returned only when a URL-form DSN cannot be parsed by net/url.
 func withSearchPath(dsn, schema string) (string, error) {
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		sep := "?"
-		if strings.Contains(dsn, "?") {
-			sep = "&"
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", fmt.Errorf("withSearchPath: parse DSN: %w", err)
 		}
-		return dsn + sep + "search_path=" + schema, nil
+		q := u.Query()
+		q.Set("options", fmt.Sprintf("-c search_path=%s,public", schema))
+		u.RawQuery = q.Encode()
+		return u.String(), nil
 	}
-	return dsn + " search_path=" + schema, nil
+	return fmt.Sprintf("%s options='-c search_path=%s,public'", dsn, schema), nil
 }

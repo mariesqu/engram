@@ -105,6 +105,7 @@ func captureStderr(t *testing.T, f func()) string {
 	if _, err := io.Copy(&buf, r); err != nil {
 		t.Fatalf("read captured stderr: %v", err)
 	}
+	_ = r.Close()
 	return buf.String()
 }
 
