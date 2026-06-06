@@ -17,11 +17,11 @@ const keysUsage = `Usage: engram keys <subcommand> [flags]
 Manage per-writer HMAC keys used for request authentication.
 
 Subcommands:
-  provision <writer-id> [--dsn <dsn>]
+  provision [--dsn <dsn>] <writer-id>
       Generate a new HMAC key for <writer-id> and store it in the DB.
       The key is printed ONCE to stdout — store it securely.
 
-  revoke <writer-id> [--dsn <dsn>]
+  revoke [--dsn <dsn>] <writer-id>
       Deactivate the HMAC key for <writer-id>. The key is preserved in the
       DB for audit purposes but will no longer authenticate requests. Use
       'provision' to issue a new key for the same writer-id.
@@ -53,7 +53,7 @@ func runKeysCmd(args []string) error {
 func runProvisionCmd(args []string) error {
 	fs := flag.NewFlagSet("keys provision", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: engram keys provision <writer-id> [--dsn <dsn>]")
+		fmt.Fprintln(os.Stderr, "Usage: engram keys provision [--dsn <dsn>] <writer-id>")
 		fs.PrintDefaults()
 	}
 	// --dsn defaults to EMPTY (not envOr): a Postgres DSN carries credentials and
@@ -73,7 +73,7 @@ func runProvisionCmd(args []string) error {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")
 	}
 	if fs.NArg() == 0 {
-		return fmt.Errorf("writer-id is required: engram keys provision <writer-id>")
+		return fmt.Errorf("writer-id is required: engram keys provision [--dsn <dsn>] <writer-id>")
 	}
 	writerID := fs.Arg(0)
 
@@ -94,7 +94,7 @@ func runProvisionCmd(args []string) error {
 func runRevokeCmd(args []string) error {
 	fs := flag.NewFlagSet("keys revoke", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: engram keys revoke <writer-id> [--dsn <dsn>]")
+		fmt.Fprintln(os.Stderr, "Usage: engram keys revoke [--dsn <dsn>] <writer-id>")
 		fs.PrintDefaults()
 	}
 	// --dsn defaults to EMPTY (not envOr): a Postgres DSN carries credentials and
@@ -114,7 +114,7 @@ func runRevokeCmd(args []string) error {
 		return fmt.Errorf("--dsn is required (or set ENGRAM_DSN)")
 	}
 	if fs.NArg() == 0 {
-		return fmt.Errorf("writer-id is required: engram keys revoke <writer-id>")
+		return fmt.Errorf("writer-id is required: engram keys revoke [--dsn <dsn>] <writer-id>")
 	}
 	writerID := fs.Arg(0)
 

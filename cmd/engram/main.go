@@ -6,10 +6,10 @@
 //	    Run the central cloudserve HTTP server. TLS is terminated upstream;
 //	    the server itself listens on plain HTTP.
 //
-//	engram keys provision <writer-id> [--dsn <dsn>]
+//	engram keys provision [--dsn <dsn>] <writer-id>
 //	    Generate a new HMAC key for <writer-id> and store it in the DB.
 //
-//	engram keys revoke <writer-id> [--dsn <dsn>]
+//	engram keys revoke [--dsn <dsn>] <writer-id>
 //	    Deactivate the HMAC key for <writer-id>.
 //
 // All subcommands accept --dsn (or the ENGRAM_DSN environment variable).
@@ -26,8 +26,8 @@ const usage = `engram — central sync server
 
 Usage:
   engram serve [--addr <addr>] [--dsn <dsn>]
-  engram keys provision <writer-id> [--dsn <dsn>]
-  engram keys revoke   <writer-id> [--dsn <dsn>]
+  engram keys provision [--dsn <dsn>] <writer-id>
+  engram keys revoke   [--dsn <dsn>] <writer-id>
 
 Environment:
   ENGRAM_ADDR  default listen address for 'serve' (default ":8080")
