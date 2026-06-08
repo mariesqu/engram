@@ -33,6 +33,13 @@ func FindSimilar(name string, existing []string, maxDistance int) []ProjectMatch
 
 	nameLower := strings.ToLower(strings.TrimSpace(name))
 
+	// An empty query has no meaningful "similar" candidate — return nothing rather
+	// than matching every short name (effectiveMax stays at maxDistance when the
+	// rune length is 0, so an empty query would otherwise match all short names).
+	if nameLower == "" {
+		return nil
+	}
+
 	// Scale maxDistance for short names to avoid noisy matches.
 	// A 2-char name with maxDistance 3 would match almost everything.
 	// Use rune count (not byte length) so non-ASCII names are scaled correctly.
@@ -78,7 +85,7 @@ func FindSimilar(name string, existing []string, maxDistance int) []ProjectMatch
 
 		// Substring match — skip for very short names (< 3 chars)
 		// to avoid noisy matches like "go" matching "golang-tools".
-		if len(nameLower) >= 3 {
+		if utf8.RuneCountInString(nameLower) >= 3 {
 			if strings.Contains(candidateLower, nameLower) || strings.Contains(nameLower, candidateLower) {
 				if !seen[candidate] {
 					seen[candidate] = true

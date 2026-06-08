@@ -188,7 +188,9 @@ basename:
 	// ── Case 5: dir_basename ─────────────────────────────────────────────
 	absDir, _ := filepath.Abs(dir)
 	base := filepath.Base(dir)
-	if base == "" || base == "." {
+	if base == "" || base == "." || base == "/" || base == "\\" {
+		// empty, ".", or a filesystem root ("/" or a Windows drive root) — none
+		// of which is a usable project name.
 		base = "unknown"
 	}
 	return DetectionResult{
@@ -387,7 +389,7 @@ func DetectProject(dir string) string {
 			return "unknown"
 		}
 		base := filepath.Base(dir)
-		if base == "" || base == "." {
+		if base == "" || base == "." || base == "/" || base == "\\" {
 			return "unknown"
 		}
 		return normalize(base)
@@ -433,6 +435,10 @@ func detectFromGitRemote(dir string) string {
 //   - HTTPS: https://github.com/user/repo.git
 //   - Either with or without the trailing .git suffix
 func extractRepoName(url string) string {
+	// Trim trailing slashes first so a URL ending in "/repo.git/" still has its
+	// .git suffix stripped (TrimSuffix would otherwise no-op on the trailing
+	// slash and return "repo.git" as the name).
+	url = strings.TrimRight(url, "/")
 	// Strip trailing .git suffix.
 	url = strings.TrimSuffix(url, ".git")
 
