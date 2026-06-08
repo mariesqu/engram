@@ -25,8 +25,8 @@ import (
 const daemonUsage = `Usage: engram daemon [flags]
 
 Run the engram local daemon — an MCP server (stdio transport) backed by a local
-SQLite store.  The daemon exposes zero tools in this release; tool
-registration lands in subsequent PRs.
+SQLite store.  The daemon exposes mem_session_start and mem_session_end in this
+release; additional tools land in subsequent PRs.
 
 When --central-url is set the daemon wires an autosync Loop that pushes local
 writes to the central server and pulls remote mutations back on a periodic
@@ -181,23 +181,26 @@ func runDaemonCmd(args []string) error {
 	return runDaemon(ctx, cfg)
 }
 
-// buildDaemon opens the local store, constructs the MCP server (zero tools),
-// and — when cfg.centralURL is non-empty — wires the signing remote client and
-// an autosync Loop.  It does NOT serve or start the Loop; that is runDaemon's
-// responsibility.  This factoring mirrors serve.go / runServe and allows unit
-// tests to assert wiring correctness without blocking on stdio.
+// buildDaemon opens the local store, constructs the MCP server, registers the
+// session tools, and — when cfg.centralURL is non-empty — wires the signing
+// remote client and an autosync Loop.  It does NOT serve or start the Loop;
+// that is runDaemon's responsibility.  This factoring mirrors serve.go /
+// runServe and allows unit tests to assert wiring correctness without blocking
+// on stdio.
 func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	store, err := localstore.Open(cfg.db)
 	if err != nil {
 		return nil, fmt.Errorf("open store %q: %w", cfg.db, err)
 	}
 
-	// MCP server — zero tools registered in PR1.  Tools land in subsequent PRs.
 	mcpSrv := mcpserver.NewMCPServer(
 		"engram",
 		"0.1.0",
 		mcpserver.WithToolCapabilities(true),
 	)
+
+	// Register all MCP tools. Tools work regardless of sync mode.
+	registerTools(mcpSrv, store)
 
 	if cfg.centralURL == "" {
 		// Local-only mode: no Loop, no remote client.
