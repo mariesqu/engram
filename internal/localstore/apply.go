@@ -9,8 +9,14 @@ import (
 )
 
 // Apply executes a domain.Decision against the local SQLite store inside a
-// single transaction. It is the pull-apply adapter: callers (the sync loop)
-// invoke Decide() first, then pass the returned Decision here.
+// single transaction. It is the low-level pull-apply primitive: invoke Decide()
+// first, then pass the returned Decision here.
+//
+// WARNING: Apply writes directly on the passed *sql.DB and does NOT take the
+// Store's write-queue mutex (s.mu). It has zero production callers — the
+// production pull-apply path is Store.ApplyPulled, which holds s.mu. Use Apply
+// only from the test/harness path; never pass it Store.DB() from production or a
+// concurrent goroutine, as that bypasses write serialization.
 //
 // NoOp is a valid input — Apply returns nil immediately.
 // For all other actions, the applied_mutations row is written so future

@@ -433,11 +433,13 @@ func (s *Store) ApplyPulled(m domain.Mutation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Defensive normalisation: a well-behaved central store already sends nil for
-	// no-topic mutations, but fold &"" → nil here so '' never reaches any local
-	// index (every partial topic index uses `WHERE topic_key IS NOT NULL`, which
-	// is the complete no-topic exclusion once '' is normalised away at store entry).
-	m = domain.NormalizeTopicKey(m)
+	// Normalize symmetrically with localWriteLocked: fold &"" → nil topic keys and,
+	// ONLY when a field is unset, derive Payload/MutationID/OccurredAt. A well-behaved
+	// central store already sends Payload/MutationID/OccurredAt (so for real pulls this
+	// just folds the topic key and preserves the central identity); calling the full
+	// normalizeMutation closes the latent asymmetry for callers that hand ApplyPulled a
+	// bare domain.Mutation.
+	m = normalizeMutation(m)
 
 	tx, err := s.db.Begin()
 	if err != nil {
