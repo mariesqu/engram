@@ -223,11 +223,11 @@ func (e *syncAllError) Error() string {
 	if len(e.errs) == 1 {
 		return e.errs[0].Error()
 	}
-	msg := fmt.Sprintf("%d project pull errors: %s", len(e.errs), e.errs[0].Error())
+	buf := fmt.Appendf(nil, "%d project pull errors: %s", len(e.errs), e.errs[0].Error())
 	for _, err := range e.errs[1:] {
-		msg += "; " + err.Error()
+		buf = fmt.Appendf(buf, "; %s", err.Error())
 	}
-	return msg
+	return string(buf)
 }
 
 // Retryable returns true if ANY wrapped error is retryable. The Loop backs off
