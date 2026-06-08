@@ -207,12 +207,11 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	central := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
 	node := syncer.NewNode("daemon", store)
 
-	// TODO(PR-later): multi-project autosync — the Loop currently drives a
-	// single project ("" = wildcard / pull-all is not yet wired).  For the
-	// skeleton, pass an empty project string; actual multi-project support
-	// (iterating over all stored project names and syncing each) is deferred
-	// to a later PR once the project-registry layer is in place.
-	loop := syncer.NewLoop(node, central, "", syncer.Config{
+	// The Loop drives SyncAllProjects per tick: Push once (outbox is
+	// project-agnostic), then Pull each project using its own per-project
+	// cursor. No project parameter is needed — projects are discovered via
+	// localstore.ListProjects() at each tick.
+	loop := syncer.NewLoop(node, central, syncer.Config{
 		Interval: cfg.syncInterval,
 	})
 

@@ -55,7 +55,21 @@ import (
 //   modernc sqlite 3.43+ supports DROP COLUMN. The migration is guarded by
 //   PRAGMA table_info so a fresh DB (where ApplySchema never created the column)
 //   is a no-op.
-const currentSchemaVersion = 5
+//
+// v5 → v6: add pull_cursors table for per-project pull cursors. Central seqs form
+//   a single global BIGSERIAL — pulling multiple projects with a GLOBAL cursor
+//   would skip interleaved projects (pull A advances the global cursor past A's
+//   seqs; B's lower interleaved seqs then fall below the cursor and are silently
+//   missed). The fix is per-project cursors: pull_cursors(target_key, project,
+//   last_pulled_seq, PK(target_key, project)).
+//
+//   The legacy sync_state.last_pulled_seq is left in place (harmless dead column):
+//   its value is an AMBIGUOUS global cursor — it reflects the highest seq seen
+//   across all pulled projects, not a reliable per-project cursor, and migrating it
+//   to per-project rows would require knowing which projects were previously pulled
+//   (unknowable from the local store alone). Leaving it avoids a lossy migration.
+//   New code uses PullCursorFor/SetPullCursorFor exclusively.
+const currentSchemaVersion = 6
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -259,9 +273,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 5
 	}
 
+	if ver < 6 {
+		if err := migrateV5ToV6(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 6
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes the
-	// final `ver = 5` assignment so it is not flagged as ineffectual (SA4006); the
-	// value stays in sync for any future `if ver < 6` migration block.
+	// final `ver = 6` assignment so it is not flagged as ineffectual (SA4006); the
+	// value stays in sync for any future `if ver < 7` migration block.
 	_ = ver
 	return nil
 }
@@ -740,6 +762,37 @@ func migrateV4ToV5(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV5ToV6 creates the pull_cursors table for per-project pull cursors.
+//
+// A fresh DB created by ApplySchema already has pull_cursors (via
+// CREATE TABLE IF NOT EXISTS), so this migration is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 5.
+func migrateV5ToV6(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS pull_cursors (
+		target_key       TEXT    NOT NULL,
+		project          TEXT    NOT NULL,
+		last_pulled_seq  INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (target_key, project)
+	)`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 6`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -805,6 +858,24 @@ func ApplySchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS applied_mutations (
 			mutation_id TEXT    PRIMARY KEY,
 			applied_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+		)`,
+
+		// ── pull_cursors — per-project pull cursors ───────────────────────────
+		// Central seqs form a single global BIGSERIAL. Pulling multiple projects
+		// with the global cursor (sync_state.last_pulled_seq) would skip
+		// interleaved projects: pull A advances the global cursor past A's seqs;
+		// B's lower interleaved seqs then fall below the cursor and are missed.
+		// Per-project cursors (one row per (target_key, project)) solve this:
+		// each project advances independently, so interleaved seqs are never
+		// skipped. See PullCursorFor / SetPullCursorFor in sync.go.
+		//
+		// Note: sync_state.last_pulled_seq is kept for backward compatibility
+		// (its value is a dead ambiguous global cursor; new code never reads it).
+		`CREATE TABLE IF NOT EXISTS pull_cursors (
+			target_key       TEXT    NOT NULL,
+			project          TEXT    NOT NULL,
+			last_pulled_seq  INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (target_key, project)
 		)`,
 
 		// ── Indexes ──────────────────────────────────────────────────────────

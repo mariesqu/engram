@@ -186,6 +186,47 @@ func autoNode(t *testing.T, name string) *syncer.Node {
 	return syncer.NewNode(name, st)
 }
 
+// autoNodeForProjects opens a fresh localstore, seeds one local write per
+// project (using writerID as the mutation's writer_id so Push doesn't get a
+// 403 writer_id mismatch from central), and wraps it as a syncer.Node.
+//
+// The seed ensures ListProjects returns each project so SyncAllProjects calls
+// PullSince for it. Without a seed a fresh node starts empty and the Loop would
+// never discover the project to pull.
+//
+// In production a node is always provisioned with at least one local write per
+// project it intends to sync (the first session's mem_save creates it). Tests
+// that rely on cross-node propagation must mirror that by seeding the receiver
+// node for the expected projects.
+func autoNodeForProjects(t *testing.T, name, writerID string, projects []string) *syncer.Node {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := localstore.Open(filepath.Join(dir, name+".db"))
+	if err != nil {
+		t.Fatalf("autoNodeForProjects %s: localstore.Open: %v", name, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	n := syncer.NewNode(name, st)
+	for i, proj := range projects {
+		_, err := n.Write(domain.Mutation{
+			Op:         domain.OpUpsert,
+			SyncID:     name + "-seed-" + proj + string(rune('0'+i)),
+			SessionID:  "sess-seed",
+			EntityType: domain.EntityMemory,
+			Type:       "manual",
+			Title:      "seed",
+			Project:    proj,
+			Scope:      "project",
+			WriterID:   writerID,
+			UpdatedAt:  time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+		if err != nil {
+			t.Fatalf("autoNodeForProjects %s seed %q: %v", name, proj, err)
+		}
+	}
+	return n
+}
+
 // ── Acceptance proof ─────────────────────────────────────────────────────────
 
 const (
@@ -225,7 +266,14 @@ func TestAutoSync_WriteOnA_ReachesB(t *testing.T) {
 	centralB := newClient("writer-B")
 
 	nodeA := autoNode(t, "A")
-	nodeB := autoNode(t, "B")
+	// nodeB must be seeded with autoProject so that SyncAllProjects calls
+	// PullSince for "engram". A fresh empty node has no local projects — its
+	// ListProjects() returns nothing, and the Loop would never pull autoProject.
+	// In production a node always has at least one local write for each project
+	// it syncs. The seed here mirrors that: a single dummy write before the loop
+	// starts ensures ListProjects returns "engram" on the first tick.
+	// writerID must match the HMAC-authenticated writer so Push doesn't 403.
+	nodeB := autoNodeForProjects(t, "B", "writer-B", []string{autoProject})
 
 	// Short Interval so the test completes quickly without needing Trigger on B.
 	loopCfg := syncer.Config{
@@ -233,8 +281,8 @@ func TestAutoSync_WriteOnA_ReachesB(t *testing.T) {
 		Debounce: 10 * time.Millisecond,
 	}
 
-	loopA := syncer.NewLoop(nodeA, centralA, autoProject, loopCfg)
-	loopB := syncer.NewLoop(nodeB, centralB, autoProject, loopCfg)
+	loopA := syncer.NewLoop(nodeA, centralA, loopCfg)
+	loopB := syncer.NewLoop(nodeB, centralB, loopCfg)
 
 	loopA.Start(ctx)
 	loopB.Start(ctx)

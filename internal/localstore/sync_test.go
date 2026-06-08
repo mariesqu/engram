@@ -607,3 +607,187 @@ func TestApplyPulled_EmptyTopicKey_StoresNULL(t *testing.T) {
 		t.Errorf("ApplyPulled topic_key = %q; want SQL NULL", *topicKey)
 	}
 }
+
+// ── Per-project pull cursor tests ─────────────────────────────────────────────
+
+// TestListProjects returns the union of distinct project names from memories and
+// memory_tombstones, sorted alphabetically, with no duplicates.
+func TestListProjects(t *testing.T) {
+	s := openTempStore(t)
+
+	at := baseT.Add(1 * time.Second)
+
+	// Write memories for projects "alpha" and "bravo".
+	writeMut := func(syncID, project, scope string) domain.Mutation {
+		return domain.Mutation{
+			Op:         domain.OpUpsert,
+			SyncID:     syncID,
+			SessionID:  "sess",
+			EntityType: domain.EntityMemory,
+			Type:       "manual",
+			Title:      "title",
+			Content:    "content",
+			Project:    project,
+			Scope:      scope,
+			WriterID:   "w",
+			UpdatedAt:  at,
+		}
+	}
+	deleteMut := func(syncID, project, scope string) domain.Mutation {
+		return domain.Mutation{
+			Op:         domain.OpDelete,
+			SyncID:     syncID,
+			SessionID:  "sess",
+			EntityType: domain.EntityMemory,
+			Type:       "manual",
+			Title:      "title",
+			Project:    project,
+			Scope:      scope,
+			WriterID:   "w",
+			UpdatedAt:  at.Add(time.Second),
+			Version:    2,
+		}
+	}
+
+	// alpha appears in memories.
+	if _, err := s.LocalWrite(writeMut("lp-a1", "alpha", "project")); err != nil {
+		t.Fatalf("LocalWrite alpha: %v", err)
+	}
+	// bravo appears in memories.
+	if _, err := s.LocalWrite(writeMut("lp-b1", "bravo", "project")); err != nil {
+		t.Fatalf("LocalWrite bravo: %v", err)
+	}
+	// charlie: write then delete — appears in memory_tombstones only (tombstone-only project).
+	if _, err := s.LocalWrite(writeMut("lp-c1", "charlie", "project")); err != nil {
+		t.Fatalf("LocalWrite charlie: %v", err)
+	}
+	if _, err := s.LocalWrite(deleteMut("lp-c1", "charlie", "project")); err != nil {
+		t.Fatalf("delete charlie: %v", err)
+	}
+
+	projects, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+
+	want := []string{"alpha", "bravo", "charlie"}
+	if len(projects) != len(want) {
+		t.Fatalf("ListProjects: got %v, want %v", projects, want)
+	}
+	for i, p := range want {
+		if projects[i] != p {
+			t.Errorf("ListProjects[%d] = %q, want %q", i, projects[i], p)
+		}
+	}
+
+	// A second write for alpha (same project) must not duplicate it.
+	if _, err := s.LocalWrite(writeMut("lp-a2", "alpha", "project")); err != nil {
+		t.Fatalf("LocalWrite alpha2: %v", err)
+	}
+	projects2, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects after second alpha write: %v", err)
+	}
+	if len(projects2) != 3 {
+		t.Errorf("ListProjects after dup write: got %v, want {alpha, bravo, charlie}", projects2)
+	}
+}
+
+// TestListProjects_Empty returns nil (not an error) when the store has no rows.
+func TestListProjects_Empty(t *testing.T) {
+	s := openTempStore(t)
+	projects, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects on empty store: %v", err)
+	}
+	if len(projects) != 0 {
+		t.Errorf("ListProjects on empty store: got %v, want []", projects)
+	}
+}
+
+// TestPullCursorFor_PerProjectIndependent proves that PullCursorFor and
+// SetPullCursorFor track each project's cursor independently:
+//   - A fresh store returns 0 for any project.
+//   - Advancing project A does not affect project B.
+//   - Each project's cursor is monotonic: a lower seq is silently ignored.
+func TestPullCursorFor_PerProjectIndependent(t *testing.T) {
+	s := openTempStore(t)
+
+	// Fresh store: both projects return 0.
+	got, err := s.PullCursorFor("projectA")
+	if err != nil {
+		t.Fatalf("PullCursorFor A (fresh): %v", err)
+	}
+	if got != 0 {
+		t.Errorf("fresh PullCursorFor A = %d, want 0", got)
+	}
+	got, err = s.PullCursorFor("projectB")
+	if err != nil {
+		t.Fatalf("PullCursorFor B (fresh): %v", err)
+	}
+	if got != 0 {
+		t.Errorf("fresh PullCursorFor B = %d, want 0", got)
+	}
+
+	// Advance A to 10 — B must remain at 0.
+	if err := s.SetPullCursorFor("projectA", 10); err != nil {
+		t.Fatalf("SetPullCursorFor A=10: %v", err)
+	}
+	gotA, err := s.PullCursorFor("projectA")
+	if err != nil {
+		t.Fatalf("PullCursorFor A after set: %v", err)
+	}
+	if gotA != 10 {
+		t.Errorf("PullCursorFor A = %d, want 10", gotA)
+	}
+	gotB, err := s.PullCursorFor("projectB")
+	if err != nil {
+		t.Fatalf("PullCursorFor B after A set: %v", err)
+	}
+	if gotB != 0 {
+		t.Errorf("PullCursorFor B = %d, want 0 (must not be affected by A)", gotB)
+	}
+
+	// Advance B to 5 — A must remain at 10.
+	if err := s.SetPullCursorFor("projectB", 5); err != nil {
+		t.Fatalf("SetPullCursorFor B=5: %v", err)
+	}
+	gotA, err = s.PullCursorFor("projectA")
+	if err != nil {
+		t.Fatalf("PullCursorFor A after B set: %v", err)
+	}
+	if gotA != 10 {
+		t.Errorf("PullCursorFor A = %d after B set, want 10 (must not be affected by B)", gotA)
+	}
+	gotB, err = s.PullCursorFor("projectB")
+	if err != nil {
+		t.Fatalf("PullCursorFor B after set: %v", err)
+	}
+	if gotB != 5 {
+		t.Errorf("PullCursorFor B = %d, want 5", gotB)
+	}
+
+	// Monotonic: lower seq must NOT rewind A's cursor.
+	if err := s.SetPullCursorFor("projectA", 3); err != nil {
+		t.Fatalf("SetPullCursorFor A=3 (lower than 10): %v", err)
+	}
+	gotA, err = s.PullCursorFor("projectA")
+	if err != nil {
+		t.Fatalf("PullCursorFor A after lower set: %v", err)
+	}
+	if gotA != 10 {
+		t.Errorf("PullCursorFor A = %d after lower set, want 10 (cursor must not rewind)", gotA)
+	}
+
+	// Advance A further — confirms forward progression works after a rewind attempt.
+	if err := s.SetPullCursorFor("projectA", 20); err != nil {
+		t.Fatalf("SetPullCursorFor A=20: %v", err)
+	}
+	gotA, err = s.PullCursorFor("projectA")
+	if err != nil {
+		t.Fatalf("PullCursorFor A final: %v", err)
+	}
+	if gotA != 20 {
+		t.Errorf("PullCursorFor A = %d, want 20", gotA)
+	}
+}

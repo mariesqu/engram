@@ -83,8 +83,13 @@ func applyDefaults(c Config) Config {
 	return c
 }
 
-// Loop runs syncer.Sync in the background on a periodic schedule with
+// Loop runs SyncAllProjects in the background on a periodic schedule with
 // debounced on-demand triggering and exponential backoff on retryable errors.
+//
+// Each tick calls SyncAllProjects: Push once (drain outbox → central) then Pull
+// each project the local store knows about, using per-project pull cursors. This
+// is correct for any number of projects — including zero (no-op pull round) and
+// one (degenerate case identical to the old single-project loop).
 //
 // Construct with NewLoop; start with Start(ctx); request an early sync with
 // Trigger(); stop with Stop() or by cancelling the ctx.
@@ -96,7 +101,6 @@ func applyDefaults(c Config) Config {
 type Loop struct {
 	node    *Node
 	central Central
-	project string
 	cfg     Config
 
 	// triggerCh carries Trigger() signals. Size 1: a pending signal is as good
@@ -121,11 +125,11 @@ type Loop struct {
 }
 
 // NewLoop constructs a Loop. cfg zero values are replaced by defaults.
-func NewLoop(node *Node, central Central, project string, cfg Config) *Loop {
+// The Loop drives SyncAllProjects per tick — no project parameter is required.
+func NewLoop(node *Node, central Central, cfg Config) *Loop {
 	return &Loop{
 		node:      node,
 		central:   central,
-		project:   project,
 		cfg:       applyDefaults(cfg),
 		triggerCh: make(chan struct{}, 1),
 		done:      make(chan struct{}),
@@ -229,10 +233,10 @@ func (l *Loop) run(ctx context.Context) {
 			timer.Reset(l.waitDuration(triggered, backoff, intervalFloor))
 
 		case <-timer.C:
-			// Timer fired — run one sync.
+			// Timer fired — run one multi-project sync round.
 			triggered = false // consumed
 
-			pushed, pulled, err := Sync(ctx, l.node, l.central, l.project)
+			pushed, pulled, err := SyncAllProjects(ctx, l.node, l.central)
 			if err != nil {
 				if ctx.Err() != nil {
 					// Context cancelled (Stop or parent shutdown) mid-sync: exit
