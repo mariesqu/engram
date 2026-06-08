@@ -18,9 +18,10 @@ import (
 // ─── Flag validation: run() dispatch ────────────────────────────────────────
 
 // TestServeErr verifies that serveErr treats nil and context.Canceled (a clean
-// SIGINT/SIGTERM shutdown — mcp-go's ServeStdio cancels its Listen ctx on signal)
-// as success, and surfaces only genuine errors. Guards the daemon exit code: a
-// normal signal stop must exit 0, not 1.
+// shutdown) as success, and surfaces only genuine errors. On SIGINT/SIGTERM the
+// daemon's signal.NotifyContext (runDaemonCmd) cancels the ctx passed to
+// StdioServer.Listen, which returns context.Canceled. Guards the daemon exit
+// code: a normal signal stop must exit 0, not 1.
 func TestServeErr(t *testing.T) {
 	if err := serveErr(nil); err != nil {
 		t.Errorf("serveErr(nil) = %v, want nil", err)

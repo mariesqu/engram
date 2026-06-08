@@ -29,8 +29,10 @@ registration lands in subsequent PRs.
 
 When --central-url is set the daemon wires an autosync Loop that pushes local
 writes to the central server and pulls remote mutations back on a periodic
-schedule.  Without --central-url the daemon runs in LOCAL-ONLY mode: no network
-traffic, no HMAC credentials required.
+schedule.  Pulls cover only projects already present in the local store, so a
+fresh/empty database pulls nothing until a local write first creates a project.
+Without --central-url the daemon runs in LOCAL-ONLY mode: no network traffic,
+no HMAC credentials required.
 
 On SIGINT or SIGTERM the daemon stops the autosync loop (if running), closes the
 store, and exits cleanly.

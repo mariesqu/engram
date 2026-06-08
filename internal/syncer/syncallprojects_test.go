@@ -243,13 +243,11 @@ func TestSyncAllProjects_PartialFailure(t *testing.T) {
 
 	// The error must be retryable (projA's error is retryable).
 	type retryableIface interface{ Retryable() bool }
-	var r retryableIface
 	isRetryableErr := false
 	// Walk the error chain manually — syncAllError wraps the individual errors.
 	if re, ok := err.(retryableIface); ok {
 		isRetryableErr = re.Retryable()
 	}
-	_ = r
 	if !isRetryableErr {
 		t.Errorf("SyncAllProjects error not retryable: %v (want Retryable()=true)", err)
 	}
