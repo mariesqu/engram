@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,27 @@ import (
 )
 
 // ─── Flag validation: run() dispatch ────────────────────────────────────────
+
+// TestServeErr verifies that serveErr treats nil and context.Canceled (a clean
+// SIGINT/SIGTERM shutdown — mcp-go's ServeStdio cancels its Listen ctx on signal)
+// as success, and surfaces only genuine errors. Guards the daemon exit code: a
+// normal signal stop must exit 0, not 1.
+func TestServeErr(t *testing.T) {
+	if err := serveErr(nil); err != nil {
+		t.Errorf("serveErr(nil) = %v, want nil", err)
+	}
+	if err := serveErr(context.Canceled); err != nil {
+		t.Errorf("serveErr(context.Canceled) = %v, want nil (clean signal shutdown)", err)
+	}
+	if err := serveErr(fmt.Errorf("listen: %w", context.Canceled)); err != nil {
+		t.Errorf("serveErr(wrapped context.Canceled) = %v, want nil", err)
+	}
+	realErr := errors.New("broken pipe")
+	got := serveErr(realErr)
+	if got == nil || !errors.Is(got, realErr) {
+		t.Errorf("serveErr(realErr) = %v, want a non-nil error wrapping realErr", got)
+	}
+}
 
 // TestRun_DaemonMissingDB verifies that 'daemon' with no --db and no ENGRAM_DB
 // returns exit code 1 (the "db required" validation error).

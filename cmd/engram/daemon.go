@@ -239,8 +239,19 @@ func runDaemon(ctx context.Context, cfg daemonCfg) error {
 
 	log.Printf("engram daemon: MCP over stdio (db=%s, autosync=%s)", cfg.db, autosync)
 
-	if err := mcpserver.ServeStdio(components.mcpServer); err != nil {
-		return fmt.Errorf("daemon: ServeStdio: %w", err)
+	return serveErr(mcpserver.ServeStdio(components.mcpServer))
+}
+
+// serveErr classifies the error returned by mcpserver.ServeStdio. ServeStdio
+// traps SIGINT/SIGTERM internally and cancels its Listen context, so it returns
+// context.Canceled on a clean signal shutdown — that, like a nil return (stdin
+// EOF / normal MCP client disconnect), is a SUCCESSFUL exit, not an error.
+// Without this, a normal Ctrl-C / `kill` would exit non-zero and log a spurious
+// "context canceled", which a process supervisor reads as a crash. Only a
+// genuine I/O failure is surfaced.
+func serveErr(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("daemon: ServeStdio: %w", err)
 }
