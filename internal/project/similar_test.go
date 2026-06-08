@@ -193,3 +193,36 @@ func TestFindSimilar_ZeroMaxDistance(t *testing.T) {
 		t.Errorf("expected no matches with maxDistance=0, got %v", matches)
 	}
 }
+
+// TestFindSimilar_NonASCIIRuneScaling verifies Fix 4: effectiveMax is derived
+// from the rune count of the query, not its byte length. A 2-rune non-ASCII
+// name ("éà") has runeLen=2 but byteLen=4; with maxDistance=3 the effective max
+// must be 1 (max(1, 2/2)), not 2 (byte-based: 4/2). The candidate "éb" has
+// Levenshtein distance 1, so it must still match; a candidate at distance 2
+// must not match (it exceeds effectiveMax=1).
+func TestFindSimilar_NonASCIIRuneScaling(t *testing.T) {
+	// "éà" is 2 runes / 4 bytes. effectiveMax = max(1, 2/2) = 1.
+	query := "éà"
+	// distance("éà","éb") == 1  → should match
+	// distance("éà","xy") == 2  → must NOT match (exceeds effectiveMax=1)
+	existing := []string{"éb", "xy"}
+	matches := FindSimilar(query, existing, 3)
+
+	foundEb := false
+	foundXy := false
+	for _, m := range matches {
+		switch m.Name {
+		case "éb":
+			foundEb = true
+		case "xy":
+			foundXy = true
+		}
+	}
+
+	if !foundEb {
+		t.Errorf("expected 'éb' (distance 1) to match with rune-based effectiveMax=1, but it did not")
+	}
+	if foundXy {
+		t.Errorf("expected 'xy' (distance 2) to be excluded by rune-based effectiveMax=1, but it was included")
+	}
+}

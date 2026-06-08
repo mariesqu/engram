@@ -3,6 +3,7 @@ package project
 import (
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // ProjectMatch represents a project name that is similar to a query string.
@@ -17,7 +18,9 @@ type ProjectMatch struct {
 //
 //  1. Case-insensitive exact match (different case, same letters)
 //  2. Substring containment (query is a substring of candidate or vice-versa)
-//  3. Levenshtein distance ≤ maxDistance
+//  3. Levenshtein distance ≤ effectiveMax, where effectiveMax is
+//     min(maxDistance, max(1, runeLen(query)/2)). Very short queries therefore
+//     match more conservatively than the raw maxDistance would allow.
 //
 // Exact matches (identical strings) are always excluded.
 //
@@ -32,9 +35,10 @@ func FindSimilar(name string, existing []string, maxDistance int) []ProjectMatch
 
 	// Scale maxDistance for short names to avoid noisy matches.
 	// A 2-char name with maxDistance 3 would match almost everything.
+	// Use rune count (not byte length) so non-ASCII names are scaled correctly.
 	effectiveMax := maxDistance
-	if len(nameLower) > 0 {
-		halfLen := len(nameLower) / 2
+	if runeLen := utf8.RuneCountInString(nameLower); runeLen > 0 {
+		halfLen := runeLen / 2
 		if halfLen < 1 {
 			halfLen = 1
 		}

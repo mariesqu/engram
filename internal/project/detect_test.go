@@ -2,6 +2,7 @@ package project
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -700,5 +701,73 @@ func TestDetectProject_AmbiguousEmpty(t *testing.T) {
 	got := DetectProject(parent)
 	if got == "" {
 		t.Error("DetectProject must not return empty string on ambiguous cwd")
+	}
+}
+
+// TestDetectFromConfig_PureFSWalkFindsConfigFromSubdir verifies Fix 1: config
+// detection uses a pure-Go filesystem walk (no git on PATH) and correctly
+// finds .engram/config.json at the repo root when called from a nested subdir.
+// The .git entry is a plain directory (normal repo layout).
+func TestDetectFromConfig_PureFSWalkFindsConfigFromSubdir(t *testing.T) {
+	root := t.TempDir()
+
+	// Create a .git directory to mark this as a "repo root" for findGitRootFS.
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a valid config at the repo root.
+	configDir := filepath.Join(root, ".engram")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"fs-walk-project"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a nested subdir two levels deep.
+	subdir := filepath.Join(root, "src", "service")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(subdir)
+
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %v", res.Error)
+	}
+	if res.Source != SourceConfig {
+		t.Errorf("Source = %q; want %q", res.Source, SourceConfig)
+	}
+	if res.Project != "fs-walk-project" {
+		t.Errorf("Project = %q; want %q", res.Project, "fs-walk-project")
+	}
+	gotPath, _ := filepath.EvalSymlinks(res.Path)
+	wantPath, _ := filepath.EvalSymlinks(root)
+	if gotPath != wantPath {
+		t.Errorf("Path = %q; want %q", gotPath, wantPath)
+	}
+}
+
+// TestInvalidConfigResult_NoDoubleWrap verifies Fix 2: when the inner error is
+// already wrapped with ErrInvalidConfig (e.g. from normalizeConfigProjectName),
+// invalidConfigResult must not produce a second "invalid .engram/config.json:"
+// prefix in the error message.
+func TestInvalidConfigResult_NoDoubleWrap(t *testing.T) {
+	// Simulate what normalizeConfigProjectName returns — already wrapped.
+	inner := fmt.Errorf("%w: project_name is required", ErrInvalidConfig)
+
+	res := invalidConfigResult("/some/path", inner)
+
+	if !errors.Is(res.Error, ErrInvalidConfig) {
+		t.Fatalf("result error must wrap ErrInvalidConfig, got: %v", res.Error)
+	}
+
+	msg := res.Error.Error()
+	const prefix = "invalid .engram/config.json"
+	// Count occurrences of the prefix.
+	count := strings.Count(msg, prefix)
+	if count != 1 {
+		t.Errorf("expected the %q prefix to appear exactly once; got %d occurrence(s) in %q", prefix, count, msg)
 	}
 }

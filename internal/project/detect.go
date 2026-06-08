@@ -17,6 +17,29 @@ import (
 	"time"
 )
 
+// findGitRootFS walks the filesystem upward from startDir looking for a .git
+// entry (which may be a directory for a normal repo or a file for a
+// worktree/submodule). It returns the first directory that contains a .git
+// entry, or "" if no such ancestor is found before the filesystem root.
+// This is a pure-Go alternative to running `git rev-parse --show-toplevel`
+// and works when git is not on PATH.
+func findGitRootFS(startDir string) string {
+	current := filepath.Clean(startDir)
+	for {
+		gitEntry := filepath.Join(current, ".git")
+		if _, err := os.Lstat(gitEntry); err == nil {
+			// Found a .git entry (file or directory).
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the filesystem root.
+			return ""
+		}
+		current = parent
+	}
+}
+
 // ErrAmbiguousProject is returned when the working directory is a parent of
 // multiple git repositories and we cannot auto-select one.
 var ErrAmbiguousProject = errors.New("ambiguous project: multiple git repos found in cwd")
@@ -99,6 +122,8 @@ func DetectProjectFull(dir string) DetectionResult {
 	}
 
 	// ── Case 1: git_remote ──────────────────────────────────────────────
+	// detectFromGitRemote resolves the remote from anywhere inside the repo
+	// (via the repo root), not only when cwd is the root itself.
 	if name := detectFromGitRemote(dir); name != "" {
 		// Use repo root as Path for consistency with Case 2 (git_root).
 		// When called from a subdir, both cases should set Path to the root.
@@ -185,10 +210,12 @@ func detectFromConfig(dir string) (DetectionResult, bool) {
 	absDir = canonicalizePath(absDir)
 
 	// Project config is a project/repo lock, not a global ancestor setting. When
-	// cwd is inside git, walk upward only within the enclosing repository so a
-	// nearest subproject .engram/config.json can override the repo root without
-	// letting ~/.engram/config.json leak into nested workspaces under $HOME.
-	if gitRoot := canonicalizePath(detectGitRootDir(absDir)); gitRoot != "" {
+	// cwd is inside a git repo, walk upward only within the enclosing repository
+	// so a nearest subproject .engram/config.json can override the repo root
+	// without letting ~/.engram/config.json leak into nested workspaces under
+	// $HOME. The repo root is detected via a pure-Go filesystem walk (no git on
+	// PATH required).
+	if gitRoot := canonicalizePath(findGitRootFS(absDir)); gitRoot != "" {
 		return readNearestConfigAtOrBelow(absDir, gitRoot)
 	}
 
@@ -240,11 +267,20 @@ func readConfigAt(projectDir string) (DetectionResult, bool) {
 }
 
 func invalidConfigResult(path string, err error) DetectionResult {
+	// Avoid double-wrapping when err is already wrapped with ErrInvalidConfig
+	// (e.g. from normalizeConfigProjectName), which would produce messages like
+	// "invalid .engram/config.json: invalid .engram/config.json: ...".
+	var resultErr error
+	if errors.Is(err, ErrInvalidConfig) {
+		resultErr = err
+	} else {
+		resultErr = fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
 	return DetectionResult{
 		Project: "",
 		Source:  SourceConfig,
 		Path:    path,
-		Error:   fmt.Errorf("%w: %v", ErrInvalidConfig, err),
+		Error:   resultErr,
 	}
 }
 
