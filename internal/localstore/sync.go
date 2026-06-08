@@ -319,8 +319,8 @@ func (s *Store) SetPullCursor(seq int64) error {
 }
 
 // PullCursorFor returns the last central seq this store has pulled and applied
-// for the given project (pull_cursors.last_pulled_seq WHERE target_key=default
-// AND project=project). A missing row means no pulls have been made for that
+// for the given project (pull_cursors.last_pulled_seq WHERE target_key='central'
+// AND project=?). A missing row means no pulls have been made for that
 // project yet and 0 is returned.
 //
 // PullCursorFor is the per-project replacement for PullCursor. The old
