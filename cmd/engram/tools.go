@@ -93,15 +93,26 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				resolvedDir = cwd
 			}
 		}
-		// Surface a broken .engram/config.json as a tool error (faithful to
-		// old_code) rather than silently storing the session under "unknown".
-		// Other resolution errors (e.g. ambiguous repo) fall back to the basename.
+		// Surface broken-config and ambiguous-project resolution errors as tool
+		// errors (faithful to old_code) rather than silently storing the session
+		// under a wrong/basename project. ErrInvalidConfig = malformed
+		// .engram/config.json; ErrAmbiguousProject = the directory is a parent of
+		// multiple repos so no single project can be chosen. Any other error falls
+		// back to the basename.
 		det := projectpkg.DetectProjectFull(resolvedDir)
 		if det.Error != nil {
-			if errors.Is(det.Error, projectpkg.ErrInvalidConfig) {
+			switch {
+			case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
 				return mcp.NewToolResultError("mem_session_start: " + det.Error.Error()), nil
+			case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
+				msg := "mem_session_start: " + det.Error.Error()
+				if len(det.AvailableProjects) > 0 {
+					msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") + "); supply a more specific directory"
+				}
+				return mcp.NewToolResultError(msg), nil
+			default:
+				det.Project = projectpkg.DetectProject(resolvedDir)
 			}
-			det.Project = projectpkg.DetectProject(resolvedDir)
 		}
 		project := det.Project
 

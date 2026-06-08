@@ -82,10 +82,10 @@ func (s *Store) GetSession(id string) (*Session, error) {
 		id,
 	)
 	var sess Session
-	var startedRaw, endedRaw sql.NullString
+	var startedRaw, endedRaw, summaryRaw sql.NullString
 	if err := row.Scan(
 		&sess.ID, &sess.Project, &sess.Directory,
-		&startedRaw, &endedRaw, &sess.Summary,
+		&startedRaw, &endedRaw, &summaryRaw,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrSessionNotFound
@@ -99,6 +99,9 @@ func (s *Store) GetSession(id string) (*Session, error) {
 		if t, err := parseSessionTime(endedRaw.String); err == nil {
 			sess.EndedAt = &t
 		}
+	}
+	if summaryRaw.Valid {
+		sess.Summary = &summaryRaw.String
 	}
 	return &sess, nil
 }
@@ -135,9 +138,12 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	var results []SessionSummary
 	for rows.Next() {
 		var ss SessionSummary
-		var startedRaw, endedRaw sql.NullString
-		if err := rows.Scan(&ss.ID, &ss.Project, &startedRaw, &endedRaw, &ss.Summary); err != nil {
+		var startedRaw, endedRaw, summaryRaw sql.NullString
+		if err := rows.Scan(&ss.ID, &ss.Project, &startedRaw, &endedRaw, &summaryRaw); err != nil {
 			return nil, err
+		}
+		if summaryRaw.Valid {
+			ss.Summary = &summaryRaw.String
 		}
 		if t, err := parseSessionTime(startedRaw.String); err == nil {
 			ss.StartedAt = t

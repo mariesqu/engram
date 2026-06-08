@@ -430,6 +430,38 @@ func TestDaemonTool_SessionStart_InvalidConfig(t *testing.T) {
 	}
 }
 
+// TestDaemonTool_SessionStart_AmbiguousProject verifies that a directory which is
+// the parent of multiple git repos surfaces as a tool error (faithful to old_code)
+// rather than silently storing the session under the parent's basename.
+func TestDaemonTool_SessionStart_AmbiguousProject(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	parent := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		if err := os.MkdirAll(filepath.Join(parent, name, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startTool := components.mcpServer.ListTools()["mem_session_start"]
+	req := newToolRequest("mem_session_start", map[string]any{"id": "ambig-session", "directory": parent})
+	result, err := startTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected a tool error for an ambiguous (multi-repo parent) directory, got success: %v", result.Content)
+	}
+	if _, err := components.store.GetSession("ambig-session"); err == nil {
+		t.Error("session created despite ambiguous project — should have errored before CreateSession")
+	}
+}
+
 // TestDaemonTool_SessionEnd_ClosesRow verifies that calling mem_session_end via
 // its registered handler sets ended_at and summary on the session row.
 func TestDaemonTool_SessionEnd_ClosesRow(t *testing.T) {
