@@ -46,6 +46,11 @@ import (
 	"io"
 )
 
+// KeySize is the required length of HMAC keys in bytes (32 bytes = 256 bits,
+// matching HMAC-SHA256). Callers that decode a hex key from an environment
+// variable or config file must verify len(key) == KeySize before use.
+const KeySize = 32
+
 // Header name constants used by both the signing client and the verifying server.
 const (
 	// HeaderWriterID is the HTTP request header that identifies the writer.
@@ -124,11 +129,12 @@ func Verify(key []byte, method, path string, body []byte, sig string) bool {
 	return hmac.Equal(expected, sigBytes)
 }
 
-// NewKey generates a fresh 32-byte HMAC key from crypto/rand. 32 bytes provides
-// 256 bits of entropy — appropriate for HMAC-SHA256. Returns an error only if
-// crypto/rand fails, which should not happen in practice on any supported OS.
+// NewKey generates a fresh KeySize-byte HMAC key from crypto/rand. 32 bytes
+// provides 256 bits of entropy — appropriate for HMAC-SHA256. Returns an error
+// only if crypto/rand fails, which should not happen in practice on any
+// supported OS.
 func NewKey() ([]byte, error) {
-	key := make([]byte, 32)
+	key := make([]byte, KeySize)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
 	}
