@@ -248,6 +248,13 @@ func (e *syncAllError) Retryable() bool {
 	return false
 }
 
+// Unwrap exposes the per-project errors so callers can use errors.Is / errors.As
+// to inspect or match specific underlying failures (Go 1.20+ multi-error
+// semantics). The Loop still classifies retryability via Retryable() above.
+func (e *syncAllError) Unwrap() []error {
+	return e.errs
+}
+
 // SyncAll runs `rounds` full bidirectional sync rounds across all nodes in
 // order for the given project. Multiple rounds let writes propagate: round 1
 // pushes everyone's local writes to central; round 2 lets each node pull the

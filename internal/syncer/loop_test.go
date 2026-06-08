@@ -145,7 +145,7 @@ func openNode(t *testing.T, name string) *syncer.Node {
 	// empty store returns no projects, so PullSince is never called and the
 	// mockCentral.syncCh never fires. The seed ensures at least one project is
 	// always present so PullSince (and thus the mock's signal) fires each tick.
-	_, _ = n.Write(domain.Mutation{
+	if _, err := n.Write(domain.Mutation{
 		Op:         domain.OpUpsert,
 		SyncID:     "loop-test-seed-" + name,
 		SessionID:  "sess-seed",
@@ -155,7 +155,9 @@ func openNode(t *testing.T, name string) *syncer.Node {
 		Project:    "testproject",
 		Scope:      "project",
 		WriterID:   "test",
-	})
+	}); err != nil {
+		t.Fatalf("openNode: seed write: %v", err)
+	}
 	return n
 }
 

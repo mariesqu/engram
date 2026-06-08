@@ -4,6 +4,7 @@ package syncer_test
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -67,7 +68,7 @@ func (m *multiProjectCentral) getCalls() []pullCall {
 // central seq (Seq). SyncID and MutationID are distinct per mutation so
 // ApplyPulled's idempotency guard never de-dupes them.
 func makeMutation(project string, seq int64) domain.Mutation {
-	suffix := project + "-" + string(rune('0'+seq))
+	suffix := project + "-" + strconv.FormatInt(seq, 10)
 	syncID := "sync-mp-" + suffix
 	return domain.Mutation{
 		Op:         domain.OpUpsert,

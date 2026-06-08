@@ -210,7 +210,7 @@ func autoNodeForProjects(t *testing.T, name, writerID string, projects []string)
 	for i, proj := range projects {
 		_, err := n.Write(domain.Mutation{
 			Op:         domain.OpUpsert,
-			SyncID:     name + "-seed-" + proj + string(rune('0'+i)),
+			SyncID:     fmt.Sprintf("%s-seed-%s%d", name, proj, i),
 			SessionID:  "sess-seed",
 			EntityType: domain.EntityMemory,
 			Type:       "manual",
