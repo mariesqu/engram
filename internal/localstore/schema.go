@@ -39,8 +39,10 @@ import (
 //	astronomically-rare exact tie — see writeWins doc comment).
 //
 // v3 → v4: add memory_tombstones_topic_uidx — a partial UNIQUE index on
-//   memory_tombstones(topic_key, project, scope)
-//   WHERE topic_key IS NOT NULL AND topic_key <> ''
+//
+//	memory_tombstones(topic_key, project, scope)
+//	WHERE topic_key IS NOT NULL AND topic_key <> ''
+//
 // schema-enforcing the ≤1-tombstone-per-topic invariant (INV-B) that was
 // previously only logic-guaranteed by Decide's canonical re-targeting. Mirrors
 // central_tombstones_topic_uidx in the central store. CREATE UNIQUE INDEX IF NOT
@@ -48,33 +50,44 @@ import (
 // are a no-op.
 //
 // v4 → v5: drop the memories.seq column. The seq was a materialized copy of the
-//   central journal seq in each row, but it is consumed by nothing in production:
-//   the LWW tiebreaker uses (updated_at, version, writer_id, last_write_mutation_id)
-//   only (see writeWins in domain/reconcile.go), and the pull cursor is
-//   sync_state.last_pulled_seq (the journal seq from Mutation.Seq / PullSince).
-//   modernc sqlite 3.43+ supports DROP COLUMN. The migration is guarded by
-//   PRAGMA table_info so a fresh DB (where ApplySchema never created the column)
-//   is a no-op.
+//
+//	central journal seq in each row, but it is consumed by nothing in production:
+//	the LWW tiebreaker uses (updated_at, version, writer_id, last_write_mutation_id)
+//	only (see writeWins in domain/reconcile.go), and the pull cursor is
+//	sync_state.last_pulled_seq (the journal seq from Mutation.Seq / PullSince).
+//	modernc sqlite 3.43+ supports DROP COLUMN. The migration is guarded by
+//	PRAGMA table_info so a fresh DB (where ApplySchema never created the column)
+//	is a no-op.
 //
 // v5 → v6: add pull_cursors table for per-project pull cursors. Central seqs form
-//   a single global BIGSERIAL — pulling multiple projects with a GLOBAL cursor
-//   would skip interleaved projects (pull A advances the global cursor past A's
-//   seqs; B's lower interleaved seqs then fall below the cursor and are silently
-//   missed). The fix is per-project cursors: pull_cursors(target_key, project,
-//   last_pulled_seq, PK(target_key, project)).
 //
-//   The legacy sync_state.last_pulled_seq is left in place (harmless dead column):
-//   its value is an AMBIGUOUS global cursor — it reflects the highest seq seen
-//   across all pulled projects, not a reliable per-project cursor, and migrating it
-//   to per-project rows would require knowing which projects were previously pulled
-//   (unknowable from the local store alone). Leaving it avoids a lossy migration.
-//   New code uses PullCursorFor/SetPullCursorFor exclusively.
+//	a single global BIGSERIAL — pulling multiple projects with a GLOBAL cursor
+//	would skip interleaved projects (pull A advances the global cursor past A's
+//	seqs; B's lower interleaved seqs then fall below the cursor and are silently
+//	missed). The fix is per-project cursors: pull_cursors(target_key, project,
+//	last_pulled_seq, PK(target_key, project)).
+//
+//	The legacy sync_state.last_pulled_seq is left in place (harmless dead column):
+//	its value is an AMBIGUOUS global cursor — it reflects the highest seq seen
+//	across all pulled projects, not a reliable per-project cursor, and migrating it
+//	to per-project rows would require knowing which projects were previously pulled
+//	(unknowable from the local store alone). Leaving it avoids a lossy migration.
+//	New code uses PullCursorFor/SetPullCursorFor exclusively.
 //
 // v6 → v7: add sessions table for MCP session lifecycle tracking.
-//   mem_session_start creates a row; mem_session_end records ended_at + summary.
-//   The table is idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema), so a
-//   fresh DB where ApplySchema already created it is a no-op in the migration.
-const currentSchemaVersion = 7
+//
+//	mem_session_start creates a row; mem_session_end records ended_at + summary.
+//	The table is idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema), so a
+//	fresh DB where ApplySchema already created it is a no-op in the migration.
+//
+// v7 → v8: add conflict_relations table for post-save conflict detection.
+//
+//	FindCandidates inserts a pending row per candidate; mem_judge (PR-b) resolves
+//	them. Named conflict_relations (not memory_relations) to avoid collision with
+//	the existing SDD parent-child memory_relations table (from_sync_id/to_sync_id).
+//	The table is idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema), so a
+//	fresh DB where ApplySchema already created it is a no-op in the migration.
+const currentSchemaVersion = 8
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -247,6 +260,40 @@ const memoryRelationsTableDDL = `CREATE TABLE IF NOT EXISTS memory_relations (
 	PRIMARY KEY (from_sync_id, to_sync_id, rel_type)
 )`
 
+// conflictRelationsTableDDL is the authoritative CREATE TABLE statement for the
+// conflict_relations table. It is shared between ApplySchema (fresh DB) and
+// migrateV7ToV8 (existing DB upgrade) so both always produce the same schema.
+//
+// This table is DISTINCT from memory_relations (from_sync_id/to_sync_id/rel_type),
+// which is the SDD parent-child hierarchy table. conflict_relations stores
+// post-save conflict-detection results produced by FindCandidates and resolved
+// by mem_judge (PR-b).
+//
+// Column notes:
+//   - id: integer autoincrement PK
+//   - sync_id: "rel-<16hex>" unique relation identifier (= JudgmentID returned to callers)
+//   - source_id: sync_id of the saved observation (the one that triggered detection)
+//   - target_id: sync_id of the candidate observation
+//   - relation: pending initially; updated to a verb by mem_judge
+//   - judgment_status: pending | judged | orphaned | ignored
+//   - confidence: optional 0..1 score set by mem_judge
+//   - reason: optional free-text explanation
+//   - evidence: optional free-form JSON/text evidence
+//   - created_at / updated_at: UTC timestamps
+const conflictRelationsTableDDL = `CREATE TABLE IF NOT EXISTS conflict_relations (
+	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	sync_id          TEXT    NOT NULL UNIQUE,
+	source_id        TEXT    NOT NULL,
+	target_id        TEXT    NOT NULL,
+	relation         TEXT    NOT NULL DEFAULT 'pending',
+	judgment_status  TEXT    NOT NULL DEFAULT 'pending',
+	confidence       REAL,
+	reason           TEXT,
+	evidence         TEXT,
+	created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+	updated_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+)`
+
 // runMigrations inspects PRAGMA user_version and applies any pending migrations
 // in order.  It is idempotent: a DB already at currentSchemaVersion is a no-op.
 // Migrations are applied inside individual transactions so a failure leaves the
@@ -314,9 +361,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 7
 	}
 
+	if ver < 8 {
+		if err := migrateV7ToV8(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 8
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 7` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 8` migration block.
+	// the final `ver = 8` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 9` migration block.
 	_ = ver
 	return nil
 }
@@ -473,7 +528,7 @@ type rowScanner interface {
 // Each ADD COLUMN is guarded by PRAGMA table_info: on a FRESH DB, ApplySchema
 // already created the column with the new DDL, so the migration must skip it
 // (SQLite errors on a duplicate ADD COLUMN). On an EXISTING DB at user_version=2
-// the column is absent and gets added with DEFAULT '' so existing rows are
+// the column is absent and gets added with DEFAULT ” so existing rows are
 // backfilled to empty (which yields to any incoming write at the exact tie).
 //
 // All steps run in ONE transaction with the robust UNCONDITIONAL
@@ -510,7 +565,7 @@ func migrateV2ToV3(db *sql.DB) error {
 
 // migrateV3ToV4 adds the memory_tombstones_topic_uidx partial UNIQUE index on
 // memory_tombstones(topic_key, project, scope) WHERE topic_key IS NOT NULL AND
-// topic_key <> '' (the domain treats both NULL and '' as "no topic").
+// topic_key <> ” (the domain treats both NULL and ” as "no topic").
 //
 // This is the defense-in-depth close-out for INV-B (≤1 tombstone per topic
 // identity). Previously the invariant was only logic-guaranteed by Decide's
@@ -560,9 +615,9 @@ func migrateV3ToV4(db *sql.DB) error {
 //     e. Recreate FTS virtual table + triggers via the shared DDL statements.
 //     f. Rebuild FTS index from the copied rows.
 //     g. DROP INDEX IF EXISTS for all four idx_mem_* names — necessary because
-//        ALTER TABLE RENAME preserves index names on memories_old, so
-//        CREATE INDEX IF NOT EXISTS would silently no-op (name already exists).
-//        Dropping the names first lets the CREATE INDEX run against the new table.
+//     ALTER TABLE RENAME preserves index names on memories_old, so
+//     CREATE INDEX IF NOT EXISTS would silently no-op (name already exists).
+//     Dropping the names first lets the CREATE INDEX run against the new table.
 //     h. Recreate indexes on the new memories table.
 //     i. Drop memories_old (this also drops any indexes that survived on it).
 //  3. `PRAGMA foreign_keys = ON`.
@@ -853,6 +908,50 @@ func migrateV6ToV7(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV7ToV8 creates the conflict_relations table and its indexes for
+// post-save conflict detection (FindCandidates + mem_judge).
+//
+// A fresh DB created by ApplySchema already has conflict_relations (via
+// CREATE TABLE IF NOT EXISTS), so this migration is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 7.
+func migrateV7ToV8(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(conflictRelationsTableDDL); err != nil {
+		return err
+	}
+
+	// Indexes match the access patterns in FindCandidates and mem_judge (PR-b):
+	//   - (source_id, judgment_status): look up pending relations for a given source
+	//   - (target_id, judgment_status): look up pending relations for a given target
+	//   - (judgment_status, created_at DESC): list all pending by age
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_confrel_source_status
+			ON conflict_relations(source_id, judgment_status)`,
+		`CREATE INDEX IF NOT EXISTS idx_confrel_target_status
+			ON conflict_relations(target_id, judgment_status)`,
+		`CREATE INDEX IF NOT EXISTS idx_confrel_status_created
+			ON conflict_relations(judgment_status, created_at DESC)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 8`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -941,6 +1040,11 @@ func ApplySchema(db *sql.DB) error {
 		// ── sessions — MCP session lifecycle tracking ────────────────────────
 		sessionsTableDDL,
 
+		// ── conflict_relations — post-save conflict detection ────────────────
+		// Distinct from memory_relations (SDD parent-child hierarchy).
+		// FindCandidates inserts pending rows; mem_judge (PR-b) resolves them.
+		conflictRelationsTableDDL,
+
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic
 			ON memories(topic_key, project, scope, updated_at DESC)
@@ -962,6 +1066,14 @@ func ApplySchema(db *sql.DB) error {
 		// the table; the index lets SQLite satisfy the distinct via an index scan.
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_tomb_project ON memory_tombstones(project)`,
+
+		// conflict_relations indexes — support FindCandidates and mem_judge access patterns.
+		`CREATE INDEX IF NOT EXISTS idx_confrel_source_status
+			ON conflict_relations(source_id, judgment_status)`,
+		`CREATE INDEX IF NOT EXISTS idx_confrel_target_status
+			ON conflict_relations(target_id, judgment_status)`,
+		`CREATE INDEX IF NOT EXISTS idx_confrel_status_created
+			ON conflict_relations(judgment_status, created_at DESC)`,
 
 		// ── FTS5 virtual table over memories ────────────────────────────────
 		// content=memories with content_rowid=id means FTS is a shadow/external
