@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,58 @@ func TestServeErr(t *testing.T) {
 	got := serveErr(realErr)
 	if got == nil || !errors.Is(got, realErr) {
 		t.Errorf("serveErr(realErr) = %v, want a non-nil error wrapping realErr", got)
+	}
+}
+
+// TestRunDaemon_CtxCancelUnblocks proves that ctx cancellation drives Listen to
+// return, unblocking runDaemonWithIO even when stdin never closes.  A blocking
+// io.Pipe read end is passed as stdin; the goroutine should unblock within 5s of
+// ctx being cancelled and return nil (context.Canceled → serveErr → nil).
+func TestRunDaemon_CtxCancelUnblocks(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "d.db")
+	cfg := daemonCfg{
+		db:           dbPath,
+		centralURL:   "", // local-only
+		syncInterval: 30 * time.Second,
+	}
+
+	// A blocking stdin: pr never has data written to it, so reads block
+	// indefinitely.  pw is closed by defer so the goroutine's blocked Read
+	// eventually sees EOF if the ctx path is broken — but the assertion below
+	// expects nil within 5s, so the ctx path must fire first.
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- runDaemonWithIO(ctx, cfg, pr, io.Discard)
+	}()
+
+	// Cancel the context; Listen must return context.Canceled which serveErr maps to nil.
+	cancel()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("runDaemonWithIO after ctx cancel: got %v, want nil (ctx not wired — serve did not unblock)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDaemonWithIO did not return within 5s after ctx cancel — ctx not wired into serve")
+	}
+}
+
+// TestRun_DaemonNegativeSyncInterval verifies that a negative --sync-interval
+// value (e.g. -5s) is rejected with exit code 1.  A zero value is mapped to the
+// 30s default before this check, so only negatives reach the guard.
+func TestRun_DaemonNegativeSyncInterval(t *testing.T) {
+	t.Setenv("ENGRAM_DB", "")
+	t.Setenv("ENGRAM_CENTRAL_URL", "")
+	code := run([]string{"daemon", "--db", "x", "--sync-interval", "-5s"})
+	if code != 1 {
+		t.Errorf("run([daemon --sync-interval -5s]): got exit code %d, want 1", code)
 	}
 }
 
@@ -227,8 +280,13 @@ func TestBuildDaemon_WithCentral(t *testing.T) {
 	}
 }
 
-// TestBuildDaemon_MCPServerZeroTools verifies that the MCP server registered
-// in the skeleton has zero tools — this is PR1's explicit contract.
+// TestBuildDaemon_MCPServerZeroTools verifies that the MCP server built by the
+// skeleton has zero tools registered — this is PR1's explicit contract.
+//
+// Mechanism: mcpserver.MCPServer.ListTools() returns nil when no tools are
+// registered (it returns nil rather than an empty map when len(tools)==0, per
+// server/server.go:759).  This directly reflects the internal tools map, so it
+// will fail if any AddTool call is introduced in buildDaemon.
 func TestBuildDaemon_MCPServerZeroTools(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "engram.db")
 	cfg := daemonCfg{
@@ -242,13 +300,18 @@ func TestBuildDaemon_MCPServerZeroTools(t *testing.T) {
 	}
 	t.Cleanup(components.Close)
 
-	// The MCPServer's ListTools(context.Background(), mcp.ListToolsRequest{})
-	// requires importing mcp-go/mcp — instead we assert the server is non-nil
-	// (construction succeeded) and absence of a zero-tool contract violation
-	// is validated by the absence of any AddTool call in daemon.go.
-	// This test documents the intended invariant for Codex review.
 	if components.mcpServer == nil {
 		t.Fatal("MCP server must be non-nil")
+	}
+
+	// ListTools returns nil when no tools are registered.  A non-nil (non-empty)
+	// map means at least one tool was registered, which violates the PR1 contract.
+	if tools := components.mcpServer.ListTools(); len(tools) != 0 {
+		names := make([]string, 0, len(tools))
+		for n := range tools {
+			names = append(names, n)
+		}
+		t.Errorf("MCP server must have zero tools in PR1 skeleton; got %d: %v", len(tools), names)
 	}
 }
 
@@ -267,7 +330,10 @@ func TestBuildDaemon_Close_IsIdempotent(t *testing.T) {
 		t.Fatalf("buildDaemon: %v", err)
 	}
 
-	// Close should not panic.
+	// Call Close 3 times to exercise the idempotency contract: multiple deferred
+	// Close calls (e.g. from nested defer chains) must not panic or double-free.
+	components.Close()
+	components.Close()
 	components.Close()
 
 	// Verify the file was created (store opened and schema applied).

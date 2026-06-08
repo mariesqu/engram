@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -157,6 +158,9 @@ func runDaemonCmd(args []string) error {
 	if *syncInterval == 0 {
 		*syncInterval = 30 * time.Second
 	}
+	if *syncInterval <= 0 {
+		return fmt.Errorf("--sync-interval must be positive (got %s)", *syncInterval)
+	}
 
 	cfg := daemonCfg{
 		db:           *db,
@@ -180,7 +184,7 @@ func runDaemonCmd(args []string) error {
 func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	store, err := localstore.Open(cfg.db)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: open store %q: %w", cfg.db, err)
+		return nil, fmt.Errorf("open store %q: %w", cfg.db, err)
 	}
 
 	// MCP server — zero tools registered in PR1.  Tools land in subsequent PRs.
@@ -219,12 +223,24 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	}, nil
 }
 
-// runDaemon is the testable core of the daemon subcommand.  It builds all
-// components via buildDaemon, starts the autosync Loop (when present), then
-// blocks on mcpserver.ServeStdio until the context is cancelled (SIGINT/SIGTERM
-// in production; test cancellation in tests) or stdin is closed (normal MCP
-// client disconnect).  On return it stops the Loop and closes the store.
+// runDaemon is the entry point called by runDaemonCmd.  It delegates to
+// runDaemonWithIO with the real os.Stdin and os.Stdout so that the signal
+// context (ctx) is the single shutdown source.
 func runDaemon(ctx context.Context, cfg daemonCfg) error {
+	return runDaemonWithIO(ctx, cfg, os.Stdin, os.Stdout)
+}
+
+// runDaemonWithIO is the testable core of the daemon subcommand.  It builds all
+// components via buildDaemon, starts the autosync Loop (when present), then
+// blocks on StdioServer.Listen until the context is cancelled (SIGINT/SIGTERM in
+// production; test cancellation in tests) or stdin is closed (normal MCP client
+// disconnect).  On return it stops the Loop and closes the store.
+//
+// Wiring ctx into Listen (rather than using ServeStdio, which creates its own
+// internal context) makes the daemon's NotifyContext the SINGLE shutdown source:
+// ctx cancellation causes Listen to return context.Canceled, which serveErr maps
+// to a clean exit.
+func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout io.Writer) error {
 	components, err := buildDaemon(cfg)
 	if err != nil {
 		return err
@@ -239,19 +255,18 @@ func runDaemon(ctx context.Context, cfg daemonCfg) error {
 
 	log.Printf("engram daemon: MCP over stdio (db=%s, autosync=%s)", cfg.db, autosync)
 
-	return serveErr(mcpserver.ServeStdio(components.mcpServer))
+	return serveErr(mcpserver.NewStdioServer(components.mcpServer).Listen(ctx, stdin, stdout))
 }
 
-// serveErr classifies the error returned by mcpserver.ServeStdio. ServeStdio
-// traps SIGINT/SIGTERM internally and cancels its Listen context, so it returns
-// context.Canceled on a clean signal shutdown — that, like a nil return (stdin
-// EOF / normal MCP client disconnect), is a SUCCESSFUL exit, not an error.
-// Without this, a normal Ctrl-C / `kill` would exit non-zero and log a spurious
-// "context canceled", which a process supervisor reads as a crash. Only a
-// genuine I/O failure is surfaced.
+// serveErr classifies the error returned by StdioServer.Listen. Listen returns
+// context.Canceled when the ctx passed to it is cancelled (SIGINT/SIGTERM in
+// production, test cancel in tests) and nil on stdin EOF (normal MCP client
+// disconnect). Both are SUCCESSFUL exits. Without this, a normal Ctrl-C / `kill`
+// would exit non-zero and log a spurious "context canceled", which a process
+// supervisor reads as a crash. Only a genuine I/O failure is surfaced.
 func serveErr(err error) error {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return nil
 	}
-	return fmt.Errorf("daemon: ServeStdio: %w", err)
+	return fmt.Errorf("daemon: serve: %w", err)
 }
