@@ -126,7 +126,10 @@ var (
 
 // ── node factory ─────────────────────────────────────────────────────────────
 
-// openNode opens a fresh localstore in t.TempDir and wraps it as a syncer.Node.
+// openNode opens a fresh localstore in t.TempDir, seeds one local write so
+// ListProjects returns "testproject" (required for SyncAllProjects to call
+// PullSince, which is what loop unit tests observe), and wraps it as a
+// syncer.Node.
 func openNode(t *testing.T, name string) *syncer.Node {
 	t.Helper()
 	dir := t.TempDir()
@@ -135,7 +138,27 @@ func openNode(t *testing.T, name string) *syncer.Node {
 		t.Fatalf("openNode %s: %v", name, err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return syncer.NewNode(name, st)
+	n := syncer.NewNode(name, st)
+	// Seed one write so ListProjects returns "testproject". Loop unit tests
+	// don't push real mutations (mockCentral.Apply is a no-op), but
+	// SyncAllProjects calls ListProjects to discover projects for Pull — an
+	// empty store returns no projects, so PullSince is never called and the
+	// mockCentral.syncCh never fires. The seed ensures at least one project is
+	// always present so PullSince (and thus the mock's signal) fires each tick.
+	if _, err := n.Write(domain.Mutation{
+		Op:         domain.OpUpsert,
+		SyncID:     "loop-test-seed-" + name,
+		SessionID:  "sess-seed",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "seed",
+		Project:    "testproject",
+		Scope:      "project",
+		WriterID:   "test",
+	}); err != nil {
+		t.Fatalf("openNode: seed write: %v", err)
+	}
+	return n
 }
 
 // ── fast config ──────────────────────────────────────────────────────────────
@@ -161,7 +184,7 @@ func TestLoop_Periodic(t *testing.T) {
 
 	central := newMockCentral(20)
 	node := openNode(t, "periodic")
-	l := syncer.NewLoop(node, central, "testproject", fastCfg())
+	l := syncer.NewLoop(node, central, fastCfg())
 	l.Start(ctx)
 	defer l.Stop()
 
@@ -183,7 +206,7 @@ func TestLoop_TriggerDebounce(t *testing.T) {
 
 	central := newMockCentral(20)
 	node := openNode(t, "debounce")
-	l := syncer.NewLoop(node, central, "testproject", cfg)
+	l := syncer.NewLoop(node, central, cfg)
 	l.Start(ctx)
 
 	// Fire a burst of triggers. With a buffered channel of size 1, only 1 pending
@@ -225,7 +248,7 @@ func TestLoop_BackoffRetryable(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		central := newMockCentral(50)
 		node := openNode(t, "backoff-baseline")
-		l := syncer.NewLoop(node, central, "testproject", cfg)
+		l := syncer.NewLoop(node, central, cfg)
 		l.Start(ctx)
 		time.Sleep(30 * time.Millisecond)
 		cancel()
@@ -245,7 +268,7 @@ func TestLoop_BackoffRetryable(t *testing.T) {
 		central := newMockCentral(50)
 		central.setStaticErr(errRetryable)
 		node := openNode(t, "backoff-retry")
-		l := syncer.NewLoop(node, central, "testproject", cfg)
+		l := syncer.NewLoop(node, central, cfg)
 		l.Start(ctx)
 		time.Sleep(30 * time.Millisecond)
 		retryCount := int(central.callN.Load())
@@ -282,7 +305,7 @@ func TestLoop_NonRetryableNoHotLoop(t *testing.T) {
 	central := newMockCentral(50)
 	central.setStaticErr(errNonRetryable)
 	node := openNode(t, "nonretryable")
-	l := syncer.NewLoop(node, central, "testproject", cfg)
+	l := syncer.NewLoop(node, central, cfg)
 	l.Start(ctx)
 
 	// Allow 80ms = 10 × Interval. Expect roughly 8-12 syncs (Interval cadence).
@@ -310,7 +333,7 @@ func TestLoop_Stop_BlocksUntilExit(t *testing.T) {
 
 	central := newMockCentral(10)
 	node := openNode(t, "stop")
-	l := syncer.NewLoop(node, central, "testproject", fastCfg())
+	l := syncer.NewLoop(node, central, fastCfg())
 	l.Start(ctx)
 
 	// Let at least one sync fire so the goroutine is in its main loop.
@@ -339,7 +362,7 @@ func TestLoop_Stop_Idempotent(t *testing.T) {
 
 	central := newMockCentral(10)
 	node := openNode(t, "stop-idem")
-	l := syncer.NewLoop(node, central, "testproject", fastCfg())
+	l := syncer.NewLoop(node, central, fastCfg())
 	l.Start(ctx)
 	central.waitN(1, 2*time.Second)
 
@@ -356,7 +379,7 @@ func TestLoop_Stop_AfterCtxCancel(t *testing.T) {
 
 	central := newMockCentral(10)
 	node := openNode(t, "stop-after-cancel")
-	l := syncer.NewLoop(node, central, "testproject", fastCfg())
+	l := syncer.NewLoop(node, central, fastCfg())
 	l.Start(ctx)
 	central.waitN(1, 2*time.Second)
 
@@ -383,7 +406,7 @@ func TestLoop_NoSyncsAfterStop(t *testing.T) {
 
 	central := newMockCentral(20)
 	node := openNode(t, "no-after-stop")
-	l := syncer.NewLoop(node, central, "testproject", fastCfg())
+	l := syncer.NewLoop(node, central, fastCfg())
 	l.Start(ctx)
 
 	// Wait for a couple syncs, then Stop.
@@ -425,7 +448,7 @@ func TestLoop_BackoffIsFloorForTrigger(t *testing.T) {
 	})
 
 	node := openNode(t, "backoff-floor")
-	l := syncer.NewLoop(node, central, "testproject", cfg)
+	l := syncer.NewLoop(node, central, cfg)
 	l.Start(ctx)
 
 	// Trigger the first sync (Interval=5s so we can't wait for periodic).
@@ -483,7 +506,7 @@ func TestLoop_NonRetryableIntervalFloor(t *testing.T) {
 	})
 
 	node := openNode(t, "nonretryable-floor")
-	l := syncer.NewLoop(node, central, "testproject", cfg)
+	l := syncer.NewLoop(node, central, cfg)
 	l.Start(ctx)
 
 	// Trigger the first sync (Interval=60ms, too long to wait for periodic).
@@ -567,7 +590,7 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 			})
 
 			node := openNode(t, "classify-"+tc.name)
-			l := syncer.NewLoop(node, central, "testproject", cfg)
+			l := syncer.NewLoop(node, central, cfg)
 			l.Start(ctx)
 
 			// Trigger the first sync.
@@ -609,7 +632,7 @@ func TestLoop_IsRetryable_Classification(t *testing.T) {
 // was never Started — it must return immediately, not block forever on the
 // never-closed done channel.
 func TestLoop_StopBeforeStart_NoDeadlock(t *testing.T) {
-	l := syncer.NewLoop(nil, nil, "proj", syncer.Config{})
+	l := syncer.NewLoop(nil, nil, syncer.Config{})
 
 	done := make(chan struct{})
 	go func() {
@@ -639,7 +662,7 @@ func TestLoop_ConcurrentStartStop_NoDeadlock(t *testing.T) {
 		central := newMockCentral(10)
 		node := openNode(t, "concurrent-startstop")
 
-		l := syncer.NewLoop(node, central, "testproject", fastCfg())
+		l := syncer.NewLoop(node, central, fastCfg())
 
 		startDone := make(chan struct{})
 		stopDone := make(chan struct{})

@@ -318,6 +318,87 @@ func (s *Store) SetPullCursor(seq int64) error {
 	return nil
 }
 
+// PullCursorFor returns the last central seq this store has pulled and applied
+// for the given project (pull_cursors.last_pulled_seq WHERE target_key='central'
+// AND project=?). A missing row means no pulls have been made for that
+// project yet and 0 is returned.
+//
+// PullCursorFor is the per-project replacement for PullCursor. The old
+// PullCursor / SetPullCursor methods track a GLOBAL cursor (sync_state) which
+// skips interleaved projects when multiple projects are pulled from central's
+// single BIGSERIAL journal — see schema.go v5→v6 migration comment for the
+// full correctness argument.
+func (s *Store) PullCursorFor(project string) (int64, error) {
+	var seq int64
+	err := s.db.QueryRow(
+		`SELECT last_pulled_seq FROM pull_cursors WHERE target_key = ? AND project = ?`,
+		defaultTargetKey, project,
+	).Scan(&seq)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("PullCursorFor(%q): %w", project, err)
+	}
+	return seq, nil
+}
+
+// SetPullCursorFor advances pull_cursors.last_pulled_seq to seq for the given
+// project under the default central target. The cursor is monotonic: a seq
+// lower than the stored value is ignored (re-pulling an older window must never
+// rewind the cursor). The UPSERT creates the row if absent.
+//
+// Monotonicity proof: the ON CONFLICT … WHERE clause makes the UPDATE a no-op
+// when excluded.last_pulled_seq ≤ pull_cursors.last_pulled_seq — identical to
+// the existing SetPullCursor pattern.
+func (s *Store) SetPullCursorFor(project string, seq int64) error {
+	_, err := s.db.Exec(`
+		INSERT INTO pull_cursors (target_key, project, last_pulled_seq)
+		VALUES (?, ?, ?)
+		ON CONFLICT(target_key, project) DO UPDATE SET
+		  last_pulled_seq = excluded.last_pulled_seq
+		WHERE excluded.last_pulled_seq > pull_cursors.last_pulled_seq`,
+		defaultTargetKey, project, seq,
+	)
+	if err != nil {
+		return fmt.Errorf("SetPullCursorFor(%q, %d): %w", project, seq, err)
+	}
+	return nil
+}
+
+// ListProjects returns the distinct project names known to this store, derived
+// from memories and memory_tombstones. This is the set of projects the autosync
+// Loop should pull from central.
+//
+// The union of both tables covers all projects that have ever had a write
+// (memories) or a delete (memory_tombstones) applied locally — whether those
+// writes originated locally or were pulled from central. The result is sorted
+// alphabetically so the caller iterates in a stable order.
+func (s *Store) ListProjects() ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT project FROM memories
+		UNION
+		SELECT DISTINCT project FROM memory_tombstones
+		ORDER BY project`)
+	if err != nil {
+		return nil, fmt.Errorf("ListProjects: query: %w", err)
+	}
+	defer rows.Close()
+
+	var projects []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("ListProjects: scan: %w", err)
+		}
+		projects = append(projects, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListProjects: rows: %w", err)
+	}
+	return projects, nil
+}
+
 // ApplyPulled applies a mutation pulled FROM central to this local store. It is
 // a thin convenience wrapper used by the pull half of the sync harness: it runs
 // the SAME domain.Decide → applyTx path as LocalWrite, but does NOT enqueue
