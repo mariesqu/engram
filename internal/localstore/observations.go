@@ -194,6 +194,7 @@ func (s *Store) GetObservation(id int64) (*domain.Record, error) {
 	if rec == nil {
 		return nil, ErrObservationNotFound
 	}
+	rec.ID = id
 	return rec, nil
 }
 

@@ -307,9 +307,9 @@ func TestBuildDaemon_WithCentral(t *testing.T) {
 }
 
 // TestBuildDaemon_MCPServerTools verifies that the MCP server built by
-// buildDaemon registers exactly the five tools introduced through PR4:
+// buildDaemon registers exactly the seven tools for the MVP:
 // mem_session_start, mem_session_end, mem_save, mem_get_observation,
-// mem_session_summary.
+// mem_session_summary, mem_search, mem_context.
 //
 // Mechanism: mcpserver.MCPServer.ListTools() returns the registered tool map
 // directly.  Asserting the exact key set ensures no accidental additions and
@@ -339,6 +339,8 @@ func TestBuildDaemon_MCPServerTools(t *testing.T) {
 		"mem_save",
 		"mem_get_observation",
 		"mem_session_summary",
+		"mem_search",
+		"mem_context",
 	}
 	if len(tools) != len(wantTools) {
 		names := make([]string, 0, len(tools))

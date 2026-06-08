@@ -28,39 +28,46 @@ func ValidEntityType(et EntityType) bool {
 // Record is the in-memory representation of a row in the memories table.
 // All fields match the column set defined in the local-store schema.
 type Record struct {
+	// ID is the local-store autoincrement primary key. It is populated by
+	// localstore reads (GetObservation, search, recent) so the
+	// mem_search → mem_get_observation(id) workflow has a real id to surface; it is
+	// 0 for records not read from a local row (e.g. central-store records). It is
+	// NOT part of the canonical payload or reconciliation — sync_id is the row identity.
+	ID int64 `db:"id"`
+
 	// Required
-	SyncID    string     `db:"sync_id"`
-	SessionID string     `db:"session_id"`
+	SyncID     string     `db:"sync_id"`
+	SessionID  string     `db:"session_id"`
 	EntityType EntityType `db:"entity_type"`
-	Type      string     `db:"type"`
-	Title     string     `db:"title"`
-	Content   string     `db:"content"`
-	Project   string     `db:"project"`
-	Scope     string     `db:"scope"`
-	Version   int        `db:"version"`
-	WriterID string     `db:"writer_id"`
+	Type       string     `db:"type"`
+	Title      string     `db:"title"`
+	Content    string     `db:"content"`
+	Project    string     `db:"project"`
+	Scope      string     `db:"scope"`
+	Version    int        `db:"version"`
+	WriterID   string     `db:"writer_id"`
 	// LastWriteMutationID is the content-addressed mutation_id of the WINNING
 	// write that last materialized this row. Unlike SyncID (the canonical row PK,
 	// fixed at first-insert), this is overwritten on every in-place update/tombstone
 	// with the winning mutation's id, so it is REPLICA-IDENTICAL: every store that
 	// converges on the same winning write carries the same value. It is the final
 	// LWW tiebreaker — see writeWins in reconcile.go.
-	LastWriteMutationID string `db:"last_write_mutation_id"`
-	CreatedAt time.Time  `db:"created_at"`
-	UpdatedAt time.Time  `db:"updated_at"`
+	LastWriteMutationID string    `db:"last_write_mutation_id"`
+	CreatedAt           time.Time `db:"created_at"`
+	UpdatedAt           time.Time `db:"updated_at"`
 
 	// Optional
-	TopicKey      *string    `db:"topic_key"`
-	Status        *string    `db:"status"`
-	ParentSyncID  *string    `db:"parent_sync_id"`
-	ReviewAfter   *time.Time `db:"review_after"`
-	ExpiresAt     *time.Time `db:"expires_at"`
-	DeletedAt     *time.Time `db:"deleted_at"`
-	NormalizedHash *string   `db:"normalized_hash"`
+	TopicKey       *string    `db:"topic_key"`
+	Status         *string    `db:"status"`
+	ParentSyncID   *string    `db:"parent_sync_id"`
+	ReviewAfter    *time.Time `db:"review_after"`
+	ExpiresAt      *time.Time `db:"expires_at"`
+	DeletedAt      *time.Time `db:"deleted_at"`
+	NormalizedHash *string    `db:"normalized_hash"`
 
 	// Reserved — never populated in this change
-	Embedding      []byte  `db:"embedding"`
-	EmbeddingModel *string `db:"embedding_model"`
+	Embedding          []byte     `db:"embedding"`
+	EmbeddingModel     *string    `db:"embedding_model"`
 	EmbeddingCreatedAt *time.Time `db:"embedding_created_at"`
 }
 
@@ -106,20 +113,20 @@ const (
 // Mutation is the unit of work carried by the push/pull cycle.
 // MutationID is content-addressed (SHA-256 of canonical payload).
 type Mutation struct {
-	MutationID string
-	Op         Op
-	SyncID     string
-	SessionID  string
-	EntityType EntityType
-	Type       string
-	Title      string
-	Content    string
-	Project    string
-	Scope      string
-	TopicKey   *string
+	MutationID   string
+	Op           Op
+	SyncID       string
+	SessionID    string
+	EntityType   EntityType
+	Type         string
+	Title        string
+	Content      string
+	Project      string
+	Scope        string
+	TopicKey     *string
 	ParentSyncID *string
-	Status     *string
-	Version    int
+	Status       *string
+	Version      int
 	// Seq is the JOURNAL seq assigned by central_mutations (BIGSERIAL). It is set
 	// by PullSince from the central_mutations row and used by the pull cursor
 	// (sync_state.last_pulled_seq) and the harness to advance the pull position.
