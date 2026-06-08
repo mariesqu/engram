@@ -338,6 +338,44 @@ func scanRecordFromRows(rows *sql.Rows) (*domain.Record, error) {
 	return &r, nil
 }
 
+// scanRecordWithIDFromRows reads one Record plus its integer primary key from an
+// open *sql.Rows cursor. The SELECT must list `id` as the FIRST column, followed
+// by the standard record columns. Used by the search/recent read paths so the
+// mem_search → mem_get_observation(id) workflow surfaces a real id.
+func scanRecordWithIDFromRows(rows *sql.Rows) (*domain.Record, error) {
+	var r domain.Record
+	var topicKey, status, parentSyncID sql.NullString
+	var deletedAt sql.NullString
+	var createdAtStr, updatedAtStr string
+
+	err := rows.Scan(
+		&r.ID,
+		&r.SyncID, &r.SessionID, &r.EntityType, &r.Type, &r.Title, &r.Content,
+		&r.Project, &r.Scope, &r.Version, &r.WriterID, &r.LastWriteMutationID,
+		&topicKey, &status, &parentSyncID,
+		&createdAtStr, &updatedAtStr, &deletedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if topicKey.Valid {
+		r.TopicKey = &topicKey.String
+	}
+	if status.Valid {
+		r.Status = &status.String
+	}
+	if parentSyncID.Valid {
+		r.ParentSyncID = &parentSyncID.String
+	}
+	r.CreatedAt = parseTime(createdAtStr)
+	r.UpdatedAt = parseTime(updatedAtStr)
+	if deletedAt.Valid {
+		t := parseTime(deletedAt.String)
+		r.DeletedAt = &t
+	}
+	return &r, nil
+}
+
 func scanTombstone(row *sql.Row) (*domain.Tombstone, error) {
 	var ts domain.Tombstone
 	var topicKey sql.NullString

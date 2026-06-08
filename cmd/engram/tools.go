@@ -549,6 +549,12 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		project := resolveReadProject(explicitProject)
+		// REQ-391: personal-scope memories are NOT project-scoped. When scope is
+		// personal and no explicit project was given, search across ALL projects so
+		// personal memories saved under any project remain visible.
+		if strings.EqualFold(strings.TrimSpace(scope), "personal") && strings.TrimSpace(explicitProject) == "" {
+			project = ""
+		}
 
 		results, err := store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{
 			Type:  typ,
@@ -572,8 +578,8 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				anyTruncated = true
 				preview = string([]rune(r.Content)[:previewLen]) + " [preview]"
 			}
-			fmt.Fprintf(&b, "[%d] #? (%s) — %s\n    %s\n    project: %s | scope: %s\n",
-				i+1, r.Type, r.Title,
+			fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    project: %s | scope: %s\n",
+				i+1, r.ID, r.Type, r.Title,
 				preview,
 				r.Project, r.Scope)
 			if r.TopicKey != nil && *r.TopicKey != "" {
@@ -582,7 +588,7 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			b.WriteString("\n")
 		}
 		if anyTruncated {
-			fmt.Fprintf(&b, "---\nResults above are previews (%d chars). Use mem_get_observation(id) for the full content.\n", 300)
+			b.WriteString("---\nResults above are previews (300 chars). To read the full content of a specific memory, call mem_get_observation(id: <ID>).\n")
 		}
 
 		return mcp.NewToolResultText(b.String()), nil
@@ -602,6 +608,10 @@ func handleContext(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		scope, _ := args["scope"].(string)
 
 		project := resolveReadProject(explicitProject)
+		// REQ-391: personal-scope memories are NOT project-scoped (see handleSearch).
+		if strings.EqualFold(strings.TrimSpace(scope), "personal") && strings.TrimSpace(explicitProject) == "" {
+			project = ""
+		}
 
 		contextResult, err := store.FormatContext(project, scope)
 		if err != nil {

@@ -51,7 +51,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	// Build the SQL query dynamically based on which filters are active.
 	// Base query joins FTS shadow table to memories for full column access.
 	q := `
-		SELECT m.sync_id, m.session_id, m.entity_type, m.type, m.title, m.content,
+		SELECT m.id, m.sync_id, m.session_id, m.entity_type, m.type, m.title, m.content,
 		       m.project, m.scope, m.version, m.writer_id, m.last_write_mutation_id,
 		       m.topic_key, m.status, m.parent_sync_id,
 		       m.created_at, m.updated_at, m.deleted_at
@@ -89,7 +89,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 
 	var results []*domain.Record
 	for rows.Next() {
-		r, err := scanRecordFromRows(rows)
+		r, err := scanRecordWithIDFromRows(rows)
 		if err != nil {
 			return nil, fmt.Errorf("SearchMemoriesFiltered scan: %w", err)
 		}
@@ -110,7 +110,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.
 	project = normalizeProject(project)
 
 	q := `
-		SELECT sync_id, session_id, entity_type, type, title, content,
+		SELECT id, sync_id, session_id, entity_type, type, title, content,
 		       project, scope, version, writer_id, last_write_mutation_id,
 		       topic_key, status, parent_sync_id,
 		       created_at, updated_at, deleted_at
@@ -138,7 +138,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.
 
 	var results []*domain.Record
 	for rows.Next() {
-		r, err := scanRecordFromRows(rows)
+		r, err := scanRecordWithIDFromRows(rows)
 		if err != nil {
 			return nil, fmt.Errorf("RecentObservations scan: %w", err)
 		}
