@@ -66,10 +66,10 @@ type ObservationResult struct {
 }
 
 // AddObservation materializes a new memory write through the reconciliation-
-// correct LocalWrite path. It MUST NOT bypass LocalWrite — that function is the
-// single correct entry point for local writes: it runs domain.Decide inside the
-// transaction (INV5 idempotency guard) and atomically enqueues the outbox row
-// (so the write is never lost from the push journal).
+// correct localWriteLocked path. It MUST NOT bypass the write path — that
+// function is the single correct entry point for local writes: it runs
+// domain.Decide inside the transaction (INV5 idempotency guard) and atomically
+// enqueues the outbox row (so the write is never lost from the push journal).
 //
 // Mutation construction:
 //   - Op = OpUpsert — observations are always upserts (Decide determines insert vs update).
@@ -83,8 +83,17 @@ type ObservationResult struct {
 //   - TopicKey: normalized via domain.NormalizeTopicKey (nil when empty string).
 //   - Scope: defaults to "project" when empty.
 //
+// Atomicity: AddObservation holds s.mu for its ENTIRE sequence — version
+// pre-read (FindByTopic) → write (localWriteLocked) → PK resolution
+// (FindByTopic + SELECT id) — so no concurrent write (LocalWrite, ApplyPulled)
+// can interleave between the read and the commit. The single-writer assumption
+// caveat is retired: this sequence is now provably atomic.
+//
+// Re-entrancy: AddObservation calls localWriteLocked (not the public LocalWrite)
+// to avoid a recursive lock on s.mu, which is not reentrant.
+//
 // Returns the integer PK of the materialized row (looked up by sync_id after
-// LocalWrite commits) and the sync_id. Returns ErrObservationNotFound if the
+// the write commits) and the sync_id. Returns ErrObservationNotFound if the
 // row cannot be found after write (should not happen in practice).
 func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error) {
 	if p.Type == "" {
@@ -95,22 +104,28 @@ func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error
 	}
 	p.Project = normalizeProject(p.Project)
 
-	syncID := newObsSyncID()
-	now := time.Now().UTC()
-
 	var topicKey *string
 	if p.TopicKey != "" {
 		tk := p.TopicKey
 		topicKey = &tk
 	}
 
+	// Acquire the write lock for the ENTIRE sequence: version pre-read → write →
+	// PK resolution. This makes the whole read-modify-write atomic with respect to
+	// any concurrent write (LocalWrite, ApplyPulled, another AddObservation).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	syncID := newObsSyncID()
+	now := time.Now().UTC()
+
 	// Version progression for topic-keyed upserts: a re-save to the same topic must
 	// deterministically win the LWW tiebreaker (updated_at, version, writer_id,
 	// mutation_id). On a coarse wall clock two rapid saves can share the same
 	// UpdatedAt; without a higher version the winner would fall to the arbitrary
 	// content-addressed mutation_id. We read the current version for the topic and
-	// write existing+1. (Single-writer daemon: the only concurrent writer is the
-	// autosync pull; a rare interleave is acceptable until write-queue serialization.)
+	// write existing+1. This pre-read is now under the write lock, so no concurrent
+	// ApplyPulled can interleave between the version read and the write commit.
 	version := 1
 	if topicKey != nil {
 		if rec, ferr := s.FindByTopic(*topicKey, p.Project, p.Scope); ferr == nil && rec != nil {
@@ -134,7 +149,9 @@ func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error
 		WriterID:   p.WriterID,
 	}
 
-	written, err := s.LocalWrite(m)
+	// Call localWriteLocked (not the public LocalWrite) — we already hold s.mu;
+	// the public method would deadlock trying to re-acquire the same non-reentrant mutex.
+	written, err := s.localWriteLocked(m)
 	if err != nil {
 		return ObservationResult{}, fmt.Errorf("AddObservation: LocalWrite: %w", err)
 	}
@@ -144,7 +161,8 @@ func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error
 	// different sync_id (TargetSyncID); the outbox row still carries written.SyncID
 	// (the incoming mutation's SyncID). We resolve the integer PK through the
 	// memories row that is now live for the given (topic_key, project, scope) when
-	// a topic_key was supplied, or by written.SyncID otherwise.
+	// a topic_key was supplied, or by written.SyncID otherwise. The lock is still
+	// held here, so this resolution reads a consistent post-commit state.
 	var id int64
 	var resolvedSyncID string
 

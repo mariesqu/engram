@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; registers "sqlite" driver name
@@ -12,8 +13,29 @@ import (
 )
 
 // Store is the local SQLite adapter. It implements domain.Reader.
+//
+// Concurrency model: all write paths (AddObservation, LocalWrite, ApplyPulled,
+// AckMutation, SetPullCursor, SetPullCursorFor, CreateSession, EndSession) are
+// serialized under mu. Read paths (FindByTopic, FindBySyncID, SearchMemories,
+// GetObservation, RecentObservations, Search*, RecentSessions, PullCursor,
+// PullCursorFor, DrainOutbox, PendingCount, ListProjects) do NOT take mu — they
+// may run concurrently with each other and with an in-flight write (WAL mode
+// provides snapshot isolation for readers).
+//
+// Re-entrancy: public write methods acquire mu.Lock() once and delegate to
+// unexported *Locked helpers, avoiding deadlock when one write method calls
+// another (e.g. AddObservation calls localWriteLocked, not LocalWrite).
+//
+// Why mu AND SetMaxOpenConns(1): the single connection serializes each individual
+// SQL statement, but NOT a multi-statement read-modify-write. mu makes the whole
+// sequence atomic — e.g. AddObservation's version pre-read → write → PK resolution
+// must not have a concurrent ApplyPulled commit in between, which would make the
+// pre-read stale and let the re-save tie/lose the LWW. mu is therefore NOT
+// redundant with SetMaxOpenConns(1); removing it reintroduces that race. See
+// TestWriteQueue_VersionProgressionNoCollision.
 type Store struct {
 	db *sql.DB
+	mu sync.Mutex // serializes all write operations (read-modify-write atomicity)
 }
 
 // Open opens (or creates) the SQLite database at path, applies WAL pragmas,
@@ -62,10 +84,13 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// DB exposes the underlying *sql.DB so callers (the sync harness, tests) can run
-// raw queries and pass it to the package-level Apply without going through the
-// Store's typed methods. Mirrors centralstore.Store.Pool(). The connection is
-// configured with SetMaxOpenConns(1) — callers must not assume concurrency.
+// DB exposes the underlying *sql.DB for READ-ONLY raw queries (the sync harness,
+// tests, and the Reader implementation). Mirrors centralstore.Store.Pool().
+//
+// WRITES must go through the Store's typed methods, which hold s.mu to serialize
+// the write-queue. Passing DB() to the package-level Apply (or running any raw
+// write) from production or a concurrent goroutine BYPASSES s.mu and reintroduces
+// the write race. The connection is configured with SetMaxOpenConns(1).
 func (s *Store) DB() *sql.DB {
 	return s.db
 }

@@ -49,7 +49,22 @@ type OutboxEntry struct {
 }
 
 // LocalWrite applies a brand-new LOCAL write to this store and enqueues it for
-// push to central. It is the local-write twin of pull-apply:
+// push to central. It acquires the write lock and delegates to localWriteLocked
+// so the entire decide+apply+enqueue sequence is atomic with respect to any
+// concurrent write (AddObservation, ApplyPulled, etc.).
+//
+// The returned Mutation is the normalized mutation (Payload + MutationID filled
+// in) so callers can inspect the derived ID.
+func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localWriteLocked(m)
+}
+
+// localWriteLocked is the mutex-free core of LocalWrite. Callers MUST hold s.mu
+// before calling this method. Using a separate locked/unlocked split avoids
+// deadlock: AddObservation acquires mu once and calls localWriteLocked directly
+// rather than calling the public LocalWrite which would attempt a recursive lock.
 //
 //  1. Derive the canonical Payload and MutationID if the caller left them unset
 //     (MutationID = NewMutationID(CanonicalPayload(m))). This makes the local
@@ -57,22 +72,18 @@ type OutboxEntry struct {
 //  2. Open a SQLite transaction, then run domain.Decide(&txReader{tx}, m) INSIDE
 //     the transaction so the decision and the subsequent apply see the same
 //     consistent snapshot. With db.SetMaxOpenConns(1) the single connection is
-//     held by the tx for its entire duration, so a concurrent LocalWrite or
-//     ApplyPulled on another goroutine cannot interleave between Decide and
-//     applyTx — the whole decide+apply+enqueue sequence is atomic.
+//     held by the tx for its entire duration, so a concurrent write on another
+//     goroutine is excluded by mu before it can even begin the transaction —
+//     the whole decide+apply+enqueue sequence is atomic.
 //  3. Execute applyTx (the local state change) AND enqueueOutboxTx (the outbox
 //     INSERT) inside that SAME transaction. Both operations commit together or
 //     not at all: a crash between the two can never leave the local memory table
 //     updated without a corresponding outbox entry.
-//
-// The returned Mutation is the normalized mutation (Payload + MutationID filled
-// in) so callers can inspect the derived ID.
-func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
+func (s *Store) localWriteLocked(m domain.Mutation) (domain.Mutation, error) {
 	m = normalizeMutation(m)
 
 	// Open the transaction FIRST so that Decide, applyTx, and enqueueOutboxTx all
-	// run on the same snapshot. This mirrors centralstore.Apply's pattern where
-	// Decide is run against a decideReader wrapping the in-flight transaction.
+	// run on the same snapshot.
 	tx, err := s.db.Begin()
 	if err != nil {
 		return m, fmt.Errorf("LocalWrite: begin tx: %w", err)
@@ -84,8 +95,7 @@ func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
 	}()
 
 	// Decide inside the transaction: txReader routes all Reader calls through the
-	// same *sql.Tx, so Decide sees a consistent snapshot that includes no writes
-	// from concurrent goroutines that haven't committed yet.
+	// same *sql.Tx, so Decide sees a consistent snapshot.
 	d := domain.Decide(&txReader{tx: tx}, m)
 
 	// The outbox is populated even when the local Decision is NoOp. A local NoOp
@@ -222,6 +232,9 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 // already acked — AckMutation returns an error and does NOT advance the cursor.
 // This prevents the cursor from drifting ahead of genuinely pushed mutations.
 func (s *Store) AckMutation(localSeq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("AckMutation: begin: %w", err)
@@ -304,6 +317,9 @@ func (s *Store) PullCursor() (int64, error) {
 // 'central' row is seeded by ApplySchema; UPSERT guards the case where it is
 // somehow absent.
 func (s *Store) SetPullCursor(seq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	_, err := s.db.Exec(`
 		INSERT INTO sync_state (target_key, last_pulled_seq)
 		VALUES (?, ?)
@@ -352,6 +368,9 @@ func (s *Store) PullCursorFor(project string) (int64, error) {
 // when excluded.last_pulled_seq ≤ pull_cursors.last_pulled_seq — identical to
 // the existing SetPullCursor pattern.
 func (s *Store) SetPullCursorFor(project string, seq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	_, err := s.db.Exec(`
 		INSERT INTO pull_cursors (target_key, project, last_pulled_seq)
 		VALUES (?, ?, ?)
@@ -399,24 +418,28 @@ func (s *Store) ListProjects() ([]string, error) {
 	return projects, nil
 }
 
-// ApplyPulled applies a mutation pulled FROM central to this local store. It is
-// a thin convenience wrapper used by the pull half of the sync harness: it runs
-// the SAME domain.Decide → applyTx path as LocalWrite, but does NOT enqueue
-// anything into the outbox (a pulled mutation must not be re-pushed).
+// ApplyPulled applies a mutation pulled FROM central to this local store. It
+// acquires the write lock so it is mutually exclusive with LocalWrite and
+// AddObservation — no interleaving between a local write's version pre-read and
+// its commit is possible.
 //
-// Like LocalWrite, Decide runs INSIDE the transaction (via txReader) so the
-// decision and the apply see the same consistent snapshot — a concurrent
-// LocalWrite that commits between Decide and apply cannot make the decision stale.
+// It runs the SAME domain.Decide → applyTx path as LocalWrite, but does NOT
+// enqueue anything into the outbox (a pulled mutation must not be re-pushed).
 //
 // The mutation arrives carrying its central Seq, MutationID and Payload (from
 // PullSince); those are preserved as-is. Decide's INV5 guard (MutationApplied)
 // plus applyTx's applied_mutations INSERT make a re-pulled mutation a no-op.
 func (s *Store) ApplyPulled(m domain.Mutation) error {
-	// Defensive normalisation: a well-behaved central store already sends nil for
-	// no-topic mutations, but fold &"" → nil here so '' never reaches any local
-	// index (every partial topic index uses `WHERE topic_key IS NOT NULL`, which
-	// is the complete no-topic exclusion once '' is normalised away at store entry).
-	m = domain.NormalizeTopicKey(m)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Normalize symmetrically with localWriteLocked: fold &"" → nil topic keys and,
+	// ONLY when a field is unset, derive Payload/MutationID/OccurredAt. A well-behaved
+	// central store already sends Payload/MutationID/OccurredAt (so for real pulls this
+	// just folds the topic key and preserves the central identity); calling the full
+	// normalizeMutation closes the latent asymmetry for callers that hand ApplyPulled a
+	// bare domain.Mutation.
+	m = normalizeMutation(m)
 
 	tx, err := s.db.Begin()
 	if err != nil {
