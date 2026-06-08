@@ -58,7 +58,7 @@ type Candidate struct {
 	Type string
 	// TopicKey is the candidate's topic_key (may be nil).
 	TopicKey *string
-	// Score is the FTS5 BM25 rank (negative; closer to 0 = better match).
+	// Score is the FTS5 BM25 rank (negative; MORE negative = better/stronger match).
 	Score float64
 	// JudgmentID is the sync_id of the pending conflict_relations row created for
 	// this (source, candidate) pair. Empty when SkipInsert=true.
@@ -67,9 +67,10 @@ type Candidate struct {
 
 // CandidateOptions controls the FindCandidates query.
 type CandidateOptions struct {
-	// BM25Floor is the minimum BM25 score to include (negative; closer to 0 = better).
-	// nil means use the default (-2.0). An explicit pointer — including 0.0 — is
-	// used as-is so callers can enforce a strict "nothing passes" floor.
+	// BM25Floor is the MAXIMUM BM25 score to include (FTS5 bm25 is negative and more
+	// negative = stronger; a candidate passes only when score <= floor). nil means
+	// use the default (-2.0); a stricter (more negative) floor admits only stronger
+	// matches, and 0.0 admits every match (no filtering).
 	BM25Floor *float64
 	// Limit caps the number of candidates returned. Default 3 when nil or <=0.
 	Limit int
@@ -124,7 +125,10 @@ func sanitizeFTSCandidates(title string) string {
 	}
 	quoted := make([]string, 0, len(words))
 	for _, w := range words {
-		w = strings.Trim(w, `"`)
+		// Strip ALL double-quotes (not just leading/trailing): an interior quote
+		// (e.g. token JWT"auth) would otherwise produce "JWT"auth" — an unterminated
+		// FTS5 string literal that errors the whole MATCH. Mirrors sanitizeFTS.
+		w = strings.ReplaceAll(w, `"`, "")
 		if w != "" {
 			quoted = append(quoted, `"`+w+`"`)
 		}
@@ -230,9 +234,12 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 			rows.Close() //nolint:errcheck
 			return nil, fmt.Errorf("FindCandidates: scan: %w", err)
 		}
-		// Apply BM25 floor. Scores are negative; closer to 0 = better match.
-		// Include rows whose score >= floor (e.g. -1.5 >= -2.0 passes).
-		if rc.score < floor {
+		// Apply BM25 floor. FTS5 bm25 scores are NEGATIVE and MORE NEGATIVE = a
+		// BETTER (stronger) match — verified empirically: a 4-word-overlap title
+		// scores ~-5.9, a 1-word overlap ~-1.5. The floor is therefore a MAXIMUM
+		// score: a candidate must be at least as relevant as the floor (score <=
+		// floor). Drop anything weaker (score > floor, i.e. closer to 0).
+		if rc.score > floor {
 			continue
 		}
 		raw = append(raw, rc)
@@ -285,6 +292,11 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 	).Scan(&sourceSyncID); err != nil {
 		return nil, fmt.Errorf("FindCandidates: get source sync_id: %w", err)
 	}
+	if sourceSyncID == "" {
+		// savedID vanished (or had its sync_id cleared) between the FTS phase and
+		// here — never write relation rows with an empty source_id.
+		return nil, fmt.Errorf("FindCandidates: source observation %d has no sync_id", savedID)
+	}
 
 	candidates := make([]Candidate, 0, len(raw))
 	for _, rc := range raw {
@@ -324,20 +336,12 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*ConflictRelation, error) 
 		return nil, fmt.Errorf("JudgeRelation: invalid relation verb %q — must be one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict", p.Relation)
 	}
 
-	// Verify the relation exists before acquiring the write lock.
-	var exists int
-	if err := s.db.QueryRow(
-		`SELECT 1 FROM conflict_relations WHERE sync_id = ?`, p.JudgmentID,
-	).Scan(&exists); err == sql.ErrNoRows {
-		return nil, fmt.Errorf("JudgeRelation: relation %q not found", p.JudgmentID)
-	} else if err != nil {
-		return nil, fmt.Errorf("JudgeRelation: check existence: %w", err)
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, err := s.db.Exec(`
+	// Update + check RowsAffected atomically under the lock — no separate pre-lock
+	// existence check (which would be a TOCTOU window). 0 rows affected = not found.
+	res, err := s.db.Exec(`
 		UPDATE conflict_relations
 		SET relation        = ?,
 		    reason          = ?,
@@ -346,8 +350,16 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*ConflictRelation, error) 
 		    judgment_status = 'judged',
 		    updated_at      = datetime('now')
 		WHERE sync_id = ?
-	`, p.Relation, p.Reason, p.Evidence, p.Confidence, p.JudgmentID); err != nil {
+	`, p.Relation, p.Reason, p.Evidence, p.Confidence, p.JudgmentID)
+	if err != nil {
 		return nil, fmt.Errorf("JudgeRelation: update: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("JudgeRelation: rows affected: %w", err)
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("JudgeRelation: relation %q not found", p.JudgmentID)
 	}
 
 	return s.GetRelation(p.JudgmentID)

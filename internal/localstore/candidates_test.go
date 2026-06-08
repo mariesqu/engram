@@ -51,6 +51,14 @@ func conflictRelationsCount(t *testing.T, s *Store) int {
 	return n
 }
 
+// floatPtr returns a pointer to f. lenientFloor() is a floor of 0.0 — since FTS5
+// bm25 scores are always negative and a candidate passes when score <= floor, a
+// floor of 0.0 admits EVERY match. Tests that exercise exclusion/insert/limit (not
+// the floor itself) use it so their assertions don't depend on the BM25 score
+// magnitude, which varies with the (small) test corpus size.
+func floatPtr(f float64) *float64 { return &f }
+func lenientFloor() *float64      { return floatPtr(0.0) }
+
 // ── sanitizeFTSCandidates ─────────────────────────────────────────────────────
 
 func TestSanitizeFTSCandidates_Basic(t *testing.T) {
@@ -78,6 +86,24 @@ func TestSanitizeFTSCandidates_StripQuotes(t *testing.T) {
 	}
 }
 
+// TestSanitizeFTSCandidates_InteriorQuote guards the fix for the interior-quote
+// crash: a token with an INTERIOR double-quote must have ALL quotes stripped, not
+// just leading/trailing — otherwise it emits an unterminated FTS5 string literal.
+func TestSanitizeFTSCandidates_InteriorQuote(t *testing.T) {
+	got := sanitizeFTSCandidates(`Fixed JWT"auth bug`)
+	want := `"Fixed" OR "JWTauth" OR "bug"`
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// And the produced query must actually run against FTS5 without error.
+	s := openTestStore(t)
+	insertMemory(t, s, "obs-q", "JWTauth handling", "proj", "project")
+	savedID := insertMemory(t, s, "obs-new", `Fixed JWT"auth bug`, "proj", "project")
+	if _, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()}); err != nil {
+		t.Errorf("FindCandidates with an interior-quote title errored: %v", err)
+	}
+}
+
 func TestSanitizeFTSCandidates_Empty(t *testing.T) {
 	if got := sanitizeFTSCandidates(""); got != "" {
 		t.Errorf("expected empty, got %q", got)
@@ -95,40 +121,28 @@ func TestSanitizeFTSCandidates_OnlySpaces(t *testing.T) {
 func TestFindCandidates_OverlappingTitles(t *testing.T) {
 	s := openTestStore(t)
 
-	// Seed three memories with overlapping title words and one unrelated.
 	insertMemory(t, s, "obs-001", "JWT authentication fix", "proj", "project")
 	insertMemory(t, s, "obs-002", "auth middleware refactor", "proj", "project")
 	insertMemory(t, s, "obs-003", "authentication session bug", "proj", "project")
 	insertMemory(t, s, "obs-unrelated", "database migration plan", "proj", "project")
 
-	// Save the new observation that triggers detection.
 	savedID := insertMemory(t, s, "obs-new", "JWT authentication session bug", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{})
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
-
-	// We expect at least the closely matching ones to surface (limit default 3).
 	if len(candidates) == 0 {
 		t.Fatal("expected candidates, got none")
 	}
-
-	// Self must be excluded.
 	for _, c := range candidates {
 		if c.ID == savedID {
 			t.Errorf("self (savedID=%d) must be excluded from candidates", savedID)
 		}
-	}
-
-	// Unrelated "database migration plan" should not appear (no title overlap).
-	for _, c := range candidates {
 		if c.SyncID == "obs-unrelated" {
-			t.Error("unrelated observation must not be a candidate")
+			t.Error("unrelated observation (no title overlap) must not be a candidate")
 		}
 	}
-
-	// At most limit=3 candidates returned.
 	if len(candidates) > 3 {
 		t.Errorf("expected at most 3 candidates, got %d", len(candidates))
 	}
@@ -141,28 +155,24 @@ func TestFindCandidates_RelationRowsInserted(t *testing.T) {
 	insertMemory(t, s, "obs-b", "auth token refresh", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{})
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
-
 	if len(candidates) == 0 {
-		t.Skip("no candidates found — FTS index may not have materialized in test; skipping row assertion")
+		t.Fatal("expected candidates with a lenient floor, got none")
 	}
 
-	// Each candidate must have a non-empty JudgmentID with "rel-" prefix.
 	for _, c := range candidates {
 		if c.JudgmentID == "" {
 			t.Errorf("candidate %q has empty JudgmentID", c.SyncID)
 		}
 		if !strings.HasPrefix(c.JudgmentID, "rel-") {
-			t.Errorf("candidate %q JudgmentID %q does not have 'rel-' prefix", c.SyncID, c.JudgmentID)
+			t.Errorf("candidate %q JudgmentID %q lacks 'rel-' prefix", c.SyncID, c.JudgmentID)
 		}
 	}
 
-	// A conflict_relations row per candidate must exist in pending state.
-	n := conflictRelationsCount(t, s)
-	if n != len(candidates) {
+	if n := conflictRelationsCount(t, s); n != len(candidates) {
 		t.Errorf("expected %d conflict_relations rows, got %d", len(candidates), n)
 	}
 
@@ -178,6 +188,9 @@ func TestFindCandidates_RelationRowsInserted(t *testing.T) {
 		if rel.Relation != RelationPending {
 			t.Errorf("expected pending relation, got %q", rel.Relation)
 		}
+		if rel.SourceID != "obs-new" {
+			t.Errorf("expected source_id obs-new, got %q", rel.SourceID)
+		}
 	}
 }
 
@@ -187,19 +200,15 @@ func TestFindCandidates_SkipInsert(t *testing.T) {
 	insertMemory(t, s, "obs-a", "JWT auth middleware", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true})
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true, BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates(SkipInsert=true): %v", err)
 	}
-
-	// JudgmentID must be empty for every candidate.
 	for _, c := range candidates {
 		if c.JudgmentID != "" {
 			t.Errorf("SkipInsert=true: expected empty JudgmentID, got %q", c.JudgmentID)
 		}
 	}
-
-	// Zero rows must be written regardless of how many candidates came back.
 	if n := conflictRelationsCount(t, s); n != 0 {
 		t.Errorf("SkipInsert=true: expected 0 conflict_relations rows, got %d", n)
 	}
@@ -209,8 +218,6 @@ func TestFindCandidates_SoftDeletedExcluded(t *testing.T) {
 	s := openTestStore(t)
 
 	idA := insertMemory(t, s, "obs-a", "JWT auth middleware", "proj", "project")
-
-	// Soft-delete obs-a.
 	if _, err := s.db.Exec(
 		`UPDATE memories SET deleted_at = datetime('now') WHERE id = ?`, idA,
 	); err != nil {
@@ -219,11 +226,12 @@ func TestFindCandidates_SoftDeletedExcluded(t *testing.T) {
 
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{})
+	// Lenient floor so the ONLY reason obs-a can be excluded is the deleted_at
+	// filter (not the BM25 floor dropping everything in a tiny corpus).
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
-
 	for _, c := range candidates {
 		if c.SyncID == "obs-a" {
 			t.Error("soft-deleted observation must not be a candidate")
@@ -234,18 +242,35 @@ func TestFindCandidates_SoftDeletedExcluded(t *testing.T) {
 func TestFindCandidates_CrossProjectExcluded(t *testing.T) {
 	s := openTestStore(t)
 
-	// Different project — should NOT be a candidate.
 	insertMemory(t, s, "obs-other-proj", "JWT auth middleware", "other-proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{})
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
-
 	for _, c := range candidates {
 		if c.SyncID == "obs-other-proj" {
-			t.Error("observation from different project must not be a candidate")
+			t.Error("observation from a different project must not be a candidate")
+		}
+	}
+}
+
+// TestFindCandidates_CrossScopeExcluded verifies the scope filter: a personal
+// observation is not a candidate for a project-scoped save.
+func TestFindCandidates_CrossScopeExcluded(t *testing.T) {
+	s := openTestStore(t)
+
+	insertMemory(t, s, "obs-personal", "JWT auth middleware", "proj", "personal")
+	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
+
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	if err != nil {
+		t.Fatalf("FindCandidates: %v", err)
+	}
+	for _, c := range candidates {
+		if c.SyncID == "obs-personal" {
+			t.Error("observation from a different scope must not be a candidate")
 		}
 	}
 }
@@ -253,7 +278,6 @@ func TestFindCandidates_CrossProjectExcluded(t *testing.T) {
 func TestFindCandidates_LimitHonored(t *testing.T) {
 	s := openTestStore(t)
 
-	// Seed 10 observations all with very similar titles.
 	for i := 0; i < 10; i++ {
 		insertMemory(t, s,
 			fmt.Sprintf("obs-%02d", i),
@@ -265,38 +289,62 @@ func TestFindCandidates_LimitHonored(t *testing.T) {
 	limit := 2
 	savedID := insertMemory(t, s, "obs-new", "JWT auth session token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{Limit: limit})
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{Limit: limit, BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
-
 	if len(candidates) > limit {
 		t.Errorf("expected at most %d candidates, got %d", limit, len(candidates))
 	}
 }
 
+// TestFindCandidates_BM25FloorFilters proves the floor keeps STRONG (multi-word
+// overlap, more-negative score) matches and drops WEAK (single shared word,
+// closer-to-zero score) ones. Uses a realistic corpus so BM25 IDF spreads the
+// scores around the default −2.0 floor (in a 2-row corpus all scores hug 0).
 func TestFindCandidates_BM25FloorFilters(t *testing.T) {
 	s := openTestStore(t)
 
-	// Seed a low-relevance observation with only one overlapping word.
-	insertMemory(t, s, "obs-low", "jwt", "proj", "project")
-	// Seed a high-relevance one.
-	insertMemory(t, s, "obs-high", "JWT auth session bug", "proj", "project")
+	insertMemory(t, s, "obs-strong-1", "JWT auth login bug in middleware", "proj", "project")
+	insertMemory(t, s, "obs-strong-2", "fix JWT auth login session bug", "proj", "project")
+	insertMemory(t, s, "obs-weak", "user login redesign notes", "proj", "project") // only "login" overlaps
+	for i := 0; i < 12; i++ {
+		insertMemory(t, s,
+			fmt.Sprintf("obs-noise-%02d", i),
+			fmt.Sprintf("unrelated infrastructure topic number %d", i),
+			"proj", "project",
+		)
+	}
 
-	// Very strict floor: only the best matches should pass.
-	strictFloor := -0.1
-	savedID := insertMemory(t, s, "obs-new", "JWT auth session token bug", "proj", "project")
+	savedID := insertMemory(t, s, "obs-new", "JWT auth login bug", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: &strictFloor})
+	// Default floor (−2.0): strong multi-word matches pass; the single-word weak
+	// match (closer to 0) is excluded.
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
+	if len(candidates) == 0 {
+		t.Fatal("expected the strong matches to pass the default floor")
+	}
 
-	// All returned candidates must have score >= floor.
+	var sawStrong, sawWeak bool
 	for _, c := range candidates {
-		if c.Score < strictFloor {
-			t.Errorf("candidate %q score %f is below floor %f", c.SyncID, c.Score, strictFloor)
+		if c.Score > -2.0 {
+			t.Errorf("candidate %q score %.4f is weaker than floor −2.0 (should be excluded)", c.SyncID, c.Score)
 		}
+		if c.SyncID == "obs-strong-1" || c.SyncID == "obs-strong-2" {
+			sawStrong = true
+		}
+		if c.SyncID == "obs-weak" {
+			sawWeak = true
+		}
+	}
+	if !sawStrong {
+		t.Error("expected a strong multi-word match among candidates")
+	}
+	if sawWeak {
+		t.Error("weak single-word match should be excluded by the default floor")
 	}
 }
 
@@ -314,7 +362,6 @@ func TestFindCandidates_ObservationNotFound(t *testing.T) {
 func TestJudgeRelation_RoundTrip(t *testing.T) {
 	s := openTestStore(t)
 
-	// Insert a pending relation directly.
 	judgmentID := newRelSyncID()
 	if _, err := s.db.Exec(`
 		INSERT INTO conflict_relations
@@ -327,7 +374,6 @@ func TestJudgeRelation_RoundTrip(t *testing.T) {
 	reason := "overlapping topic"
 	confidence := 0.9
 
-	// Judge it.
 	rel, err := s.JudgeRelation(JudgeRelationParams{
 		JudgmentID: judgmentID,
 		Relation:   RelationConflictsWith,
@@ -351,7 +397,6 @@ func TestJudgeRelation_RoundTrip(t *testing.T) {
 		t.Errorf("confidence mismatch: %v", rel.Confidence)
 	}
 
-	// GetRelation must return the same row.
 	got, err := s.GetRelation(judgmentID)
 	if err != nil {
 		t.Fatalf("GetRelation: %v", err)
@@ -434,7 +479,6 @@ func TestGetRelation_NotFound(t *testing.T) {
 // ── Migration tests ───────────────────────────────────────────────────────────
 
 func TestMigrateV7ToV8_FreshDB(t *testing.T) {
-	// A fresh Open() should reach version 8 with conflict_relations present.
 	s := openTestStore(t)
 
 	var ver int
@@ -445,7 +489,6 @@ func TestMigrateV7ToV8_FreshDB(t *testing.T) {
 		t.Errorf("expected schema version %d, got %d", currentSchemaVersion, ver)
 	}
 
-	// Verify conflict_relations table exists and is writable.
 	if _, err := s.db.Exec(`
 		INSERT INTO conflict_relations
 			(sync_id, source_id, target_id, relation, judgment_status, created_at, updated_at)
@@ -455,32 +498,23 @@ func TestMigrateV7ToV8_FreshDB(t *testing.T) {
 	}
 }
 
-func TestMigrateV7ToV8_ExistingV7DB(t *testing.T) {
-	// Simulate an existing v7 DB by applying schema up to v7 then running
-	// migrateV7ToV8 directly.
-	dbPath := filepath.Join(t.TempDir(), "v7.db")
-
-	// Open and bring to v7 by temporarily patching currentSchemaVersion is not
-	// feasible directly, so we instead open normally (goes to v8), confirm the
-	// migrateV7ToV8 function is idempotent when re-run on a v8 DB (CREATE TABLE
-	// IF NOT EXISTS + CREATE INDEX IF NOT EXISTS are both no-ops).
+func TestMigrateV7ToV8_Idempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v8.db")
 	s, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer s.Close()
 
-	// Re-run migration — must be a no-op (no error, same user_version).
+	// Re-run migration on an already-v8 DB — must be a no-op (CREATE TABLE/INDEX IF
+	// NOT EXISTS), no error, version stays 8.
 	if err := migrateV7ToV8(s.db); err != nil {
 		t.Fatalf("migrateV7ToV8 (idempotent run): %v", err)
 	}
-
 	var ver int
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
 		t.Fatalf("PRAGMA user_version: %v", err)
 	}
-	// user_version is 8 (set by the idempotent re-run — CREATE TABLE IF NOT EXISTS
-	// was a no-op but PRAGMA user_version = 8 ran again which is fine).
 	if ver != 8 {
 		t.Errorf("expected user_version 8, got %d", ver)
 	}
@@ -488,14 +522,12 @@ func TestMigrateV7ToV8_ExistingV7DB(t *testing.T) {
 
 // ── Concurrency smoke test ────────────────────────────────────────────────────
 
-// TestFindCandidates_ConcurrentNoDead confirms that concurrent FindCandidates
-// calls do not produce SQLITE_BUSY or deadlock — validating that:
-//  1. The FTS SELECT cursor is drained+closed BEFORE any write.
-//  2. s.mu serializes the write phase.
+// TestFindCandidates_ConcurrentNoDead confirms concurrent FindCandidates calls do
+// not produce SQLITE_BUSY or deadlock — validating that (1) the FTS cursor is
+// drained+closed BEFORE any write, and (2) s.mu serializes the write phase.
 func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 	s := openTestStore(t)
 
-	// Seed overlapping memories.
 	for i := 0; i < 5; i++ {
 		insertMemory(t, s,
 			fmt.Sprintf("obs-seed-%d", i),
@@ -504,7 +536,6 @@ func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 		)
 	}
 
-	// Insert 5 "new" observations that each trigger FindCandidates concurrently.
 	savedIDs := make([]int64, 5)
 	for i := 0; i < 5; i++ {
 		savedIDs[i] = insertMemory(t, s,
@@ -526,7 +557,8 @@ func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			_, errs[i] = s.FindCandidates(savedIDs[i], CandidateOptions{})
+			// Lenient floor so the write phase (INSERT) is actually exercised.
+			_, errs[i] = s.FindCandidates(savedIDs[i], CandidateOptions{BM25Floor: lenientFloor()})
 		}()
 	}
 
@@ -537,7 +569,6 @@ func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 
 	select {
 	case <-done:
-		// All goroutines finished — check for errors.
 	case <-deadline:
 		t.Fatal("TestFindCandidates_ConcurrentNoDead: timed out — likely deadlock")
 	}
