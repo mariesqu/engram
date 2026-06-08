@@ -64,14 +64,12 @@ func (s *Store) CreateSession(id, project, directory string) error {
 // session id. If the session does not exist the call is a no-op (returns nil),
 // mirroring old_code EndSession behaviour: rows==0 is not an error.
 func (s *Store) EndSession(id, summary string) error {
-	res, err := s.db.Exec(
+	// An UPDATE affecting zero rows (unknown id) is intentionally NOT an error —
+	// it is a no-op, mirroring old_code EndSession.
+	_, err := s.db.Exec(
 		`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
 		nullableStr(summary), id,
 	)
-	if err != nil {
-		return err
-	}
-	_, err = res.RowsAffected()
 	return err
 }
 
@@ -108,6 +106,10 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // RecentSessions returns the most recent sessions for the given project,
 // ordered by started_at DESC with id DESC as a deterministic tie-breaker.
 // If project is empty all projects are included. limit <= 0 defaults to 5.
+//
+// TODO(PR4+): old_code orders by MAX(COALESCE(obs.created_at, started_at)) DESC
+// (latest ACTIVITY). This uses started_at DESC as a simplification until the
+// observations table exists — revisit the ORDER BY when it lands.
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	project = normalizeProject(project)
 	if limit <= 0 {

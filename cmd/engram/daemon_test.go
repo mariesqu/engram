@@ -367,9 +367,10 @@ func TestDaemonTool_SessionStart_CreatesRow(t *testing.T) {
 		t.Fatal("mem_session_start not registered")
 	}
 
+	dir := t.TempDir()
 	req := newToolRequest("mem_session_start", map[string]any{
 		"id":        "test-session-1",
-		"directory": t.TempDir(),
+		"directory": dir,
 	})
 	result, err := startTool.Handler(t.Context(), req)
 	if err != nil {
@@ -388,6 +389,44 @@ func TestDaemonTool_SessionStart_CreatesRow(t *testing.T) {
 	}
 	if sess.EndedAt != nil {
 		t.Errorf("EndedAt should be nil after start, got %v", sess.EndedAt)
+	}
+	if sess.Directory != dir {
+		t.Errorf("session Directory: got %q, want %q (supplied directory not stored)", sess.Directory, dir)
+	}
+}
+
+// TestDaemonTool_SessionStart_InvalidConfig verifies that a malformed
+// .engram/config.json surfaces as a tool error rather than silently storing the
+// session under "unknown" (faithful to old_code's ErrInvalidConfig handling).
+func TestDaemonTool_SessionStart_InvalidConfig(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	badDir := t.TempDir()
+	cfgDir := filepath.Join(badDir, ".engram")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte("{ not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	startTool := components.mcpServer.ListTools()["mem_session_start"]
+	req := newToolRequest("mem_session_start", map[string]any{"id": "bad-cfg-session", "directory": badDir})
+	result, err := startTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected a tool error for invalid .engram/config.json, got success: %v", result.Content)
+	}
+	// The session must NOT have been created (we errored before CreateSession).
+	if _, err := components.store.GetSession("bad-cfg-session"); err == nil {
+		t.Error("session was created despite invalid config — should have errored before CreateSession")
 	}
 }
 

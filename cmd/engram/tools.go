@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -92,7 +93,17 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				resolvedDir = cwd
 			}
 		}
-		project := projectpkg.DetectProject(resolvedDir)
+		// Surface a broken .engram/config.json as a tool error (faithful to
+		// old_code) rather than silently storing the session under "unknown".
+		// Other resolution errors (e.g. ambiguous repo) fall back to the basename.
+		det := projectpkg.DetectProjectFull(resolvedDir)
+		if det.Error != nil {
+			if errors.Is(det.Error, projectpkg.ErrInvalidConfig) {
+				return mcp.NewToolResultError("mem_session_start: " + det.Error.Error()), nil
+			}
+			det.Project = projectpkg.DetectProject(resolvedDir)
+		}
+		project := det.Project
 
 		// If the caller supplied a directory, use it; otherwise use the cwd we
 		// detected the project from so the stored path is always meaningful.
