@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mariesqu/engram/internal/wireauth"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // ─── Flag validation: run() dispatch ────────────────────────────────────────
@@ -304,14 +305,14 @@ func TestBuildDaemon_WithCentral(t *testing.T) {
 	}
 }
 
-// TestBuildDaemon_MCPServerZeroTools verifies that the MCP server built by the
-// skeleton has zero tools registered — this is PR1's explicit contract.
+// TestBuildDaemon_MCPServerSessionTools verifies that the MCP server built by
+// buildDaemon registers exactly the two session tools introduced in PR3:
+// mem_session_start and mem_session_end.
 //
-// Mechanism: mcpserver.MCPServer.ListTools() returns nil when no tools are
-// registered (it returns nil rather than an empty map when len(tools)==0, per
-// server/server.go:759).  This directly reflects the internal tools map, so it
-// will fail if any AddTool call is introduced in buildDaemon.
-func TestBuildDaemon_MCPServerZeroTools(t *testing.T) {
+// Mechanism: mcpserver.MCPServer.ListTools() returns the registered tool map
+// directly.  Asserting the exact key set ensures no accidental additions and
+// no missing tools.
+func TestBuildDaemon_MCPServerSessionTools(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "engram.db")
 	cfg := daemonCfg{
 		db:           dbPath,
@@ -328,14 +329,218 @@ func TestBuildDaemon_MCPServerZeroTools(t *testing.T) {
 		t.Fatal("MCP server must be non-nil")
 	}
 
-	// ListTools returns nil when no tools are registered.  A non-nil (non-empty)
-	// map means at least one tool was registered, which violates the PR1 contract.
-	if tools := components.mcpServer.ListTools(); len(tools) != 0 {
+	tools := components.mcpServer.ListTools()
+
+	wantTools := []string{"mem_session_start", "mem_session_end"}
+	if len(tools) != len(wantTools) {
 		names := make([]string, 0, len(tools))
 		for n := range tools {
 			names = append(names, n)
 		}
-		t.Errorf("MCP server must have zero tools in PR1 skeleton; got %d: %v", len(tools), names)
+		t.Errorf("MCP server: got %d tools %v, want exactly %d: %v",
+			len(tools), names, len(wantTools), wantTools)
+		return
+	}
+	for _, name := range wantTools {
+		if _, ok := tools[name]; !ok {
+			t.Errorf("expected tool %q to be registered; registered tools: %v", name, tools)
+		}
+	}
+}
+
+// TestDaemonTool_SessionStart_CreatesRow verifies the mem_session_start handler
+// end-to-end: after calling it via the registered handler the session row must
+// be present in the store.
+func TestDaemonTool_SessionStart_CreatesRow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	cfg := daemonCfg{db: dbPath, syncInterval: 30 * time.Second}
+
+	components, err := buildDaemon(cfg)
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	tools := components.mcpServer.ListTools()
+	startTool, ok := tools["mem_session_start"]
+	if !ok {
+		t.Fatal("mem_session_start not registered")
+	}
+
+	dir := t.TempDir()
+	req := newToolRequest("mem_session_start", map[string]any{
+		"id":        "test-session-1",
+		"directory": dir,
+	})
+	result, err := startTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("handler returned tool error: %v", result.Content)
+	}
+
+	sess, err := components.store.GetSession("test-session-1")
+	if err != nil {
+		t.Fatalf("GetSession after start: %v", err)
+	}
+	if sess.ID != "test-session-1" {
+		t.Errorf("session ID: got %q, want %q", sess.ID, "test-session-1")
+	}
+	if sess.EndedAt != nil {
+		t.Errorf("EndedAt should be nil after start, got %v", sess.EndedAt)
+	}
+	if sess.Directory != dir {
+		t.Errorf("session Directory: got %q, want %q (supplied directory not stored)", sess.Directory, dir)
+	}
+}
+
+// TestDaemonTool_SessionStart_InvalidConfig verifies that a malformed
+// .engram/config.json surfaces as a tool error rather than silently storing the
+// session under "unknown" (faithful to old_code's ErrInvalidConfig handling).
+func TestDaemonTool_SessionStart_InvalidConfig(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	badDir := t.TempDir()
+	cfgDir := filepath.Join(badDir, ".engram")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte("{ not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	startTool := components.mcpServer.ListTools()["mem_session_start"]
+	req := newToolRequest("mem_session_start", map[string]any{"id": "bad-cfg-session", "directory": badDir})
+	result, err := startTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected a tool error for invalid .engram/config.json, got success: %v", result.Content)
+	}
+	// The session must NOT have been created (we errored before CreateSession).
+	if _, err := components.store.GetSession("bad-cfg-session"); err == nil {
+		t.Error("session was created despite invalid config — should have errored before CreateSession")
+	}
+}
+
+// TestDaemonTool_SessionStart_AmbiguousProject verifies that a directory which is
+// the parent of multiple git repos surfaces as a tool error (faithful to old_code)
+// rather than silently storing the session under the parent's basename.
+func TestDaemonTool_SessionStart_AmbiguousProject(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	parent := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		if err := os.MkdirAll(filepath.Join(parent, name, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startTool := components.mcpServer.ListTools()["mem_session_start"]
+	req := newToolRequest("mem_session_start", map[string]any{"id": "ambig-session", "directory": parent})
+	result, err := startTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected a tool error for an ambiguous (multi-repo parent) directory, got success: %v", result.Content)
+	}
+	if _, err := components.store.GetSession("ambig-session"); err == nil {
+		t.Error("session created despite ambiguous project — should have errored before CreateSession")
+	}
+}
+
+// TestDaemonTool_SessionEnd_ClosesRow verifies that calling mem_session_end via
+// its registered handler sets ended_at and summary on the session row.
+func TestDaemonTool_SessionEnd_ClosesRow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	cfg := daemonCfg{db: dbPath, syncInterval: 30 * time.Second}
+
+	components, err := buildDaemon(cfg)
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	// First start a session directly on the store.
+	if err := components.store.CreateSession("end-test", "myproject", "/src"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	tools := components.mcpServer.ListTools()
+	endTool, ok := tools["mem_session_end"]
+	if !ok {
+		t.Fatal("mem_session_end not registered")
+	}
+
+	req := newToolRequest("mem_session_end", map[string]any{
+		"id":      "end-test",
+		"summary": "finished everything",
+	})
+	result, err := endTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("handler returned tool error: %v", result.Content)
+	}
+
+	sess, err := components.store.GetSession("end-test")
+	if err != nil {
+		t.Fatalf("GetSession after end: %v", err)
+	}
+	if sess.EndedAt == nil {
+		t.Fatal("EndedAt is nil after mem_session_end")
+	}
+	if sess.Summary == nil || *sess.Summary != "finished everything" {
+		t.Errorf("Summary: got %v, want %q", sess.Summary, "finished everything")
+	}
+}
+
+// TestDaemonTool_SessionStart_MissingID verifies that mem_session_start returns
+// a tool error (not a transport error) when id is absent.
+func TestDaemonTool_SessionStart_MissingID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	cfg := daemonCfg{db: dbPath, syncInterval: 30 * time.Second}
+	components, err := buildDaemon(cfg)
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	tools := components.mcpServer.ListTools()
+	startTool := tools["mem_session_start"]
+
+	req := newToolRequest("mem_session_start", map[string]any{})
+	result, err := startTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler should not return transport error, got: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for missing id, got success: %v", result.Content)
+	}
+}
+
+// newToolRequest builds a minimal mcp.CallToolRequest for unit-testing handlers
+// without a full MCP transport round-trip.
+func newToolRequest(name string, args map[string]any) mcp.CallToolRequest {
+	return mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      name,
+			Arguments: args,
+		},
 	}
 }
 

@@ -69,7 +69,12 @@ import (
 //   to per-project rows would require knowing which projects were previously pulled
 //   (unknowable from the local store alone). Leaving it avoids a lossy migration.
 //   New code uses PullCursorFor/SetPullCursorFor exclusively.
-const currentSchemaVersion = 6
+//
+// v6 → v7: add sessions table for MCP session lifecycle tracking.
+//   mem_session_start creates a row; mem_session_end records ended_at + summary.
+//   The table is idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema), so a
+//   fresh DB where ApplySchema already created it is a no-op in the migration.
+const currentSchemaVersion = 7
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -163,6 +168,26 @@ BEGIN
 		COALESCE(NEW.topic_key, '')
 	WHERE NEW.deleted_at IS NULL;
 END`
+
+// sessionsTableDDL is the authoritative CREATE TABLE statement for the sessions
+// table. It is shared between ApplySchema (fresh DB) and migrateV6ToV7 so both
+// paths always produce the same column set and constraints.
+//
+// Columns mirror old_code/internal/store/store.go sessions DDL exactly:
+//   - id TEXT PRIMARY KEY — opaque session identifier supplied by the caller
+//   - project TEXT NOT NULL — normalized project name (lowercased, trimmed)
+//   - directory TEXT NOT NULL — working directory at session start
+//   - started_at — UTC timestamp, defaults to datetime('now')
+//   - ended_at TEXT — NULL until mem_session_end is called
+//   - summary TEXT — NULL until mem_session_end is called
+const sessionsTableDDL = `CREATE TABLE IF NOT EXISTS sessions (
+	id         TEXT PRIMARY KEY,
+	project    TEXT NOT NULL,
+	directory  TEXT NOT NULL,
+	started_at TEXT NOT NULL DEFAULT (datetime('now')),
+	ended_at   TEXT,
+	summary    TEXT
+)`
 
 // memoriesTableDDL is the authoritative CREATE TABLE statement for the memories
 // table. It is shared between ApplySchema (fresh DB) and migrateV0ToV1 (rebuild)
@@ -281,9 +306,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 6
 	}
 
-	// ver is read by the `if ver < N` conditions above. This blank read consumes the
-	// final `ver = 6` assignment so it is not flagged as ineffectual (SA4006); the
-	// value stays in sync for any future `if ver < 7` migration block.
+	if ver < 7 {
+		if err := migrateV6ToV7(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 7
+	}
+
+	// ver is read by the `if ver < N` conditions above. This blank read consumes
+	// the final `ver = 7` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 8` migration block.
 	_ = ver
 	return nil
 }
@@ -794,6 +827,32 @@ func migrateV5ToV6(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV6ToV7 creates the sessions table for MCP session lifecycle tracking.
+//
+// A fresh DB created by ApplySchema already has sessions (via
+// CREATE TABLE IF NOT EXISTS), so this migration is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 6.
+func migrateV6ToV7(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(sessionsTableDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 7`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -878,6 +937,9 @@ func ApplySchema(db *sql.DB) error {
 			last_pulled_seq  INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (target_key, project)
 		)`,
+
+		// ── sessions — MCP session lifecycle tracking ────────────────────────
+		sessionsTableDDL,
 
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic
