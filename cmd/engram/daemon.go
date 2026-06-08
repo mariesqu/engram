@@ -222,7 +222,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 
 	// Register all MCP tools. Pass loop (may be nil) so write handlers can
 	// trigger an immediate sync after each local write.
-	registerTools(mcpSrv, store, loop)
+	registerTools(mcpSrv, store, loop, cfg.writerID)
 
 	return &daemonComponents{
 		store:     store,

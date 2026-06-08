@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 
@@ -23,7 +24,7 @@ import (
 // loop may be nil (local-only mode). Write handlers call loop.Trigger() only
 // when loop is non-nil, so the autosync runs immediately after a local write
 // when central is configured.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop) {
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, writerID string) {
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -112,7 +113,7 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 				mcp.Description("Optional explicit project for this memory. When omitted the project is auto-detected from the working directory."),
 			),
 		),
-		handleSave(store, loop),
+		handleSave(store, loop, writerID),
 	)
 
 	// ── mem_get_observation ──────────────────────────────────────────────────
@@ -169,7 +170,7 @@ FORMAT — use this exact structure in the content field:
 				mcp.Description("Session ID (default: manual-save-{project})"),
 			),
 		),
-		handleSessionSummary(store, loop),
+		handleSessionSummary(store, loop, writerID),
 	)
 }
 
@@ -298,7 +299,7 @@ func resolveSaveProject(store *localstore.Store, explicitProject string) (string
 }
 
 // handleSave returns the handler for mem_save.
-func handleSave(store *localstore.Store, loop *syncer.Loop) mcpserver.ToolHandlerFunc {
+func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -328,6 +329,7 @@ func handleSave(store *localstore.Store, loop *syncer.Loop) mcpserver.ToolHandle
 			Project:   project,
 			Scope:     scope,
 			TopicKey:  topicKey,
+			WriterID:  writerID,
 		})
 		if err != nil {
 			return mcp.NewToolResultError("mem_save: failed to save: " + err.Error()), nil
@@ -355,10 +357,12 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		if !ok {
 			return mcp.NewToolResultError("mem_get_observation: id must be a number"), nil
 		}
-		id := int64(idFloat)
-		if id <= 0 {
+		// Reject non-integer / out-of-range floats: the MCP SDK delivers all JSON
+		// numbers as float64, which cannot represent every int64 above 2^53.
+		if idFloat != math.Trunc(idFloat) || idFloat <= 0 || idFloat > math.MaxInt64 {
 			return mcp.NewToolResultError("mem_get_observation: id must be a positive integer"), nil
 		}
+		id := int64(idFloat)
 
 		rec, err := store.GetObservation(id)
 		if err != nil {
@@ -390,7 +394,7 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 // handleSessionSummary returns the handler for mem_session_summary.
 // It saves a session_summary-typed observation using the cwd-detected project
 // and optionally triggers autosync.
-func handleSessionSummary(store *localstore.Store, loop *syncer.Loop) mcpserver.ToolHandlerFunc {
+func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID string) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -400,12 +404,24 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop) mcpserver.
 		}
 
 		sessionID, _ := args["session_id"].(string)
+		sessionID = strings.TrimSpace(sessionID)
 
-		// project field intentionally not in the schema — auto-detect only
-		// (mirrors old_code REQ-308 write-tool contract).
-		project, toolErr := resolveSaveProject(store, "")
-		if toolErr != nil {
-			return toolErr, nil
+		// Project: prefer the session's stored project (captured at mem_session_start
+		// from the client's directory). The daemon is a separate process, so its cwd
+		// is not a reliable per-call signal; the session row is. Fall back to cwd
+		// detection only when there is no usable session project.
+		var project string
+		if sessionID != "" {
+			if sess, gerr := store.GetSession(sessionID); gerr == nil && sess.Project != "" {
+				project = sess.Project
+			}
+		}
+		if project == "" {
+			var toolErr *mcp.CallToolResult
+			project, toolErr = resolveSaveProject(store, "")
+			if toolErr != nil {
+				return toolErr, nil
+			}
 		}
 
 		result, err := store.AddObservation(localstore.AddObservationParams{
@@ -415,6 +431,7 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop) mcpserver.
 			Content:   content,
 			Project:   project,
 			Scope:     "project",
+			WriterID:  writerID,
 		})
 		if err != nil {
 			return mcp.NewToolResultError("mem_session_summary: failed to save: " + err.Error()), nil

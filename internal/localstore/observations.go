@@ -46,6 +46,14 @@ type AddObservationParams struct {
 	// domain.Decide which produces ActionUpdate — the existing row is updated
 	// in-place rather than a new row being inserted.
 	TopicKey string
+
+	// WriterID is the node's writer identity — the daemon's --writer-id in central
+	// mode, "" in local-only. It is baked into the mutation's canonical payload
+	// (and thus the mutation_id) and is the LWW writer tiebreaker. The central
+	// server's per-writer HMAC forgery check rejects a pushed mutation whose
+	// writer_id does not match the authenticated writer, so a central-mode write
+	// MUST carry the daemon's writer id or every push is a 403.
+	WriterID string
 }
 
 // ObservationResult is the minimal result returned by AddObservation to avoid
@@ -96,6 +104,20 @@ func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error
 		topicKey = &tk
 	}
 
+	// Version progression for topic-keyed upserts: a re-save to the same topic must
+	// deterministically win the LWW tiebreaker (updated_at, version, writer_id,
+	// mutation_id). On a coarse wall clock two rapid saves can share the same
+	// UpdatedAt; without a higher version the winner would fall to the arbitrary
+	// content-addressed mutation_id. We read the current version for the topic and
+	// write existing+1. (Single-writer daemon: the only concurrent writer is the
+	// autosync pull; a rare interleave is acceptable until write-queue serialization.)
+	version := 1
+	if topicKey != nil {
+		if rec, ferr := s.FindByTopic(*topicKey, p.Project, p.Scope); ferr == nil && rec != nil {
+			version = rec.Version + 1
+		}
+	}
+
 	m := domain.Mutation{
 		Op:         domain.OpUpsert,
 		SyncID:     syncID,
@@ -107,9 +129,9 @@ func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error
 		Project:    p.Project,
 		Scope:      p.Scope,
 		TopicKey:   topicKey,
-		Version:    1,
+		Version:    version,
 		UpdatedAt:  now,
-		WriterID:   "",
+		WriterID:   p.WriterID,
 	}
 
 	written, err := s.LocalWrite(m)
