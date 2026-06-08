@@ -197,10 +197,10 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 
 	var errs []error
 	for _, proj := range projects {
-		n, err := Pull(ctx, n, central, proj)
-		pulled += n
-		if err != nil {
-			errs = append(errs, err)
+		cnt, perr := Pull(ctx, n, central, proj)
+		pulled += cnt
+		if perr != nil {
+			errs = append(errs, perr)
 		}
 	}
 
