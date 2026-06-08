@@ -140,8 +140,8 @@ func TestSyncAllProjects_TwoProjects(t *testing.T) {
 	}
 	// pushed: the seed from openNode + local-alpha-1 + local-beta-1 = 3 outbox entries.
 	// (They are consumed — pushed to the mock central.)
-	if pushed < 0 {
-		t.Errorf("SyncAllProjects pushed=%d, want ≥0", pushed)
+	if pushed != 3 {
+		t.Errorf("SyncAllProjects pushed=%d, want 3 (seed + alpha + beta)", pushed)
 	}
 	// pulled: 1 alpha + 1 beta = 2 (testproject has 0 central mutations).
 	if pulled != 2 {
