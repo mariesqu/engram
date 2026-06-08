@@ -24,7 +24,7 @@ import (
 const daemonUsage = `Usage: engram daemon [flags]
 
 Run the engram local daemon — an MCP server (stdio transport) backed by a local
-SQLite store.  The daemon exposes zero tools in this skeleton release; tool
+SQLite store.  The daemon exposes zero tools in this release; tool
 registration lands in subsequent PRs.
 
 When --central-url is set the daemon wires an autosync Loop that pushes local

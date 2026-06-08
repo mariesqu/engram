@@ -656,6 +656,7 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mem_deleted
 			ON memories(deleted_at)
 			WHERE deleted_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
 	}
 	for _, s := range idxStmts {
 		if _, err = tx.Exec(s); err != nil {
@@ -893,6 +894,12 @@ func ApplySchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mem_deleted
 			ON memories(deleted_at)
 			WHERE deleted_at IS NOT NULL`,
+
+		// idx_mem_project / idx_tomb_project back ListProjects() — called by the
+		// autosync Loop every tick. Without them, SELECT DISTINCT project full-scans
+		// the table; the index lets SQLite satisfy the distinct via an index scan.
+		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
+		`CREATE INDEX IF NOT EXISTS idx_tomb_project ON memory_tombstones(project)`,
 
 		// ── FTS5 virtual table over memories ────────────────────────────────
 		// content=memories with content_rowid=id means FTS is a shadow/external
