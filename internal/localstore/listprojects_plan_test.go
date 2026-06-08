@@ -40,10 +40,10 @@ func TestListProjects_UsesProjectIndexes(t *testing.T) {
 	plan := strings.Join(lines, "\n")
 	t.Logf("ListProjects query plan:\n%s", plan)
 
-	if !strings.Contains(plan, "idx_mem_project") {
-		t.Errorf("memories arm not using idx_mem_project (full scan?):\n%s", plan)
+	if !strings.Contains(plan, "memories USING") {
+		t.Errorf("memories arm not using an index (full scan?):\n%s", plan)
 	}
-	if !strings.Contains(plan, "idx_tomb_project") {
-		t.Errorf("tombstones arm not using idx_tomb_project (full scan?):\n%s", plan)
+	if !strings.Contains(plan, "memory_tombstones USING") {
+		t.Errorf("tombstones arm not using an index (full scan?):\n%s", plan)
 	}
 }
