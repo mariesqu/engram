@@ -16,6 +16,31 @@ import (
 	"github.com/mariesqu/engram/internal/syncer"
 )
 
+// resolveReadProject resolves the project for a READ tool call. Unlike write
+// tools, read tools are LENIENT: no hard errors on ambiguous or invalid config.
+// The policy mirrors old_code handleSearch/handleContext (REQ-310 lenient path):
+//
+//  1. Explicit project argument wins (normalized, used as-is — no store lookup).
+//  2. Detect from cwd via DetectProjectFull.
+//  3. On ANY detection error (ambiguous, invalid config, no .git, etc.) fall
+//     back to the dir basename via DetectProject. Read tools never return a
+//     project-resolution error to the agent.
+//
+// This contrasts with write tools (resolveSaveProject) which hard-error on
+// ErrInvalidConfig and ErrAmbiguousProject.
+func resolveReadProject(explicitProject string) string {
+	if strings.TrimSpace(explicitProject) != "" {
+		return strings.TrimSpace(explicitProject)
+	}
+	cwd, _ := os.Getwd()
+	det := projectpkg.DetectProjectFull(cwd)
+	if det.Error != nil {
+		// Lenient: fall back to basename, never error.
+		return projectpkg.DetectProject(cwd)
+	}
+	return det.Project
+}
+
 // registerTools adds the MCP tools exposed by this binary to srv. It is called
 // unconditionally from buildDaemon regardless of whether the daemon is running
 // in local-only or central mode — session tracking and memory writes work
@@ -131,6 +156,54 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			),
 		),
 		handleGetObservation(store),
+	)
+
+	// ── mem_search ───────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_search",
+			mcp.WithDescription("Search your persistent memory across all sessions. Use this to find past decisions, bugs fixed, patterns used, files changed, or any context from previous coding sessions."),
+			mcp.WithTitleAnnotation("Search Memory"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("query",
+				mcp.Required(),
+				mcp.Description("Search query — natural language or keywords"),
+			),
+			mcp.WithString("type",
+				mcp.Description("Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Filter by project name"),
+			),
+			mcp.WithString("scope",
+				mcp.Description("Filter by scope: project (default) or personal"),
+			),
+			mcp.WithNumber("limit",
+				mcp.Description("Max results (default: 10, max: 20)"),
+			),
+		),
+		handleSearch(store),
+	)
+
+	// ── mem_context ───────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_context",
+			mcp.WithDescription("Get recent memory context from previous sessions. Shows recent sessions and observations to understand what was done before."),
+			mcp.WithTitleAnnotation("Get Memory Context"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("project",
+				mcp.Description("Filter by project (omit for auto-detect)"),
+			),
+			mcp.WithString("scope",
+				mcp.Description("Filter observations by scope: project (default) or personal"),
+			),
+		),
+		handleContext(store),
 	)
 
 	// ── mem_session_summary ──────────────────────────────────────────────────
@@ -444,6 +517,102 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"Session summary saved for project %q (id=%d)", project, result.ID,
 		)), nil
+	}
+}
+
+// handleSearch returns the handler for mem_search. It performs an FTS search
+// with optional type/scope filters, using the LENIENT read-project policy so a
+// search never hard-errors on an ambiguous or misconfigured cwd.
+//
+// Read tools do NOT use transactions (query-only) and do NOT trigger autosync.
+func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		query, _ := args["query"].(string)
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return mcp.NewToolResultError("mem_search: query is required"), nil
+		}
+
+		typ, _ := args["type"].(string)
+		explicitProject, _ := args["project"].(string)
+		scope, _ := args["scope"].(string)
+
+		// Lenient limit: accept float64 (JSON number), default 10, cap at 20.
+		limit := 10
+		if raw, ok := args["limit"].(float64); ok && raw > 0 {
+			limit = int(raw)
+			if limit > 20 {
+				limit = 20
+			}
+		}
+
+		project := resolveReadProject(explicitProject)
+
+		results, err := store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{
+			Type:  typ,
+			Scope: scope,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_search: search error: %s. Try simpler keywords.", err)), nil
+		}
+
+		if len(results) == 0 {
+			return mcp.NewToolResultText(fmt.Sprintf("No memories found for: %q", query)), nil
+		}
+
+		var b strings.Builder
+		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		anyTruncated := false
+		for i, r := range results {
+			preview := r.Content
+			const previewLen = 300
+			if len([]rune(r.Content)) > previewLen {
+				anyTruncated = true
+				preview = string([]rune(r.Content)[:previewLen]) + " [preview]"
+			}
+			fmt.Fprintf(&b, "[%d] #? (%s) — %s\n    %s\n    project: %s | scope: %s\n",
+				i+1, r.Type, r.Title,
+				preview,
+				r.Project, r.Scope)
+			if r.TopicKey != nil && *r.TopicKey != "" {
+				fmt.Fprintf(&b, "    topic: %s\n", *r.TopicKey)
+			}
+			b.WriteString("\n")
+		}
+		if anyTruncated {
+			fmt.Fprintf(&b, "---\nResults above are previews (%d chars). Use mem_get_observation(id) for the full content.\n", 300)
+		}
+
+		return mcp.NewToolResultText(b.String()), nil
+	}
+}
+
+// handleContext returns the handler for mem_context. It assembles recent
+// sessions and observations into the agent-facing context blob via
+// store.FormatContext, using the LENIENT read-project policy.
+//
+// Read tool — no transaction, no autosync trigger.
+func handleContext(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		explicitProject, _ := args["project"].(string)
+		scope, _ := args["scope"].(string)
+
+		project := resolveReadProject(explicitProject)
+
+		contextResult, err := store.FormatContext(project, scope)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_context: failed to get context: %s", err)), nil
+		}
+
+		if contextResult == "" {
+			return mcp.NewToolResultText("No previous session memories found."), nil
+		}
+
+		return mcp.NewToolResultText(contextResult), nil
 	}
 }
 
