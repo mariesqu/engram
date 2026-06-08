@@ -156,6 +156,29 @@ func TestRun_DaemonWriterKeyWrongLength(t *testing.T) {
 	}
 }
 
+// TestRun_DaemonWriterKeyTrimmedBeforeDecode proves ENGRAM_WRITER_KEY is trimmed
+// before hex decoding: a valid 16-byte hex value with a trailing newline reaches
+// the LENGTH check rather than failing hex decoding (which an untrimmed newline
+// would). runDaemonCmd is called directly so the returned error can be inspected
+// (run() logs via log.Printf, which does not go through the swapped os.Stderr).
+func TestRun_DaemonWriterKeyTrimmedBeforeDecode(t *testing.T) {
+	t.Setenv("ENGRAM_DB", t.TempDir()+"/test.db")
+	t.Setenv("ENGRAM_CENTRAL_URL", "http://localhost:8080")
+	t.Setenv("ENGRAM_WRITER_ID", "writer-x")
+	t.Setenv("ENGRAM_WRITER_KEY", hex.EncodeToString(make([]byte, 16))+"\n")
+
+	err := runDaemonCmd([]string{})
+	if err == nil {
+		t.Fatal("expected a wrong-length error, got nil")
+	}
+	if strings.Contains(err.Error(), "not valid hex") {
+		t.Errorf("trailing newline not trimmed (hex decode failed): %v", err)
+	}
+	if !strings.Contains(err.Error(), "wrong length") {
+		t.Errorf("expected wrong-length error (trim + decode succeeded), got: %v", err)
+	}
+}
+
 // TestRun_DaemonExtraPositional verifies that extra positional arguments to
 // 'daemon' return exit code 1 (rejected before opening the store).
 func TestRun_DaemonExtraPositional(t *testing.T) {

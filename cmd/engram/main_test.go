@@ -17,6 +17,20 @@ func TestRun_NoArgs(t *testing.T) {
 	}
 }
 
+// TestEnvOr_TrimsWhitespace verifies envOr strips surrounding whitespace (env vars
+// from files/CI often carry a trailing newline) and treats a whitespace-only value
+// as unset, falling back to the default.
+func TestEnvOr_TrimsWhitespace(t *testing.T) {
+	t.Setenv("ENGRAM_TEST_TRIM", "  value\n")
+	if got := envOr("ENGRAM_TEST_TRIM", "def"); got != "value" {
+		t.Errorf("envOr = %q, want %q (trimmed)", got, "value")
+	}
+	t.Setenv("ENGRAM_TEST_TRIM", " \n\t")
+	if got := envOr("ENGRAM_TEST_TRIM", "def"); got != "def" {
+		t.Errorf("envOr whitespace-only = %q, want default %q", got, "def")
+	}
+}
+
 // TestRun_HelpFlag verifies that -h, --help, and "help" all return exit code 2.
 func TestRun_HelpFlag(t *testing.T) {
 	for _, arg := range []string{"-h", "--help", "help"} {

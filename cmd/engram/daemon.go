@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -130,7 +131,9 @@ func runDaemonCmd(args []string) error {
 		if *writerID == "" {
 			return fmt.Errorf("--writer-id is required when --central-url is set (or set ENGRAM_WRITER_ID)")
 		}
-		keyHex := os.Getenv("ENGRAM_WRITER_KEY")
+		// TrimSpace: ENGRAM_WRITER_KEY is often injected from a file/CI secret with a
+		// trailing newline, which would otherwise fail hex decoding.
+		keyHex := strings.TrimSpace(os.Getenv("ENGRAM_WRITER_KEY"))
 		if keyHex == "" {
 			return fmt.Errorf("ENGRAM_WRITER_KEY env var is required when --central-url is set")
 		}

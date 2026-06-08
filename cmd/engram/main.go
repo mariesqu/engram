@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 )
 
 const usage = `engram — central sync server and local daemon
@@ -99,7 +100,10 @@ func run(args []string) int {
 // envOr returns the value of the environment variable named key, or def if
 // the variable is unset or empty.
 func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+	// TrimSpace: env vars injected from files/CI commonly carry a trailing newline,
+	// and leading/trailing whitespace is never meaningful for our config values
+	// (paths, URLs, DSNs, addrs, durations, writer-ids).
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
 	}
 	return def
