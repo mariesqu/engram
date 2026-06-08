@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,7 +18,8 @@ func TestDaemonTool_GetObservation_RejectsBadID(t *testing.T) {
 	t.Cleanup(components.Close)
 
 	getTool := components.mcpServer.ListTools()["mem_get_observation"]
-	for _, badID := range []float64{1.5, -3, 0, 9.3e18} {
+	// float64(math.MaxInt64) == 2^63 is the exact boundary that int64() overflows.
+	for _, badID := range []float64{1.5, -3, 0, float64(math.MaxInt64), 9.3e18} {
 		req := newToolRequest("mem_get_observation", map[string]any{"id": badID})
 		result, err := getTool.Handler(t.Context(), req)
 		if err != nil {

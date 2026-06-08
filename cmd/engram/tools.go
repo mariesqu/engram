@@ -359,7 +359,9 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 		// Reject non-integer / out-of-range floats: the MCP SDK delivers all JSON
 		// numbers as float64, which cannot represent every int64 above 2^53.
-		if idFloat != math.Trunc(idFloat) || idFloat <= 0 || idFloat > math.MaxInt64 {
+		// >= float64(math.MaxInt64): float64 rounds MaxInt64 (2^63-1) UP to 2^63, so
+		// the exact boundary must be rejected — int64(2^63) overflows to negative.
+		if idFloat != math.Trunc(idFloat) || idFloat <= 0 || idFloat >= float64(math.MaxInt64) {
 			return mcp.NewToolResultError("mem_get_observation: id must be a positive integer"), nil
 		}
 		id := int64(idFloat)
