@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/wireauth"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -305,14 +306,15 @@ func TestBuildDaemon_WithCentral(t *testing.T) {
 	}
 }
 
-// TestBuildDaemon_MCPServerSessionTools verifies that the MCP server built by
-// buildDaemon registers exactly the two session tools introduced in PR3:
-// mem_session_start and mem_session_end.
+// TestBuildDaemon_MCPServerTools verifies that the MCP server built by
+// buildDaemon registers exactly the five tools introduced through PR4:
+// mem_session_start, mem_session_end, mem_save, mem_get_observation,
+// mem_session_summary.
 //
 // Mechanism: mcpserver.MCPServer.ListTools() returns the registered tool map
 // directly.  Asserting the exact key set ensures no accidental additions and
 // no missing tools.
-func TestBuildDaemon_MCPServerSessionTools(t *testing.T) {
+func TestBuildDaemon_MCPServerTools(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "engram.db")
 	cfg := daemonCfg{
 		db:           dbPath,
@@ -331,7 +333,13 @@ func TestBuildDaemon_MCPServerSessionTools(t *testing.T) {
 
 	tools := components.mcpServer.ListTools()
 
-	wantTools := []string{"mem_session_start", "mem_session_end"}
+	wantTools := []string{
+		"mem_session_start",
+		"mem_session_end",
+		"mem_save",
+		"mem_get_observation",
+		"mem_session_summary",
+	}
 	if len(tools) != len(wantTools) {
 		names := make([]string, 0, len(tools))
 		for n := range tools {
@@ -568,5 +576,233 @@ func TestBuildDaemon_Close_IsIdempotent(t *testing.T) {
 	// Verify the file was created (store opened and schema applied).
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		t.Error("expected SQLite DB file to exist after buildDaemon+Close")
+	}
+}
+
+// ─── mem_save / mem_get_observation / mem_session_summary handler tests ───────
+
+// TestDaemonTool_MemSave_CreatesObservation verifies the mem_save handler
+// end-to-end: the observation is persisted and retrievable via GetObservation.
+func TestDaemonTool_MemSave_CreatesObservation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "save.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	saveTool, ok := components.mcpServer.ListTools()["mem_save"]
+	if !ok {
+		t.Fatal("mem_save not registered")
+	}
+
+	req := newToolRequest("mem_save", map[string]any{
+		"title":   "test observation",
+		"content": "content body",
+		"type":    "decision",
+	})
+	result, err := saveTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("handler returned tool error: %v", result.Content)
+	}
+
+	// The response must mention the title.
+	if len(result.Content) == 0 {
+		t.Fatal("empty content in result")
+	}
+	text, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected TextContent, got %T", result.Content[0])
+	}
+	if !strings.Contains(text.Text, "test observation") {
+		t.Errorf("result text %q does not mention the title", text.Text)
+	}
+
+	// Verify the row is in the store (id is embedded in the response text).
+	// We verify by retrieving id=1 (first row on a fresh DB).
+	rec, err := components.store.GetObservation(1)
+	if err != nil {
+		t.Fatalf("GetObservation(1): %v", err)
+	}
+	if rec.Title != "test observation" {
+		t.Errorf("Title = %q, want %q", rec.Title, "test observation")
+	}
+	if rec.Type != "decision" {
+		t.Errorf("Type = %q, want %q", rec.Type, "decision")
+	}
+}
+
+// TestDaemonTool_MemSave_MissingTitle verifies that mem_save returns a tool
+// error when title is absent (not a transport error).
+func TestDaemonTool_MemSave_MissingTitle(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "save_missing_title.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	req := newToolRequest("mem_save", map[string]any{"content": "no title"})
+	result, err := saveTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler should not return transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for missing title, got success: %v", result.Content)
+	}
+}
+
+// TestDaemonTool_MemSave_InvalidConfig verifies that mem_save surfaces
+// ErrInvalidConfig as a tool error rather than panicking or succeeding silently.
+func TestDaemonTool_MemSave_InvalidConfig(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "save_bad_cfg.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	// Create a malformed .engram/config.json in a temp dir and change cwd to it.
+	badDir := t.TempDir()
+	cfgDir := filepath.Join(badDir, ".engram")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte("{ not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(badDir); err != nil {
+		t.Fatalf("chdir to badDir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	req := newToolRequest("mem_save", map[string]any{"title": "bad config test", "content": "body"})
+	result, err := saveTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for invalid .engram/config.json, got success: %v", result.Content)
+	}
+}
+
+// TestDaemonTool_MemGetObservation_ReturnsContent verifies mem_get_observation
+// returns the content of a previously saved observation.
+func TestDaemonTool_MemGetObservation_ReturnsContent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "get_obs.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	// Save an observation directly via the store.
+	obs, err := components.store.AddObservation(localstore.AddObservationParams{
+		SessionID: "sess-get",
+		Title:     "get obs title",
+		Content:   "unique get obs content",
+		Project:   "testproj",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	getTool := components.mcpServer.ListTools()["mem_get_observation"]
+	req := newToolRequest("mem_get_observation", map[string]any{"id": float64(obs.ID)})
+	result, err := getTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("handler returned tool error: %v", result.Content)
+	}
+
+	text := result.Content[0].(mcp.TextContent).Text
+	if !strings.Contains(text, "unique get obs content") {
+		t.Errorf("response %q does not contain saved content", text)
+	}
+}
+
+// TestDaemonTool_MemGetObservation_NotFound verifies that requesting a
+// non-existent id returns a tool error (not a transport error).
+func TestDaemonTool_MemGetObservation_NotFound(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "get_obs_nf.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	getTool := components.mcpServer.ListTools()["mem_get_observation"]
+	req := newToolRequest("mem_get_observation", map[string]any{"id": float64(99999)})
+	result, err := getTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for missing id=99999, got success: %v", result.Content)
+	}
+}
+
+// TestDaemonTool_MemSessionSummary_CreatesSessionSummary verifies that
+// mem_session_summary creates an observation with type="session_summary".
+func TestDaemonTool_MemSessionSummary_CreatesSessionSummary(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sess_sum.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
+	req := newToolRequest("mem_session_summary", map[string]any{
+		"content": "## Goal\nTest the session summary tool.",
+	})
+	result, err := sumTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("handler returned tool error: %v", result.Content)
+	}
+
+	// The first observation on a fresh store has id=1.
+	rec, err := components.store.GetObservation(1)
+	if err != nil {
+		t.Fatalf("GetObservation(1): %v", err)
+	}
+	if rec.Type != "session_summary" {
+		t.Errorf("Type = %q, want %q", rec.Type, "session_summary")
+	}
+	if !strings.Contains(rec.Content, "Test the session summary tool") {
+		t.Errorf("Content %q does not contain expected text", rec.Content)
+	}
+}
+
+// TestDaemonTool_MemSessionSummary_MissingContent verifies that
+// mem_session_summary returns a tool error when content is empty.
+func TestDaemonTool_MemSessionSummary_MissingContent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sess_sum_empty.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
+	req := newToolRequest("mem_session_summary", map[string]any{"content": "   "})
+	result, err := sumTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for whitespace-only content, got success: %v", result.Content)
 	}
 }

@@ -182,11 +182,15 @@ func runDaemonCmd(args []string) error {
 }
 
 // buildDaemon opens the local store, constructs the MCP server, registers the
-// session tools, and — when cfg.centralURL is non-empty — wires the signing
-// remote client and an autosync Loop.  It does NOT serve or start the Loop;
-// that is runDaemon's responsibility.  This factoring mirrors serve.go /
-// runServe and allows unit tests to assert wiring correctness without blocking
-// on stdio.
+// MCP tools, and — when cfg.centralURL is non-empty — wires the signing remote
+// client and an autosync Loop.  It does NOT serve or start the Loop; that is
+// runDaemon's responsibility.  This factoring mirrors serve.go / runServe and
+// allows unit tests to assert wiring correctness without blocking on stdio.
+//
+// Ordering: the Loop (if any) is constructed BEFORE registerTools so that write
+// handlers can receive a non-nil loop and call loop.Trigger() immediately after
+// a local write.  In local-only mode loop is nil and write handlers skip the
+// trigger (triggerSync is nil-safe).
 func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	store, err := localstore.Open(cfg.db)
 	if err != nil {
@@ -199,29 +203,26 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 		mcpserver.WithToolCapabilities(true),
 	)
 
-	// Register all MCP tools. Tools work regardless of sync mode.
-	registerTools(mcpSrv, store)
+	var loop *syncer.Loop
 
-	if cfg.centralURL == "" {
-		// Local-only mode: no Loop, no remote client.
-		return &daemonComponents{
-			store:     store,
-			mcpServer: mcpSrv,
-			loop:      nil,
-		}, nil
+	if cfg.centralURL != "" {
+		// Central mode: wire the signing remote client and autosync Loop BEFORE
+		// registerTools so the loop reference is available to write handlers.
+		central := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
+		node := syncer.NewNode("daemon", store)
+
+		// The Loop drives SyncAllProjects per tick: Push once (outbox is
+		// project-agnostic), then Pull each project using its own per-project
+		// cursor. No project parameter is needed — projects are discovered via
+		// localstore.ListProjects() at each tick.
+		loop = syncer.NewLoop(node, central, syncer.Config{
+			Interval: cfg.syncInterval,
+		})
 	}
 
-	// Central mode: wire the signing remote client and autosync Loop.
-	central := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
-	node := syncer.NewNode("daemon", store)
-
-	// The Loop drives SyncAllProjects per tick: Push once (outbox is
-	// project-agnostic), then Pull each project using its own per-project
-	// cursor. No project parameter is needed — projects are discovered via
-	// localstore.ListProjects() at each tick.
-	loop := syncer.NewLoop(node, central, syncer.Config{
-		Interval: cfg.syncInterval,
-	})
+	// Register all MCP tools. Pass loop (may be nil) so write handlers can
+	// trigger an immediate sync after each local write.
+	registerTools(mcpSrv, store, loop)
 
 	return &daemonComponents{
 		store:     store,

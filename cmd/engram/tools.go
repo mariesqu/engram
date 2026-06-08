@@ -12,19 +12,18 @@ import (
 
 	"github.com/mariesqu/engram/internal/localstore"
 	projectpkg "github.com/mariesqu/engram/internal/project"
+	"github.com/mariesqu/engram/internal/syncer"
 )
 
 // registerTools adds the MCP tools exposed by this binary to srv. It is called
 // unconditionally from buildDaemon regardless of whether the daemon is running
-// in local-only or central mode — session tracking works without sync.
+// in local-only or central mode — session tracking and memory writes work
+// without sync.
 //
-// This function establishes the tool-registration pattern for subsequent PRs:
-//   - Each tool is a mcp.NewTool(...) with its parameter schema.
-//   - The handler is a closure over store.
-//   - Handlers return (*mcp.CallToolResult, nil) — the SDK treats a returned
-//     error as a transport-level failure; tool-level failures use
-//     mcp.NewToolResultError so the error is visible to the agent.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store) {
+// loop may be nil (local-only mode). Write handlers call loop.Trigger() only
+// when loop is non-nil, so the autosync runs immediately after a local write
+// when central is configured.
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop) {
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -63,6 +62,114 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store) {
 			),
 		),
 		handleSessionEnd(store),
+	)
+
+	// ── mem_save ─────────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_save",
+			mcp.WithDescription(`Save an important observation to persistent memory. Call this PROACTIVELY after completing significant work — don't wait to be asked.
+
+WHEN to save (call this after each of these):
+- Architectural decisions or tradeoffs
+- Bug fixes (what was wrong, why, how you fixed it)
+- New patterns or conventions established
+- Configuration changes or environment setup
+- Important discoveries or gotchas
+- File structure changes
+
+FORMAT for content — use this structured format:
+  **What**: [concise description of what was done]
+  **Why**: [the reasoning, user request, or problem that drove it]
+  **Where**: [files/paths affected, e.g. src/auth/middleware.ts, internal/store/store.go]
+  **Learned**: [any gotchas, edge cases, or decisions made — omit if none]
+
+TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query sanitization", "Fixed N+1 in user list"`),
+			mcp.WithTitleAnnotation("Save Memory"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("title",
+				mcp.Required(),
+				mcp.Description("Short, searchable title (e.g. 'JWT auth middleware', 'Fixed N+1 query')"),
+			),
+			mcp.WithString("content",
+				mcp.Description("Structured content using **What**, **Why**, **Where**, **Learned** format"),
+			),
+			mcp.WithString("type",
+				mcp.Description("Category: decision, architecture, bugfix, pattern, config, discovery, learning (default: manual)"),
+			),
+			mcp.WithString("session_id",
+				mcp.Description("Session ID to associate with (default: manual-save-{project})"),
+			),
+			mcp.WithString("scope",
+				mcp.Description("Scope for this observation: project (default) or personal"),
+			),
+			mcp.WithString("topic_key",
+				mcp.Description("Optional topic identifier for upserts (e.g. architecture/auth-model). Reuses and updates the latest observation in same project+scope."),
+			),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project for this memory. When omitted the project is auto-detected from the working directory."),
+			),
+		),
+		handleSave(store, loop),
+	)
+
+	// ── mem_get_observation ──────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_get_observation",
+			mcp.WithDescription("Get the full content of a specific observation by ID. Use when you need the complete, untruncated content of an observation found via mem_search."),
+			mcp.WithTitleAnnotation("Get Observation"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithNumber("id",
+				mcp.Required(),
+				mcp.Description("The observation ID to retrieve"),
+			),
+		),
+		handleGetObservation(store),
+	)
+
+	// ── mem_session_summary ──────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_session_summary",
+			mcp.WithDescription(`Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete.
+
+FORMAT — use this exact structure in the content field:
+
+## Goal
+[One sentence: what were we building/working on in this session]
+
+## Instructions
+[User preferences, constraints, or context discovered during this session. Skip if nothing notable.]
+
+## Discoveries
+- [Technical finding, gotcha, or learning 1]
+
+## Accomplished
+- [Completed task 1 — with key implementation details]
+
+## Next Steps
+- [What remains to be done — for the next session]
+
+## Relevant Files
+- path/to/file.go — [what it does or what changed]`),
+			mcp.WithTitleAnnotation("Save Session Summary"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("content",
+				mcp.Required(),
+				mcp.Description("Full session summary using the Goal/Instructions/Discoveries/Accomplished/Next Steps/Relevant Files format"),
+			),
+			mcp.WithString("session_id",
+				mcp.Description("Session ID (default: manual-save-{project})"),
+			),
+		),
+		handleSessionSummary(store, loop),
 	)
 }
 
@@ -150,5 +257,181 @@ func handleSessionEnd(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Session %q completed", id)), nil
+	}
+}
+
+// resolveSaveProject resolves the project for a write tool call using the same
+// precedence as handleSessionStart (mirrors old_code write-tool contract):
+//
+//  1. Explicit "project" argument if non-empty (caller override).
+//  2. DetectProjectFull(cwd) — repo config / git remote / git root / dir basename.
+//
+// ErrInvalidConfig and ErrAmbiguousProject are surfaced as tool errors exactly
+// like handleSessionStart so agents get actionable feedback on misconfigured
+// repos (faithful to old_code handleSave precedence).
+//
+// Conflict detection (explicit project vs store's known projects) is DEFERRED
+// to a future PR.
+func resolveSaveProject(store *localstore.Store, explicitProject string) (string, *mcp.CallToolResult) {
+	if strings.TrimSpace(explicitProject) != "" {
+		return strings.TrimSpace(explicitProject), nil
+	}
+
+	cwd, _ := os.Getwd()
+	det := projectpkg.DetectProjectFull(cwd)
+	if det.Error != nil {
+		switch {
+		case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
+			return "", mcp.NewToolResultError("mem_save: project resolution: " + det.Error.Error())
+		case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
+			msg := "mem_save: project resolution: " + det.Error.Error()
+			if len(det.AvailableProjects) > 0 {
+				msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") + "); pass project= explicitly"
+			}
+			return "", mcp.NewToolResultError(msg)
+		default:
+			// Other errors (e.g. no .git): fall back to basename.
+			return projectpkg.DetectProject(cwd), nil
+		}
+	}
+	return det.Project, nil
+}
+
+// handleSave returns the handler for mem_save.
+func handleSave(store *localstore.Store, loop *syncer.Loop) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		title, _ := args["title"].(string)
+		title = strings.TrimSpace(title)
+		if title == "" {
+			return mcp.NewToolResultError("mem_save: title is required"), nil
+		}
+
+		content, _ := args["content"].(string)
+		typ, _ := args["type"].(string)
+		sessionID, _ := args["session_id"].(string)
+		scope, _ := args["scope"].(string)
+		topicKey, _ := args["topic_key"].(string)
+		explicitProject, _ := args["project"].(string)
+
+		project, toolErr := resolveSaveProject(store, explicitProject)
+		if toolErr != nil {
+			return toolErr, nil
+		}
+
+		result, err := store.AddObservation(localstore.AddObservationParams{
+			SessionID: sessionID,
+			Type:      typ,
+			Title:     title,
+			Content:   content,
+			Project:   project,
+			Scope:     scope,
+			TopicKey:  topicKey,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("mem_save: failed to save: " + err.Error()), nil
+		}
+
+		triggerSync(loop)
+
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Memory saved: %q (id=%d, project=%q)", title, result.ID, project,
+		)), nil
+	}
+}
+
+// handleGetObservation returns the handler for mem_get_observation.
+func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		// The MCP SDK decodes JSON numbers as float64.
+		rawID, ok := args["id"]
+		if !ok {
+			return mcp.NewToolResultError("mem_get_observation: id is required"), nil
+		}
+		idFloat, ok := rawID.(float64)
+		if !ok {
+			return mcp.NewToolResultError("mem_get_observation: id must be a number"), nil
+		}
+		id := int64(idFloat)
+		if id <= 0 {
+			return mcp.NewToolResultError("mem_get_observation: id must be a positive integer"), nil
+		}
+
+		rec, err := store.GetObservation(id)
+		if err != nil {
+			if errors.Is(err, localstore.ErrObservationNotFound) {
+				return mcp.NewToolResultError(fmt.Sprintf("mem_get_observation: observation #%d not found", id)), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("mem_get_observation: %s", err)), nil
+		}
+
+		topic := ""
+		if rec.TopicKey != nil {
+			topic = fmt.Sprintf("\nTopic: %s", *rec.TopicKey)
+		}
+
+		text := fmt.Sprintf("#%d [%s] %s\n%s\nSession: %s\nProject: %s\nScope: %s%s\nCreated: %s",
+			id, rec.Type, rec.Title,
+			rec.Content,
+			rec.SessionID,
+			rec.Project,
+			rec.Scope,
+			topic,
+			rec.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		)
+
+		return mcp.NewToolResultText(text), nil
+	}
+}
+
+// handleSessionSummary returns the handler for mem_session_summary.
+// It saves a session_summary-typed observation using the cwd-detected project
+// and optionally triggers autosync.
+func handleSessionSummary(store *localstore.Store, loop *syncer.Loop) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		content, _ := args["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			return mcp.NewToolResultError("mem_session_summary: content is required"), nil
+		}
+
+		sessionID, _ := args["session_id"].(string)
+
+		// project field intentionally not in the schema — auto-detect only
+		// (mirrors old_code REQ-308 write-tool contract).
+		project, toolErr := resolveSaveProject(store, "")
+		if toolErr != nil {
+			return toolErr, nil
+		}
+
+		result, err := store.AddObservation(localstore.AddObservationParams{
+			SessionID: sessionID,
+			Type:      "session_summary",
+			Title:     fmt.Sprintf("Session summary: %s", project),
+			Content:   content,
+			Project:   project,
+			Scope:     "project",
+		})
+		if err != nil {
+			return mcp.NewToolResultError("mem_session_summary: failed to save: " + err.Error()), nil
+		}
+
+		triggerSync(loop)
+
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Session summary saved for project %q (id=%d)", project, result.ID,
+		)), nil
+	}
+}
+
+// triggerSync calls loop.Trigger() when loop is non-nil. It is nil-safe: in
+// local-only mode the daemon has no Loop and writes must not panic.
+func triggerSync(loop *syncer.Loop) {
+	if loop != nil {
+		loop.Trigger()
 	}
 }
