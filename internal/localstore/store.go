@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; registers "sqlite" driver name
@@ -12,8 +13,21 @@ import (
 )
 
 // Store is the local SQLite adapter. It implements domain.Reader.
+//
+// Concurrency model: all write paths (AddObservation, LocalWrite, ApplyPulled,
+// AckMutation, SetPullCursor, SetPullCursorFor, CreateSession, EndSession) are
+// serialized under mu. Read paths (FindByTopic, FindBySyncID, SearchMemories,
+// GetObservation, RecentObservations, Search*, RecentSessions, PullCursor,
+// PullCursorFor, DrainOutbox, PendingCount, ListProjects) do NOT take mu — they
+// may run concurrently with each other and with an in-flight write (WAL mode
+// provides snapshot isolation for readers).
+//
+// Re-entrancy: public write methods acquire mu.Lock() once and delegate to
+// unexported *Locked helpers, avoiding deadlock when one write method calls
+// another (e.g. AddObservation calls localWriteLocked, not LocalWrite).
 type Store struct {
 	db *sql.DB
+	mu sync.Mutex // serializes all write operations
 }
 
 // Open opens (or creates) the SQLite database at path, applies WAL pragmas,

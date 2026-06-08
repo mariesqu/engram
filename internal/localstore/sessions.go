@@ -49,6 +49,9 @@ func normalizeProject(project string) string {
 // empty — matching old_code createSessionTx semantics (REQ-308: no overwrite
 // of a populated project with a new one).
 func (s *Store) CreateSession(id, project, directory string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	project = normalizeProject(project)
 	_, err := s.db.Exec(
 		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)
@@ -64,6 +67,9 @@ func (s *Store) CreateSession(id, project, directory string) error {
 // session id. If the session does not exist the call is a no-op (returns nil),
 // mirroring old_code EndSession behaviour: rows==0 is not an error.
 func (s *Store) EndSession(id, summary string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// An UPDATE affecting zero rows (unknown id) is intentionally NOT an error —
 	// it is a no-op, mirroring old_code EndSession.
 	_, err := s.db.Exec(
