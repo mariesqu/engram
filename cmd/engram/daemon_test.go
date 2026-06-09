@@ -307,9 +307,9 @@ func TestBuildDaemon_WithCentral(t *testing.T) {
 }
 
 // TestBuildDaemon_MCPServerTools verifies that the MCP server built by
-// buildDaemon registers exactly the seven tools for the MVP:
+// buildDaemon registers exactly the eight tools:
 // mem_session_start, mem_session_end, mem_save, mem_get_observation,
-// mem_session_summary, mem_search, mem_context.
+// mem_session_summary, mem_search, mem_context, mem_judge.
 //
 // Mechanism: mcpserver.MCPServer.ListTools() returns the registered tool map
 // directly.  Asserting the exact key set ensures no accidental additions and
@@ -341,6 +341,7 @@ func TestBuildDaemon_MCPServerTools(t *testing.T) {
 		"mem_session_summary",
 		"mem_search",
 		"mem_context",
+		"mem_judge",
 	}
 	if len(tools) != len(wantTools) {
 		names := make([]string, 0, len(tools))
@@ -806,5 +807,338 @@ func TestDaemonTool_MemSessionSummary_MissingContent(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Errorf("expected tool error for whitespace-only content, got success: %v", result.Content)
+	}
+}
+
+// ─── mem_save judgment envelope + mem_judge tests ────────────────────────────
+
+// seedCorpus inserts a realistic corpus of observations into store for the given
+// project+scope so that FTS5 BM25 scoring produces meaningful (negative) ranks.
+// It seeds ~12 noise memories with varied titles, plus 2–3 strongly overlapping
+// "JWT auth middleware cookie" titles that will score well (more negative) against
+// a query on the same phrase. This pushes corpus IDF down so BM25 rewards strong
+// multi-term matches enough to clear the default -2.0 floor.
+func seedCorpus(t *testing.T, store *localstore.Store, project string) {
+	t.Helper()
+	// Noise: varied topics so IDF rewards overlapping terms.
+	noise := []string{
+		"Fixed N+1 query in user list",
+		"Added pagination to dashboard",
+		"Redis cache eviction strategy",
+		"Postgres connection pool tuning",
+		"React component lazy loading",
+		"Docker multi-stage build setup",
+		"Terraform state locking config",
+		"GraphQL resolver error handling",
+		"TypeScript strict mode migration",
+		"Webpack bundle size optimization",
+		"CORS policy for API gateway",
+		"Kubernetes readiness probe config",
+	}
+	for _, title := range noise {
+		_, err := store.AddObservation(localstore.AddObservationParams{
+			SessionID: "corpus-seed",
+			Title:     title,
+			Content:   "corpus noise: " + title,
+			Project:   project,
+			Scope:     "project",
+			Type:      "discovery",
+		})
+		if err != nil {
+			t.Fatalf("seedCorpus noise %q: %v", title, err)
+		}
+	}
+	// Strong overlap: these share most terms with the test save title.
+	// "JWT auth middleware cookie session" overlaps 4 words with the test title.
+	overlapping := []string{
+		"JWT auth middleware cookie session token",
+		"JWT auth middleware refactored for cookie-based sessions",
+	}
+	for _, title := range overlapping {
+		_, err := store.AddObservation(localstore.AddObservationParams{
+			SessionID: "corpus-seed",
+			Title:     title,
+			Content:   "overlapping title for conflict detection: " + title,
+			Project:   project,
+			Scope:     "project",
+			Type:      "architecture",
+		})
+		if err != nil {
+			t.Fatalf("seedCorpus overlap %q: %v", title, err)
+		}
+	}
+}
+
+// TestDaemonTool_MemSave_JudgmentEnvelope verifies that mem_save returns a
+// judgment envelope (not an error) when FindCandidates surfaces candidates.
+// It seeds a realistic corpus so BM25 scores clear the default -2.0 floor,
+// then saves a strongly-overlapping title and asserts the envelope fields.
+func TestDaemonTool_MemSave_JudgmentEnvelope(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "envelope.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	const project = "envelope-test"
+	seedCorpus(t, components.store, project)
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	// Title shares 4+ terms with the overlapping corpus entries above.
+	req := newToolRequest("mem_save", map[string]any{
+		"title":   "JWT auth middleware cookie session handling",
+		"content": "Switched to cookie-based JWT sessions in the auth middleware.",
+		"type":    "architecture",
+		"project": project,
+		"scope":   "project",
+	})
+	result, err := saveTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	// MUST be success, not an error — save succeeded regardless of candidates.
+	if result.IsError {
+		t.Fatalf("mem_save returned IsError=true; candidates must never fail the save: %v", result.Content)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("empty result content")
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+
+	// The envelope must contain a judgment_id with "rel-" prefix.
+	if !strings.Contains(text, "rel-") {
+		t.Errorf("result does not contain a judgment_id (expected 'rel-' prefix):\n%s", text)
+	}
+	// At least one candidate title from the corpus must appear.
+	foundCandidate := strings.Contains(text, "JWT auth middleware refactored") ||
+		strings.Contains(text, "JWT auth middleware cookie session token")
+	if !foundCandidate {
+		t.Errorf("result does not contain any overlapping candidate title:\n%s", text)
+	}
+	// judgment_required must be signalled.
+	if !strings.Contains(text, "CONFLICT REVIEW PENDING") {
+		t.Errorf("result does not signal CONFLICT REVIEW PENDING:\n%s", text)
+	}
+
+	// The memory itself must have been saved — retrieve it via the store.
+	// id is the last inserted row; on this DB it will be > len(noise)+len(overlap).
+	results, searchErr := components.store.SearchMemoriesFiltered(
+		"JWT auth middleware cookie session handling", project, 5, localstore.SearchFilter{},
+	)
+	if searchErr != nil {
+		t.Fatalf("SearchMemoriesFiltered: %v", searchErr)
+	}
+	found := false
+	for _, r := range results {
+		if r.Title == "JWT auth middleware cookie session handling" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("saved memory not found via search — save must persist even when candidates are found")
+	}
+}
+
+// TestDaemonTool_MemSave_NoEnvelope_EmptyStore verifies that mem_save on a
+// fresh (empty) store returns the plain success text with no judgment envelope
+// and IsError=false.
+func TestDaemonTool_MemSave_NoEnvelope_EmptyStore(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "no_envelope.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	req := newToolRequest("mem_save", map[string]any{
+		"title":   "first memory in empty store",
+		"content": "nothing else here yet",
+		"project": "empty-proj",
+	})
+	result, err := saveTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success on empty store, got IsError: %v", result.Content)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	// No envelope fields.
+	if strings.Contains(text, "judgment_required") || strings.Contains(text, "rel-") {
+		t.Errorf("expected no judgment envelope on empty store, got:\n%s", text)
+	}
+	if !strings.Contains(text, "Memory saved") {
+		t.Errorf("expected 'Memory saved' in result, got:\n%s", text)
+	}
+}
+
+// TestDaemonTool_MemSave_SpecialCharTitle verifies that a title with special
+// characters (including double-quotes) does not cause a save failure — the FTS
+// sanitizer strips interior quotes safely.
+func TestDaemonTool_MemSave_SpecialCharTitle(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "special.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	req := newToolRequest("mem_save", map[string]any{
+		"title":   `Fix "auth" bug in session handling`,
+		"content": "special char title test",
+		"project": "special-proj",
+	})
+	result, err := saveTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("special-char title must not fail the save: %v", result.Content)
+	}
+	if !strings.Contains(result.Content[0].(mcp.TextContent).Text, "Memory saved") {
+		t.Errorf("expected 'Memory saved', got: %v", result.Content)
+	}
+}
+
+// TestDaemonTool_MemJudge_RecordsVerdict verifies the mem_judge handler
+// end-to-end: seeds a corpus, mem_save a strongly-overlapping title to obtain
+// a judgment_id, then calls mem_judge and asserts the updated row shows "judged".
+func TestDaemonTool_MemJudge_RecordsVerdict(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "judge.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	const project = "judge-test"
+	seedCorpus(t, components.store, project)
+
+	// Save to get a judgment envelope.
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	saveReq := newToolRequest("mem_save", map[string]any{
+		"title":   "JWT auth middleware cookie session handling",
+		"content": "body",
+		"type":    "architecture",
+		"project": project,
+		"scope":   "project",
+	})
+	saveResult, err := saveTool.Handler(t.Context(), saveReq)
+	if err != nil {
+		t.Fatalf("mem_save transport error: %v", err)
+	}
+	if saveResult.IsError {
+		t.Fatalf("mem_save returned error: %v", saveResult.Content)
+	}
+
+	saveText := saveResult.Content[0].(mcp.TextContent).Text
+	// Extract the first judgment_id from the envelope text.
+	// Format: "judgment_id: rel-<hex>"
+	judgmentID := ""
+	for _, line := range strings.Split(saveText, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "judgment_id:") {
+			judgmentID = strings.TrimSpace(strings.TrimPrefix(line, "judgment_id:"))
+			break
+		}
+		// Also handle candidate-level judgment_id (indented).
+		if strings.HasPrefix(line, "judgment_id:") {
+			judgmentID = strings.TrimSpace(strings.TrimPrefix(line, "judgment_id:"))
+			break
+		}
+	}
+	if judgmentID == "" || !strings.HasPrefix(judgmentID, "rel-") {
+		t.Fatalf("could not extract judgment_id from mem_save response:\n%s", saveText)
+	}
+
+	// Call mem_judge with the extracted judgment_id.
+	judgeTool, ok := components.mcpServer.ListTools()["mem_judge"]
+	if !ok {
+		t.Fatal("mem_judge not registered")
+	}
+	judgeReq := newToolRequest("mem_judge", map[string]any{
+		"judgment_id": judgmentID,
+		"relation":    "supersedes",
+		"reason":      "new implementation replaces the old one",
+		"confidence":  float64(0.9),
+	})
+	judgeResult, err := judgeTool.Handler(t.Context(), judgeReq)
+	if err != nil {
+		t.Fatalf("mem_judge transport error: %v", err)
+	}
+	if judgeResult.IsError {
+		t.Fatalf("mem_judge returned error: %v", judgeResult.Content)
+	}
+
+	judgeText := judgeResult.Content[0].(mcp.TextContent).Text
+	if !strings.Contains(judgeText, "supersedes") {
+		t.Errorf("judge result does not mention relation 'supersedes': %s", judgeText)
+	}
+	if !strings.Contains(judgeText, "judged") {
+		t.Errorf("judge result does not mention status 'judged': %s", judgeText)
+	}
+
+	// Verify via store.GetRelation that the row is now "judged".
+	rel, relErr := components.store.GetRelation(judgmentID)
+	if relErr != nil {
+		t.Fatalf("GetRelation(%q): %v", judgmentID, relErr)
+	}
+	if rel.JudgmentStatus != "judged" {
+		t.Errorf("JudgmentStatus = %q, want %q", rel.JudgmentStatus, "judged")
+	}
+	if rel.Relation != "supersedes" {
+		t.Errorf("Relation = %q, want %q", rel.Relation, "supersedes")
+	}
+}
+
+// TestDaemonTool_MemJudge_InvalidVerb verifies that mem_judge returns IsError=true
+// for an unrecognised relation verb without mutating any row.
+func TestDaemonTool_MemJudge_InvalidVerb(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "judge_invalid.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	judgeTool := components.mcpServer.ListTools()["mem_judge"]
+	req := newToolRequest("mem_judge", map[string]any{
+		"judgment_id": "rel-doesnotmatter",
+		"relation":    "INVALID_VERB",
+	})
+	result, err := judgeTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for invalid verb, got success: %v", result.Content)
+	}
+}
+
+// TestDaemonTool_MemJudge_UnknownJudgmentID verifies that mem_judge returns
+// IsError=true when the judgment_id does not exist in the store.
+func TestDaemonTool_MemJudge_UnknownJudgmentID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "judge_unknown.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	judgeTool := components.mcpServer.ListTools()["mem_judge"]
+	req := newToolRequest("mem_judge", map[string]any{
+		"judgment_id": "rel-0000000000000000",
+		"relation":    "related",
+	})
+	result, err := judgeTool.Handler(t.Context(), req)
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for unknown judgment_id, got success: %v", result.Content)
 	}
 }
