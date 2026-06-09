@@ -5,7 +5,7 @@ import "testing"
 func TestValidEntityType_KnownValues(t *testing.T) {
 	known := []EntityType{
 		EntityMemory, EntityChange, EntitySpec,
-		EntityTask, EntityStandard, EntityPlan,
+		EntityTask, EntityStandard, EntityPlan, EntityPrompt,
 	}
 	for _, et := range known {
 		if !ValidEntityType(et) {

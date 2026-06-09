@@ -14,12 +14,16 @@ const (
 	EntityTask     EntityType = "task"
 	EntityStandard EntityType = "standard"
 	EntityPlan     EntityType = "plan"
+	// EntityPrompt represents a user prompt captured by mem_save_prompt.
+	// It is stored in the dedicated user_prompts table (not memories) and
+	// synced via domain.Mutation with EntityType="prompt".
+	EntityPrompt EntityType = "prompt"
 )
 
 // ValidEntityType reports whether et is a recognised EntityType.
 func ValidEntityType(et EntityType) bool {
 	switch et {
-	case EntityMemory, EntityChange, EntitySpec, EntityTask, EntityStandard, EntityPlan:
+	case EntityMemory, EntityChange, EntitySpec, EntityTask, EntityStandard, EntityPlan, EntityPrompt:
 		return true
 	}
 	return false

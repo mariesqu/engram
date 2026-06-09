@@ -581,12 +581,12 @@ func TestSanitizeFTS_InteriorQuotesStripped(t *testing.T) {
 		input string
 		want  string
 	}{
-		{`a"b`, `"ab"`},                    // interior quote removed
+		{`a"b`, `"ab"`}, // interior quote removed
 		{`foo" OR title:"bar`, `"foo" "OR" "title:bar"`}, // quotes from injection attempt removed
-		{`"already quoted"`, `"already" "quoted"`},      // outer quotes (existing behaviour)
-		{`a""b`, `"ab"`},                   // multiple interior quotes
-		{`"`, ``},                           // token that is only a quote — skipped
-		{`" "`, ``},                         // two all-quote tokens — both skipped
+		{`"already quoted"`, `"already" "quoted"`},       // outer quotes (existing behaviour)
+		{`a""b`, `"ab"`}, // multiple interior quotes
+		{`"`, ``},        // token that is only a quote — skipped
+		{`" "`, ``},      // two all-quote tokens — both skipped
 	}
 	for _, tc := range cases {
 		got := sanitizeFTS(tc.input)
@@ -1482,7 +1482,7 @@ func createV2DB(t *testing.T) string {
 // table) is opened; the migration chain MUST add the column to BOTH memories and
 // memory_tombstones AND add memory_tombstones_topic_uidx, bump user_version to
 // currentSchemaVersion, and PRESERVE pre-existing rows with the column defaulted
-// to ''.
+// to ”.
 func TestMigration_V2ToV3_LastWriteMutationIDAdded(t *testing.T) {
 	path := createV2DB(t)
 
@@ -1852,10 +1852,10 @@ func TestTombstone_TopicUniqueIndex_SchemaEnforcesOnePerTopic(t *testing.T) {
 }
 
 // TestTombstone_TopicUniqueIndex_NoTopicEmptyStringNotConstrained verifies the
-// partial index treats topic_key='' as "no topic" (matching the domain's
+// partial index treats topic_key=” as "no topic" (matching the domain's
 // TopicKey != nil && *TopicKey != "" semantics) and does NOT constrain it. Two
-// genuine no-topic tombstones that round-trip as topic_key='' under different
-// sync_ids in the same (project, scope) must BOTH persist, since the '' exclusion
+// genuine no-topic tombstones that round-trip as topic_key=” under different
+// sync_ids in the same (project, scope) must BOTH persist, since the ” exclusion
 // in the index predicate prevents spurious UNIQUE violations.
 func TestTombstone_TopicUniqueIndex_NoTopicEmptyStringNotConstrained(t *testing.T) {
 	s := openTempStore(t)
@@ -2131,6 +2131,138 @@ func TestMigration_V4ToV5_FreshDB_NoSeqColumn(t *testing.T) {
 	}
 	if ver != currentSchemaVersion {
 		t.Errorf("fresh DB user_version = %d; want %d", ver, currentSchemaVersion)
+	}
+}
+
+// TestMigration_V8ToV9_FreshDB verifies that a fresh DB opened via Open:
+//   - has user_version == 9 (currentSchemaVersion)
+//   - has user_prompts and prompt_tombstones tables
+//   - accepts an insert into both tables (column set is correct)
+func TestMigration_V8ToV9_FreshDB(t *testing.T) {
+	s := openTempStore(t)
+
+	// user_version must be at currentSchemaVersion.
+	var ver int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("fresh DB user_version = %d; want %d (currentSchemaVersion)", ver, currentSchemaVersion)
+	}
+
+	// Both tables must exist.
+	for _, tbl := range []string{"user_prompts", "prompt_tombstones"} {
+		var name string
+		if err := s.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, tbl,
+		).Scan(&name); err != nil {
+			t.Errorf("table %q not found after migrateV8ToV9: %v", tbl, err)
+		}
+	}
+
+	// Insert into user_prompts — verifies column set matches DDL.
+	_, err := s.db.Exec(`
+		INSERT INTO user_prompts (sync_id, session_id, content, project, writer_id)
+		VALUES ('prompt-v9-1', 'sess-v9', 'hello world', 'engram', 'writer-test')
+	`)
+	if err != nil {
+		t.Fatalf("INSERT into user_prompts on fresh DB: %v", err)
+	}
+
+	// Insert into prompt_tombstones — verifies column set matches DDL.
+	_, err = s.db.Exec(`
+		INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at, deleted_by)
+		VALUES ('prompt-v9-1', 'sess-v9', 'engram', datetime('now'), 'writer-test')
+	`)
+	if err != nil {
+		t.Fatalf("INSERT into prompt_tombstones on fresh DB: %v", err)
+	}
+}
+
+// TestMigration_V8ToV9_ExistingDB verifies that migrateV8ToV9 applies correctly
+// to a DB that was at user_version=8 (the conflict_relations version).  It
+// manually constructs such a DB, runs runMigrations, then asserts:
+//   - user_version is 9 after migration
+//   - user_prompts and prompt_tombstones tables exist and are writable
+//   - re-running runMigrations on the migrated DB is a no-op (idempotent)
+func TestMigration_V8ToV9_ExistingDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v8.db")
+
+	// Open a raw DB and apply the full current schema, then wind user_version
+	// back to 8 to simulate a DB that hasn't seen the v8→v9 migration yet.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open v8 DB: %v", err)
+	}
+	defer db.Close()
+
+	if err := ApplySchema(db); err != nil {
+		t.Fatalf("ApplySchema: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 8`); err != nil {
+		t.Fatalf("set user_version=8: %v", err)
+	}
+
+	// Insert a pre-existing memory to confirm data survives the migration.
+	if _, err := db.Exec(`
+		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+		VALUES ('v8-mem-1', 'sess1', 'memory', 'manual', 'Pre-v9 Memory', 'pre-v9 content', 'p', 'project', 'w')
+	`); err != nil {
+		t.Fatalf("insert pre-migration row: %v", err)
+	}
+
+	// Now run migrations — should advance from v8 to v9.
+	if err := runMigrations(db); err != nil {
+		t.Fatalf("runMigrations from v8: %v", err)
+	}
+
+	// 1. user_version must now be 9.
+	var ver int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if ver != 9 {
+		t.Errorf("user_version = %d after migrateV8ToV9; want 9", ver)
+	}
+
+	// 2. Both new tables must exist.
+	for _, tbl := range []string{"user_prompts", "prompt_tombstones"} {
+		var name string
+		if err := db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, tbl,
+		).Scan(&name); err != nil {
+			t.Errorf("table %q not found after migrateV8ToV9: %v", tbl, err)
+		}
+	}
+
+	// 3. Both tables must be writable.
+	if _, err := db.Exec(`
+		INSERT INTO user_prompts (sync_id, session_id, content, project, writer_id)
+		VALUES ('prompt-migrated-1', 'sess1', 'migrated prompt', 'p', 'w')
+	`); err != nil {
+		t.Fatalf("INSERT user_prompts after migration: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at, deleted_by)
+		VALUES ('prompt-migrated-1', 'sess1', 'p', datetime('now'), 'w')
+	`); err != nil {
+		t.Fatalf("INSERT prompt_tombstones after migration: %v", err)
+	}
+
+	// 4. Pre-existing memory data survived.
+	var content string
+	if err := db.QueryRow(
+		`SELECT content FROM memories WHERE sync_id='v8-mem-1'`,
+	).Scan(&content); err != nil {
+		t.Fatalf("read pre-migration row after migration: %v", err)
+	}
+	if content != "pre-v9 content" {
+		t.Errorf("pre-migration row content = %q; want %q", content, "pre-v9 content")
+	}
+
+	// 5. Re-running migrations is idempotent.
+	if err := runMigrations(db); err != nil {
+		t.Errorf("re-running migrations on v9 DB must be a no-op: %v", err)
 	}
 }
 

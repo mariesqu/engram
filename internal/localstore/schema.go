@@ -87,7 +87,26 @@ import (
 //	the existing SDD parent-child memory_relations table (from_sync_id/to_sync_id).
 //	The table is idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema), so a
 //	fresh DB where ApplySchema already created it is a no-op in the migration.
-const currentSchemaVersion = 8
+//
+// v8 → v9: add user_prompts and prompt_tombstones tables as the local-store
+//
+//	materialization layer for EntityPrompt ("prompt") mutations.  These tables
+//	are the foundation for PR-1 of the synced-prompts feature; apply/dispatch
+//	logic (mem_save_prompt, pull-apply for prompts) is deferred to PR-2/3/4.
+//
+//	Design decisions:
+//	  - user_prompts carries NO REFERENCES sessions(id) FK.  An out-of-order pull
+//	    can land a prompt row before its owning session row arrives — the same
+//	    rationale that removed the memories→sessions FK in v0→v1.  session_id is
+//	    therefore a SOFT (unvalidated) reference.
+//	  - writer_id column is added (absent in old_code) for LWW tiebreaking parity
+//	    with the memories table and the central_user_prompts table.
+//	  - project NOT NULL DEFAULT '' (absent in old_code, which allowed NULL and
+//	    had a migration to backfill to '').  New codebase always sets project.
+//	  - prompts_fts / FTS triggers are intentionally omitted; prompt search is
+//	    deferred to a later PR.
+//	  - Both tables are idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema).
+const currentSchemaVersion = 9
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -294,6 +313,38 @@ const conflictRelationsTableDDL = `CREATE TABLE IF NOT EXISTS conflict_relations
 	updated_at       TEXT    NOT NULL DEFAULT (datetime('now'))
 )`
 
+// userPromptsTableDDL is the authoritative CREATE TABLE statement for the
+// user_prompts table. It is shared between ApplySchema (fresh DB) and
+// migrateV8ToV9 (existing DB upgrade) so both always produce the same schema.
+//
+// session_id carries NO REFERENCES clause — an out-of-order pull can land a
+// prompt row before its owning session arrives, the same rationale that removed
+// the memories→sessions FK in v0→v1.  session_id is a SOFT (unvalidated) ref.
+//
+// writer_id is required for LWW tiebreaking parity with memories and
+// central_user_prompts; absent in old_code but added here from the start.
+const userPromptsTableDDL = `CREATE TABLE IF NOT EXISTS user_prompts (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	sync_id    TEXT    NOT NULL UNIQUE,
+	session_id TEXT    NOT NULL DEFAULT '',
+	content    TEXT    NOT NULL,
+	project    TEXT    NOT NULL DEFAULT '',
+	writer_id  TEXT    NOT NULL DEFAULT '',
+	created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+)`
+
+// promptTombstonesTableDDL is the authoritative CREATE TABLE statement for the
+// prompt_tombstones table. It mirrors memory_tombstones structure but is
+// intentionally leaner: prompts have no scope/topic_key/version LWW fields
+// because prompt identity is sync_id-only (no topic convergence).
+const promptTombstonesTableDDL = `CREATE TABLE IF NOT EXISTS prompt_tombstones (
+	sync_id    TEXT    PRIMARY KEY,
+	session_id TEXT    NOT NULL DEFAULT '',
+	project    TEXT    NOT NULL DEFAULT '',
+	deleted_at TEXT    NOT NULL,
+	deleted_by TEXT    NOT NULL DEFAULT ''
+)`
+
 // runMigrations inspects PRAGMA user_version and applies any pending migrations
 // in order.  It is idempotent: a DB already at currentSchemaVersion is a no-op.
 // Migrations are applied inside individual transactions so a failure leaves the
@@ -369,9 +420,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 8
 	}
 
+	if ver < 9 {
+		if err := migrateV8ToV9(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 9
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 8` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 9` migration block.
+	// the final `ver = 9` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 10` migration block.
 	_ = ver
 	return nil
 }
@@ -952,6 +1011,56 @@ func migrateV7ToV8(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV8ToV9 creates the user_prompts and prompt_tombstones tables and their
+// indexes for EntityPrompt ("prompt") sync materialization (PR-1 foundation).
+//
+// A fresh DB created by ApplySchema already has both tables (via
+// CREATE TABLE IF NOT EXISTS), so this migration is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 8.
+func migrateV8ToV9(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(userPromptsTableDDL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(promptTombstonesTableDDL); err != nil {
+		return err
+	}
+
+	// Indexes match the access patterns anticipated for prompt retrieval:
+	//   - idx_prompts_session: list prompts by session
+	//   - idx_prompts_project: list / filter prompts by project (also backs ListProjects)
+	//   - idx_prompts_created: recent-prompts ordering (DESC so newest is first)
+	//   - idx_prompt_tomb_project: list tombstones by project (for pull-apply filtering)
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_prompts_session
+			ON user_prompts(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompts_project
+			ON user_prompts(project)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompts_created
+			ON user_prompts(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_tomb_project
+			ON prompt_tombstones(project)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 9`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1045,6 +1154,15 @@ func ApplySchema(db *sql.DB) error {
 		// FindCandidates inserts pending rows; mem_judge (PR-b) resolves them.
 		conflictRelationsTableDDL,
 
+		// ── user_prompts — EntityPrompt materialization (PR-1 foundation) ────
+		// Stores captured user prompts synced via domain.Mutation with
+		// EntityType="prompt".  Apply/dispatch logic is in PR-2/3/4.
+		// No REFERENCES sessions(id) — soft parent ref; see userPromptsTableDDL.
+		userPromptsTableDDL,
+
+		// ── prompt_tombstones — soft-delete for EntityPrompt ─────────────────
+		promptTombstonesTableDDL,
+
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic
 			ON memories(topic_key, project, scope, updated_at DESC)
@@ -1074,6 +1192,18 @@ func ApplySchema(db *sql.DB) error {
 			ON conflict_relations(target_id, judgment_status)`,
 		`CREATE INDEX IF NOT EXISTS idx_confrel_status_created
 			ON conflict_relations(judgment_status, created_at DESC)`,
+
+		// user_prompts indexes — support session/project queries and recent ordering.
+		`CREATE INDEX IF NOT EXISTS idx_prompts_session
+			ON user_prompts(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompts_project
+			ON user_prompts(project)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompts_created
+			ON user_prompts(created_at DESC)`,
+
+		// prompt_tombstones index — supports pull-apply project filtering.
+		`CREATE INDEX IF NOT EXISTS idx_prompt_tomb_project
+			ON prompt_tombstones(project)`,
 
 		// ── FTS5 virtual table over memories ────────────────────────────────
 		// content=memories with content_rowid=id means FTS is a shadow/external
