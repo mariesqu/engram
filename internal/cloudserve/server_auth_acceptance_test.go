@@ -257,6 +257,182 @@ func TestAuthAcceptance_WriterIDForgery_Returns403(t *testing.T) {
 	}
 }
 
+// promptMutation returns a template domain.Mutation for EntityType=EntityPrompt.
+// Unlike baseMutation (EntityMemory), prompts have no topic_key — they are
+// keyed solely by sync_id in central_user_prompts.
+func promptMutation(writerID, syncID, project string) domain.Mutation {
+	return domain.Mutation{
+		Op:         domain.OpUpsert,
+		SyncID:     syncID,
+		SessionID:  "sess-prompt-auth-1",
+		EntityType: domain.EntityPrompt,
+		Content:    "prompt auth test content",
+		Project:    project,
+		Scope:      "project",
+		Version:    1,
+		WriterID:   writerID,
+		UpdatedAt:  time.Now().UTC(),
+		OccurredAt: time.Now().UTC(),
+	}
+}
+
+// assertCentralPromptRow checks that central_user_prompts contains exactly one
+// row for syncID with the expected writer_id and content.
+func assertCentralPromptRow(t *testing.T, store *centralstore.Store, syncID, wantWriter, wantContent string) {
+	t.Helper()
+	var gotWriter, gotContent string
+	err := store.Pool().QueryRow(
+		context.Background(),
+		`SELECT writer_id, content FROM central_user_prompts WHERE sync_id = $1`,
+		syncID,
+	).Scan(&gotWriter, &gotContent)
+	if err != nil {
+		t.Fatalf("assertCentralPromptRow(%q): query: %v", syncID, err)
+	}
+	if gotWriter != wantWriter {
+		t.Errorf("central_user_prompts writer_id = %q, want %q", gotWriter, wantWriter)
+	}
+	if gotContent != wantContent {
+		t.Errorf("central_user_prompts content = %q, want %q", gotContent, wantContent)
+	}
+}
+
+// assertCentralPromptAbsent checks that central_user_prompts has no row for syncID.
+func assertCentralPromptAbsent(t *testing.T, store *centralstore.Store, syncID string) {
+	t.Helper()
+	var n int
+	if err := store.Pool().QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM central_user_prompts WHERE sync_id = $1`,
+		syncID,
+	).Scan(&n); err != nil {
+		t.Fatalf("assertCentralPromptAbsent(%q): query: %v", syncID, err)
+	}
+	if n != 0 {
+		t.Errorf("central_user_prompts: unexpected row for sync_id=%q (want absent)", syncID)
+	}
+}
+
+// TestAuthAcceptance_PromptPush_ValidWriter_Returns200 is the happy-path
+// end-to-end proof for EntityPrompt over the real HMAC transport:
+//
+//  1. Set up a cloudserve server with cloudserve.NewKeyVerifier (the production
+//     key-lookup path — NOT AllowAllVerifier).
+//  2. Provision writer-A's key in cloud_writer_keys.
+//  3. Build a prompt domain.Mutation (EntityType=EntityPrompt, WriterID="writer-A",
+//     a sync_id, content, project) normalized so MutationID is content-addressed.
+//  4. Push it via a manually-signed HTTP request (X-Writer-Id=writer-A,
+//     X-Signature=HMAC(keyA, ...)).
+//  5. Assert: HTTP 200 AND the prompt is materialized in central_user_prompts with
+//     the correct sync_id, writer_id, and content.
+//
+// This proves that the entity-agnostic forgery check LETS a correctly-signed
+// prompt through end-to-end — the check has no entity-type branch that would
+// accidentally reject prompts.
+func TestAuthAcceptance_PromptPush_ValidWriter_Returns200(t *testing.T) {
+	store := newIsolatedStore(t)
+	srv := newAuthServer(t, store)
+	ctx := context.Background()
+
+	writerID := "writer-prompt-valid"
+	key, err := wireauth.NewKey()
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	if err := store.UpsertWriterKey(ctx, writerID, key); err != nil {
+		t.Fatalf("UpsertWriterKey: %v", err)
+	}
+
+	const (
+		syncID  = "sync-prompt-auth-valid-1"
+		project = "prompt-auth-project"
+	)
+	m := promptMutation(writerID, syncID, project)
+	// Normalize: derive canonical Payload and content-addressed MutationID, mirroring
+	// what localWriteLocked does before pushing to central.
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+
+	body, sig := signedPushRequest(t, m, key, http.MethodPost, "/v1/push")
+	resp := doAuthPost(t, srv.URL+"/v1/push", writerID, sig, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("valid prompt push: status = %d, want 200", resp.StatusCode)
+	}
+
+	// The prompt must be materialized in central_user_prompts — proving the
+	// entity-agnostic forgery check (which only compares writer IDs, not entity
+	// types) lets the correctly-signed prompt through to central.Apply, which then
+	// routes it to applyPromptDecisionQ → applyPromptUpsertQ.
+	assertCentralPromptRow(t, store, syncID, writerID, "prompt auth test content")
+}
+
+// TestAuthAcceptance_PromptPush_ForgeryRejected_Returns403 is the forgery proof
+// for EntityPrompt:
+//
+//  1. Provision writer-A and writer-B, each with their own key in cloud_writer_keys.
+//  2. Build a prompt mutation with m.WriterID = "writer-B" (the victim identity).
+//  3. Sign the request as writer-A (X-Writer-Id = writer-A, HMAC with keyA).
+//  4. Send: the server authenticates writer-A (keyA HMAC passes), but the
+//     mutation body claims WriterID = writer-B → forgery check fires → 403.
+//  5. Assert: HTTP 403 AND nothing materialized in central_user_prompts.
+//
+// This proves that the forgery check in handlePush (authWriterID != "" &&
+// m.WriterID != authWriterID) is ENTITY-AGNOSTIC: it covers EntityPrompt
+// exactly the same way it covers EntityMemory.
+func TestAuthAcceptance_PromptPush_ForgeryRejected_Returns403(t *testing.T) {
+	store := newIsolatedStore(t)
+	srv := newAuthServer(t, store)
+	ctx := context.Background()
+
+	writerA := "writer-prompt-forger-a"
+	writerB := "writer-prompt-forger-b"
+
+	keyA, err := wireauth.NewKey()
+	if err != nil {
+		t.Fatalf("NewKey A: %v", err)
+	}
+	keyB, err := wireauth.NewKey()
+	if err != nil {
+		t.Fatalf("NewKey B: %v", err)
+	}
+	if err := store.UpsertWriterKey(ctx, writerA, keyA); err != nil {
+		t.Fatalf("UpsertWriterKey A: %v", err)
+	}
+	if err := store.UpsertWriterKey(ctx, writerB, keyB); err != nil {
+		t.Fatalf("UpsertWriterKey B: %v", err)
+	}
+
+	const (
+		syncID  = "sync-prompt-auth-forged-1"
+		project = "prompt-forgery-project"
+	)
+
+	// Build the mutation claiming writerB's identity — this is the forged body.
+	// The payload and MutationID are derived from m with WriterID=writerB, which
+	// also passes VerifyMutationID on the server.
+	m := promptMutation(writerB, syncID, project)
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+
+	// Sign with keyA — so X-Writer-Id=writerA, HMAC(keyA) passes verification.
+	// The mismatch (authWriterID=writerA, m.WriterID=writerB) is the forgery.
+	body, sig := signedPushRequest(t, m, keyA, http.MethodPost, "/v1/push")
+
+	// Send: X-Writer-Id=writerA (HMAC passes), mutation.WriterID=writerB (forgery).
+	resp := doAuthPost(t, srv.URL+"/v1/push", writerA, sig, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("forged prompt push: status = %d, want 403", resp.StatusCode)
+	}
+
+	// Nothing must have materialized in central_user_prompts — the forgery check
+	// fires before central.Apply is called, so the prompt is never persisted.
+	assertCentralPromptAbsent(t, store, syncID)
+}
+
 // TestAuthAcceptance_SignedPull_Returns200 proves that a correctly-signed pull
 // request is accepted and returns mutations.
 func TestAuthAcceptance_SignedPull_Returns200(t *testing.T) {
