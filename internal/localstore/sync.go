@@ -94,21 +94,36 @@ func (s *Store) localWriteLocked(m domain.Mutation) (domain.Mutation, error) {
 		}
 	}()
 
-	// Decide inside the transaction: txReader routes all Reader calls through the
-	// same *sql.Tx, so Decide sees a consistent snapshot.
-	d := domain.Decide(&txReader{tx: tx}, m)
+	// EntityPrompt dispatch: prompt mutations bypass domain.Decide entirely —
+	// they have no topic_key / LWW reconciliation.  applyPromptTx handles
+	// insert-if-missing by sync_id and the tombstone resurrection guard.
+	// enqueueOutboxTx still runs for BOTH branches so every local write
+	// (memory or prompt) is pushed to central on the next sync cycle.
+	if m.EntityType == domain.EntityPrompt {
+		if err = applyPromptTx(tx, m); err != nil {
+			return m, fmt.Errorf("LocalWrite: applyPromptTx: %w", err)
+		}
+	} else {
+		// Decide inside the transaction: txReader routes all Reader calls through the
+		// same *sql.Tx, so Decide sees a consistent snapshot.
+		d := domain.Decide(&txReader{tx: tx}, m)
 
-	// The outbox is populated even when the local Decision is NoOp. A local NoOp
-	// means the local store already reflects this mutation (or an equivalent
-	// newer write), but the central store may not — it assigns authoritative seqs
-	// independently. Forwarding the mutation lets central reconcile with its own
-	// Decide path. INSERT OR IGNORE on the UNIQUE mutation_id makes a true
-	// idempotent re-enqueue a no-op at the SQL layer (INV5).
-	if d.Action != domain.NoOp {
-		if err = applyTx(tx, d, m); err != nil {
-			return m, fmt.Errorf("LocalWrite: applyTx: %w", err)
+		// The outbox is populated even when the local Decision is NoOp. A local NoOp
+		// means the local store already reflects this mutation (or an equivalent
+		// newer write), but the central store may not — it assigns authoritative seqs
+		// independently. Forwarding the mutation lets central reconcile with its own
+		// Decide path. INSERT OR IGNORE on the UNIQUE mutation_id makes a true
+		// idempotent re-enqueue a no-op at the SQL layer (INV5).
+		if d.Action != domain.NoOp {
+			if err = applyTx(tx, d, m); err != nil {
+				return m, fmt.Errorf("LocalWrite: applyTx: %w", err)
+			}
 		}
 	}
+
+	// Enqueue the outbox entry regardless of entity type. Prompts must be pushed
+	// to central just like memories.  INSERT OR IGNORE on UNIQUE mutation_id
+	// makes a duplicate enqueue a no-op (INV5 at the outbox layer).
 	if err = enqueueOutboxTx(tx, m); err != nil {
 		return m, fmt.Errorf("LocalWrite: enqueueOutboxTx: %w", err)
 	}
@@ -386,18 +401,24 @@ func (s *Store) SetPullCursorFor(project string, seq int64) error {
 }
 
 // ListProjects returns the distinct project names known to this store, derived
-// from memories and memory_tombstones. This is the set of projects the autosync
-// Loop should pull from central.
+// from memories, memory_tombstones, user_prompts, and prompt_tombstones.  This
+// is the set of projects the autosync Loop should pull from central.
 //
-// The union of both tables covers all projects that have ever had a write
-// (memories) or a delete (memory_tombstones) applied locally — whether those
-// writes originated locally or were pulled from central. The result is sorted
-// alphabetically so the caller iterates in a stable order.
+// The union of all four tables covers every project that has ever had a write
+// or a delete applied locally — whether those writes originated locally or were
+// pulled from central.  Including user_prompts and prompt_tombstones ensures
+// that a node which only captured prompts (no memories) still participates in
+// pull for its projects.  The result is sorted alphabetically so the caller
+// iterates in a stable order.
 func (s *Store) ListProjects() ([]string, error) {
 	rows, err := s.db.Query(`
 		SELECT DISTINCT project FROM memories
 		UNION
 		SELECT DISTINCT project FROM memory_tombstones
+		UNION
+		SELECT DISTINCT project FROM user_prompts
+		UNION
+		SELECT DISTINCT project FROM prompt_tombstones
 		ORDER BY project`)
 	if err != nil {
 		return nil, fmt.Errorf("ListProjects: query: %w", err)
@@ -451,10 +472,19 @@ func (s *Store) ApplyPulled(m domain.Mutation) error {
 		}
 	}()
 
-	d := domain.Decide(&txReader{tx: tx}, m)
-	if d.Action != domain.NoOp {
-		if err = applyTx(tx, d, m); err != nil {
-			return fmt.Errorf("ApplyPulled: applyTx: %w", err)
+	// EntityPrompt dispatch: same branch as localWriteLocked.  Pulled prompt
+	// mutations bypass domain.Decide and are materialized via applyPromptTx.
+	// No outbox enqueue — pulled mutations must never be re-pushed.
+	if m.EntityType == domain.EntityPrompt {
+		if err = applyPromptTx(tx, m); err != nil {
+			return fmt.Errorf("ApplyPulled: applyPromptTx: %w", err)
+		}
+	} else {
+		d := domain.Decide(&txReader{tx: tx}, m)
+		if d.Action != domain.NoOp {
+			if err = applyTx(tx, d, m); err != nil {
+				return fmt.Errorf("ApplyPulled: applyTx: %w", err)
+			}
 		}
 	}
 
