@@ -752,8 +752,13 @@ func handleJudge(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		// confidence is a JSON number → float64. Default 1.0 when absent.
+		// Reject out-of-range values (faithful to old_code) so the agent heuristic
+		// (e.g. "confidence < 0.7 → surface to user") can never be corrupted.
 		confidence := 1.0
 		if v, ok := args["confidence"].(float64); ok {
+			if v < 0 || v > 1 {
+				return mcp.NewToolResultError("mem_judge: confidence must be between 0.0 and 1.0"), nil
+			}
 			confidence = v
 		}
 		confidencePtr := &confidence
