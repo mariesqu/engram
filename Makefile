@@ -1,12 +1,15 @@
 .PHONY: build build-release vet test test-acceptance
 
+# Binary name: engram.exe on Windows, engram elsewhere.
+BIN := engram$(if $(filter Windows_NT,$(OS)),.exe)
+
 # Build a development binary in the repo root.
 build:
-	CGO_ENABLED=0 go build -o engram ./cmd/engram
+	CGO_ENABLED=0 go build -o $(BIN) ./cmd/engram
 
 # Build a stripped release binary (smaller, no debug info).
 build-release:
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o engram ./cmd/engram
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(BIN) ./cmd/engram
 
 # Run go vet for both the default and acceptance build tags.
 vet:

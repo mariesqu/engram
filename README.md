@@ -44,7 +44,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Build from source
 
-Requires Go 1.22 or later.
+Requires Go 1.26.1 or later (see `go.mod`).
 
 ```bash
 git clone https://github.com/mariesqu/engram.git
@@ -99,6 +99,7 @@ Run this once per node (or per machine/agent identity). The key is printed once 
 # provisioned writer "my-laptop"
 # key (hex): <64 hex chars>
 # WARNING: this is the writer's HMAC secret — shown ONCE.
+# Store it securely and configure the node's client with it.
 ```
 
 To revoke a key:
@@ -125,7 +126,7 @@ On Windows (PowerShell):
 
 ```powershell
 $env:ENGRAM_WRITER_KEY = "<hex key>"
-.\engram.exe daemon --db $env:APPDATA\engram\memories.db `
+.\engram.exe daemon --db "$env:APPDATA\engram\memories.db" `
   --central-url http://your-central-host:8080 `
   --writer-id my-laptop
 ```
@@ -173,7 +174,7 @@ With central sync:
 
 ```bash
 claude mcp add engram \
-  -e ENGRAM_WRITER_KEY=<hex-key> \
+  -e ENGRAM_WRITER_KEY="<hex key from provisioning>" \
   -- /path/to/engram daemon \
        --db /home/you/.engram/memories.db \
        --central-url http://your-central:8080 \
