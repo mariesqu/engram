@@ -52,6 +52,13 @@ func applyPromptTx(tx *sql.Tx, m domain.Mutation) error {
 
 // applyPromptUpsertTx handles the upsert branch of applyPromptTx.
 func applyPromptUpsertTx(tx *sql.Tx, m domain.Mutation) error {
+	// Symmetric with applyPromptDeleteTx: never ON CONFLICT(sync_id) on an empty
+	// sync_id (which would merge all empty-sync_id prompts into one row). Reachable
+	// only via a malformed external/pulled mutation; AddPrompt always sets one.
+	if m.SyncID == "" {
+		return fmt.Errorf("applyPromptUpsertTx: empty sync_id")
+	}
+
 	// Check for a tombstone. If one exists, apply the staleness guard.
 	var tombDeletedAtStr string
 	err := tx.QueryRow(

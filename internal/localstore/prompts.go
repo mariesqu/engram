@@ -75,9 +75,14 @@ func (s *Store) AddPrompt(p AddPromptParams) (Prompt, error) {
 	return resolvePromptRow(s.db, m.SyncID)
 }
 
-// AddPromptIfMissing is an idempotent capture helper: if a live user_prompts
+// AddPromptIfMissing is an idempotent capture helper: if a LIVE user_prompts
 // row already exists for the same (session_id, project, content) triple it is
 // returned without inserting a duplicate; otherwise a new row is written.
+//
+// Dedup is over LIVE rows only. If the prompt was previously DELETED (a tombstone
+// exists, no live row), the same content is captured again as a NEW occurrence
+// with a fresh sync_id — a re-prompt after a delete is a new event, not a
+// resurrection. This matches old_code's AddPromptIfMissing semantics.
 //
 // Atomicity: the dedup-read AND the write are performed under a single s.mu
 // acquisition (same lock held from check to commit) so no concurrent

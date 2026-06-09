@@ -12,10 +12,15 @@ import (
 func TestListProjects_UsesProjectIndexes(t *testing.T) {
 	s := openTempStore(t)
 
+	// Must mirror ListProjects()'s actual 4-arm UNION so the plan is representative.
 	const q = `EXPLAIN QUERY PLAN
 		SELECT DISTINCT project FROM memories
 		UNION
 		SELECT DISTINCT project FROM memory_tombstones
+		UNION
+		SELECT DISTINCT project FROM user_prompts
+		UNION
+		SELECT DISTINCT project FROM prompt_tombstones
 		ORDER BY project`
 
 	rows, err := s.db.Query(q)
@@ -45,5 +50,11 @@ func TestListProjects_UsesProjectIndexes(t *testing.T) {
 	}
 	if !strings.Contains(plan, "memory_tombstones USING") {
 		t.Errorf("tombstones arm not using an index (full scan?):\n%s", plan)
+	}
+	if !strings.Contains(plan, "user_prompts USING") {
+		t.Errorf("user_prompts arm not using an index (full scan?):\n%s", plan)
+	}
+	if !strings.Contains(plan, "prompt_tombstones USING") {
+		t.Errorf("prompt_tombstones arm not using an index (full scan?):\n%s", plan)
 	}
 }
