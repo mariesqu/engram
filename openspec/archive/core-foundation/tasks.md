@@ -92,11 +92,21 @@ Chain strategy: pending
 
 > Spec traceable: writer-identity (every mutation carries writer_id, HMAC token, constant-time verify, audit trail on LWW discards).
 
-- [ ] 6.1 Extend `cmd/engram/main.go` (or a `config.go` sibling): read `ENGRAM_WRITER_ID` and `ENGRAM_WRITER_SECRET` from env; call `domain.Identity{}.Verify(secret, sig)` on startup; fail fast with clear error if invalid.
-- [ ] 6.2 Add `internal/centralstore/auth.go` — `ValidatePush(writerID, sig string, secret []byte) error`: constant-time HMAC verify; returns typed `ErrUnauthorized` on failure; all `PushApply` calls go through this gate first.
-- [ ] 6.3 Create `internal/centralstore/audit.go` — `RecordLWWDiscard(db *sql.DB, writerID string, syncID string, updatedAt time.Time, reason string) error`: inserts into a `central_lww_discards` table (writerID, syncID, updatedAt, reason, recorded_at); add DDL for this table to `schema.go`.
-- [ ] 6.4 Wire audit call: in `centralstore/apply.go`, when `Decide` returns `NoOp` on an Upsert (LWW discard), call `RecordLWWDiscard` before returning.
-- [ ] 6.5 Unit test `TestIdentity_HMACRoundtrip` (`internal/domain/identity_test.go`): Sign then Verify passes; tampered sig fails; different secret fails.
+> ARCHIVE NOTE: Phase 6 as written was SUPERSEDED by the HTTP-transport phase
+> (PRs #19–#32), which shipped a stronger design than these spike-grade tasks:
+> per-writer HMAC request signing over HTTP (`internal/wireauth`), a server-side
+> key verifier + writer_id forgery check in `internal/cloudserve` (403 on
+> mismatch, entity-agnostic — proven for memories AND prompts by acceptance
+> tests), and `ENGRAM_WRITER_KEY` (hex, env-only) read in `cmd/engram`.
+> Items 6.3/6.4 (LWW-discard audit table) are the ONLY genuinely unimplemented
+> work — consciously DEFERRED as a future observability change (correctness
+> does not depend on it; discards are already deterministic via Decide).
+
+- [x] 6.1 SUPERSEDED — `ENGRAM_WRITER_KEY` env config lives in `cmd/engram/daemon.go`/`main.go` with fail-fast validation; `domain.Identity` was never needed (writer identity rides every `domain.Mutation.WriterID`).
+- [x] 6.2 SUPERSEDED — push auth gate is `internal/cloudserve/server.go`: `KeyVerifier` (constant-time HMAC via `internal/wireauth`) + the writer_id forgery check (`authWriterID != m.WriterID → 403`), covered by `server_auth_test.go` + `server_auth_acceptance_test.go`.
+- [ ] 6.3 DEFERRED — `central_lww_discards` audit table; future observability change.
+- [ ] 6.4 DEFERRED — wire `RecordLWWDiscard` on LWW NoOp; future observability change (pairs with 6.3).
+- [x] 6.5 SUPERSEDED — HMAC sign/verify roundtrip + tamper + wrong-key tests live in `internal/wireauth/wireauth_test.go` (the production signing layer, not the never-built `domain.Identity`).
 
 ---
 
@@ -125,7 +135,15 @@ Chain strategy: pending
 
 > Design: `cmd/engram/main.go` wires adapters; spike run validates end-to-end path before archive.
 
-- [ ] 8.1 Wire `cmd/engram/main.go`: open local SQLite; open Postgres (from `ENGRAM_PG_DSN` env); instantiate Identity from env; define a thin `PushAndPull` function that pushes a test mutation, reads back seq, pulls since 0, applies locally — used as smoke check only (not production transport).
-- [ ] 8.2 Run `go build ./...` — zero errors, zero CGO, single static binary target confirmed.
-- [ ] 8.3 Run `go vet ./...` and `go test ./internal/domain/... ./internal/localstore/... ./internal/mutation/...` (no build tags) — all pass without Postgres.
-- [ ] 8.4 Run acceptance suite: `go test -tags acceptance ./internal/spike/... -v` with `ENGRAM_TEST_PG_DSN` set; all 4 acceptance tests pass.
+> ARCHIVE NOTE: Phase 8 as written was SUPERSEDED by the real production
+> transport and daemon, which exceed the planned smoke check: `internal/remote`
+> (HTTP client) + `internal/syncer` (autosync loop) + `internal/cloudserve`
+> (central HTTP server) replace the throwaway `PushAndPull`; `cmd/engram serve`
+> is the production MCP daemon. The build/vet/test gates below ran green on
+> EVERY one of the ~17 review-gated PRs and at the feature-complete milestone
+> (full `-tags acceptance ./...` suite, 12 packages, embedded-postgres).
+
+- [x] 8.1 SUPERSEDED — production transport (`remote.Client` push/pull + `syncer` loop + `cloudserve` server) replaced the smoke-only `PushAndPull`; end-to-end path proven by `wire_convergence_acceptance_test.go` and `autosync_convergence_acceptance_test.go`.
+- [x] 8.2 `CGO_ENABLED=0 go build ./...` green (single static binary; enforced on every PR).
+- [x] 8.3 `go vet ./...` + no-tag unit suite green without Postgres (enforced on every PR).
+- [x] 8.4 EXCEEDED — full `go test -tags acceptance ./... -count=1` green (all 12 packages via embedded-postgres, no DSN required; includes the spike convergence suite proving all six invariants).
