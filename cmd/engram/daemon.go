@@ -2,20 +2,25 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/mariesqu/engram/internal/controlapi"
 	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/syncer"
@@ -37,14 +42,22 @@ fresh/empty database pulls nothing until a local write first creates a project.
 Without --central-url the daemon runs in LOCAL-ONLY mode: no network traffic,
 no HMAC credentials required.
 
+When --http is set the daemon starts as a resident HTTP control plane instead of
+serving stdio MCP. It binds to 127.0.0.1:<port> (default 7700) and writes a
+daemon.json discovery file next to the database. CLI subcommands (engram status,
+engram ui) read daemon.json to connect. A second daemon start on the same port
+will probe the running daemon; if it is healthy it will refuse to start.
+
 On SIGINT or SIGTERM the daemon stops the autosync loop (if running), closes the
-store, and exits cleanly.
+store, and exits cleanly.  In HTTP mode daemon.json is removed on clean shutdown.
 
 Flags:
   --db              Path to the local SQLite database file (required; or set ENGRAM_DB)
   --central-url     Central server URL, e.g. http://localhost:8080 (optional; or set ENGRAM_CENTRAL_URL)
   --writer-id       Writer identity sent to the central server (required when --central-url is set; or set ENGRAM_WRITER_ID)
   --sync-interval   Autosync cadence (default: ENGRAM_SYNC_INTERVAL env, then 30s)
+  --http            Enable resident HTTP control plane (default: false — stdio MCP mode)
+  --http-port       TCP port for the HTTP control plane (default: 7700)
 
   ENGRAM_WRITER_KEY (env only — never a flag): hex-encoded 32-byte HMAC key.
     Required when --central-url is set.  Must never appear in flag defaults or
@@ -54,10 +67,13 @@ Flags:
 
 // daemonCfg holds the validated, resolved configuration for the daemon.
 type daemonCfg struct {
-	db           string
-	centralURL   string // empty → local-only mode
-	writerID     string
-	writerKey    []byte // nil → local-only mode
+	db         string
+	centralURL string // empty → local-only mode
+	writerID   string
+	writerKey  []byte // nil → local-only mode
+	// HTTP resident-mode flags (added in PR-①).
+	httpMode     bool // true → bind control API instead of stdio MCP
+	httpPort     int  // TCP port for the control API (default 7700)
 	syncInterval time.Duration
 }
 
@@ -99,6 +115,12 @@ func runDaemonCmd(args []string) error {
 
 	// --sync-interval: sensible default, overridable.
 	syncInterval := fs.Duration("sync-interval", 0, "autosync cadence (default: ENGRAM_SYNC_INTERVAL env, then 30s)")
+
+	// --http / --http-port: opt-in resident mode (PR-①).
+	// NOTE: --http is intentionally NOT wired to ENGRAM_WRITER_KEY-style resolution
+	// because it is a mode flag, not a secret. It appears in --help (flag default "false").
+	httpMode := fs.Bool("http", false, "enable resident HTTP control plane (default: stdio MCP mode)")
+	httpPort := fs.Int("http-port", 7700, "TCP port for the HTTP control plane")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -175,6 +197,8 @@ func runDaemonCmd(args []string) error {
 		writerID:     *writerID,
 		writerKey:    writerKey,
 		syncInterval: *syncInterval,
+		httpMode:     *httpMode,
+		httpPort:     *httpPort,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -237,10 +261,13 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	}, nil
 }
 
-// runDaemon is the entry point called by runDaemonCmd.  It delegates to
-// runDaemonWithIO with the real os.Stdin and os.Stdout so that the signal
-// context (ctx) is the single shutdown source.
+// runDaemon is the entry point called by runDaemonCmd. It dispatches to:
+//   - runDaemonHTTP when cfg.httpMode is true (resident control plane, PR-①)
+//   - runDaemonWithIO otherwise (stdio MCP mode — the pre-existing path)
 func runDaemon(ctx context.Context, cfg daemonCfg) error {
+	if cfg.httpMode {
+		return runDaemonHTTP(ctx, cfg)
+	}
 	return runDaemonWithIO(ctx, cfg, os.Stdin, os.Stdout)
 }
 
@@ -270,6 +297,229 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	log.Printf("engram daemon: MCP over stdio (db=%s, autosync=%s)", cfg.db, autosync)
 
 	return serveErr(mcpserver.NewStdioServer(components.mcpServer).Listen(ctx, stdin, stdout))
+}
+
+// ── HTTP resident-mode (PR-①) ─────────────────────────────────────────────────
+
+// runDaemonHTTP starts the resident daemon in HTTP control-plane mode.
+//
+// It:
+//  1. Opens the local store and wires the autosync loop (same as stdio mode).
+//  2. Generates a 32-byte-hex bearer token and writes daemon.json atomically.
+//  3. Binds 127.0.0.1:<port> — if the port is already in use it probes the
+//     existing process; a healthy engram daemon → refuse with a clear error.
+//  4. Serves the control API until ctx is cancelled (SIGINT/SIGTERM).
+//  5. On clean shutdown, removes daemon.json.
+//
+// stdio MCP is NOT started in this mode — the HTTP control plane owns the process.
+func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
+	components, err := buildDaemon(cfg)
+	if err != nil {
+		return err
+	}
+	defer components.Close()
+
+	if components.loop != nil {
+		components.loop.Start(ctx)
+	}
+
+	// Generate a fresh 32-byte (64 hex char) token. Token rotates on every start.
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return fmt.Errorf("daemon HTTP: generate token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	// The discovery file lives next to the database.
+	dir := filepath.Dir(cfg.db)
+
+	// Attempt to bind before writing daemon.json so we never write a stale
+	// file if the port is already in use.
+	addr := fmt.Sprintf("127.0.0.1:%d", cfg.httpPort)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		// Port in use — probe the existing occupant.
+		if probeErr := probeDaemon(dir, cfg.httpPort); probeErr == nil {
+			return fmt.Errorf("daemon already running on :%d (probe succeeded); refusing to start a second SQLite owner", cfg.httpPort)
+		}
+		return fmt.Errorf("daemon HTTP: listen %s: %w", addr, err)
+	}
+	defer ln.Close()
+
+	// Write daemon.json AFTER successful bind so clients that read the file can
+	// immediately connect. The write is atomic (temp+rename) inside WriteDaemonJSON.
+	if err := controlapi.WriteDaemonJSON(dir, token, cfg.httpPort, os.Getpid()); err != nil {
+		return fmt.Errorf("daemon HTTP: write daemon.json: %w", err)
+	}
+	defer func() {
+		// Remove daemon.json on clean shutdown so stale discovery files are not left behind.
+		_ = controlapi.RemoveDaemonJSON(dir)
+	}()
+
+	// Wire the control API server. The store adapter bridges localstore.Store to
+	// the controlapi.Store interface.
+	storeAdapter := &localStoreAdapter{store: components.store}
+	syncAdapter := &loopSyncAdapter{
+		loop:       components.loop,
+		centralURL: cfg.centralURL,
+	}
+	cfgAdapter := &daemonCfgAdapter{cfg: cfg}
+
+	ctrlSrv := controlapi.New(token, cfg.httpPort, storeAdapter, syncAdapter, cfgAdapter, "0.1.0")
+
+	httpSrv := &http.Server{
+		Handler:           ctrlSrv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	log.Printf("engram daemon: HTTP control plane on %s (db=%s)", addr, cfg.db)
+
+	errCh := make(chan error, 1)
+	go func() {
+		if serveErr := httpSrv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- serveErr
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpSrv.Shutdown(shutCtx)
+	}
+}
+
+// probeDaemon probes an existing daemon on the given port using the token from
+// daemon.json in dir. Returns nil if the probe returns a healthy response from
+// an engram daemon (i.e. a 200 JSON response with daemon_version set).
+func probeDaemon(dir string, port int) error {
+	d, err := controlapi.ReadDaemonJSON(dir)
+	if err != nil {
+		return fmt.Errorf("read daemon.json: %w", err)
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("http://127.0.0.1:%d/api/v1/status", port), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+d.Token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("probe: got %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ── Port adapters (wire localstore and syncer to controlapi interfaces) ───────
+
+// localStoreAdapter adapts *localstore.Store to controlapi.Store.
+type localStoreAdapter struct {
+	store *localstore.Store
+}
+
+func (a *localStoreAdapter) ListProjectsWithPolicy() ([]controlapi.ProjectPolicy, error) {
+	lpp, err := a.store.ListProjectsWithPolicy()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]controlapi.ProjectPolicy, len(lpp))
+	for i, p := range lpp {
+		out[i] = controlapi.ProjectPolicy{
+			Name:   p.Name,
+			Policy: controlapi.Policy(p.Policy),
+		}
+	}
+	return out, nil
+}
+
+func (a *localStoreAdapter) SetPolicy(project string, p controlapi.Policy) error {
+	return a.store.SetPolicy(project, localstore.Policy(p))
+}
+
+func (a *localStoreAdapter) GetPolicy(project string) (controlapi.Policy, error) {
+	p, err := a.store.GetPolicy(project)
+	return controlapi.Policy(p), err
+}
+
+// loopSyncAdapter adapts *syncer.Loop to controlapi.SyncController.
+// In PR-① this is a minimal stub; PR-③ will extend it with full sync state.
+type loopSyncAdapter struct {
+	loop       *syncer.Loop // nil → local-only mode
+	centralURL string
+}
+
+func (a *loopSyncAdapter) Status() controlapi.Status {
+	var url *string
+	if a.centralURL != "" {
+		u := a.centralURL
+		url = &u
+	}
+	return controlapi.Status{
+		CentralConnected: a.centralURL != "" && a.loop != nil,
+		CentralURL:       url,
+		LastSyncResult:   controlapi.SyncResult{},
+		DaemonVersion:    "0.1.0",
+	}
+}
+
+func (a *loopSyncAdapter) TriggerNow(_ context.Context) error {
+	if a.loop != nil {
+		a.loop.Trigger()
+	}
+	return nil
+}
+
+func (a *loopSyncAdapter) Disconnect() error {
+	// PR-③ will implement full disconnect. For PR-① this is a stub.
+	return fmt.Errorf("disconnect not implemented until PR-③")
+}
+
+func (a *loopSyncAdapter) Reconnect(_ controlapi.CentralConfig) error {
+	// PR-③ will implement reconnect.
+	return fmt.Errorf("reconnect not implemented until PR-③")
+}
+
+// daemonCfgAdapter adapts the daemon config to controlapi.ConfigStore.
+// PR-③ will replace this with a real internal/config.Store adapter.
+type daemonCfgAdapter struct {
+	cfg daemonCfg
+}
+
+func (a *daemonCfgAdapter) Load() (controlapi.RedactedConfig, error) {
+	cfg := controlapi.RedactedConfig{
+		DB: a.cfg.db,
+		HTTP: &controlapi.HTTPConfig{
+			Port: a.cfg.httpPort,
+		},
+		SyncInterval: a.cfg.syncInterval.String(),
+	}
+	if a.cfg.centralURL != "" {
+		cfg.Central = &controlapi.CentralConfig{
+			URL:      a.cfg.centralURL,
+			WriterID: a.cfg.writerID,
+		}
+	}
+	if len(a.cfg.writerKey) > 0 {
+		redacted := "***REDACTED***"
+		cfg.WriterKey = &redacted
+	}
+	return cfg, nil
+}
+
+func (a *daemonCfgAdapter) Apply(_ controlapi.ConfigPatch) (bool, error) {
+	// PR-③ will implement config mutation.
+	return false, fmt.Errorf("config mutation not implemented until PR-③")
 }
 
 // serveErr classifies the error returned by StdioServer.Listen. Listen returns

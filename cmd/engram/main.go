@@ -36,12 +36,14 @@ Usage:
   engram serve  [--addr <addr>] [--dsn <dsn>]
   engram keys   provision [--dsn <dsn>] <writer-id>
   engram keys   revoke    [--dsn <dsn>] <writer-id>
-  engram daemon [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>]
+  engram daemon [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
+  engram status [--db <path>]
+  engram ui     [--db <path>]
 
 Environment:
   ENGRAM_ADDR            default listen address for 'serve' (default ":8080")
   ENGRAM_DSN             Postgres DSN (required for 'serve' and 'keys provision/revoke')
-  ENGRAM_DB              path to local SQLite database (required for 'daemon')
+  ENGRAM_DB              path to local SQLite database (required for 'daemon', 'status', 'ui')
   ENGRAM_CENTRAL_URL     central server URL for autosync (optional for 'daemon')
   ENGRAM_WRITER_ID       writer identity for autosync (required when ENGRAM_CENTRAL_URL is set)
   ENGRAM_WRITER_KEY      hex-encoded 32-byte HMAC key (env only; required when ENGRAM_CENTRAL_URL is set)
@@ -50,10 +52,11 @@ Environment:
 Subcommands:
   serve   Run the central HTTP server (plain HTTP — terminate TLS upstream).
   keys    Provision or revoke per-writer HMAC keys.
-  daemon  Run the local MCP daemon over stdio (SQLite store + optional autosync).
+  daemon  Run the local MCP daemon (stdio MCP by default; use --http for resident control plane).
+  status  Print status of the running resident daemon (requires daemon --http).
+  ui      Open the web UI in the default browser (requires daemon --http).
 
-Run 'engram serve --help', 'engram keys provision --help', 'engram keys revoke --help',
-or 'engram daemon --help' for flags.
+Run 'engram <subcommand> --help' for per-subcommand flags.
 `
 
 func main() {
@@ -63,7 +66,7 @@ func main() {
 // run is the testable dispatch entry-point. It returns an OS exit code:
 //   - 0  success
 //   - 1  a subcommand returned an error — runtime OR validation (missing --dsn,
-//        missing/extra writer-id, unknown keys subcommand) — logged via log.Printf
+//     missing/extra writer-id, unknown keys subcommand) — logged via log.Printf
 //   - 2  top-level usage error (no args, top-level --help, or unknown subcommand)
 func run(args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
@@ -87,6 +90,18 @@ func run(args []string) int {
 	case "daemon":
 		if err := runDaemonCmd(args[1:]); err != nil {
 			log.Printf("engram daemon: %v", err)
+			return 1
+		}
+		return 0
+	case "status":
+		if err := runStatusCmd(args[1:]); err != nil {
+			log.Printf("engram status: %v", err)
+			return 1
+		}
+		return 0
+	case "ui":
+		if err := runUICmd(args[1:]); err != nil {
+			log.Printf("engram ui: %v", err)
 			return 1
 		}
 		return 0
