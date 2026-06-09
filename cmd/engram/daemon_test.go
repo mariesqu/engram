@@ -1045,11 +1045,6 @@ func TestDaemonTool_MemJudge_RecordsVerdict(t *testing.T) {
 			judgmentID = strings.TrimSpace(strings.TrimPrefix(line, "judgment_id:"))
 			break
 		}
-		// Also handle candidate-level judgment_id (indented).
-		if strings.HasPrefix(line, "judgment_id:") {
-			judgmentID = strings.TrimSpace(strings.TrimPrefix(line, "judgment_id:"))
-			break
-		}
 	}
 	if judgmentID == "" || !strings.HasPrefix(judgmentID, "rel-") {
 		t.Fatalf("could not extract judgment_id from mem_save response:\n%s", saveText)
