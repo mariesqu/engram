@@ -220,9 +220,13 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 		})
 	}
 
+	// Create in-memory session activity tracker. Shared across all write handlers
+	// so mem_save_prompt can record the current prompt and mem_save can auto-capture it.
+	activity := NewSessionActivity()
+
 	// Register all MCP tools. Pass loop (may be nil) so write handlers can
 	// trigger an immediate sync after each local write.
-	registerTools(mcpSrv, store, loop, cfg.writerID)
+	registerTools(mcpSrv, store, loop, cfg.writerID, activity)
 
 	return &daemonComponents{
 		store:     store,

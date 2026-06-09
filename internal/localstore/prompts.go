@@ -186,6 +186,36 @@ func scanPromptRow(row *sql.Row) (*Prompt, error) {
 	return &p, nil
 }
 
+// GetPromptBySessionAndContent returns the most-recent live user_prompts row
+// for the given (session_id, project, content) triple, or ErrPromptNotFound
+// when none exists. It is a read-only helper intended for tests and handlers
+// that need to verify a prompt was persisted.
+func (s *Store) GetPromptBySessionAndContent(sessionID, project, content string) (Prompt, error) {
+	p, err := findLivePromptByIdentity(s.db, sessionID, project, content)
+	if err != nil {
+		return Prompt{}, fmt.Errorf("GetPromptBySessionAndContent: %w", err)
+	}
+	if p == nil {
+		return Prompt{}, ErrPromptNotFound
+	}
+	return *p, nil
+}
+
+// CountPromptsForSession returns the number of live user_prompts rows for the
+// given (session_id, project, content) triple. Used in tests to assert dedup
+// correctness.
+func (s *Store) CountPromptsForSession(sessionID, project, content string) (int, error) {
+	const q = `
+		SELECT COUNT(*)
+		FROM user_prompts
+		WHERE session_id = ? AND project = ? AND content = ?`
+	var n int
+	if err := s.db.QueryRow(q, sessionID, project, content).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountPromptsForSession: %w", err)
+	}
+	return n, nil
+}
+
 // newPromptSyncID generates a random sync_id for a new prompt, using the same
 // format as old_code: "prompt-<16 hex chars>".
 func newPromptSyncID() string {

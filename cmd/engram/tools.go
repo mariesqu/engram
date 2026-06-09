@@ -49,7 +49,10 @@ func resolveReadProject(explicitProject string) string {
 // loop may be nil (local-only mode). Write handlers call loop.Trigger() only
 // when loop is non-nil, so the autosync runs immediately after a local write
 // when central is configured.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, writerID string) {
+//
+// activity must be non-nil; it is shared across all write handlers so that
+// mem_save_prompt can record the current prompt and mem_save can auto-capture it.
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) {
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -87,7 +90,7 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 				mcp.Description("Summary of what was accomplished"),
 			),
 		),
-		handleSessionEnd(store),
+		handleSessionEnd(store, activity),
 	)
 
 	// ── mem_save ─────────────────────────────────────────────────────────────
@@ -137,8 +140,34 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			mcp.WithString("project",
 				mcp.Description("Optional explicit project for this memory. When omitted the project is auto-detected from the working directory."),
 			),
+			mcp.WithBoolean("capture_prompt",
+				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
+			),
 		),
-		handleSave(store, loop, writerID),
+		handleSave(store, loop, writerID, activity),
+	)
+
+	// ── mem_save_prompt ──────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_save_prompt",
+			mcp.WithDescription("Save a user prompt to persistent memory. Use this to record what the user asked — their intent, questions, and requests — so future sessions have context about the user's goals."),
+			mcp.WithTitleAnnotation("Save User Prompt"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("content",
+				mcp.Required(),
+				mcp.Description("The user's prompt text"),
+			),
+			mcp.WithString("session_id",
+				mcp.Description("Session ID to associate with (default: manual-save-{project})"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project for this prompt. When omitted the project is auto-detected from the working directory."),
+			),
+		),
+		handleSavePrompt(store, loop, writerID, activity),
 	)
 
 	// ── mem_get_observation ──────────────────────────────────────────────────
@@ -363,8 +392,9 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 }
 
 // handleSessionEnd returns the handler for mem_session_end. It reads the id
-// (required) and summary (optional) arguments and calls EndSession.
-func handleSessionEnd(store *localstore.Store) mcpserver.ToolHandlerFunc {
+// (required) and summary (optional) arguments, calls EndSession, and clears
+// the session's in-memory activity so stale prompts do not leak across sessions.
+func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		id, _ := args["id"].(string)
@@ -378,6 +408,8 @@ func handleSessionEnd(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		if err := store.EndSession(id, summary); err != nil {
 			return mcp.NewToolResultError("Failed to end session: " + err.Error()), nil
 		}
+
+		activity.ClearSession(id)
 
 		return mcp.NewToolResultText(fmt.Sprintf("Session %q completed", id)), nil
 	}
@@ -421,7 +453,12 @@ func resolveSaveProject(store *localstore.Store, explicitProject string) (string
 }
 
 // handleSave returns the handler for mem_save.
-func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string) mcpserver.ToolHandlerFunc {
+//
+// capture_prompt (default true): after a successful save, if the session has a
+// recorded prompt via RecordPrompt that matches this project, it is persisted via
+// AddPromptIfMissing. This is BEST-EFFORT: any error is logged to stderr and
+// swallowed — it never alters the mem_save result or fails the save.
+func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -437,6 +474,12 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string) mcp
 		scope, _ := args["scope"].(string)
 		topicKey, _ := args["topic_key"].(string)
 		explicitProject, _ := args["project"].(string)
+
+		// capture_prompt defaults to true when absent; explicit false disables it.
+		capturePrompt := true
+		if v, ok := args["capture_prompt"].(bool); ok {
+			capturePrompt = v
+		}
 
 		project, toolErr := resolveSaveProject(store, explicitProject)
 		if toolErr != nil {
@@ -455,6 +498,21 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string) mcp
 		})
 		if err != nil {
 			return mcp.NewToolResultError("mem_save: failed to save: " + err.Error()), nil
+		}
+
+		// Auto-capture the current prompt for this session+project (best-effort).
+		// Errors are swallowed — they must never fail or alter the save result.
+		if capturePrompt {
+			if prompt, ok := activity.CurrentPrompt(sessionID, project); ok {
+				if _, promptErr := store.AddPromptIfMissing(localstore.AddPromptParams{
+					SessionID: sessionID,
+					Content:   prompt,
+					Project:   project,
+					WriterID:  writerID,
+				}); promptErr != nil {
+					fmt.Fprintf(os.Stderr, "engram: auto prompt capture error (non-fatal): %v\n", promptErr)
+				}
+			}
 		}
 
 		triggerSync(loop)
@@ -780,6 +838,46 @@ func handleJudge(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			msg += fmt.Sprintf(" | reason=%q", *updated.Reason)
 		}
 		return mcp.NewToolResultText(msg), nil
+	}
+}
+
+// handleSavePrompt returns the handler for mem_save_prompt. It persists the
+// prompt via AddPrompt (which enqueues an outbox entry for central push) and
+// records it in the in-memory SessionActivity so that a subsequent mem_save
+// with capture_prompt=true can auto-capture it without a re-insert (dedup).
+func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		content, _ := args["content"].(string)
+		content = strings.TrimSpace(content)
+		if content == "" {
+			return mcp.NewToolResultError("mem_save_prompt: content is required"), nil
+		}
+
+		sessionID, _ := args["session_id"].(string)
+		sessionID = strings.TrimSpace(sessionID)
+
+		explicitProject, _ := args["project"].(string)
+		project, toolErr := resolveSaveProject(store, explicitProject)
+		if toolErr != nil {
+			return toolErr, nil
+		}
+
+		if _, err := store.AddPrompt(localstore.AddPromptParams{
+			SessionID: sessionID,
+			Content:   content,
+			Project:   project,
+			WriterID:  writerID,
+		}); err != nil {
+			return mcp.NewToolResultError("mem_save_prompt: failed to save prompt: " + err.Error()), nil
+		}
+
+		activity.RecordPrompt(sessionID, project, content)
+
+		triggerSync(loop)
+
+		return mcp.NewToolResultText(fmt.Sprintf("Prompt saved for project %q", project)), nil
 	}
 }
 
