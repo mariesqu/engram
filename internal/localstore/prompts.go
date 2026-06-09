@@ -191,6 +191,7 @@ func scanPromptRow(row *sql.Row) (*Prompt, error) {
 // when none exists. It is a read-only helper intended for tests and handlers
 // that need to verify a prompt was persisted.
 func (s *Store) GetPromptBySessionAndContent(sessionID, project, content string) (Prompt, error) {
+	project = normalizeProject(project) // match how AddPrompt normalizes before storing
 	p, err := findLivePromptByIdentity(s.db, sessionID, project, content)
 	if err != nil {
 		return Prompt{}, fmt.Errorf("GetPromptBySessionAndContent: %w", err)
@@ -205,6 +206,7 @@ func (s *Store) GetPromptBySessionAndContent(sessionID, project, content string)
 // given (session_id, project, content) triple. Used in tests to assert dedup
 // correctness.
 func (s *Store) CountPromptsForSession(sessionID, project, content string) (int, error) {
+	project = normalizeProject(project) // match how AddPrompt normalizes before storing
 	const q = `
 		SELECT COUNT(*)
 		FROM user_prompts

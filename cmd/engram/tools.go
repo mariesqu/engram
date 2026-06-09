@@ -471,6 +471,7 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string, act
 		content, _ := args["content"].(string)
 		typ, _ := args["type"].(string)
 		sessionID, _ := args["session_id"].(string)
+		sessionID = strings.TrimSpace(sessionID)
 		scope, _ := args["scope"].(string)
 		topicKey, _ := args["topic_key"].(string)
 		explicitProject, _ := args["project"].(string)
