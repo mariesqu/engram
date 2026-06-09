@@ -60,6 +60,14 @@ func Apply(db *sql.DB, d domain.Decision, m domain.Mutation) error {
 // The caller is responsible for beginning and committing (or rolling back) the
 // transaction. applyTx itself never calls Begin, Commit, or Rollback.
 func applyTx(tx *sql.Tx, d domain.Decision, m domain.Mutation) error {
+	// Defense in depth: prompt mutations are materialized into user_prompts via the
+	// dedicated prompt apply path, never the memories table. If one reaches here it
+	// is a routing bug — fail with a clear domain error rather than a cryptic
+	// entity_type CHECK-constraint violation at the INSERT.
+	if m.EntityType == domain.EntityPrompt {
+		return fmt.Errorf("applyTx: EntityPrompt must not reach the memories apply path (belongs in user_prompts) — routing bug")
+	}
+
 	var err error
 
 	switch d.Action {

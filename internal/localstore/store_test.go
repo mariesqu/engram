@@ -2203,6 +2203,16 @@ func TestMigration_V8ToV9_ExistingDB(t *testing.T) {
 		t.Fatalf("set user_version=8: %v", err)
 	}
 
+	// Drop the v9 tables so migrateV8ToV9 must actually CREATE them — a real v8 DB
+	// has no user_prompts/prompt_tombstones. Without this, ApplySchema already made
+	// them and the migration's CREATE IF NOT EXISTS would be a silent no-op that
+	// could not catch a DDL typo.
+	for _, drop := range []string{`DROP TABLE IF EXISTS user_prompts`, `DROP TABLE IF EXISTS prompt_tombstones`} {
+		if _, err := db.Exec(drop); err != nil {
+			t.Fatalf("drop v9 table: %v", err)
+		}
+	}
+
 	// Insert a pre-existing memory to confirm data survives the migration.
 	if _, err := db.Exec(`
 		INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)

@@ -201,6 +201,9 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_cprompt_project
 			ON central_user_prompts(project)`,
 
+		`CREATE INDEX IF NOT EXISTS idx_cprompt_session
+			ON central_user_prompts(session_id)`,
+
 		// ── central_prompt_tombstones — soft-delete for EntityPrompt ─────────────
 		// Records each prompt soft-delete so resurrections are blocked and pull-apply
 		// can detect and propagate deletes.  deleted_by (writer_id) mirrors the

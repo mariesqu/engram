@@ -336,7 +336,10 @@ const userPromptsTableDDL = `CREATE TABLE IF NOT EXISTS user_prompts (
 // promptTombstonesTableDDL is the authoritative CREATE TABLE statement for the
 // prompt_tombstones table. It mirrors memory_tombstones structure but is
 // intentionally leaner: prompts have no scope/topic_key/version LWW fields
-// because prompt identity is sync_id-only (no topic convergence).
+// because prompt identity is sync_id-only (no topic convergence). The
+// resurrection/staleness guard (PR-3) compares the INCOMING prompt mutation's
+// created_at (carried in the mutation payload) against deleted_at here, so no
+// created_at column is needed on the tombstone itself.
 const promptTombstonesTableDDL = `CREATE TABLE IF NOT EXISTS prompt_tombstones (
 	sync_id    TEXT    PRIMARY KEY,
 	session_id TEXT    NOT NULL DEFAULT '',
