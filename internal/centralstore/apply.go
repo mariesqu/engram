@@ -130,6 +130,13 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 // It mirrors localstore.Apply's switch so the local and central adapters stay
 // structurally identical (same Decision contract, same dispatch).
 func applyDecision(ctx context.Context, tx pgx.Tx, d domain.Decision, m domain.Mutation) error {
+	// Defense in depth: prompt mutations are materialized into central_user_prompts
+	// via the dedicated prompt apply path, never central_memories. If one reaches
+	// here it is a routing bug — fail clearly rather than hit the entity_type CHECK.
+	if m.EntityType == domain.EntityPrompt {
+		return fmt.Errorf("applyDecision: EntityPrompt must not reach the central_memories apply path (belongs in central_user_prompts) — routing bug")
+	}
+
 	switch d.Action {
 	case domain.NoOp:
 		// Stored state already correct (INV3 older write discarded, or INV4

@@ -901,6 +901,83 @@ func TestCentralMemories_HasNoSeqColumn(t *testing.T) {
 	}
 }
 
+// TestCentralPromptTables_ExistAndWritable verifies that ApplySchema creates
+// central_user_prompts and central_prompt_tombstones, and that both tables
+// accept a well-formed INSERT (column set is correct).
+//
+// This is the PR-1 foundation test — no dispatch/apply logic yet; we are only
+// verifying schema presence and writability after ApplySchema.
+func TestCentralPromptTables_ExistAndWritable(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+
+	// Verify central_user_prompts exists.
+	var cpCount int
+	if err := store.Pool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_name = 'central_user_prompts'`,
+	).Scan(&cpCount); err != nil {
+		t.Fatalf("query information_schema for central_user_prompts: %v", err)
+	}
+	if cpCount != 1 {
+		t.Errorf("central_user_prompts table not found after ApplySchema; count=%d", cpCount)
+	}
+
+	// Verify central_prompt_tombstones exists.
+	var ctCount int
+	if err := store.Pool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_name = 'central_prompt_tombstones'`,
+	).Scan(&ctCount); err != nil {
+		t.Fatalf("query information_schema for central_prompt_tombstones: %v", err)
+	}
+	if ctCount != 1 {
+		t.Errorf("central_prompt_tombstones table not found after ApplySchema; count=%d", ctCount)
+	}
+
+	// INSERT into central_user_prompts — verifies column set is correct.
+	if _, err := store.Pool().Exec(ctx, `
+		INSERT INTO central_user_prompts (sync_id, session_id, content, project, writer_id)
+		VALUES ($1, $2, $3, $4, $5)`,
+		"prompt-central-1", "sess-central-1", "test prompt content", "engram", "writer-test",
+	); err != nil {
+		t.Fatalf("INSERT into central_user_prompts: %v", err)
+	}
+
+	// Read it back to confirm round-trip.
+	var gotContent string
+	if err := store.Pool().QueryRow(ctx,
+		`SELECT content FROM central_user_prompts WHERE sync_id = $1`,
+		"prompt-central-1",
+	).Scan(&gotContent); err != nil {
+		t.Fatalf("SELECT from central_user_prompts: %v", err)
+	}
+	if gotContent != "test prompt content" {
+		t.Errorf("central_user_prompts round-trip content=%q; want %q", gotContent, "test prompt content")
+	}
+
+	// INSERT into central_prompt_tombstones — verifies column set is correct.
+	if _, err := store.Pool().Exec(ctx, `
+		INSERT INTO central_prompt_tombstones (sync_id, session_id, project, deleted_at, deleted_by)
+		VALUES ($1, $2, $3, now(), $4)`,
+		"prompt-central-1", "sess-central-1", "engram", "writer-test",
+	); err != nil {
+		t.Fatalf("INSERT into central_prompt_tombstones: %v", err)
+	}
+
+	// Confirm the tombstone round-trips the deleted_by field.
+	var gotDeletedBy string
+	if err := store.Pool().QueryRow(ctx,
+		`SELECT deleted_by FROM central_prompt_tombstones WHERE sync_id = $1`,
+		"prompt-central-1",
+	).Scan(&gotDeletedBy); err != nil {
+		t.Fatalf("SELECT from central_prompt_tombstones: %v", err)
+	}
+	if gotDeletedBy != "writer-test" {
+		t.Errorf("central_prompt_tombstones deleted_by=%q; want %q", gotDeletedBy, "writer-test")
+	}
+}
+
 // cacheRoot returns the directory where embedded-postgres binaries are cached.
 // Uses GOPATH/pkg/mod/cache or a sensible fallback.
 func cacheRoot() string {

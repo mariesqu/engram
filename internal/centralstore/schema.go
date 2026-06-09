@@ -181,6 +181,41 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			active     BOOLEAN     NOT NULL DEFAULT true
 		)`,
+
+		// ── central_user_prompts — EntityPrompt central materialization ───────────
+		// Canonical store for prompt mutations synced via domain.Mutation with
+		// EntityType="prompt".  sync_id is the portable identity (primary key).
+		// session_id is a soft (unvalidated) reference — no FK to central_memories
+		// sessions because out-of-order pulls can land a prompt before its session
+		// arrives.  writer_id enables LWW tiebreaking at pull-apply time (PR-3/4).
+		// Apply/dispatch logic is deferred to PR-2/3/4; this table is schema-only.
+		`CREATE TABLE IF NOT EXISTS central_user_prompts (
+			sync_id    TEXT         PRIMARY KEY,
+			session_id TEXT         NOT NULL DEFAULT '',
+			content    TEXT         NOT NULL DEFAULT '',
+			project    TEXT         NOT NULL DEFAULT '',
+			writer_id  TEXT         NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ  NOT NULL DEFAULT now()
+		)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_cprompt_project
+			ON central_user_prompts(project)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_cprompt_session
+			ON central_user_prompts(session_id)`,
+
+		// ── central_prompt_tombstones — soft-delete for EntityPrompt ─────────────
+		// Records each prompt soft-delete so resurrections are blocked and pull-apply
+		// can detect and propagate deletes.  deleted_by (writer_id) mirrors the
+		// pattern from central_tombstones.  No scope/topic_key: prompt identity is
+		// sync_id-only.
+		`CREATE TABLE IF NOT EXISTS central_prompt_tombstones (
+			sync_id    TEXT         PRIMARY KEY,
+			session_id TEXT         NOT NULL DEFAULT '',
+			project    TEXT         NOT NULL DEFAULT '',
+			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+			deleted_by TEXT         NOT NULL DEFAULT ''
+		)`,
 	}
 
 	for i, stmt := range stmts {
