@@ -46,13 +46,13 @@ import (
 //     tx so they observe a consistent snapshot.
 //  5. Materialize the Decision on the tx (mirrors localstore.Apply):
 //     - ActionInsert / ActionUpdate → UpsertMemory(TargetSyncID). When
-//       Decision.Undelete is set, the upsert already clears deleted_at on the
-//       row (the ON CONFLICT SET deleted_at = NULL), and we additionally remove
-//       the central_tombstones row so the revived record is fully live.
+//     Decision.Undelete is set, the upsert already clears deleted_at on the
+//     row (the ON CONFLICT SET deleted_at = NULL), and we additionally remove
+//     the central_tombstones row so the revived record is fully live.
 //     - ActionWriteTombstone → WriteTombstone(TargetSyncID) AND set
-//       central_memories.deleted_at on the target row. The central WriteTombstone
-//       primitive writes only the tombstone row, so the deleted_at flag is set
-//       here — matching localstore.execWriteTombstone, which does both.
+//     central_memories.deleted_at on the target row. The central WriteTombstone
+//     primitive writes only the tombstone row, so the deleted_at flag is set
+//     here — matching localstore.execWriteTombstone, which does both.
 //     - NoOp → nothing.
 //  6. Commit. Any error rolls back the whole transaction.
 //
@@ -109,13 +109,33 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 		return fmt.Errorf("Apply: insert mutation: %w", err)
 	}
 
-	// Step 4 — run the pure Decide against this tx's snapshot. decideReader forces
-	// MutationApplied=false so the just-inserted mutation does not make Decide NoOp.
-	d := domain.Decide(&decideReader{ctx: ctx, q: tx}, m)
+	// Step 4 — materialize into the entity-specific table atomically on the tx.
+	//
+	// EntityPrompt mutations bypass domain.Decide entirely (no topic_key / LWW
+	// reconciliation) and are routed to applyPromptDecisionQ which writes into
+	// central_user_prompts / central_prompt_tombstones.  Every other entity type
+	// goes through the proven Decide → applyDecision path (central_memories /
+	// central_tombstones).
+	//
+	// insertMutationQ (step 3) always runs first for BOTH branches — the journal
+	// entry and the durable applied-marker are entity-agnostic.  applyDecision
+	// retains its defense-in-depth guard that rejects EntityPrompt as a routing
+	// error, so the ONLY way a prompt reaches applyDecision would be a logic bug
+	// in this switch.
+	if m.EntityType == domain.EntityPrompt {
+		if err = applyPromptDecisionQ(ctx, tx, m); err != nil {
+			return err
+		}
+	} else {
+		// Step 4b — run the pure Decide against this tx's snapshot. decideReader
+		// forces MutationApplied=false so the just-inserted mutation does not make
+		// Decide NoOp.
+		d := domain.Decide(&decideReader{ctx: ctx, q: tx}, m)
 
-	// Step 5 — materialize the Decision atomically on the tx.
-	if err = applyDecision(ctx, tx, d, m); err != nil {
-		return err
+		// Step 5 — materialize the Decision atomically on the tx.
+		if err = applyDecision(ctx, tx, d, m); err != nil {
+			return err
+		}
 	}
 
 	// Step 6 — commit.
