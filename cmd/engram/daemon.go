@@ -25,8 +25,10 @@ import (
 const daemonUsage = `Usage: engram daemon [flags]
 
 Run the engram local daemon — an MCP server (stdio transport) backed by a local
-SQLite store.  The daemon exposes mem_session_start and mem_session_end in this
-release; additional tools land in subsequent PRs.
+SQLite store.  The daemon exposes the full memory toolset: session lifecycle
+(mem_session_start, mem_session_end, mem_session_summary), writes (mem_save,
+mem_save_prompt), reads (mem_search, mem_context, mem_get_observation), and
+conflict judgment (mem_judge).
 
 When --central-url is set the daemon wires an autosync Loop that pushes local
 writes to the central server and pulls remote mutations back on a periodic
