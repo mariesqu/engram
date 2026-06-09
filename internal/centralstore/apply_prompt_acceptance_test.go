@@ -37,13 +37,15 @@
 //  5. Idempotency: re-push / re-pull the same prompt mutation → one central row,
 //     one B row, no error.
 //
-//  6. Forgery/writer_id: the harness uses real HMAC auth (via cloudserve +
-//     remote.Client); the push carries A's writer_id and is accepted. Central
-//     forgery guard (per-writer key check in cloudserve) passes end-to-end.
-//     NOTE: scenarios 1-5 use the direct in-process Apply path (no HTTP server)
-//     which bypasses the HMAC transport layer — the transport-level forgery proof
-//     for prompts belongs to PR-4 (real-verifier prompt push via remote.Client).
-//     The writer_id column is asserted on the materialized row in all scenarios.
+// Forgery/writer_id NOTE (no separate test in THIS PR): scenarios 1-5 use the
+// direct in-process Apply path (no HTTP server), which bypasses the HMAC transport.
+// cloudserve handlePush's forgery check is ENTITY-AGNOSTIC (it compares m.WriterID
+// to the authenticated writer with no entity branch), so it already covers prompts;
+// the writer_id column is asserted on the materialized row in every scenario. The
+// end-to-end real-verifier prompt push (via remote.Client) lands in PR-4.
+//
+// This file: 5 numbered convergence scenarios + a unit round-trip + a memory-
+// regression guard (7 test functions total).
 package centralstore_test
 
 import (
@@ -66,7 +68,6 @@ const (
 	promptProject = "engram-prompts"
 	promptScope   = "project"
 	writerA       = "prompt-writer-A"
-	writerB       = "prompt-writer-B"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -281,6 +282,22 @@ func assertLocalPromptTombstone(t *testing.T, st *localstore.Store, syncID strin
 	}
 }
 
+// assertLocalPromptTombstoneAbsent asserts there is NO tombstone row in the
+// node's prompt_tombstones for sync_id (the prompt is live, not deleted) — used
+// to confirm a fresh revival cleared the tombstone rather than leaving a phantom.
+func assertLocalPromptTombstoneAbsent(t *testing.T, st *localstore.Store, syncID string) {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(
+		`SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, syncID,
+	).Scan(&n); err != nil {
+		t.Fatalf("assertLocalPromptTombstoneAbsent(%q): %v", syncID, err)
+	}
+	if n != 0 {
+		t.Errorf("prompt_tombstones: expected NO tombstone for sync_id=%q, found %d", syncID, n)
+	}
+}
+
 // assertLocalMemoriesNoPrompt asserts no row in local memories for sync_id.
 func assertLocalMemoriesNoPrompt(t *testing.T, st *localstore.Store, syncID string) {
 	t.Helper()
@@ -469,6 +486,9 @@ func TestPromptCentral_StaleResurrectionRejected_FreshRevives(t *testing.T) {
 		t.Fatalf("Pull B: %v", err)
 	}
 	assertLocalPromptPresent(t, nodeB.Store, "prompt-stale-1", "fresh revival", "sess-A", writerA)
+	// The fresh revival must also have CLEARED B's local tombstone (no phantom
+	// tombstone left alongside the revived live row).
+	assertLocalPromptTombstoneAbsent(t, nodeB.Store, "prompt-stale-1")
 
 	t.Logf("Scenario 3 PASSED: stale blocked, fresh revived on central and B")
 }
@@ -562,6 +582,15 @@ func TestPromptCentral_MixedMemoryAndPromptSharedCursor(t *testing.T) {
 		t.Fatalf("query central seq for prompt: %v", err)
 	}
 	t.Logf("central seqs: memory=%d, prompt=%d (shared per-project journal)", seqMem, seqPrompt)
+	// ASSERT (not just log) the shared journal: the memory and the prompt got
+	// DISTINCT, CONSECUTIVE seqs from the SAME central_mutations BIGSERIAL for this
+	// project. A separate-journal or separate-cursor bug would break this.
+	if seqMem == seqPrompt {
+		t.Errorf("memory and prompt share seq %d — not distinct journal entries", seqMem)
+	}
+	if d := seqMem - seqPrompt; d != 1 && d != -1 {
+		t.Errorf("seqs not consecutive in the shared journal: memory=%d, prompt=%d", seqMem, seqPrompt)
+	}
 
 	// B pulls with ONE Pull call (one per-project cursor advance). B must see
 	// BOTH the memory AND the prompt in one pass.
@@ -652,7 +681,7 @@ func TestPromptCentral_Idempotency(t *testing.T) {
 		t.Fatalf("count central_mutations: %v", err)
 	}
 	if mutCount != 1 {
-		t.Errorf("central_mutations rows for mutation_id = %d, want 1 (idempotency guard)", mutCount)
+		t.Errorf("central_mutations count for mutation_id %s = %d, want 1 (idempotency guard)", written.MutationID, mutCount)
 	}
 
 	// B pulls — should get exactly 1 mutation applied, no error.
