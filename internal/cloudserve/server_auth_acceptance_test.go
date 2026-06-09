@@ -348,11 +348,8 @@ func TestAuthAcceptance_PromptPush_ValidWriter_Returns200(t *testing.T) {
 		project = "prompt-auth-project"
 	)
 	m := promptMutation(writerID, syncID, project)
-	// Normalize: derive canonical Payload and content-addressed MutationID, mirroring
-	// what localWriteLocked does before pushing to central.
-	m.Payload = mutation.CanonicalPayload(m)
-	m.MutationID = mutation.NewMutationID(m.Payload)
-
+	// signedPushRequest derives the canonical Payload + content-addressed MutationID
+	// (same as localWriteLocked) and signs the body — no pre-normalization needed.
 	body, sig := signedPushRequest(t, m, key, http.MethodPost, "/v1/push")
 	resp := doAuthPost(t, srv.URL+"/v1/push", writerID, sig, body)
 	defer resp.Body.Close()
@@ -410,11 +407,10 @@ func TestAuthAcceptance_PromptPush_ForgeryRejected_Returns403(t *testing.T) {
 	)
 
 	// Build the mutation claiming writerB's identity — this is the forged body.
-	// The payload and MutationID are derived from m with WriterID=writerB, which
-	// also passes VerifyMutationID on the server.
+	// signedPushRequest derives Payload + MutationID from m (WriterID=writerB), so the
+	// body's MutationID is over writerB and VerifyMutationID passes on the server —
+	// the ONLY rejection is the writer_id forgery check (authWriterID=writerA != writerB).
 	m := promptMutation(writerB, syncID, project)
-	m.Payload = mutation.CanonicalPayload(m)
-	m.MutationID = mutation.NewMutationID(m.Payload)
 
 	// Sign with keyA — so X-Writer-Id=writerA, HMAC(keyA) passes verification.
 	// The mismatch (authWriterID=writerA, m.WriterID=writerB) is the forgery.
@@ -425,12 +421,22 @@ func TestAuthAcceptance_PromptPush_ForgeryRejected_Returns403(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("forged prompt push: status = %d, want 403", resp.StatusCode)
+		t.Fatalf("forged prompt push: status = %d, want 403", resp.StatusCode)
 	}
 
-	// Nothing must have materialized in central_user_prompts — the forgery check
-	// fires before central.Apply is called, so the prompt is never persisted.
+	// Nothing must have materialized — the forgery check fires BEFORE central.Apply,
+	// so neither the journal (central_mutations) nor the row (central_user_prompts) is
+	// written. Asserting both makes the boundary tight from both sides.
 	assertCentralPromptAbsent(t, store, syncID)
+	var nMut int
+	if err := store.Pool().QueryRow(context.Background(),
+		`SELECT count(*) FROM central_mutations WHERE entity_key = $1`, syncID,
+	).Scan(&nMut); err != nil {
+		t.Fatalf("count central_mutations: %v", err)
+	}
+	if nMut != 0 {
+		t.Errorf("central_mutations: unexpected journal row for forged sync_id=%q (want absent)", syncID)
+	}
 }
 
 // TestAuthAcceptance_SignedPull_Returns200 proves that a correctly-signed pull
