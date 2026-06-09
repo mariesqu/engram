@@ -322,8 +322,8 @@ func TestMigrateV6ToV7_ExistingV6Store(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
 		t.Fatalf("PRAGMA user_version: %v", err)
 	}
-	if ver != 7 {
-		t.Errorf("after re-open, user_version = %d, want 7", ver)
+	if ver != currentSchemaVersion {
+		t.Errorf("after re-open, user_version = %d, want %d", ver, currentSchemaVersion)
 	}
 
 	// sessions table must exist and be usable after migration.
