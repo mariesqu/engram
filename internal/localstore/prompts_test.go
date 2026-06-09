@@ -17,8 +17,6 @@ package localstore
 //   - ListProjects includes a prompt-only project.
 
 import (
-	"database/sql"
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -685,18 +683,5 @@ func TestIsStalePromptUpsert(t *testing.T) {
 				t.Errorf("isStalePromptUpsert = %v, want %v", got, tc.wantStale)
 			}
 		})
-	}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// helper: assertNoUserPromptsRow verifies that sql.ErrNoRows is returned
-// ─────────────────────────────────────────────────────────────────────────────
-
-func assertNoUserPromptsRow(t *testing.T, db *sql.DB, syncID string) {
-	t.Helper()
-	var id int64
-	err := db.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ?`, syncID).Scan(&id)
-	if !errors.Is(err, sql.ErrNoRows) {
-		t.Errorf("expected no user_prompts row for sync_id=%q, got id=%d (err=%v)", syncID, id, err)
 	}
 }
