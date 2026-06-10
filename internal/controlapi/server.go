@@ -204,14 +204,15 @@ func (s *Server) WithAuthAndOrigin(next http.HandlerFunc) http.HandlerFunc {
 	return s.withAuth(s.withOrigin(next))
 }
 
-// Handler returns a *http.ServeMux pre-wired with all PR-① routes.
+// Handler returns a *http.ServeMux pre-wired with all PR-① + PR-② routes.
 //
 // Route table:
 //
-//	GET /api/v1/status   → withAuth → handleStatus
-//	GET /api/v1/config   → withAuth → handleConfig
-//	GET /api/v1/projects → withAuth → handleProjects
-//	/                    → withAuth → 404 JSON catch-all
+//	GET /api/v1/status                       → withAuth → handleStatus
+//	GET /api/v1/config                       → withAuth → handleConfig
+//	GET /api/v1/projects                     → withAuth → handleProjects (real policies)
+//	PUT /api/v1/projects/{project}/policy    → withAuth+Origin → handleProjectPolicy
+//	/                                        → withAuth → 404 JSON catch-all
 //
 // The catch-all is auth-wrapped too: unknown paths return 401 to
 // unauthenticated callers (no route enumeration), 404 only with a valid token.
@@ -220,6 +221,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/status", s.withAuth(s.handleStatus))
 	mux.HandleFunc("/api/v1/config", s.withAuth(s.handleConfig))
 	mux.HandleFunc("/api/v1/projects", s.withAuth(s.handleProjects))
+	// PR-②: PUT /api/v1/projects/{project}/policy
+	// Go 1.22+ ServeMux supports {variable} patterns and method prefixes.
+	mux.HandleFunc("PUT /api/v1/projects/{project}/policy", s.WithAuthAndOrigin(s.handleProjectPolicy))
 	mux.HandleFunc("/", s.withAuth(s.handleNotFound))
 	return mux
 }
@@ -273,6 +277,43 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
 	// Fixed message: never echo the request path back into the response body.
 	writeError(w, http.StatusNotFound, "not found")
+}
+
+// handleProjectPolicy handles PUT /api/v1/projects/{project}/policy.
+// It decodes a {"policy":"..."} body, validates the value, calls store.SetPolicy,
+// and returns 200 on success or 400 on a bad policy value.
+//
+// The route is registered with the WithAuthAndOrigin chain so both bearer-token
+// auth and Origin validation are enforced before this handler runs.
+func (s *Server) handleProjectPolicy(w http.ResponseWriter, r *http.Request) {
+	project := r.PathValue("project")
+	if project == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	var body struct {
+		Policy string `json:"policy"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+
+	p, err := ParsePolicy(body.Policy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := s.store.SetPolicy(project, p); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"project": project,
+		"policy":  string(p),
+	})
 }
 
 // ── HTTP helpers (mirrored from cloudserve — same patterns, separate package) ─

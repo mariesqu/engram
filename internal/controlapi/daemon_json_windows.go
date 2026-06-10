@@ -5,6 +5,7 @@ package controlapi
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -70,7 +71,11 @@ func WriteDaemonJSON(dir, token string, port, pid int) error {
 	// DACL. On Windows the 0o600 passed to OpenFile does NOT restrict access —
 	// only the DACL does. Non-fatal: if the DACL cannot be applied the file keeps
 	// the inherited directory DACL (degraded; single-user machines unaffected).
-	_ = setUserOnlyACL(tmp)
+	// Carry-forward from PR-① review: log a warning on ACL failure so degraded
+	// state is visible in the daemon log instead of being silently swallowed.
+	if aclErr := setUserOnlyACL(tmp); aclErr != nil {
+		log.Printf("controlapi.WriteDaemonJSON: WARNING: could not set user-only DACL on %q: %v (file will have inherited directory permissions)", tmp, aclErr)
+	}
 	if err := os.Rename(tmp, target); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("controlapi.WriteDaemonJSON: rename: %w", err)
