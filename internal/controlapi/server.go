@@ -94,10 +94,20 @@ type RedactedConfig struct {
 	Extra        map[string]string `json:"extra,omitempty"`
 }
 
-// CentralConfig holds the central server coordinates visible in config reads.
+// CentralConfig holds the central server coordinates visible in config reads
+// and as the argument to SyncController.Reconnect.
+//
+// WriterKeyPlaintext is an in-memory-only field used when establishing a new
+// connection via POST /api/v1/central/connect. It is NEVER serialised to JSON
+// (the omitempty + blank tag pair prevents it) and never returned to clients.
 type CentralConfig struct {
 	URL      string `json:"url,omitempty"`
 	WriterID string `json:"writer_id,omitempty"`
+
+	// WriterKeyPlaintext carries the raw writer key from the connect request to
+	// the SyncController.Reconnect implementation, which seals it and persists
+	// the ciphertext. It is never marshalled — no json tag.
+	WriterKeyPlaintext string `json:"-"`
 }
 
 // HTTPConfig holds HTTP listener settings.
@@ -204,28 +214,52 @@ func (s *Server) WithAuthAndOrigin(next http.HandlerFunc) http.HandlerFunc {
 	return s.withAuth(s.withOrigin(next))
 }
 
-// Handler returns a *http.ServeMux pre-wired with all PR-① + PR-② routes.
+// Handler returns a *http.ServeMux pre-wired with all PR-① + PR-② + PR-③ routes.
 //
 // Route table:
 //
-//	GET /api/v1/status                       → withAuth → handleStatus
-//	GET /api/v1/config                       → withAuth → handleConfig
-//	GET /api/v1/projects                     → withAuth → handleProjects (real policies)
-//	PUT /api/v1/projects/{project}/policy    → withAuth+Origin → handleProjectPolicy
-//	/                                        → withAuth → 404 JSON catch-all
+//	GET  /api/v1/status                       → withAuth → handleStatus
+//	GET  /api/v1/config                       → withAuth → handleConfig
+//	PUT  /api/v1/config                       → withAuth+Origin → handleConfigPut
+//	GET  /api/v1/projects                     → withAuth → handleProjects (real policies)
+//	PUT  /api/v1/projects/{project}/policy    → withAuth+Origin → handleProjectPolicy
+//	POST /api/v1/central/connect              → withAuth+Origin → handleConnect
+//	POST /api/v1/central/disconnect           → withAuth+Origin → handleDisconnect
+//	POST /api/v1/sync/trigger                 → withAuth+Origin → handleSyncTrigger
+//	/                                         → withAuth → 404 JSON catch-all
 //
 // The catch-all is auth-wrapped too: unknown paths return 401 to
 // unauthenticated callers (no route enumeration), 404 only with a valid token.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/status", s.withAuth(s.handleStatus))
-	mux.HandleFunc("/api/v1/config", s.withAuth(s.handleConfig))
+	mux.HandleFunc("/api/v1/config", s.withAuth(s.handleConfigDispatch))
 	mux.HandleFunc("/api/v1/projects", s.withAuth(s.handleProjects))
 	// PR-②: PUT /api/v1/projects/{project}/policy
 	// Go 1.22+ ServeMux supports {variable} patterns and method prefixes.
 	mux.HandleFunc("PUT /api/v1/projects/{project}/policy", s.WithAuthAndOrigin(s.handleProjectPolicy))
+	// PR-③: central connect/disconnect + sync trigger.
+	mux.HandleFunc("POST /api/v1/central/connect", s.WithAuthAndOrigin(s.handleConnect))
+	mux.HandleFunc("POST /api/v1/central/disconnect", s.WithAuthAndOrigin(s.handleDisconnect))
+	mux.HandleFunc("POST /api/v1/sync/trigger", s.WithAuthAndOrigin(s.handleSyncTrigger))
 	mux.HandleFunc("/", s.withAuth(s.handleNotFound))
 	return mux
+}
+
+// handleConfigDispatch routes /api/v1/config to the appropriate handler based
+// on the HTTP method. GET → handleConfig, PUT → handleConfigPut (with Origin).
+func (s *Server) handleConfigDispatch(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleConfig(w, r)
+	case http.MethodPut:
+		// PUT requires Origin validation; apply it inline here since the mux
+		// pattern does not include the method (we handle both GET and PUT).
+		s.withOrigin(s.handleConfigPut)(w, r)
+	default:
+		w.Header().Set("Allow", "GET, PUT")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 // ── Route handlers ─────────────────────────────────────────────────────────
@@ -243,11 +277,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	cfg, err := s.cfgStore.Load()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
