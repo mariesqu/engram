@@ -16,8 +16,8 @@ type recordingMockProvider struct {
 	mu       sync.Mutex
 	Calls    [][]string // all Embed calls, each entry is the texts slice
 	dims     int
-	vecValue float32   // value to fill returned vectors with (default 0.5)
-	err      error     // if non-nil, returned from every Embed call
+	vecValue float32 // value to fill returned vectors with (default 0.5)
+	err      error   // if non-nil, returned from every Embed call
 }
 
 func newRecordingMock(dims int) *recordingMockProvider {
@@ -49,7 +49,7 @@ func (m *recordingMockProvider) Embed(_ context.Context, _ string, texts []strin
 	return vecs, nil
 }
 
-func (m *recordingMockProvider) Dimensions() int  { return m.dims }
+func (m *recordingMockProvider) Dimensions() int   { return m.dims }
 func (m *recordingMockProvider) ModelName() string { return "mock" }
 
 // totalTexts returns the flat count of all texts ever received across all calls.

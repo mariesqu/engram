@@ -11,11 +11,11 @@ import (
 )
 
 const (
-	openAIDefaultBaseURL  = "https://api.openai.com"
-	openAIModel           = "text-embedding-3-small"
-	openAIDefaultDims     = 256
-	openAIDefaultTimeout  = 30 * time.Second
-	openAIEncodingFormat  = "float"
+	openAIDefaultBaseURL = "https://api.openai.com"
+	openAIModel          = "text-embedding-3-small"
+	openAIDefaultDims    = 256
+	openAIDefaultTimeout = 30 * time.Second
+	openAIEncodingFormat = "float"
 )
 
 // RemoteOpenAIProvider sends embedding requests to OpenAI's API.

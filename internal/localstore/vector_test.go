@@ -147,9 +147,9 @@ func TestCosineTopK_MostSimilarFirst(t *testing.T) {
 	query := []float32{1, 0} // unit vector pointing along first axis
 
 	rows := []vectorRow{
-		{syncID: "a", vec: l2Normalize([]float32{0, 1})},    // orthogonal → score=0
-		{syncID: "b", vec: l2Normalize([]float32{1, 0})},    // parallel → score=1
-		{syncID: "c", vec: l2Normalize([]float32{1, 0.1})},  // close → score~0.995
+		{syncID: "a", vec: l2Normalize([]float32{0, 1})},   // orthogonal → score=0
+		{syncID: "b", vec: l2Normalize([]float32{1, 0})},   // parallel → score=1
+		{syncID: "c", vec: l2Normalize([]float32{1, 0.1})}, // close → score~0.995
 	}
 
 	// Normalize query too.
