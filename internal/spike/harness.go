@@ -25,7 +25,15 @@ type Central = syncer.Central
 type Node = syncer.Node
 
 // NewNode wraps an already-open local store as a sync node.
+//
+// The harness models nodes ACTIVELY syncing against a central, so it wires
+// central-configured=true — making the PR-② read-time policy default "synced",
+// exactly as the daemon wires it in central mode. Without this every push and
+// pull would be filtered out by the policy default (local-only when no central
+// is configured). Tests that exercise policy behavior itself use the syncer
+// package directly with their own wiring.
 func NewNode(name string, store *localstore.Store) *Node {
+	store.SetCentralConfiguredFn(func() bool { return true })
 	return syncer.NewNode(name, store)
 }
 

@@ -138,6 +138,10 @@ func openNode(t *testing.T, name string) *syncer.Node {
 		t.Fatalf("openNode %s: %v", name, err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// Syncer unit tests exercise push/pull mechanics, not the policy filter.
+	// Treat all projects as synced (central always configured) so the policy
+	// filter is transparent to these tests.
+	st.SetCentralConfiguredFn(func() bool { return true })
 	n := syncer.NewNode(name, st)
 	// Seed one write so ListProjects returns "testproject". Loop unit tests
 	// don't push real mutations (mockCentral.Apply is a no-op), but

@@ -2221,18 +2221,19 @@ func TestMigration_V8ToV9_ExistingDB(t *testing.T) {
 		t.Fatalf("insert pre-migration row: %v", err)
 	}
 
-	// Now run migrations — should advance from v8 to v9.
+	// Now run migrations — should advance from v8 all the way to the current
+	// schema version (v10 as of PR-②).
 	if err := runMigrations(db); err != nil {
 		t.Fatalf("runMigrations from v8: %v", err)
 	}
 
-	// 1. user_version must now be 9.
+	// 1. user_version must now be at the current schema version.
 	var ver int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
 		t.Fatalf("PRAGMA user_version: %v", err)
 	}
-	if ver != 9 {
-		t.Errorf("user_version = %d after migrateV8ToV9; want 9", ver)
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d after runMigrations; want %d", ver, currentSchemaVersion)
 	}
 
 	// 2. Both new tables must exist.
@@ -2272,7 +2273,105 @@ func TestMigration_V8ToV9_ExistingDB(t *testing.T) {
 
 	// 5. Re-running migrations is idempotent.
 	if err := runMigrations(db); err != nil {
-		t.Errorf("re-running migrations on v9 DB must be a no-op: %v", err)
+		t.Errorf("re-running migrations on current-version DB must be a no-op: %v", err)
+	}
+}
+
+// ── PR-② schema v10 migration tests ──────────────────────────────────────────
+
+// TestMigration_V9ToV10_TableCreated verifies that migrateV9ToV10 creates the
+// project_policy table and bumps user_version to 10.
+func TestMigration_V9ToV10_TableCreated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v9.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	// Bootstrap schema, then wind back to v9 and drop the project_policy table
+	// so the migration must actually CREATE it.
+	if err := ApplySchema(db); err != nil {
+		t.Fatalf("ApplySchema: %v", err)
+	}
+	for _, stmt := range []string{
+		`PRAGMA user_version = 9`,
+		`DROP TABLE IF EXISTS project_policy`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	if err := runMigrations(db); err != nil {
+		t.Fatalf("runMigrations from v9: %v", err)
+	}
+
+	var ver int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if ver != 10 {
+		t.Errorf("user_version = %d; want 10", ver)
+	}
+
+	var tblName string
+	if err := db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='project_policy'`,
+	).Scan(&tblName); err != nil {
+		t.Errorf("project_policy table not found after migrateV9ToV10: %v", err)
+	}
+}
+
+// TestMigration_V9ToV10_Idempotent verifies that running runMigrations on a DB
+// already at v10 is a no-op and does not return an error.
+func TestMigration_V9ToV10_Idempotent(t *testing.T) {
+	st := openTempStore(t)
+
+	var ver int
+	if err := st.DB().QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Fatalf("pre-condition: user_version=%d, want %d", ver, currentSchemaVersion)
+	}
+
+	// Re-running on a current-version DB must be a no-op.
+	if err := runMigrations(st.DB()); err != nil {
+		t.Errorf("runMigrations on current-version DB: %v", err)
+	}
+	// user_version must not change.
+	if err := st.DB().QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatalf("user_version after re-run: %v", err)
+	}
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version changed to %d after no-op re-run; want %d", ver, currentSchemaVersion)
+	}
+}
+
+// TestSchema_V10_CheckConstraint verifies that the CHECK constraint on the
+// project_policy table rejects INSERT attempts with invalid policy values.
+func TestSchema_V10_CheckConstraint(t *testing.T) {
+	st := openTempStore(t)
+
+	// Valid values must be accepted.
+	for _, valid := range []string{"synced", "local-only", "omitted"} {
+		if _, err := st.DB().Exec(
+			`INSERT OR REPLACE INTO project_policy (project, policy, updated_at)
+			 VALUES (?, ?, datetime('now'))`, "test-proj-"+valid, valid,
+		); err != nil {
+			t.Errorf("valid policy %q rejected: %v", valid, err)
+		}
+	}
+
+	// An invalid value must be rejected by the CHECK constraint.
+	_, err := st.DB().Exec(
+		`INSERT INTO project_policy (project, policy, updated_at)
+		 VALUES ('bad-proj', 'unknown', datetime('now'))`,
+	)
+	if err == nil {
+		t.Error("expected CHECK constraint violation for policy='unknown', got nil")
 	}
 }
 

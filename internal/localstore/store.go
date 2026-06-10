@@ -12,6 +12,16 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 )
 
+// IsCentralConfiguredFn is the signature for the closure injected into a Store
+// to determine whether a central server is configured.  GetPolicy and
+// ListProjectsWithPolicy use it to compute the read-time default policy
+// (synced when central is configured, local-only otherwise).
+//
+// The closure is queried at read time — not at Open time — so it always
+// reflects the daemon's current connectivity state even after a connect or
+// disconnect operation.
+type IsCentralConfiguredFn func() bool
+
 // Store is the local SQLite adapter. It implements domain.Reader.
 //
 // Concurrency model: all write paths (AddObservation, LocalWrite, ApplyPulled,
@@ -36,6 +46,19 @@ import (
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex // serializes all write operations (read-modify-write atomicity)
+
+	// isCentralConfigured is called by GetPolicy / ListProjectsWithPolicy to
+	// compute the read-time default policy.  It is nil-safe: a nil func is
+	// treated as "not configured" (local-only default).  Set via
+	// SetCentralConfiguredFn after Open, typically in daemon wiring code.
+	isCentralConfigured IsCentralConfiguredFn
+
+	// policyCache caches the most recent GetPolicy/SetPolicy reads so that the
+	// push-filter hot path (one call per outbox entry per drain) is a map lookup
+	// rather than a DB round-trip.  Invalidated (cleared) on every SetPolicy call.
+	// policyMu serializes cache reads/writes independently of the write-queue mu.
+	policyCache map[string]Policy
+	policyMu    sync.RWMutex
 }
 
 // Open opens (or creates) the SQLite database at path, applies WAL pragmas,
@@ -76,7 +99,21 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("localstore.Open: runMigrations: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, policyCache: make(map[string]Policy)}, nil
+}
+
+// SetCentralConfiguredFn installs the closure that GetPolicy and
+// ListProjectsWithPolicy use to compute the read-time default policy.
+//
+// The fn is called at read time so it always reflects the live connectivity
+// state.  A nil fn is accepted and treated as "not configured" (local-only
+// default).  SAFE for concurrent use: the pointer is guarded by policyMu, and
+// computed defaults are never cached, so PR-③'s runtime connect/disconnect can
+// re-install the closure and the very next GetPolicy read reflects it.
+func (s *Store) SetCentralConfiguredFn(fn IsCentralConfiguredFn) {
+	s.policyMu.Lock()
+	s.isCentralConfigured = fn
+	s.policyMu.Unlock()
 }
 
 // Close releases the underlying database connection.

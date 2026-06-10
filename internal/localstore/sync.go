@@ -450,7 +450,29 @@ func (s *Store) ListProjects() ([]string, error) {
 // The mutation arrives carrying its central Seq, MutationID and Payload (from
 // PullSince); those are preserved as-is. Decide's INV5 guard (MutationApplied)
 // plus applyTx's applied_mutations INSERT make a re-pulled mutation a no-op.
+//
+// Belt-and-suspenders policy check (PR-②): the steady-state pull filter in
+// SyncAllProjects excludes non-synced projects before calling Pull at all, so
+// ApplyPulled should never receive a mutation for an omitted project.  This
+// check is a defensive guard for the brief flip-to-omitted race window where an
+// in-flight pull cycle could have already fetched mutations from central before
+// the policy flip was visible to SyncAllProjects.  The mutation is refused with
+// ErrOmittedProject — an ERROR, not a silent skip — so the caller (syncer.Pull)
+// does NOT advance the per-project cursor past it.  If it were silently dropped
+// the cursor would move past the mutation and a later flip back to synced would
+// never re-pull it: permanent, invisible data loss.  With the error the cursor
+// stays put and the flip-back re-pulls the mutation cleanly.
 func (s *Store) ApplyPulled(m domain.Mutation) error {
+	// Defensive policy check (outside the write lock — GetPolicy is safe for
+	// concurrent reads).
+	pol, err := s.GetPolicy(m.Project)
+	if err != nil {
+		return fmt.Errorf("ApplyPulled: policy check for project %q: %w", m.Project, err)
+	}
+	if pol == PolicyOmitted {
+		return fmt.Errorf("ApplyPulled: project %q: %w", m.Project, ErrOmittedProject)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

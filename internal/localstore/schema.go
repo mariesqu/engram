@@ -98,6 +98,19 @@ import (
 //	  - user_prompts carries NO REFERENCES sessions(id) FK.  An out-of-order pull
 //	    can land a prompt row before its owning session row arrives — the same
 //	    rationale that removed the memories→sessions FK in v0→v1.  session_id is
+//
+// v9 → v10: add project_policy table for per-node per-project sync policy.
+//
+//	Three-state policy: synced | local-only | omitted. The migration is O(1) —
+//	only the table is created; existing projects are NOT backfilled.  The default
+//	policy is computed at read time by GetPolicy / ListProjectsWithPolicy based on
+//	whether central is configured (synced) or not (local-only).  This keeps the
+//	migration idempotent and correct even when central configuration changes later.
+//
+//	The project_policy table has a CHECK constraint enforcing the three valid
+//	values; any INSERT/UPDATE with an unknown value raises a SQLite error.
+//	CREATE TABLE IF NOT EXISTS in ApplySchema makes the migration a no-op for
+//	fresh databases where the table already exists.
 //	    therefore a SOFT (unvalidated) reference.
 //	  - writer_id column is added (absent in old_code) for LWW tiebreaking parity
 //	    with the memories table and the central_user_prompts table.
@@ -106,7 +119,7 @@ import (
 //	  - prompts_fts / FTS triggers are intentionally omitted; prompt search is
 //	    deferred to a later PR.
 //	  - Both tables are idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema).
-const currentSchemaVersion = 9
+const currentSchemaVersion = 10
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -333,6 +346,18 @@ const userPromptsTableDDL = `CREATE TABLE IF NOT EXISTS user_prompts (
 	created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 )`
 
+// projectPolicyTableDDL is the authoritative CREATE TABLE statement for the
+// project_policy table (schema v10).  One row per project; absence means
+// "use the read-time default" (synced when central configured, local-only
+// otherwise).  The CHECK constraint is the canonical enforcement of the three
+// valid policy states — any unknown value raises an SQLITE_CONSTRAINT error.
+const projectPolicyTableDDL = `CREATE TABLE IF NOT EXISTS project_policy (
+	project    TEXT PRIMARY KEY,
+	policy     TEXT NOT NULL DEFAULT 'synced'
+	             CHECK (policy IN ('synced','local-only','omitted')),
+	updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`
+
 // promptTombstonesTableDDL is the authoritative CREATE TABLE statement for the
 // prompt_tombstones table. It mirrors memory_tombstones structure but is
 // intentionally leaner: prompts have no scope/topic_key/version LWW fields
@@ -431,9 +456,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 9
 	}
 
+	if ver < 10 {
+		if err := migrateV9ToV10(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 10
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 9` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 10` migration block.
+	// the final `ver = 10` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 11` migration block.
 	_ = ver
 	return nil
 }
@@ -1064,6 +1097,38 @@ func migrateV8ToV9(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV9ToV10 creates the project_policy table for per-node per-project
+// sync policy (schema v10 — additive, no row backfill).
+//
+// A fresh DB created by ApplySchema already has the table via
+// CREATE TABLE IF NOT EXISTS, so this migration is a no-op there.
+//
+// Default policy (synced vs local-only) is read-time computed by GetPolicy /
+// ListProjectsWithPolicy — it is NOT backfilled here.  The migration success
+// criterion is satisfied by GetPolicy returning the correct default, not by
+// counting inserted rows.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 9.
+func migrateV9ToV10(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(projectPolicyTableDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 10`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1162,6 +1227,12 @@ func ApplySchema(db *sql.DB) error {
 		// EntityType="prompt".  Apply/dispatch logic is in PR-2/3/4.
 		// No REFERENCES sessions(id) — soft parent ref; see userPromptsTableDDL.
 		userPromptsTableDDL,
+
+		// ── project_policy — per-node per-project sync policy (v10) ─────────
+		// Three-state policy: synced | local-only | omitted.
+		// Absence of a row means "use the read-time default" (synced when
+		// central is configured, local-only otherwise).  See policy.go.
+		projectPolicyTableDDL,
 
 		// ── prompt_tombstones — soft-delete for EntityPrompt ─────────────────
 		promptTombstonesTableDDL,

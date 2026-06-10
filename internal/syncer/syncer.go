@@ -73,6 +73,13 @@ const pullLimit = 1000
 // (INV5 at the transport layer; central_mutations.mutation_id UNIQUE is the
 // deeper guard).
 //
+// Policy filter (PR-②): each outbox entry is checked against the project's
+// effective policy before being applied to central.  Entries whose project has
+// policy local-only or omitted are SKIPPED — they are left UNACKED in the outbox
+// so they remain eligible for drain on the next push cycle.  This is the
+// mechanism behind the "flip local-only→synced drains the queue" guarantee:
+// eligibility is re-evaluated every drain, no outbox surgery needed.
+//
 // Returns the number of mutations pushed (acked) this round.
 func Push(ctx context.Context, n *Node, central Central) (int, error) {
 	entries, err := n.Store.DrainOutbox(0)
@@ -82,6 +89,17 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 
 	pushed := 0
 	for _, e := range entries {
+		// Policy filter: skip (do not ack) entries for non-synced projects.
+		// Skipped entries remain unacked; they are re-evaluated on the next drain.
+		pol, polErr := n.Store.GetPolicy(e.Mutation.Project)
+		if polErr != nil {
+			return pushed, fmt.Errorf("push %s: get policy for project %q (local_seq=%d): %w",
+				n.Name, e.Mutation.Project, e.LocalSeq, polErr)
+		}
+		if pol != localstore.PolicySynced {
+			continue // leave unacked — eligible again when policy flips to synced
+		}
+
 		if err := central.Apply(ctx, e.Mutation); err != nil {
 			return pushed, fmt.Errorf("push %s: central.Apply(local_seq=%d, mutation_id=%s): %w",
 				n.Name, e.LocalSeq, e.Mutation.MutationID, err)
@@ -171,9 +189,14 @@ func Sync(ctx context.Context, n *Node, central Central, project string) (pushed
 // SyncAllProjects is the multi-project autosync driver used by the Loop.
 //
 // It performs one full round for node n:
-//  1. Push: drain the outbox (project-agnostic) to central once.
+//  1. Push: drain the outbox (project-agnostic, policy-filtered) to central once.
 //  2. ListProjects: discover all projects known to n's local store.
 //  3. Pull each project using its own per-project cursor.
+//
+// Policy filter on pull (PR-②): projects with policy local-only or omitted are
+// excluded from the pull loop entirely.  Their per-project cursors remain
+// unchanged, so a future flip to synced resumes pulling from where it left off
+// (pull is idempotent via per-project cursors + INV5).
 //
 // Error policy: Push errors short-circuit immediately (outbox integrity matters).
 // For Pull, every project is attempted even if earlier ones fail; all errors are
@@ -197,6 +220,16 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 
 	var errs []error
 	for _, proj := range projects {
+		// Pull filter: skip projects that are not synced.
+		pol, polErr := n.Store.GetPolicy(proj)
+		if polErr != nil {
+			errs = append(errs, fmt.Errorf("SyncAllProjects %s: get policy %q: %w", n.Name, proj, polErr))
+			continue
+		}
+		if pol != localstore.PolicySynced {
+			continue // local-only or omitted: no pull for this project
+		}
+
 		cnt, perr := Pull(ctx, n, central, proj)
 		pulled += cnt
 		if perr != nil {
