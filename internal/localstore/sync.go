@@ -141,9 +141,9 @@ func (s *Store) localWriteLocked(m domain.Mutation) (domain.Mutation, error) {
 //
 // NormalizeTopicKey runs FIRST so that when normalizeMutation derives the
 // canonical payload (and therefore the content-addressed MutationID), no-topic
-// writes always reflect nil — &"" and nil converge — and '' never reaches any
+// writes always reflect nil — &"" and nil converge — and ” never reaches any
 // index (every partial topic index uses `WHERE topic_key IS NOT NULL`, which is
-// complete once '' is normalised away at store entry).
+// complete once ” is normalised away at store entry).
 func normalizeMutation(m domain.Mutation) domain.Mutation {
 	m = domain.NormalizeTopicKey(m) // fold &"" → nil before payload/ID derivation
 	if len(m.Payload) == 0 {
@@ -450,7 +450,28 @@ func (s *Store) ListProjects() ([]string, error) {
 // The mutation arrives carrying its central Seq, MutationID and Payload (from
 // PullSince); those are preserved as-is. Decide's INV5 guard (MutationApplied)
 // plus applyTx's applied_mutations INSERT make a re-pulled mutation a no-op.
+//
+// Belt-and-suspenders policy check (PR-②): the steady-state pull filter in
+// SyncAllProjects excludes non-synced projects before calling Pull at all, so
+// ApplyPulled should never receive a mutation for an omitted project.  This
+// check is a defensive guard for the brief flip-to-omitted race window where an
+// in-flight pull cycle could have already fetched mutations from central before
+// the policy flip was visible to SyncAllProjects.  A mutation for an omitted
+// project is silently dropped here (not an error — idempotent skip).
 func (s *Store) ApplyPulled(m domain.Mutation) error {
+	// Defensive policy check (outside the write lock — GetPolicy is safe for
+	// concurrent reads). Omitted projects are silently skipped.
+	pol, err := s.GetPolicy(m.Project)
+	if err != nil {
+		return fmt.Errorf("ApplyPulled: policy check for project %q: %w", m.Project, err)
+	}
+	if pol == PolicyOmitted {
+		// Silently drop — omitted means "no local writes ever". The mutation is
+		// not acked in the central journal (this is a pull-only path; there is no
+		// ack concept for pulled mutations).
+		return nil
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
