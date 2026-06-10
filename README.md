@@ -299,22 +299,38 @@ engram ui --db ~/.engram/memories.db
 
 `engram ui` reads `daemon.json`, constructs a tokenized URL (`/ui/?token=...`), and opens your default browser. The server exchanges the token for an `HttpOnly`, `SameSite=Strict` session cookie and redirects to `/ui/` — the token leaves the address bar immediately.
 
-### Available surfaces (PR-④a — read-only)
+### Available surfaces
 
-| Path | Surface |
-|------|---------|
-| `/ui/` | **Status page** — central connected state, last sync result (pushed/pulled counts, error), daemon version. Auto-refreshes every 3 s via HTMX polling. |
-| `/ui/projects` | **Projects** — read-only table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`). |
+| Path | Surface | Auth |
+|------|---------|------|
+| `/ui/` | **Status page** — central connected state, last sync result (pushed/pulled counts, error), daemon version. Auto-refreshes every 3 s via HTMX polling. | session cookie |
+| `/ui/status` | **Status partial** — HTMX polling fragment (no full page wrapper). | session cookie |
+| `/ui/projects` | **Projects** — table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`) and a per-row policy selector. | session cookie |
+| `/ui/config` | **Configuration** — editable `sync_interval`; `central_url` and `writer_key` shown read-only (managed via the connect/disconnect actions on the Status page). | session cookie |
 
-Policy toggles, config editing, and sync triggers will be added in PR-④b.
+### Mutating actions (PR-④b)
+
+All mutating actions (POST) require both a valid session cookie **and** a CSRF double-submit token. The CSRF token is embedded as a hidden field in every form and sent as an `X-CSRF-Token` header by HTMX.
+
+| Action | Route | Notes |
+|--------|-------|-------|
+| Change project policy | `POST /ui/projects/{name}/policy` | Calls `Store.SetPolicy`; returns refreshed projects rows via HTMX swap. |
+| Update sync interval | `POST /ui/config` | Validates Go duration server-side; returns updated config form. Shows restart-required notice when applicable. |
+| Trigger sync now | `POST /ui/sync` | Calls `SyncController.TriggerNow`; button hidden/disabled when central is not connected. Returns status partial. |
+| Disconnect from central | `POST /ui/disconnect` | Calls `SyncController.Disconnect`; includes HTMX confirm dialog. Returns status partial. |
+| Connect to central | `POST /ui/connect` | Fields: `central_url`, `writer_id`, `writer_key` (password input). Calls `SyncController.Reconnect`. On failure, shows a friendly error (`invalid writer_key` or `credential validation failed`); **writer_key is never echoed back**. |
 
 ### Session and security
 
-- Session cookie: `HttpOnly`, `SameSite=Strict`, `Secure=false` (loopback — TLS is not used on localhost), scoped to `Path=/ui/`.
-- Token exchange: `GET /ui/?token=<bearer>` validates the token and sets the cookie, then redirects to `/ui/` stripping the token from the URL.
+- **Session cookie** (`engram_session`): `HttpOnly`, `SameSite=Strict`, `Secure=false` (loopback — no TLS on localhost), scoped to `Path=/ui/`.
+- **CSRF cookie** (`engram_csrf`): NOT `HttpOnly` (double-submit pattern — the template reads it to populate the hidden field), `SameSite=Strict`, `Path=/ui/`. Set at the same time as the session cookie.
+- **CSRF validation**: every mutating POST must carry a matching `X-CSRF-Token` header or `csrf_token` form field; constant-time comparison against the CSRF cookie value. Missing or mismatched → 403.
+- **Origin check**: mutating POSTs with an `Origin` header must match `http://127.0.0.1:<port>` exactly. Absent `Origin` is allowed (non-browser CLI clients). Present-mismatched → 403.
+- Token exchange: `GET /ui/?token=<bearer>` validates the token, issues both the session and CSRF cookies atomically, then redirects to `/ui/` — the token leaves the address bar immediately.
 - If the session expires, the browser shows a 401 page with a hint to re-run `engram ui`.
 - Static assets (`htmx.min.js`, `styles.css`) are fully embedded in the binary — no CDN, no internet access required.
 - HTMX version 2.0.4 is vendored at `internal/webui/static/htmx.min.js`.
+- **writer_key no-echo guarantee**: the raw writer key is used only to call `SyncController.Reconnect` and is never stored, logged, or present in any HTTP response body.
 
 ## CLI reference
 
