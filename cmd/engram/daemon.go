@@ -53,6 +53,11 @@ daemon.json discovery file next to the database. CLI subcommands (engram status,
 engram ui) read daemon.json to connect. A second daemon start on the same port
 will probe the running daemon; if it is healthy it will refuse to start.
 
+When --http is set together with --transport http, the daemon ALSO mounts an MCP
+Streamable HTTP server at /mcp on the same listener. MCP clients can connect to
+http://127.0.0.1:<port>/mcp using the bearer token from daemon.json as an
+Authorization header.  stdio MCP remains the default transport (--transport stdio).
+
 On SIGINT or SIGTERM the daemon stops the autosync loop (if running), closes the
 store, and exits cleanly.  In HTTP mode daemon.json is removed on clean shutdown.
 
@@ -67,6 +72,7 @@ Flags:
   --sync-interval   Autosync cadence (default: ENGRAM_SYNC_INTERVAL env, then config file, then 30s)
   --http            Enable resident HTTP control plane (default: false — stdio MCP mode)
   --http-port       TCP port for the HTTP control plane (default: 7700)
+  --transport       MCP transport: "stdio" (default) or "http" (mounts /mcp on the HTTP listener; requires --http)
 
   ENGRAM_WRITER_KEY (env only — never a flag): hex-encoded 32-byte HMAC key.
     Required when --central-url is set.  Must never appear in flag defaults or
@@ -88,6 +94,34 @@ type daemonCfg struct {
 	syncInterval time.Duration
 	// PR-③: config file directory (same as DB dir by default, or os.UserConfigDir()/engram).
 	configDir string
+	// PR-⑥: MCP transport selection. "stdio" (default) | "http".
+	// When "http" and httpMode=true, /mcp is mounted on the top-level ServeMux.
+	mcpTransport string
+}
+
+// resolveTransport resolves the MCP transport with the standard precedence
+// chain: explicit flag > ENGRAM_TRANSPORT env > config file > default "stdio".
+// flagVal is "" when --transport was not passed (the flag default is empty so
+// an EXPLICIT --transport stdio beats an env/file "http"). Any resolved value
+// outside {stdio, http} is a hard startup error — including a bad value coming
+// from the config file.
+func resolveTransport(flagVal, envVal, fileVal string) (string, error) {
+	v := flagVal
+	if v == "" {
+		v = envVal
+	}
+	if v == "" {
+		v = fileVal
+	}
+	if v == "" {
+		v = "stdio"
+	}
+	switch v {
+	case "stdio", "http":
+		return v, nil
+	default:
+		return "", fmt.Errorf("transport: unknown value %q (must be \"stdio\" or \"http\")", v)
+	}
 }
 
 // daemonComponents holds the wired-but-not-yet-serving components built by
@@ -134,6 +168,12 @@ func runDaemonCmd(args []string) error {
 	// --http / --http-port: opt-in resident mode (PR-①).
 	httpMode := fs.Bool("http", false, "enable resident HTTP control plane (default: stdio MCP mode)")
 	httpPort := fs.Int("http-port", 0, "TCP port for the HTTP control plane (default: 7700, or config file)")
+
+	// --transport: MCP transport selector (PR-⑥). EMPTY default so an explicit
+	// --transport stdio is distinguishable from "not set" and wins the
+	// precedence chain (flag > ENGRAM_TRANSPORT env > config file > "stdio");
+	// resolveTransport applies the chain + validation after Parse.
+	mcpTransport := fs.String("transport", "", `MCP transport: "stdio" (default) or "http" (requires --http; or set ENGRAM_TRANSPORT / config file)`)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -261,6 +301,15 @@ func runDaemonCmd(args []string) error {
 		return fmt.Errorf("--sync-interval must be positive (got %s)", *syncInterval)
 	}
 
+	// ── Resolve + validate transport (flag > env > file > default) ───────────
+	transport, err := resolveTransport(*mcpTransport, envOr("ENGRAM_TRANSPORT", ""), fileCfg.Transport)
+	if err != nil {
+		return err
+	}
+	if transport == "http" && !*httpMode {
+		return fmt.Errorf("--transport http requires --http (the HTTP control plane must be enabled)")
+	}
+
 	cfg := daemonCfg{
 		db:           *db,
 		centralURL:   *centralURL,
@@ -270,6 +319,7 @@ func runDaemonCmd(args []string) error {
 		httpMode:     *httpMode,
 		httpPort:     *httpPort,
 		configDir:    configDir,
+		mcpTransport: transport,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -416,7 +466,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	// The control API and the web UI share a single net.Listener. We mount:
 	//   /api/v1/…  → controlapi.Handler() (bearer-token auth)
 	//   /ui/…      → webui.Mount (session-cookie auth, token→cookie exchange)
-	// A future PR mounts /mcp here as well (PR-⑥).
+	//   /mcp       → StreamableHTTPServer (opt-in, --transport http only, PR-⑥)
 	topMux := http.NewServeMux()
 
 	// Mount all /api/v1/ routes from the control API handler.
@@ -435,6 +485,20 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		Port:     actualPort,
 		Version:  daemonVersion,
 	})
+
+	// ── PR-⑥: opt-in MCP HTTP transport ──────────────────────────────────────
+	// When --transport http is set, mount the Streamable HTTP MCP server at /mcp
+	// on the SAME top-level mux (same loopback listener, same port — no new port).
+	// STATELESS mode: no server-side session state for a single-user loopback daemon.
+	// Auth: MountMCP wraps the handler with the same bearer-token check as /api/v1/*.
+	if cfg.mcpTransport == "http" {
+		streamableHandler := mcpserver.NewStreamableHTTPServer(
+			components.mcpServer,
+			mcpserver.WithStateLess(true),
+		)
+		controlapi.MountMCP(topMux, token, streamableHandler)
+		log.Printf("engram daemon: MCP HTTP transport mounted at /mcp (stateless, bearer-token auth)")
+	}
 
 	httpSrv := &http.Server{
 		Handler:           topMux,

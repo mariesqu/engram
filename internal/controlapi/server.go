@@ -21,6 +21,10 @@
 //	GET /api/v1/status   → handleStatus
 //	GET /api/v1/config   → handleConfig   (writer key REDACTED)
 //	GET /api/v1/projects → handleProjects (policy per project)
+//
+// PR-⑥ exports:
+//
+//	MountMCP — registers /mcp on an existing ServeMux with bearer-token auth
 package controlapi
 
 import (
@@ -29,6 +33,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -399,4 +404,55 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// ── PR-⑥: MCP HTTP transport helper ──────────────────────────────────────────
+
+// MCPHandler is the interface satisfied by *mcpserver.StreamableHTTPServer.
+// Using an interface keeps internal/controlapi free of the mcp-go import so
+// the dependency stays in cmd/engram (the wiring layer).
+type MCPHandler interface {
+	ServeHTTP(http.ResponseWriter, *http.Request)
+}
+
+// MountMCP registers the MCP Streamable HTTP server at /mcp on mux, wrapped
+// with bearer-token authentication that mirrors the /api/v1 contract.
+//
+// The handler is the *mcpserver.StreamableHTTPServer constructed by buildDaemon
+// (it satisfies MCPHandler via its ServeHTTP method). The same token used for
+// /api/v1 is reused — a single credential for the whole loopback daemon.
+//
+// Auth contract (mirrors withAuth):
+//   - Missing or wrong Authorization: Bearer <token> → 401, no routing.
+//   - Correct token → request forwarded to the streamable handler unchanged.
+func MountMCP(mux *http.ServeMux, token string, h MCPHandler) {
+	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !checkBearer(r.Header.Get("Authorization"), token) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+	// Mount at both /mcp and /mcp/. NOTE: net/http.ServeMux does NOT strip
+	// prefixes (only http.StripPrefix does) — the handler receives the original
+	// path. That is fine: StreamableHTTPServer.ServeHTTP dispatches on the
+	// HTTP method (POST/GET/DELETE), not the path.
+	mux.Handle("/mcp", authed)
+	mux.Handle("/mcp/", authed)
+}
+
+// checkBearer reports whether the Authorization header carries exactly the
+// expected bearer token. An EMPTY configured token NEVER authenticates —
+// without this guard a zero-value server would accept "Authorization: Bearer "
+// (empty credential vs empty secret). Shared by withAuth and MountMCP so the
+// two auth gates cannot drift.
+func checkBearer(header, token string) bool {
+	if token == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	return strings.TrimPrefix(header, prefix) == token
 }

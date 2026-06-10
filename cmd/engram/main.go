@@ -53,6 +53,7 @@ Environment:
   ENGRAM_WRITER_ID       writer identity for autosync (required when ENGRAM_CENTRAL_URL is set)
   ENGRAM_WRITER_KEY      hex-encoded 32-byte HMAC key (env only; required when ENGRAM_CENTRAL_URL is set)
   ENGRAM_SYNC_INTERVAL   autosync cadence for 'daemon' (default "30s")
+  ENGRAM_TRANSPORT       MCP transport override for 'daemon' ("stdio" or "http")
 
 Subcommands:
   serve     Run the central HTTP server (plain HTTP — terminate TLS upstream).
