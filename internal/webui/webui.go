@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/mariesqu/engram/internal/controlapi"
@@ -147,7 +149,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 		case http.MethodGet:
 			handleConfigPage(w, r, deps, sessions)
 		case http.MethodPost:
-			withCSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				handleConfigPost(w, r, deps, sessions)
 			})).ServeHTTP(w, r)
 		default:
@@ -159,7 +161,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		withCSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handleSyncPost(w, r, deps, sessions)
 		})).ServeHTTP(w, r)
 
@@ -168,7 +170,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		withCSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handleConnectPost(w, r, deps, sessions)
 		})).ServeHTTP(w, r)
 
@@ -177,7 +179,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		withCSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handleDisconnectPost(w, r, deps, sessions)
 		})).ServeHTTP(w, r)
 
@@ -186,7 +188,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		withCSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handlePolicyPost(w, r, deps, sessions)
 		})).ServeHTTP(w, r)
 
@@ -211,16 +213,27 @@ func isPolicyPath(path string) bool {
 	if path[len(path)-len(suffix):] != suffix {
 		return false
 	}
-	// The middle segment (project name) must not be empty.
+	// The middle segment (project name) must be exactly ONE non-empty path
+	// segment — "/ui/projects/a/b/policy" is NOT a policy path (it would
+	// otherwise extract "a/b" as the project name).
 	middle := path[len(prefix) : len(path)-len(suffix)]
-	return middle != ""
+	return middle != "" && !strings.Contains(middle, "/")
 }
 
-// extractProject returns the project name from a /ui/projects/{project}/policy path.
+// extractProject returns the project name from a /ui/projects/{project}/policy
+// path. The segment is percent-DECODED (net/http preserves %2F in paths) so a
+// project name round-trips byte-identically; the store normalizes further
+// (trim/lowercase). A segment that decodes to contain "/" is rejected by
+// returning "" (the handler 404s on empty).
 func extractProject(path string) string {
 	const prefix = "/ui/projects/"
 	const suffix = "/policy"
-	return path[len(prefix) : len(path)-len(suffix)]
+	raw := path[len(prefix) : len(path)-len(suffix)]
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || strings.Contains(decoded, "/") {
+		return ""
+	}
+	return decoded
 }
 
 // ── View models ──────────────────────────────────────────────────────────────
@@ -479,7 +492,8 @@ func handleConnectPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, s
 		vm.ConnectCentralURL = centralURL
 		vm.ConnectWriterID = writerID
 		// writer_key is NOT echoed — the password field must be retyped.
-		w.WriteHeader(http.StatusUnprocessableEntity)
+		renderPartialStatus(w, "status-partial", vm, http.StatusUnprocessableEntity)
+		return
 	}
 
 	renderPartial(w, "status-partial", vm)
@@ -497,18 +511,20 @@ func handleConfigPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, se
 	syncInterval := r.FormValue("sync_interval")
 
 	// Validate duration server-side (mirrors controlapi.handleConfigPut logic).
+	// Validation failures return 422 — a 200-with-error-text would read as
+	// success to HTMX and any non-browser client.
 	if syncInterval != "" {
 		d, err := time.ParseDuration(syncInterval)
 		if err != nil {
 			vm := buildConfigVM(deps, sessions, "invalid sync_interval: must be a Go duration (e.g. 30s)", false)
 			vm.SyncInterval = syncInterval // echo back the invalid value
-			renderPage(w, configTmpl, vm)
+			renderPageStatus(w, configTmpl, vm, http.StatusUnprocessableEntity)
 			return
 		}
 		if d <= 0 {
 			vm := buildConfigVM(deps, sessions, "invalid sync_interval: must be positive", false)
 			vm.SyncInterval = syncInterval
-			renderPage(w, configTmpl, vm)
+			renderPageStatus(w, configTmpl, vm, http.StatusUnprocessableEntity)
 			return
 		}
 	}

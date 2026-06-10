@@ -1151,7 +1151,7 @@ func TestWebUI_Config_POST_Valid_200(t *testing.T) {
 
 // TestWebUI_Config_POST_InvalidDuration_400 verifies that an unparseable
 // sync_interval returns a 200 with an error message (no ConfigStore.Apply call).
-func TestWebUI_Config_POST_InvalidDuration_400(t *testing.T) {
+func TestWebUI_Config_POST_InvalidDuration_422(t *testing.T) {
 	const secret = "config-bad-dur-tok"
 	cfgStore := &mockConfigStore{}
 	mux := http.NewServeMux()
@@ -1176,8 +1176,8 @@ func TestWebUI_Config_POST_InvalidDuration_400(t *testing.T) {
 
 	// We return the page with the error message rather than a 4xx HTTP status
 	// (the form page re-renders with the error inline — HTMX swap pattern).
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("want 200 (form re-rendered with error), got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("want 422 (validation failure must not read as success), got %d", resp.StatusCode)
 	}
 	if !strings.Contains(bodyStr, "invalid sync_interval") {
 		t.Errorf("response must contain error text for bad duration, got: %s", bodyStr)
@@ -1219,4 +1219,87 @@ func TestWebUI_Config_GET_DoesNotEchoWriterKey(t *testing.T) {
 	// The actual "***REDACTED***" sentinel is fine; a real key must never appear.
 	// Since our mock returns "***REDACTED***" there is nothing more sensitive here
 	// to check — the guarantee is structural: WriterKeyPlaintext never flows to Load().
+}
+
+// ─── Round-1 review additions (④b) ──────────────────────────────────────────
+
+// TestCSRF_SessionBound_StaleTokenAfterRotation: pure double-submit would
+// accept ANY cookie+token pair that match each other (cookies are port-
+// agnostic on 127.0.0.1, so another local server can plant one). The CSRF
+// check must be BOUND to the token the live session minted: after a second
+// exchange rotates the token, the OLD token — submitted consistently as both
+// cookie and header — must be rejected.
+func TestCSRF_SessionBound_StaleTokenAfterRotation(t *testing.T) {
+	const secret = "tok-rotate"
+	srv := newTestServer(t, secret, controlapi.Status{CentralConnected: true}, nil)
+
+	// Exchange #1: capture both cookies.
+	sess1, csrf1 := exchangeGetBothCookies(t, srv, secret)
+	_ = sess1
+
+	// Exchange #2 rotates both; keep the NEW session cookie.
+	sess2, _ := exchangeGetBothCookies(t, srv, secret)
+
+	// POST with the LIVE session but the STALE csrf token as BOTH cookie and
+	// header — a planted/stale pair that pure double-submit would accept.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/ui/sync", nil)
+	req.AddCookie(sess2)
+	req.AddCookie(csrf1)
+	req.Header.Set("X-CSRF-Token", csrf1.Value)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("stale csrf pair accepted: got %d, want 403 (CSRF not session-bound)", resp.StatusCode)
+	}
+}
+
+// TestPolicyPath_GETAndShape: an unauthenticated GET to a policy path is 401
+// (session guard runs first); an authenticated GET is 405 (POST-only route);
+// and a multi-segment middle is NOT a policy path (404).
+func TestPolicyPath_GETAndShape(t *testing.T) {
+	const secret = "tok-shape"
+	srv := newTestServer(t, secret, controlapi.Status{},
+		[]controlapi.ProjectPolicy{{Name: "p1", Policy: controlapi.PolicySynced}})
+
+	// Unauthenticated GET → 401.
+	resp, err := http.Get(srv.URL + "/ui/projects/p1/policy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("unauth GET policy path: got %d, want 401", resp.StatusCode)
+	}
+
+	sess, csrf := exchangeGetBothCookies(t, srv, secret)
+
+	// Authenticated GET → 405 (no CSRF needed on GET).
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/ui/projects/p1/policy", nil)
+	req.AddCookie(sess)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("authed get: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("authed GET policy path: got %d, want 405", resp2.StatusCode)
+	}
+
+	// Multi-segment middle → not a policy path → 404 even as an authed,
+	// CSRF-bearing POST (the route must not exist at all).
+	req3, _ := http.NewRequest(http.MethodPost, srv.URL+"/ui/projects/a/b/policy", nil)
+	req3.AddCookie(sess)
+	req3.AddCookie(csrf)
+	req3.Header.Set("X-CSRF-Token", csrf.Value)
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatalf("multi-segment post: %v", err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusNotFound {
+		t.Errorf("multi-segment policy path: got %d, want 404", resp3.StatusCode)
+	}
 }

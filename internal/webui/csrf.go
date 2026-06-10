@@ -36,19 +36,23 @@ func setCSRFCookie(w http.ResponseWriter, port int, val string) {
 	// Expose the token in the response header so HTMX hx-headers can read it
 	// without needing client-side JS. Templates embed it directly as a hidden
 	// input value, so this header is belt-and-suspenders for HTMX swap flows.
-	w.Header().Set(csrfHeaderName, fmt.Sprintf("http://127.0.0.1:%d", port))
-	// Deliberately overwrite with the actual token value (the line above sets
-	// the host for documentation purposes; reset it to the real CSRF value).
 	w.Header().Set(csrfHeaderName, val)
 }
 
-// validateCSRF checks that the request carries a CSRF token that matches the
-// cookie. It accepts the token from the X-CSRF-Token header (HTMX hx-headers)
-// or from the csrf_token form field (plain HTML form POST).
+// validateCSRF checks that the request carries a CSRF token that (a) matches
+// the double-submit cookie AND (b) matches the SERVER-SIDE per-session token.
+// It accepts the token from the X-CSRF-Token header (HTMX hx-headers) or from
+// the csrf_token form field (plain HTML form POST).
+//
+// The session binding (b) is the load-bearing check on loopback: cookies are
+// PORT-AGNOSTIC, so any other local server on 127.0.0.1:<other-port> can plant
+// an engram_csrf cookie with a value it knows — pure double-submit would
+// accept it. Binding to the token the EXCHANGE minted (stored in the session
+// store, rotated with every exchange) defeats cookie planting outright.
 //
 // Constant-time comparison is used so even on a loopback interface we do not
 // introduce a timing oracle.
-func validateCSRF(r *http.Request) bool {
+func validateCSRF(r *http.Request, sessions *sessionStore) bool {
 	cookie, err := r.Cookie(csrfCookieName)
 	if err != nil || cookie.Value == "" {
 		return false
@@ -66,13 +70,26 @@ func validateCSRF(r *http.Request) bool {
 	if tokenVal == "" {
 		return false
 	}
-	// subtle.ConstantTimeCompare requires equal-length slices.
-	a := []byte(cookieVal)
-	b := []byte(tokenVal)
+	if !constantTimeEq(cookieVal, tokenVal) {
+		return false
+	}
+	// Session binding: the submitted token must be the one THIS session's
+	// exchange minted. A planted cookie carries a token the exchange never
+	// issued (or a stale one from a rotated-away session) and fails here.
+	serverTok := sessions.csrfToken()
+	if serverTok == "" {
+		return false
+	}
+	return constantTimeEq(tokenVal, serverTok)
+}
+
+// constantTimeEq compares two strings in constant time (length leak aside —
+// both sides are fixed-length hex in practice).
+func constantTimeEq(a, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	return subtle.ConstantTimeCompare(a, b) == 1
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // withCSRF is middleware that validates the CSRF double-submit cookie on
@@ -83,13 +100,13 @@ func validateCSRF(r *http.Request) bool {
 //
 // withOrigin is a SEPARATE guard (applied by the routeUI dispatcher for
 // mutating routes) that validates the Origin header. The two guards are
-// independent layers: withCSRF handles the cookie double-submit; the origin
-// check in dispatchUI handles the browser Origin header.
-func withCSRF(next http.Handler) http.Handler {
+// independent layers: withCSRF handles the session-bound double-submit; the
+// origin check in dispatchUI handles the browser Origin header.
+func withCSRF(sessions *sessionStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost || r.Method == http.MethodPut ||
 			r.Method == http.MethodPatch || r.Method == http.MethodDelete {
-			if !validateCSRF(r) {
+			if !validateCSRF(r, sessions) {
 				http.Error(w, "CSRF validation failed", http.StatusForbidden)
 				return
 			}
