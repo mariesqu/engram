@@ -144,10 +144,16 @@ func execInsert(tx *sql.Tx, m domain.Mutation) error {
 // P1-a fix: targetSyncID is the RESOLVED row's sync_id from Decision.TargetSyncID,
 // which may differ from m.SyncID when resolved via FindByTopic.
 func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
+	// embedding columns are RESET on every update: the stored vector was
+	// computed from the OLD title/content — keeping it would leave semantic
+	// search scoring against text that no longer exists, and the backfill
+	// predicate (IS NULL OR model mismatch) would never re-select the row.
+	// NULLing them re-enqueues the row for the backfill loop (NULL-as-queue).
 	_, err := tx.Exec(`
 		UPDATE memories
 		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
-		    version=?, writer_id=?, last_write_mutation_id=?, updated_at=?
+		    version=?, writer_id=?, last_write_mutation_id=?, updated_at=?,
+		    embedding=NULL, embedding_model=NULL, embedding_created_at=NULL
 		WHERE sync_id=?`,
 		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
 		m.Version, m.WriterID, m.MutationID,

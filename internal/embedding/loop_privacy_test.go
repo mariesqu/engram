@@ -73,7 +73,7 @@ func TestLoop_Omitted_RecordingMock_ZeroCalls(t *testing.T) {
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   10 * time.Second,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 
@@ -143,7 +143,7 @@ func TestLoop_LocalOnly_Remote_RecordingMock_ZeroCalls(t *testing.T) {
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   10 * time.Second,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 
@@ -211,7 +211,7 @@ func TestLoop_PolicyFlip_MidBackfill_PostFlipRowsSkipped(t *testing.T) {
 		return embedding.NewLoop(st, gated, embedding.LoopConfig{
 			Interval:   10 * time.Second,
 			Debounce:   1 * time.Millisecond,
-			BatchPause: 0,
+			BatchPause: -1,
 			BatchSize:  100,
 		})
 	}

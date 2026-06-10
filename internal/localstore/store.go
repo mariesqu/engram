@@ -198,6 +198,36 @@ func (s *Store) CountNullEmbeddings() (int, error) {
 	return n, nil
 }
 
+// CountPendingEmbeddings counts rows the backfill loop will ACTUALLY embed:
+// live rows without a current-model embedding whose project policy permits
+// embedding (synced — PR-1: remote provider, no sidecar consent). Without the
+// eligibility filter a store full of omitted-project rows would report a
+// forever-nonzero pending count for work the loop will never (correctly) do.
+func (s *Store) CountPendingEmbeddings(currentModel string) (int, error) {
+	projects, err := s.ListProjectsWithPolicy()
+	if err != nil {
+		return 0, fmt.Errorf("CountPendingEmbeddings: %w", err)
+	}
+	total := 0
+	for _, pp := range projects {
+		if pp.Policy != PolicySynced {
+			continue // gated for a remote provider — the loop skips these rows
+		}
+		var n int
+		err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM memories
+			 WHERE deleted_at IS NULL AND LOWER(project) = LOWER(?)
+			   AND (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?)`,
+			pp.Name, currentModel,
+		).Scan(&n)
+		if err != nil {
+			return 0, fmt.Errorf("CountPendingEmbeddings %q: %w", pp.Name, err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // EmbeddableStore is the narrow data-access port used by the embedding backfill
 // loop (internal/embedding.Loop). It is satisfied by *Store and by test doubles.
 //

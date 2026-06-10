@@ -12,6 +12,7 @@ package embedding_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -93,7 +94,7 @@ func runLoopOnce(t *testing.T, st *localstore.Store, mock *recordingMockProvider
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   100 * time.Millisecond,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0, // no pause in tests
+		BatchPause: -1, // negative = explicitly no pause (0 now defaults to the 1s spec value)
 		BatchSize:  batchSize,
 	})
 	// runTick is private, so we start the loop and immediately trigger + wait.
@@ -209,7 +210,7 @@ func TestLoop_BatchSize_Respected(t *testing.T) {
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   100 * time.Millisecond,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -239,48 +240,91 @@ func TestLoop_BatchFailure_ContinuesRemainingBatches(t *testing.T) {
 		insertRow(t, st, syncID, "open", "title "+string(rune('A'+i)))
 	}
 
-	// errorAfterFirstMock fails on the second Embed call.
+	// Deterministic failure injection: the SECOND Embed call (and later) fail.
+	// Configured before the loop starts — no goroutine, no timing race.
 	errMock := newRecordingMock(4)
-
-	// Wire a goroutine that sets the error after the first call lands.
-	go func() {
-		for range time.Tick(2 * time.Millisecond) {
-			if errMock.callCount() >= 1 {
-				errMock.setError(errors.New("provider error on call 2"))
-				return
-			}
-		}
-	}()
+	errMock.failOnCall(2, errors.New("provider error on call 2"))
 
 	checker := newSyncedPolicyChecker("open")
 	gated := embedding.NewGated(errMock, checker, true)
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   100 * time.Millisecond,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  3,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(400 * time.Millisecond)
-	loop.Stop()
+	time.Sleep(150 * time.Millisecond) // let the triggered tick run
+	loop.Stop()                        // Stop blocks until the goroutine exits — the real barrier
 
-	// Provider must have been called at least once (first batch).
-	if errMock.callCount() < 1 {
-		t.Fatalf("provider called %d times, want >= 1", errMock.callCount())
+	// Exactly: call 1 (rows A-C) succeeded, call 2 (rows D-F) failed.
+	if errMock.callCount() < 2 {
+		t.Fatalf("provider called %d times, want >= 2", errMock.callCount())
 	}
-
-	// First 3 rows must be embedded (first call succeeded before error was set).
 	embedded := 0
 	for i := 0; i < 6; i++ {
 		if hasEmbedding(t, st, "fail-"+string(rune('A'+i))) {
 			embedded++
 		}
 	}
-	if embedded == 0 {
-		t.Error("expected at least 3 rows embedded (first batch), got 0")
+	if embedded != 3 {
+		t.Errorf("embedded = %d rows, want exactly 3 (first batch only — second failed)", embedded)
+	}
+}
+
+// TestLoop_GatedRowsDoNotStarveEligible (the keyset-cursor regression proof):
+// 2×BatchSize OMITTED rows are inserted FIRST (lowest ids), then synced rows
+// behind them. Without the id-cursor, every page would return the same gated
+// rows, the tick would end "caught up", and the eligible rows would never be
+// reached. With the cursor the tick pages PAST the gated block.
+func TestLoop_GatedRowsDoNotStarveEligible(t *testing.T) {
+	st := openLoopStore(t)
+
+	for i := 0; i < 6; i++ { // 2×BatchSize=3 gated rows first (low ids)
+		insertRow(t, st, fmt.Sprintf("gated-%02d", i), "private", "secret text")
+	}
+	for i := 0; i < 3; i++ { // eligible rows BEHIND the gated block
+		insertRow(t, st, fmt.Sprintf("open-%02d", i), "open", "public text")
+	}
+
+	mock := newRecordingMock(4)
+	checker := &staticPolicyChecker{policies: map[string]localstore.Policy{
+		"private": localstore.PolicyOmitted,
+		"open":    localstore.PolicySynced,
+	}}
+	gated := embedding.NewGated(mock, checker, true)
+	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
+		Interval:   time.Hour, // single triggered tick
+		Debounce:   time.Millisecond,
+		BatchPause: -1,
+		BatchSize:  3,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	loop.Start(ctx)
+	loop.Trigger()
+	time.Sleep(200 * time.Millisecond)
+	loop.Stop()
+
+	for i := 0; i < 3; i++ {
+		if !hasEmbedding(t, st, fmt.Sprintf("open-%02d", i)) {
+			t.Errorf("open-%02d not embedded — gated rows starved the eligible ones (cursor regression)", i)
+		}
+	}
+	for i := 0; i < 6; i++ {
+		if hasEmbedding(t, st, fmt.Sprintf("gated-%02d", i)) {
+			t.Errorf("gated-%02d was embedded — PRIVACY VIOLATION", i)
+		}
+	}
+	for _, texts := range mock.receivedTexts() {
+		for _, txt := range texts {
+			if txt == "secret text" || len(txt) >= 6 && txt[:6] == "secret" {
+				t.Error("PRIVACY VIOLATION: gated text reached the provider")
+			}
+		}
 	}
 }
 
@@ -302,7 +346,7 @@ func TestLoop_Resume_AfterInterrupt(t *testing.T) {
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   100 * time.Millisecond,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  4,
 	})
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -326,7 +370,7 @@ func TestLoop_Resume_AfterInterrupt(t *testing.T) {
 	loop2 := embedding.NewLoop(st, gated2, embedding.LoopConfig{
 		Interval:   100 * time.Millisecond,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
@@ -371,7 +415,7 @@ func TestLoop_MixedPolicy_OnlySyncedEmbedded(t *testing.T) {
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   100 * time.Millisecond,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -413,7 +457,7 @@ func TestLoop_Trigger_CoalescesRapidCalls(t *testing.T) {
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   10 * time.Second,
 		Debounce:   50 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

@@ -303,7 +303,7 @@ func TestSelectEmbeddable_PicksNullAndStale(t *testing.T) {
 		t.Fatalf("insert stale row: %v", err)
 	}
 
-	rows, err := SelectEmbeddable(db, "new-model", 100)
+	rows, err := SelectEmbeddable(db, "new-model", 100, 0)
 	if err != nil {
 		t.Fatalf("SelectEmbeddable: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestSelectEmbeddable_SkipsAlreadyEmbedded(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
-	rows, err := SelectEmbeddable(db, "cur-model", 100)
+	rows, err := SelectEmbeddable(db, "cur-model", 100, 0)
 	if err != nil {
 		t.Fatalf("SelectEmbeddable: %v", err)
 	}

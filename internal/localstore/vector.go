@@ -283,6 +283,7 @@ func rrfFuse(ftsRanks []string, cosineRanks []string, k, limit int) []string {
 // EmbeddableRow represents a row eligible for embedding, returned by SelectEmbeddable.
 // Fields are exported so the embedding backfill loop (internal/embedding) can read them.
 type EmbeddableRow struct {
+	ID      int64 // rowid keyset cursor — the backfill pages with id > afterID
 	SyncID  string
 	Project string
 	Text    string // title + " " + content for embedding
@@ -293,18 +294,26 @@ type EmbeddableRow struct {
 //   - embedding_model != currentModel (stale — model changed).
 //
 // Deleted rows are excluded. limit caps the batch size.
-func SelectEmbeddable(db *sql.DB, currentModel string, limit int) ([]EmbeddableRow, error) {
+//
+// afterID is a KEYSET CURSOR: only rows with id > afterID are returned, in id
+// order. The backfill loop threads the last-seen id between pages so the tick
+// always ADVANCES past permanently-gated rows — without it, 100+ gated rows
+// with the lowest ids would fill every page and STARVE all eligible rows
+// behind them forever. Pass 0 to start from the beginning.
+func SelectEmbeddable(db *sql.DB, currentModel string, limit int, afterID int64) ([]EmbeddableRow, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	const q = `
-		SELECT sync_id, project, title, content
+		SELECT id, sync_id, project, title, content
 		FROM memories
 		WHERE deleted_at IS NULL
+		  AND id > ?
 		  AND (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?)
+		ORDER BY id ASC
 		LIMIT ?`
 
-	rows, err := db.Query(q, currentModel, limit)
+	rows, err := db.Query(q, afterID, currentModel, limit)
 	if err != nil {
 		return nil, fmt.Errorf("SelectEmbeddable: %w", err)
 	}
@@ -312,15 +321,16 @@ func SelectEmbeddable(db *sql.DB, currentModel string, limit int) ([]EmbeddableR
 
 	var result []EmbeddableRow
 	for rows.Next() {
+		var id int64
 		var syncID, project, title, content string
-		if err := rows.Scan(&syncID, &project, &title, &content); err != nil {
+		if err := rows.Scan(&id, &syncID, &project, &title, &content); err != nil {
 			return nil, fmt.Errorf("SelectEmbeddable scan: %w", err)
 		}
 		text := title
 		if content != "" {
 			text = title + " " + content
 		}
-		result = append(result, EmbeddableRow{SyncID: syncID, Project: project, Text: text})
+		result = append(result, EmbeddableRow{ID: id, SyncID: syncID, Project: project, Text: text})
 	}
 	return result, rows.Err()
 }

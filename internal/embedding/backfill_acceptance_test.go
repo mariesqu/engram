@@ -70,7 +70,7 @@ func runBackfill(t *testing.T, st *localstore.Store, gated embedding.EmbeddingPr
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   10 * time.Second,
 		Debounce:   1 * time.Millisecond,
-		BatchPause: 0,
+		BatchPause: -1,
 		BatchSize:  100,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

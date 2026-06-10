@@ -921,7 +921,7 @@ func (a *runtimeSyncAdapter) Status() controlapi.Status {
 	// The pending count is best-effort (±1 race with concurrent writes is acceptable).
 	// The field is always present when an embedding provider is configured — even
 	// for the Noop case (provider="noop", pending=N shows what would be backfilled).
-	pending, _ := a.store.CountNullEmbeddings() // error → 0 (best-effort)
+	pending, _ := a.store.CountPendingEmbeddings(a.embeddingProvider) // eligible rows only; error → 0 (best-effort)
 	st.EmbeddingBackfill = &controlapi.EmbeddingBackfill{
 		Pending:  pending,
 		Provider: a.embeddingProvider,

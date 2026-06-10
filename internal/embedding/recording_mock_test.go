@@ -18,6 +18,8 @@ type recordingMockProvider struct {
 	dims     int
 	vecValue float32 // value to fill returned vectors with (default 0.5)
 	err      error   // if non-nil, returned from every Embed call
+	failOn   int     // if >0, Embed call number N (1-based) and later return failErr
+	failErr  error
 }
 
 func newRecordingMock(dims int) *recordingMockProvider {
@@ -36,6 +38,12 @@ func (m *recordingMockProvider) Embed(_ context.Context, _ string, texts []strin
 	cp := make([]string, len(texts))
 	copy(cp, texts)
 	m.Calls = append(m.Calls, cp)
+
+	// Deterministic failure injection: the Nth call (1-based) and later fail.
+	// Recorded BEFORE failing so callCount reflects the attempt.
+	if m.failOn > 0 && len(m.Calls) >= m.failOn {
+		return nil, m.failErr
+	}
 
 	// Build deterministic vectors filled with m.vecValue.
 	vecs := make([][]float32, len(texts))
@@ -70,6 +78,18 @@ func (m *recordingMockProvider) callCount() int {
 	return len(m.Calls)
 }
 
+// failOnCall configures the mock to return err on the Nth Embed call (1-based)
+// and every call after it. Set BEFORE the loop starts — deterministic, no
+// goroutine, no race (the round-1 test injected the error from a time.Tick
+// goroutine racing the loop, which both leaked the ticker and could fire
+// before/after the intended call on a loaded runner).
+func (m *recordingMockProvider) failOnCall(n int, err error) {
+	m.mu.Lock()
+	m.failOn = n
+	m.failErr = err
+	m.mu.Unlock()
+}
+
 // setError configures the mock to return err from all subsequent Embed calls.
 func (m *recordingMockProvider) setError(err error) {
 	m.mu.Lock()
@@ -82,4 +102,17 @@ func (m *recordingMockProvider) setVecValue(v float32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.vecValue = v
+}
+
+// receivedTexts returns a copy of every Embed call's texts.
+func (m *recordingMockProvider) receivedTexts() [][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]string, len(m.Calls))
+	for i, c := range m.Calls {
+		cp := make([]string, len(c))
+		copy(cp, c)
+		out[i] = cp
+	}
+	return out
 }

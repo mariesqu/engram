@@ -61,12 +61,14 @@ func applyLoopDefaults(c LoopConfig) LoopConfig {
 	if c.BatchSize <= 0 {
 		c.BatchSize = 100
 	}
-	// BatchPause: 0 means "no pause between batches" (valid for tests or
-	// callers that manage rate-limiting externally). Only apply the default
-	// when a negative sentinel is passed, which callers should never do.
-	// Production code should set BatchPause explicitly (1s is the spec default).
-	if c.BatchPause < 0 {
+	// BatchPause: the zero value gets the 1s SPEC DEFAULT — a zero-value
+	// LoopConfig must be rate-limit-safe by construction, not by advice.
+	// Tests that genuinely want no pause pass a NEGATIVE value.
+	if c.BatchPause == 0 {
 		c.BatchPause = 1 * time.Second
+	}
+	if c.BatchPause < 0 {
+		c.BatchPause = 0
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -261,19 +263,23 @@ func (l *Loop) runTick(ctx context.Context) error {
 	db := l.store.RawDB()
 	batchSize := l.cfg.BatchSize
 	firstBatch := true
+	// Keyset cursor: strictly advances every page, so gated rows can neither
+	// livelock the tick nor starve eligible rows behind them.
+	var afterID int64
 
 	for {
 		if ctx.Err() != nil {
 			return nil // cancelled — not a provider error
 		}
 
-		rows, err := localstore.SelectEmbeddable(db, currentModel, batchSize)
+		rows, err := localstore.SelectEmbeddable(db, currentModel, batchSize, afterID)
 		if err != nil {
 			return err
 		}
 		if len(rows) == 0 {
-			return nil // all rows embedded or predicate matches zero
+			return nil // cursor exhausted — every eligible row this tick was visited
 		}
+		afterID = rows[len(rows)-1].ID // advance the cursor PAST this page
 
 		// Rate-limit pause between consecutive Embed calls, but not before the first.
 		if !firstBatch && l.cfg.BatchPause > 0 {
@@ -336,8 +342,10 @@ func (l *Loop) runTick(ctx context.Context) error {
 			// Provider succeeded for this project — mark eligible work done.
 			anyEligible = true
 
-			// Write each normalised vector back. UpdateEmbedding is idempotent:
-			// AND embedding IS NULL means a race with a concurrent write is safe.
+			// Write each normalised vector back via UpdateEmbeddingStale (the
+			// model-mismatch variant — 0 rows affected when a concurrent embedder
+			// already stamped the current model; a concurrent CONTENT edit resets
+			// the embedding to NULL in execUpdate, re-enqueuing the row).
 			for i, vec := range vecs {
 				normVec := localstore.L2Normalize(vec)
 				if ue := localstore.UpdateEmbeddingStale(db, pb.syncIDs[i], normVec, currentModel, now); ue != nil {
@@ -350,16 +358,22 @@ func (l *Loop) runTick(ctx context.Context) error {
 			}
 		}
 
-		// If a provider error occurred for at least one project, surface it so the
-		// caller can apply backoff. (Gated-only skips do NOT surface errors.)
 		if tickErr != nil {
+			if anyEligible {
+				// PARTIAL failure: some project groups embedded fine. Do NOT
+				// surface the error — backoff would punish the healthy projects
+				// for one project's transient 429/5xx. The failed rows stay NULL
+				// and retry at the normal cadence next tick (spec: batch failure
+				// surfaces no error from the tick).
+				l.cfg.Logger.Warn("embedding.Loop: partial tick failure — failed rows retry next tick",
+					"error", tickErr,
+				)
+				return nil
+			}
+			// TOTAL failure (zero successes): surface it so the caller backs off —
+			// the provider is likely down and hammering it helps nobody.
 			return tickErr
 		}
-
-		// Livelock guard: if none of the batch rows were eligible (all gated),
-		// terminate this tick. There is no useful work to do until policy changes.
-		if !anyEligible {
-			return nil
-		}
+		_ = anyEligible // cursor advance is the termination guarantee; gated-only pages just move on
 	}
 }
