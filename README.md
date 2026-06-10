@@ -286,6 +286,36 @@ PUT  /api/v1/projects/{project}/policy       → {"policy": "synced|local-only|o
 
 `PUT` requires a valid `Authorization: Bearer <token>` header. The token is read from the `daemon.json` file written by the running daemon.
 
+## Web UI
+
+The resident daemon (`engram daemon --http`) serves a browser-based dashboard at `http://127.0.0.1:<port>/ui/`.
+
+### Opening the UI
+
+```bash
+# Opens the default browser at /ui/ — token exchange happens automatically.
+engram ui --db ~/.engram/memories.db
+```
+
+`engram ui` reads `daemon.json`, constructs a tokenized URL (`/ui/?token=...`), and opens your default browser. The server exchanges the token for an `HttpOnly`, `SameSite=Strict` session cookie and redirects to `/ui/` — the token leaves the address bar immediately.
+
+### Available surfaces (PR-④a — read-only)
+
+| Path | Surface |
+|------|---------|
+| `/ui/` | **Status page** — central connected state, last sync result (pushed/pulled counts, error), daemon version. Auto-refreshes every 3 s via HTMX polling. |
+| `/ui/projects` | **Projects** — read-only table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`). |
+
+Policy toggles, config editing, and sync triggers will be added in PR-④b.
+
+### Session and security
+
+- Session cookie: `HttpOnly`, `SameSite=Strict`, `Secure=false` (loopback — TLS is not used on localhost), scoped to `Path=/ui/`.
+- Token exchange: `GET /ui/?token=<bearer>` validates the token and sets the cookie, then redirects to `/ui/` stripping the token from the URL.
+- If the session expires, the browser shows a 401 page with a hint to re-run `engram ui`.
+- Static assets (`htmx.min.js`, `styles.css`) are fully embedded in the binary — no CDN, no internet access required.
+- HTMX version 2.0.4 is vendored at `internal/webui/static/htmx.min.js`.
+
 ## CLI reference
 
 ```
