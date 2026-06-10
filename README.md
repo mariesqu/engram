@@ -239,6 +239,59 @@ All subcommands read `daemon.json` from the same directory as `--db`. If no daem
 
 `writer_key` and `central_url` are managed exclusively via `engram central connect / disconnect` — they are rejected by `PUT /api/v1/config`.
 
+### HTTP MCP transport
+
+By default, `engram daemon --http` runs the MCP layer over **stdio** — the daemon still expects a JSON-RPC client on stdin/stdout even while the HTTP control plane is active. If you run multiple MCP clients against a single resident daemon (e.g. Claude Code, Cursor, and a CI bot all sharing the same memory store), you can switch to the Streamable HTTP MCP transport instead:
+
+```bash
+# Expose MCP over HTTP on the same loopback listener as the control API
+./engram daemon --db ~/.engram/memories.db --http --transport http
+```
+
+With `--transport http` the daemon mounts the MCP server at `/mcp` on the **same port** as the control API — no second port is opened. The endpoint uses [Streamable HTTP (stateless mode)](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) so each MCP request is an independent HTTP round-trip; no persistent SSE connection is required.
+
+`--transport http` requires `--http`. Running it without `--http` is a startup error.
+
+**Authentication**
+
+`/mcp` requires the same bearer token as `/api`:
+
+```
+Authorization: Bearer <token from daemon.json>
+```
+
+Requests without a valid `Authorization` header receive `401 Unauthorized`. The token rotates on every daemon start; read it fresh from `daemon.json`.
+
+**Wiring Claude Code**
+
+Add an entry to your `claude_desktop_config.json` (or equivalent MCP host config):
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "type": "http",
+      "url": "http://127.0.0.1:7700/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+Replace `7700` with the actual port and `<token>` with the value from `daemon.json`. Re-read `daemon.json` after every daemon restart — the token is rotated on start.
+
+**Mode matrix**
+
+| Flags | MCP transport | `/mcp` endpoint |
+|-------|---------------|-----------------|
+| _(none — default)_ | stdio | absent |
+| `--http` | stdio | absent |
+| `--http --transport http` | Streamable HTTP | present, token-gated |
+
+`--transport stdio` (explicit) is identical to the default; stdio is never removed or altered by `--transport http`.
+
 ### Per-project policy
 
 Each project has an effective sync policy that controls how its observations move between the local store and central. The policy is evaluated at push/pull time — changing it takes effect on the next sync cycle with no schema migration.
