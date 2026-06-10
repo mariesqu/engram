@@ -570,12 +570,17 @@ func TestSecurityHeaders_OnUIResponses(t *testing.T) {
 	ts := newTestServer(t, "tok-sec", controlapi.Status{}, nil)
 	client := noRedirectClient()
 
-	for _, path := range []string{"/ui/", "/ui/static/styles.css"} {
+	for _, path := range []string{"/ui/", "/ui/static/styles.css", "/ui/static/htmx.min.js"} {
 		resp, err := client.Get(ts.URL + path)
 		if err != nil {
 			t.Fatalf("get %s: %v", path, err)
 		}
 		resp.Body.Close()
+		// Static assets must actually SERVE (200) — headers alone would also
+		// appear on a 404 from a broken sub-FS mount.
+		if strings.Contains(path, "/static/") && resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200 (static sub-FS broken?)", path, resp.StatusCode)
+		}
 		if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
 			t.Errorf("%s: X-Frame-Options = %q, want DENY", path, got)
 		}

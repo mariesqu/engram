@@ -84,7 +84,9 @@ func routeUI(deps WebUIDeps, sessions *sessionStore) http.Handler {
 		// Token exchange: ONLY at the canonical entry point /ui/ (the URL
 		// cmd/engram/ui.go opens). Deep links with a stray ?token= do NOT
 		// exchange — keeping the token-accepting surface as small as possible.
-		if (r.URL.Path == "/ui/" || r.URL.Path == "/ui") && r.URL.Query().Get("token") != "" {
+		// NOTE: bare "/ui" never reaches here — the ServeMux 301-redirects it to
+		// "/ui/" before the handler runs, so only the canonical path is checked.
+		if r.URL.Path == "/ui/" && r.URL.Query().Get("token") != "" {
 			exchangeToken(deps.Secret, sessions).ServeHTTP(w, r)
 			return
 		}
@@ -99,7 +101,7 @@ func routeUI(deps WebUIDeps, sessions *sessionStore) http.Handler {
 // dispatchUI routes within the cookie-authenticated /ui/* space.
 func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps) {
 	switch {
-	case r.URL.Path == "/ui/" || r.URL.Path == "/ui":
+	case r.URL.Path == "/ui/":
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
