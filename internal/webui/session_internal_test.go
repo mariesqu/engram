@@ -10,7 +10,7 @@ import (
 // raw cookie value must not stay valid for the daemon's entire lifetime).
 func TestSessionStore_ServerSideExpiry(t *testing.T) {
 	s := &sessionStore{}
-	s.set("sess-abc")
+	s.set("sess-abc", "csrf-xyz")
 
 	if !s.valid("sess-abc") {
 		t.Fatal("fresh session should be valid")
@@ -33,7 +33,7 @@ func TestSessionStore_EmptyValueNeverValid(t *testing.T) {
 	if s.valid("") {
 		t.Error("empty value validated against empty store")
 	}
-	s.set("real")
+	s.set("real", "csrf-real")
 	if s.valid("") {
 		t.Error("empty cookie value validated")
 	}
