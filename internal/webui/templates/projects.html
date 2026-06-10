@@ -1,0 +1,31 @@
+{{template "layout" .}}
+
+{{define "content"}}
+<div class="card">
+    <h2>Projects</h2>
+    {{template "projects-partial" .}}
+</div>
+{{end}}
+
+{{define "projects-partial"}}
+{{if .Projects}}
+<table>
+    <thead>
+        <tr>
+            <th>Project</th>
+            <th>Policy</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range .Projects}}
+        <tr>
+            <td class="project-name">{{.Name}}</td>
+            <td>{{policyBadge (printf "%s" .Policy)}}</td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{else}}
+<p class="muted">No projects yet. Observations will appear here once captured.</p>
+{{end}}
+{{end}}
