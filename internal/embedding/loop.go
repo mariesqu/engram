@@ -87,15 +87,13 @@ func applyLoopDefaults(c LoopConfig) LoopConfig {
 //  4. Sleeps BatchPause between consecutive batch Embed calls (rate-limit guard).
 //  5. Stops for this tick when SelectEmbeddable returns zero rows (caught up).
 //
-// Livelock safety: permanently-gated rows (omitted/local-only projects) have
-// embedding=NULL and ARE returned by SelectEmbeddable on every tick. The loop
-// skips them in-memory and continues to the next project group. When all remaining
-// rows are gated, the eligible per-project embed calls are all no-ops; on the next
-// batch fetch there are no more ungated rows with NULL embedding, so
-// SelectEmbeddable still returns rows (the gated ones) — BUT we track whether any
-// eligible (non-gated) rows were processed in this batch; if none were processed,
-// the tick terminates. This guarantees termination: the tick is "caught up" when
-// no ELIGIBLE work remains, not when no rows match the predicate.
+// Livelock + starvation safety: permanently-gated rows (omitted/local-only
+// projects) have embedding=NULL and ARE matched by the predicate forever. The
+// tick pages with a KEYSET CURSOR (id > afterID, ORDER BY id) that advances
+// past every page unconditionally — gated rows are skipped in-memory but can
+// neither make a page repeat (livelock) nor occupy every page slot ahead of
+// eligible rows (starvation). The tick terminates when the cursor exhausts
+// the predicate (SelectEmbeddable returns zero rows).
 //
 // Construct with NewLoop; start with Start(ctx); request an early pass with
 // Trigger(); stop with Stop() or by cancelling the ctx.
@@ -266,6 +264,10 @@ func (l *Loop) runTick(ctx context.Context) error {
 	// Keyset cursor: strictly advances every page, so gated rows can neither
 	// livelock the tick nor starve eligible rows behind them.
 	var afterID int64
+	// TICK-scoped (not page-scoped) failure tracking: a success on page 1
+	// followed by a provider failure on page 2 is a PARTIAL tick — it must not
+	// trigger backoff (spec: batch failure surfaces no error from the tick).
+	anySucceeded := false
 
 	for {
 		if ctx.Err() != nil {
@@ -311,10 +313,7 @@ func (l *Loop) runTick(ctx context.Context) error {
 			pb.texts = append(pb.texts, rows[i].Text)
 		}
 
-		// Track whether ANY project group produced eligible (non-gated) work.
-		// If this full batch was entirely gated, terminate the tick to prevent livelock.
-		anyEligible := false
-		var tickErr error
+		var pageErr error
 
 		for _, proj := range projectOrder {
 			if ctx.Err() != nil {
@@ -335,12 +334,12 @@ func (l *Loop) runTick(ctx context.Context) error {
 					"project", proj,
 					"error", embedErr,
 				)
-				tickErr = embedErr
+				pageErr = embedErr
 				continue
 			}
 
-			// Provider succeeded for this project — mark eligible work done.
-			anyEligible = true
+			// Provider succeeded for this project group.
+			anySucceeded = true
 
 			// Write each normalised vector back via UpdateEmbeddingStale (the
 			// model-mismatch variant — 0 rows affected when a concurrent embedder
@@ -358,22 +357,24 @@ func (l *Loop) runTick(ctx context.Context) error {
 			}
 		}
 
-		if tickErr != nil {
-			if anyEligible {
-				// PARTIAL failure: some project groups embedded fine. Do NOT
-				// surface the error — backoff would punish the healthy projects
-				// for one project's transient 429/5xx. The failed rows stay NULL
-				// and retry at the normal cadence next tick (spec: batch failure
-				// surfaces no error from the tick).
+		if pageErr != nil {
+			if anySucceeded {
+				// PARTIAL tick failure (this page or an earlier one succeeded
+				// somewhere): stop the tick WITHOUT error — backoff would punish
+				// the healthy projects for one transient 429/5xx. Failed rows
+				// stay NULL and retry at the normal cadence next tick (spec:
+				// batch failure surfaces no error from the tick).
 				l.cfg.Logger.Warn("embedding.Loop: partial tick failure — failed rows retry next tick",
-					"error", tickErr,
+					"error", pageErr,
 				)
 				return nil
 			}
-			// TOTAL failure (zero successes): surface it so the caller backs off —
-			// the provider is likely down and hammering it helps nobody.
-			return tickErr
+			// TOTAL failure (zero successes anywhere this tick): surface it so
+			// the caller backs off — the provider is likely down and paging on
+			// would hammer it for nothing.
+			return pageErr
 		}
-		_ = anyEligible // cursor advance is the termination guarantee; gated-only pages just move on
+		// Gated-only pages fall through: the cursor advance above is the
+		// termination guarantee — the next page is always NEW rows.
 	}
 }
