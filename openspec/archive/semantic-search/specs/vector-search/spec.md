@@ -191,11 +191,14 @@ defaulting to `""`. The handler maps it to `SearchFilter.Mode` and passes it to
 - THEN results are returned (no error)
 - AND the result set equals the FTS result set for the same query
 
-#### Scenario: mode="semantic" with no embeddings returns empty results, no error
+#### Scenario: mode="semantic" with no embeddings degrades to FTS with a note, no error
 
 - GIVEN a store with memories that all have `embedding IS NULL`
 - WHEN `SearchMemoriesFiltered` is called with `Mode="semantic"`
-- THEN an empty slice is returned (no error)
+- THEN FTS results are returned (no error)
+- AND an optional degradation note is appended: "semantic results not ready; showing keyword results"
+
+> RECONCILED at archive: per design decision 5, silent degradation to FTS applies even on explicit `mode=semantic` request. The user who explicitly asked for semantic search should see an honest note explaining why they got FTS instead.
 
 #### Scenario: unknown mode value falls back to FTS
 
