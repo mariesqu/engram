@@ -103,6 +103,53 @@ func TestGatePrivacy_SyncedProject_ReceivesTexts(t *testing.T) {
 	}
 }
 
+// TestGate_LocalOnly_Local_ConsentTrue_Embeds verifies that a local-only project
+// IS embedded when the provider is local (remote=false) and consent=true.
+func TestGate_LocalOnly_Local_ConsentTrue_Embeds(t *testing.T) {
+	mock := &recordingMockProvider{dims: 4, vecValue: 0.5}
+	checker := &staticPolicyChecker{
+		policies: map[string]localstore.Policy{
+			"local-proj": localstore.PolicyLocalOnly,
+		},
+	}
+	// remote=false, consent=true → eligible.
+	gated := embedding.NewGated(mock, checker, false /* local */, true /* consent */)
+
+	ctx := context.Background()
+	vecs, err := gated.Embed(ctx, "local-proj", []string{"private text"})
+	if err != nil {
+		t.Fatalf("expected no error for local-only+local+consent=true, got: %v", err)
+	}
+	if len(vecs) != 1 {
+		t.Errorf("got %d vectors, want 1", len(vecs))
+	}
+	if mock.callCount() != 1 {
+		t.Errorf("inner provider called %d times, want 1", mock.callCount())
+	}
+}
+
+// TestGate_LocalOnly_Local_ConsentFalse_Gated verifies that a local-only project
+// is NOT embedded when the provider is local but consent=false (default).
+func TestGate_LocalOnly_Local_ConsentFalse_Gated(t *testing.T) {
+	mock := &recordingMockProvider{dims: 4}
+	checker := &staticPolicyChecker{
+		policies: map[string]localstore.Policy{
+			"local-proj": localstore.PolicyLocalOnly,
+		},
+	}
+	// remote=false, no consent arg → consent defaults to false → gated.
+	gated := embedding.NewGated(mock, checker, false /* local */)
+
+	ctx := context.Background()
+	_, err := gated.Embed(ctx, "local-proj", []string{"private text"})
+	if err != embedding.ErrEmbeddingGated {
+		t.Errorf("expected ErrEmbeddingGated for local-only+local+consent=false, got: %v", err)
+	}
+	if mock.callCount() != 0 {
+		t.Errorf("inner provider called %d times, want 0", mock.callCount())
+	}
+}
+
 // TestGatePrivacy_MultipleProjects_IsolatedCalls verifies that projects with
 // different policies are handled independently within a single gate instance.
 func TestGatePrivacy_MultipleProjects_IsolatedCalls(t *testing.T) {

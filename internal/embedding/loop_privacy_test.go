@@ -182,6 +182,104 @@ func TestLoop_LocalOnly_Remote_RecordingMock_ZeroCalls(t *testing.T) {
 	}
 }
 
+// TestLoop_LocalOnly_Local_ConsentTrue_Embeds proves that a local-only project
+// IS embedded when the provider is local (remote=false) AND consent=true.
+//
+//	Store has: local-only project (2 rows).
+//	Gate: NewGated(mock, checker, remote=false, consent=true).
+//	Expected: mock receives 2 texts; rows gain embeddings.
+func TestLoop_LocalOnly_Local_ConsentTrue_Embeds(t *testing.T) {
+	st := openLoopStore(t)
+
+	insertRow(t, st, "local-c1", "consented-proj", "local private A")
+	insertRow(t, st, "local-c2", "consented-proj", "local private B")
+
+	mock := newRecordingMock(4)
+	checker := &staticPolicyChecker{
+		policies: map[string]localstore.Policy{
+			"consented-proj": localstore.PolicyLocalOnly,
+		},
+	}
+
+	// remote=false, consent=true → local-only project IS eligible.
+	gated := embedding.NewGated(mock, checker, false /* local provider */, true /* consent */)
+	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
+		Interval:   10 * time.Second,
+		Debounce:   1 * time.Millisecond,
+		BatchPause: -1,
+		BatchSize:  100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	loop.Start(ctx)
+	loop.Trigger()
+	time.Sleep(300 * time.Millisecond)
+	loop.Stop()
+
+	// Both rows must have embeddings.
+	if !hasEmbedding(t, st, "local-c1") {
+		t.Error("local-c1 should be embedded (local provider + consent=true)")
+	}
+	if !hasEmbedding(t, st, "local-c2") {
+		t.Error("local-c2 should be embedded (local provider + consent=true)")
+	}
+
+	// Provider received exactly 2 texts.
+	if mock.totalTexts() != 2 {
+		t.Errorf("provider received %d texts, want 2", mock.totalTexts())
+	}
+}
+
+// TestLoop_LocalOnly_Local_ConsentFalse_ZeroCalls proves that a local-only project
+// is NOT embedded when the provider is local but consent=false (default).
+//
+//	Store has: local-only project (2 rows).
+//	Gate: NewGated(mock, checker, remote=false) — consent defaults to false.
+//	Expected: mock receives 0 texts; rows remain NULL.
+func TestLoop_LocalOnly_Local_ConsentFalse_ZeroCalls(t *testing.T) {
+	st := openLoopStore(t)
+
+	insertRow(t, st, "local-nc1", "no-consent-proj", "sensitive A")
+	insertRow(t, st, "local-nc2", "no-consent-proj", "sensitive B")
+
+	mock := newRecordingMock(4)
+	checker := &staticPolicyChecker{
+		policies: map[string]localstore.Policy{
+			"no-consent-proj": localstore.PolicyLocalOnly,
+		},
+	}
+
+	// remote=false, no consent arg → consent defaults to false → gated.
+	gated := embedding.NewGated(mock, checker, false /* local provider */)
+	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
+		Interval:   10 * time.Second,
+		Debounce:   1 * time.Millisecond,
+		BatchPause: -1,
+		BatchSize:  100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	loop.Start(ctx)
+	loop.Trigger()
+	time.Sleep(300 * time.Millisecond)
+	loop.Stop()
+
+	// Both rows must remain NULL.
+	if hasEmbedding(t, st, "local-nc1") {
+		t.Error("local-nc1 must NOT be embedded (local-only + consent=false)")
+	}
+	if hasEmbedding(t, st, "local-nc2") {
+		t.Error("local-nc2 must NOT be embedded (local-only + consent=false)")
+	}
+
+	// Provider received zero calls.
+	if mock.totalTexts() != 0 {
+		t.Errorf("provider received %d texts, want 0", mock.totalTexts())
+	}
+}
+
 // TestLoop_PolicyFlip_MidBackfill_PostFlipRowsSkipped verifies that rows added
 // AFTER a project's policy is flipped to omitted are not embedded, while rows
 // that were in a synced project before the flip ARE embedded on the first pass.

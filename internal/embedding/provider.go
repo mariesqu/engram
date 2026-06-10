@@ -58,24 +58,28 @@ var ErrEmbeddingGated = localstore.ErrEmbeddingGated
 // memory with the given project policy may be embedded by the configured
 // provider.
 //
-// Table (decision 5, embedding-privacy spec):
+// Consent matrix (embedding-privacy spec, decision 5 + PR-2 sidecar consent):
 //
-//	omitted    + any provider  → false (never embed)
-//	local-only + remote        → false (text must not leave the node)
-//	local-only + local         → false (PR-1: consent not yet available; safe default)
-//	synced     + any provider  → true
+//	omitted    + any provider             → false (never embed)
+//	local-only + remote=true              → false (text must not leave the node)
+//	local-only + remote=false, consent=false → false (explicit opt-in required)
+//	local-only + remote=false, consent=true  → true  (user granted local consent)
+//	synced     + any provider             → true
 //
-// The 'remote' parameter is true for RemoteOpenAIProvider (sends text to an
-// external API) and false for NoopProvider or a future local sidecar.
-// In PR-1 there is no consent mechanism, so local-only is always denied.
-func EligibleForEmbedding(policy localstore.Policy, remote bool) bool {
+// The 'remote' parameter is true for RemoteOpenAIProvider (text leaves the node)
+// and false for NoopProvider or OllamaSidecarProvider (local sidecar).
+// 'consent' is the embedding_local_consent config flag; it is only checked when
+// remote=false and policy=local-only.
+func EligibleForEmbedding(policy localstore.Policy, remote bool, consent ...bool) bool {
+	localConsent := len(consent) > 0 && consent[0]
 	switch policy {
 	case localstore.PolicySynced:
 		return true
 	case localstore.PolicyLocalOnly:
-		// PR-1: no consent flag yet → always deny local-only.
-		// PR-2 will add: if !remote && consent { return true }
-		return false
+		if remote {
+			return false // text must not leave the node
+		}
+		return localConsent // local sidecar requires explicit consent
 	default: // PolicyOmitted or unknown
 		return false
 	}
