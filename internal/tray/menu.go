@@ -89,9 +89,18 @@ func NewActionDispatcher(handlers map[MenuItemID]ActionFunc) *ActionDispatcher {
 // Dispatch looks up the handler for id and, if found, sends it to workCh for
 // execution on the worker goroutine. The send is non-blocking: if the channel
 // is full the action is dropped (prevents pump blocking on a backlogged worker).
+//
+// EXCEPTION: MenuIDQuit executes SYNCHRONOUSLY on the calling goroutine and is
+// never droppable. Its handler only closes the quit channel (no HTTP, no
+// blocking) — and a Quit silently dropped because the worker is backlogged
+// would leave a tray that cannot be exited.
 func (d *ActionDispatcher) Dispatch(id MenuItemID, workCh chan<- ActionFunc) {
 	fn, ok := d.handlers[id]
 	if !ok {
+		return
+	}
+	if id == MenuIDQuit {
+		fn()
 		return
 	}
 	select {

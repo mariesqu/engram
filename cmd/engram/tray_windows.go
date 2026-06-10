@@ -33,7 +33,7 @@ Menu items:
   Connect to central          — opens the web UI to the connect form
   Disconnect from central     — disconnects from central (stops sync)
   Sync Now                    — triggers an immediate sync cycle
-  Quit                        — stops the daemon and removes the tray icon
+  Quit                        — removes the tray icon (the daemon keeps running)
 
 Flags:
   --db   Path to the local SQLite database (required; or set ENGRAM_DB)

@@ -3,6 +3,7 @@
 package tray
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -204,5 +205,48 @@ func assertMenuLacksID(t *testing.T, items []MenuItem, id MenuItemID) {
 	t.Helper()
 	if findItem(items, id) != nil {
 		t.Errorf("menu item %d should not be present", id)
+	}
+}
+
+// TestActionDispatcher_QuitNeverDropped: Quit executes synchronously even when
+// the work channel is completely full — a droppable Quit would leave a tray
+// that cannot be exited once the worker is backlogged.
+func TestActionDispatcher_QuitNeverDropped(t *testing.T) {
+	quitRan := false
+	d := NewActionDispatcher(map[MenuItemID]ActionFunc{
+		MenuIDQuit:    func() { quitRan = true },
+		MenuIDSyncNow: func() {},
+	})
+
+	// Fill the channel to capacity so any channel send would drop.
+	workCh := make(chan ActionFunc, 2)
+	d.Dispatch(MenuIDSyncNow, workCh)
+	d.Dispatch(MenuIDSyncNow, workCh)
+
+	d.Dispatch(MenuIDQuit, workCh)
+	if !quitRan {
+		t.Error("Quit was dropped on a full channel — tray would be unexitable")
+	}
+	if len(workCh) != 2 {
+		t.Errorf("Quit went through the channel (len=%d), want synchronous execution", len(workCh))
+	}
+}
+
+// TestActionDispatcher_DoubleQuit_NoPanic: a second Quit (double click) must
+// not panic — the handler guards close(quit) with sync.Once in runTray; here
+// we prove Dispatch itself happily invokes the handler twice.
+func TestActionDispatcher_DoubleQuit_NoPanic(t *testing.T) {
+	quit := make(chan struct{})
+	var once sync.Once
+	d := NewActionDispatcher(map[MenuItemID]ActionFunc{
+		MenuIDQuit: func() { once.Do(func() { close(quit) }) },
+	})
+	workCh := make(chan ActionFunc, 1)
+	d.Dispatch(MenuIDQuit, workCh) // closes quit
+	d.Dispatch(MenuIDQuit, workCh) // must be a no-op, not a panic
+	select {
+	case <-quit:
+	default:
+		t.Error("quit channel not closed")
 	}
 }

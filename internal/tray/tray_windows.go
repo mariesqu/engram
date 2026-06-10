@@ -61,6 +61,8 @@ const (
 	nifIcon    = 0x00000002
 	nifTip     = 0x00000004
 
+	wm_Null         = 0x0000
+	wm_Quit         = 0x0012
 	wm_User         = 0x0400
 	wm_TrayCallback = wm_User + 1 // private: tray callback message
 
@@ -83,7 +85,9 @@ const (
 )
 
 // ── NOTIFYICONDATAW struct ────────────────────────────────────────────────────
-// We define only the fields we use. The struct must be 952 bytes for Vista+.
+// We define only the fields we use. Full Vista+ size: 976 bytes on 64-bit
+// (952 is the 32-bit size); cbSize is set from unsafe.Sizeof so shell32 sees
+// the actual layout we pass.
 type notifyIconDataW struct {
 	cbSize           uint32
 	hWnd             uintptr
@@ -143,6 +147,7 @@ var (
 	procDefWindowProc     = modUser32.MustFindProc("DefWindowProcW")
 	procDestroyWindow     = modUser32.MustFindProc("DestroyWindow")
 	procPostQuitMessage   = modUser32.MustFindProc("PostQuitMessage")
+	procPostMessage       = modUser32.MustFindProc("PostMessageW")
 	procGetMessage        = modUser32.MustFindProc("GetMessageW")
 	procTranslateMessage  = modUser32.MustFindProc("TranslateMessage")
 	procDispatchMessage   = modUser32.MustFindProc("DispatchMessageW")
@@ -163,15 +168,19 @@ var (
 
 // globalWndProc is the Win32 WndProc callback. It is registered with
 // RegisterClassExW and called by DispatchMessage on the pump goroutine.
-// It must have the exact WNDPROC signature.
-func globalWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+//
+// ALL parameters are uintptr: syscall.NewCallback requires every argument to
+// be pointer-sized. A uint32 arg happens to work on amd64 (the x64 convention
+// zero-extends UINT into the 64-bit register) but violates the documented
+// contract and would break on other architectures (e.g. windows/arm64).
+func globalWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	wndProcMu.RLock()
 	fn := wndProcMap[hwnd]
 	wndProcMu.RUnlock()
 	if fn != nil {
-		fn(msg, wParam, lParam)
+		fn(uint32(msg), wParam, lParam)
 	}
-	r, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
+	r, _, _ := procDefWindowProc.Call(hwnd, msg, wParam, lParam)
 	return r
 }
 
@@ -343,6 +352,11 @@ func (w *realWin32) ShowContextMenu(hwnd uintptr, items []MenuItem) (MenuItemID,
 		hwnd,
 		0,
 	)
+	// MSDN (TrackPopupMenu remarks for notification icons): post WM_NULL after
+	// the menu returns so the message loop processes subsequent activations
+	// correctly — without it the SECOND right-click's menu often fails to show
+	// or dismisses immediately (the classic tray-menu-won't-reopen bug).
+	procPostMessage.Call(hwnd, wm_Null, 0, 0) //nolint:errcheck
 	return MenuItemID(cmd), nil
 }
 
@@ -357,11 +371,16 @@ func (w *realWin32) PumpMessages(hwnd uintptr, quit <-chan struct{}, onCallback 
 	var m msg
 	quitCh := make(chan struct{})
 
-	// Monitor quit channel on a separate goroutine (cannot select in a message loop).
+	// Monitor quit channel on a separate goroutine (cannot select in a message
+	// loop). CRITICAL: PostQuitMessage posts WM_QUIT to the CALLING thread's
+	// queue — this goroutine runs on an arbitrary OS thread, never the locked
+	// pump thread, so PostQuitMessage here would deadlock the pump forever.
+	// PostMessageW(hwnd, ...) routes to the queue of the thread that OWNS hwnd
+	// (the pump thread), which is exactly what we need.
 	go func() {
 		select {
 		case <-quit:
-			procPostQuitMessage.Call(0)
+			procPostMessage.Call(hwnd, wm_Quit, 0, 0) //nolint:errcheck
 		case <-quitCh:
 		}
 	}()
@@ -407,7 +426,9 @@ func runTray(cfg TrayConfig, w win32) error {
 	workCh := make(chan ActionFunc, 16)
 
 	// quit is closed to signal the pump goroutine to exit the message loop.
+	// quitOnce guards the close — Quit can fire more than once (double click).
 	quit := make(chan struct{})
+	var quitOnce sync.Once
 
 	// Mutable status snapshot, updated by the poller goroutine.
 	var snapshotMu sync.Mutex
@@ -444,7 +465,9 @@ func runTray(cfg TrayConfig, w win32) error {
 			}
 		},
 		MenuIDQuit: func() {
-			close(quit)
+			// sync.Once: a double Quit click (or sync+channel race) must not
+			// panic on closing an already-closed channel.
+			quitOnce.Do(func() { close(quit) })
 		},
 	}
 	disp := NewActionDispatcher(handlers)
