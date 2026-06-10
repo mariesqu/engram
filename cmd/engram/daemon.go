@@ -819,6 +819,7 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 		EmbeddingLocalConsent: patch.EmbeddingLocalConsent,
 		EmbeddingDims:         patch.EmbeddingDims,
 		OllamaHost:            patch.OllamaHost,
+		OllamaModel:           patch.OllamaModel,
 	}
 
 	updated, restartRequired := config.Patch(a.cfg, cfgPatch)

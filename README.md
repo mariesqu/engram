@@ -603,7 +603,7 @@ The agent calls `mem_judge` with the `judgment_id` and one of: `related`, `compa
 
 ### Configuring an embedding provider
 
-Set `embedding_provider` in `config.json` (or via `PUT /api/v1/config`):
+Set `embedding_provider` in `config.json` (or via `PUT /api/v1/config`). All embedding settings are RESTART-REQUIRED — the provider and its privacy gate are constructed at daemon startup:
 
 ```json
 {

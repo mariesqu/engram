@@ -57,7 +57,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	known := map[string]bool{
 		"sync_interval": true, "log_level": true, "http_port": true,
 		"db_path": true, "transport": true, "embedding_provider": true,
-		"embedding_local_consent": true, "embedding_dims": true, "ollama_host": true,
+		"embedding_local_consent": true, "embedding_dims": true, "ollama_host": true, "ollama_model": true,
 	}
 	for k := range raw {
 		if !known[k] {

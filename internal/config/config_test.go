@@ -309,8 +309,8 @@ func TestConfig_Patch_EmbeddingProvider(t *testing.T) {
 	p := ConfigPatch{EmbeddingProvider: &provider}
 
 	updated, restart := Patch(base, p)
-	if restart {
-		t.Error("Patch of EmbeddingProvider should not require restart")
+	if !restart {
+		t.Error("Patch of EmbeddingProvider must require restart — the provider is constructed at startup; reporting false would claim a hot-swap that never happened")
 	}
 	if updated.EmbeddingProvider != "openai" {
 		t.Errorf("EmbeddingProvider: got %q, want %q", updated.EmbeddingProvider, "openai")
@@ -350,6 +350,7 @@ func TestConfig_OllamaFields_RoundTrip(t *testing.T) {
 		EmbeddingProvider:     "ollama",
 		EmbeddingLocalConsent: true,
 		EmbeddingDims:         768,
+		OllamaModel:           "mxbai-embed-large",
 		OllamaHost:            "http://localhost:11434",
 	}
 

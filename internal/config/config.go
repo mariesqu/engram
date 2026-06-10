@@ -212,6 +212,7 @@ type ConfigPatch struct {
 	EmbeddingLocalConsent *bool   `json:"embedding_local_consent,omitempty"`
 	EmbeddingDims         *int    `json:"embedding_dims,omitempty"`
 	OllamaHost            *string `json:"ollama_host,omitempty"`
+	OllamaModel           *string `json:"ollama_model,omitempty"`
 }
 
 // DefaultConfigDir returns the directory where config.json is stored:
@@ -426,22 +427,36 @@ func Patch(base Config, p ConfigPatch) (Config, bool) {
 		restartRequired = true
 	}
 
-	// EmbeddingProvider is runtime-mutable (no restart needed). The handler must
-	// validate against ValidEmbeddingProviders before calling Patch.
-	if p.EmbeddingProvider != nil {
+	// ALL embedding settings are RESTART-REQUIRED: the gated provider, its
+	// consent flag, the dims, and the sidecar host are constructed ONCE at
+	// startup. Reporting restart_required=false here would be a lie with
+	// privacy consequences — a user revoking embedding_local_consent must not
+	// believe the running daemon stopped embedding local-only projects when its
+	// live gate still carries consent=true. (The handler validates values
+	// against ValidEmbeddingProviders before calling Patch.)
+	if p.EmbeddingProvider != nil && *p.EmbeddingProvider != base.EmbeddingProvider {
 		out.EmbeddingProvider = *p.EmbeddingProvider
+		restartRequired = true
 	}
 
-	if p.EmbeddingLocalConsent != nil {
+	if p.EmbeddingLocalConsent != nil && *p.EmbeddingLocalConsent != base.EmbeddingLocalConsent {
 		out.EmbeddingLocalConsent = *p.EmbeddingLocalConsent
+		restartRequired = true
 	}
 
-	if p.EmbeddingDims != nil {
+	if p.EmbeddingDims != nil && *p.EmbeddingDims != base.EmbeddingDims {
 		out.EmbeddingDims = *p.EmbeddingDims
+		restartRequired = true
 	}
 
-	if p.OllamaHost != nil {
+	if p.OllamaHost != nil && *p.OllamaHost != base.OllamaHost {
+		restartRequired = true
 		out.OllamaHost = *p.OllamaHost
+	}
+
+	if p.OllamaModel != nil && *p.OllamaModel != base.OllamaModel {
+		out.OllamaModel = *p.OllamaModel
+		restartRequired = true
 	}
 
 	return out, restartRequired
