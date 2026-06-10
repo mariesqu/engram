@@ -1174,7 +1174,7 @@ func TestWebUI_Config_POST_InvalidDuration_422(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := string(body)
 
-	// We return the page with the error message rather than a 4xx HTTP status
+	// 422 with the error embedded in the re-rendered form
 	// (the form page re-renders with the error inline — HTMX swap pattern).
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Errorf("want 422 (validation failure must not read as success), got %d", resp.StatusCode)

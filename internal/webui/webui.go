@@ -416,9 +416,8 @@ func handleSyncPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sess
 	if !st.CentralConnected {
 		// Return the partial with the disconnect state — the button was somehow
 		// submitted while disconnected (race/stale page). Treat as 409.
-		w.WriteHeader(http.StatusConflict)
 		vm := newStatusVM(st, deps.Version, sessions.csrfToken())
-		renderPartial(w, "status-partial", vm)
+		renderPartialStatus(w, "status-partial", vm, http.StatusConflict)
 		return
 	}
 
@@ -430,8 +429,7 @@ func handleSyncPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sess
 	// Re-fetch status after triggering.
 	st = deps.SyncCtrl.Status()
 	vm := newStatusVM(st, deps.Version, sessions.csrfToken())
-	w.WriteHeader(http.StatusAccepted)
-	renderPartial(w, "status-partial", vm)
+	renderPartialStatus(w, "status-partial", vm, http.StatusAccepted)
 }
 
 // handleDisconnectPost handles POST /ui/disconnect.
