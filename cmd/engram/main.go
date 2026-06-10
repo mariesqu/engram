@@ -44,6 +44,7 @@ Usage:
   engram projects policy <project> <synced|local-only|omitted>
   engram config   get | set <key> <value>
   engram sync     now
+  engram version
 
 Environment:
   ENGRAM_ADDR            default listen address for 'serve' (default ":8080")
@@ -65,6 +66,7 @@ Subcommands:
   projects  List and manage per-project sync policies (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).
   sync      Trigger an immediate sync cycle (requires daemon --http).
+  version   Print binary version, GOOS/GOARCH, and Go runtime version.
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
 `
@@ -136,6 +138,12 @@ func run(args []string) int {
 	case "sync":
 		if err := runSyncCmd(args[1:]); err != nil {
 			log.Printf("engram sync: %v", err)
+			return 1
+		}
+		return 0
+	case "version":
+		if err := runVersionCmd(args[1:]); err != nil {
+			log.Printf("engram version: %v", err)
 			return 1
 		}
 		return 0

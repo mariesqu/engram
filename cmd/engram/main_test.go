@@ -216,3 +216,88 @@ func TestEnvOr_EnvUnset(t *testing.T) {
 		t.Errorf("envOr with empty env: got %q, want %q", got, "default-val")
 	}
 }
+
+// captureStdout runs f with os.Stdout redirected to a pipe and returns what
+// was written. Tests are sequential so swapping the global os.Stdout is safe.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	f()
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read captured stdout: %v", err)
+	}
+	_ = r.Close()
+	return buf.String()
+}
+
+// TestRun_Version_ExitZero verifies that 'engram version' returns exit code 0.
+func TestRun_Version_ExitZero(t *testing.T) {
+	code := run([]string{"version"})
+	if code != 0 {
+		t.Errorf("run([version]): got exit code %d, want 0", code)
+	}
+}
+
+// TestRun_Version_Output verifies that 'engram version' prints the version
+// string, the OS/arch, and the Go runtime version to stdout.
+// The version var defaults to "dev" in test builds (no ldflags injection),
+// so we assert non-empty tokens rather than a literal value — this contract
+// remains valid whether the binary is built locally or from a tagged release.
+func TestRun_Version_Output(t *testing.T) {
+	out := captureStdout(t, func() {
+		if code := run([]string{"version"}); code != 0 {
+			t.Errorf("run([version]): exit code %d, want 0", code)
+		}
+	})
+
+	// Must contain the word "engram".
+	if !strings.Contains(out, "engram") {
+		t.Errorf("version output missing 'engram': %q", out)
+	}
+	// Must contain a non-empty version token (the first field after "engram ").
+	parts := strings.Fields(out)
+	if len(parts) < 4 {
+		t.Fatalf("version output has fewer than 4 fields: %q", out)
+	}
+	if parts[1] == "" {
+		t.Errorf("version token is empty: %q", out)
+	}
+	// Must contain GOOS/GOARCH pair.
+	if !strings.Contains(out, "/") {
+		t.Errorf("version output missing GOOS/GOARCH pair: %q", out)
+	}
+	// Must contain "go" runtime prefix (e.g. "go1.22.0").
+	if !strings.Contains(out, "go") {
+		t.Errorf("version output missing Go runtime version: %q", out)
+	}
+}
+
+// TestRun_Version_InjectedValue verifies that the ldflags injection contract
+// works: assigning version before calling runVersionCmd results in that value
+// appearing in the output. This proves the -X main.version=... injection path
+// without requiring a full cross-compiled binary.
+func TestRun_Version_InjectedValue(t *testing.T) {
+	original := version
+	version = "v1.2.3-test"
+	t.Cleanup(func() { version = original })
+
+	out := captureStdout(t, func() {
+		if err := runVersionCmd(nil); err != nil {
+			t.Fatalf("runVersionCmd: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "v1.2.3-test") {
+		t.Errorf("version output does not contain injected version %q: %q", "v1.2.3-test", out)
+	}
+}
