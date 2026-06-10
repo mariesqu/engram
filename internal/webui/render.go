@@ -36,9 +36,11 @@ type pageTmpl struct {
 var (
 	statusTmpl   *pageTmpl
 	projectsTmpl *pageTmpl
+	configTmpl   *pageTmpl
 )
 
 // partialTmpl is the template set for HTMX polling partials (no layout wrapper).
+// It includes all named partial defines used for HTMX swaps.
 var partialTmpl *template.Template
 
 func init() {
@@ -49,17 +51,26 @@ func init() {
 		"templates/status.html",
 	)
 
-	// Projects page: layout + projects page.
+	// Projects page: layout + projects page (includes the projects-partial define).
 	projectsTmpl = mustParsePage(
 		"templates/layout.html",
 		"templates/projects.html",
 	)
 
-	// Partial: only the status_partial fragment — no layout wrapper.
+	// Config page: layout + config form.
+	configTmpl = mustParsePage(
+		"templates/layout.html",
+		"templates/config.html",
+	)
+
+	// Partial template set: all named {{define}} blocks used for HTMX swaps.
+	// This includes status-partial (polled every 3s) and projects-rows
+	// (returned after a policy toggle POST).
 	var err error
 	partialTmpl, err = template.New("").Funcs(sharedFuncs).ParseFS(
 		TemplatesFS,
 		"templates/status_partial.html",
+		"templates/projects_rows.html",
 	)
 	if err != nil {
 		panic("webui: parse partial templates: " + err.Error())
@@ -87,6 +98,13 @@ func mustParsePage(files ...string) *pageTmpl {
 // Cache-Control: no-store prevents any proxy or browser cache from serving a
 // stale version of the dashboard.
 func renderPage(w http.ResponseWriter, tmpl *pageTmpl, data any) {
+	renderPageStatus(w, tmpl, data, http.StatusOK)
+}
+
+// renderPageStatus renders a full page with an explicit HTTP status code.
+// Headers MUST be set before WriteHeader — the old WriteHeader-then-render
+// pattern silently dropped Content-Type/Cache-Control on error responses.
+func renderPageStatus(w http.ResponseWriter, tmpl *pageTmpl, data any, status int) {
 	var buf bytes.Buffer
 	if err := tmpl.t.ExecuteTemplate(&buf, "layout", data); err != nil {
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -94,6 +112,7 @@ func renderPage(w http.ResponseWriter, tmpl *pageTmpl, data any) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	_, _ = buf.WriteTo(w)
 }
 
@@ -102,6 +121,12 @@ func renderPage(w http.ResponseWriter, tmpl *pageTmpl, data any) {
 // Cache-Control: no-store is mandatory — polled HTMX fragments must never be
 // served from an HTTP or browser cache or the status display stops updating.
 func renderPartial(w http.ResponseWriter, name string, data any) {
+	renderPartialStatus(w, name, data, http.StatusOK)
+}
+
+// renderPartialStatus renders a partial with an explicit HTTP status code.
+// See renderPageStatus for the header-ordering rationale.
+func renderPartialStatus(w http.ResponseWriter, name string, data any, status int) {
 	var buf bytes.Buffer
 	if err := partialTmpl.ExecuteTemplate(&buf, name, data); err != nil {
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -109,6 +134,7 @@ func renderPartial(w http.ResponseWriter, name string, data any) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	_, _ = buf.WriteTo(w)
 }
 

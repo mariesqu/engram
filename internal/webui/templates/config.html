@@ -1,0 +1,49 @@
+{{template "layout" .}}
+
+{{define "content"}}
+<div class="card" id="config-fragment">
+    <h2>Configuration</h2>
+    {{template "config-form" .}}
+</div>
+{{end}}
+
+{{define "config-form"}}
+{{if .Error}}
+<div class="alert alert-error">{{.Error}}</div>
+{{end}}
+{{if .RestartRequired}}
+<div class="alert alert-warn">Restart required for some changes to take effect.</div>
+{{end}}
+
+<form method="POST" action="/ui/config"
+      hx-post="/ui/config"
+      hx-target="#config-fragment"
+      hx-swap="outerHTML"
+      hx-headers='{"X-CSRF-Token": "{{.CSRFToken}}"}'>
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+    <div class="form-field">
+        <label for="sync_interval">Sync interval</label>
+        <input type="text" id="sync_interval" name="sync_interval"
+               value="{{.SyncInterval}}"
+               placeholder="e.g. 30s, 5m">
+        <span class="field-hint">Go duration format (e.g. 30s, 5m, 1h). Restart not required.</span>
+    </div>
+
+    <div class="form-field">
+        <label>Central URL</label>
+        <span class="field-value mono">{{if .CentralURL}}{{.CentralURL}}{{else}}<span class="muted">not configured</span>{{end}}</span>
+        <span class="field-hint">Managed via Connect/Disconnect on the Status page.</span>
+    </div>
+
+    <div class="form-field">
+        <label>Writer key</label>
+        <span class="field-value mono">{{if .WriterKeySet}}***REDACTED***{{else}}<span class="muted">not set</span>{{end}}</span>
+        <span class="field-hint">Set via the Connect form on the Status page.</span>
+    </div>
+
+    <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Save</button>
+    </div>
+</form>
+{{end}}

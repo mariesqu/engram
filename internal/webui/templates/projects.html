@@ -14,13 +14,30 @@
         <tr>
             <th>Project</th>
             <th>Policy</th>
+            <th>Change</th>
         </tr>
     </thead>
-    <tbody>
+    <tbody id="projects-table-body">
         {{range .Projects}}
-        <tr>
+        <tr id="project-row-{{.Name}}">
             <td class="project-name">{{.Name}}</td>
             <td>{{policyBadge (printf "%s" .Policy)}}</td>
+            <td>
+                <form method="POST"
+                      action="/ui/projects/{{.Name}}/policy"
+                      hx-post="/ui/projects/{{.Name}}/policy"
+                      hx-target="#projects-table-body"
+                      hx-swap="innerHTML"
+                      hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'>
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <select name="policy" class="policy-select">
+                        <option value="synced"{{if eq (printf "%s" .Policy) "synced"}} selected{{end}}>synced</option>
+                        <option value="local-only"{{if eq (printf "%s" .Policy) "local-only"}} selected{{end}}>local-only</option>
+                        <option value="omitted"{{if eq (printf "%s" .Policy) "omitted"}} selected{{end}}>omitted</option>
+                    </select>
+                    <button type="submit" class="btn btn-small">Apply</button>
+                </form>
+            </td>
         </tr>
         {{end}}
     </tbody>

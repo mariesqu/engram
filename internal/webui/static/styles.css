@@ -218,3 +218,147 @@ footer {
 .small {
   font-size: 0.8rem;
 }
+
+/* ── Forms (PR-④b mutating surfaces) ───────────────────────────────────── */
+
+.form-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin-bottom: 1rem;
+}
+
+.form-field label {
+    font-size: 0.82rem;
+    color: var(--muted);
+    font-weight: 500;
+}
+
+.form-field input[type="text"],
+.form-field input[type="password"],
+.form-field select,
+.policy-select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    padding: 0.4rem 0.6rem;
+    width: 100%;
+    max-width: 480px;
+}
+
+.form-field input:focus,
+.form-field select:focus,
+.policy-select:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-color: var(--accent);
+}
+
+.field-hint {
+    font-size: 0.78rem;
+    color: var(--muted);
+}
+
+.form-actions {
+    margin-top: 1.25rem;
+}
+
+/* ── Buttons ─────────────────────────────────────────────── */
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.45rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #0f1117;
+}
+.btn-primary:hover { opacity: 0.88; color: #0f1117; }
+
+.btn-danger {
+    background: #3b1515;
+    border-color: var(--red);
+    color: var(--red);
+}
+.btn-danger:hover { opacity: 0.85; }
+
+.btn-small {
+    padding: 0.25rem 0.65rem;
+    font-size: 0.78rem;
+}
+
+/* ── Action row (sync-now + disconnect side by side) ────── */
+
+.action-row {
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+}
+
+/* ── Connect form ────────────────────────────────────────── */
+
+.connect-form-wrapper {
+    margin-top: 1.25rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+}
+
+.connect-form-wrapper h3 {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0 0 0.75rem 0;
+}
+
+/* ── Alerts ──────────────────────────────────────────────── */
+
+.alert {
+    padding: 0.55rem 0.85rem;
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--border);
+}
+
+.alert-error {
+    background: #3b1515;
+    border-color: var(--red);
+    color: var(--red);
+}
+
+.alert-warn {
+    background: #422006;
+    border-color: var(--yellow);
+    color: var(--yellow);
+}
+
+/* ── Policy select in table ──────────────────────────────── */
+
+.policy-select {
+    width: auto;
+    max-width: 140px;
+    margin-right: 0.35rem;
+}
