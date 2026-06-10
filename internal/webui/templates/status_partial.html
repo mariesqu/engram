@@ -50,5 +50,62 @@
         <span class="field-label">Daemon version</span>
         <span class="field-value mono">{{.DaemonVersion}}</span>
     </div>
+
+    {{if .CentralConnected}}
+    <div class="action-row">
+        <form method="POST" action="/ui/sync"
+              hx-post="/ui/sync"
+              hx-target="#status-fragment"
+              hx-swap="outerHTML"
+              hx-headers='{"X-CSRF-Token": "{{.CSRFToken}}"}'>
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit" class="btn btn-primary">Sync now</button>
+        </form>
+        <form method="POST" action="/ui/disconnect"
+              hx-post="/ui/disconnect"
+              hx-target="#status-fragment"
+              hx-swap="outerHTML"
+              hx-confirm="Disconnect from central? Local data will not be deleted."
+              hx-headers='{"X-CSRF-Token": "{{.CSRFToken}}"}'>
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit" class="btn btn-danger">Disconnect</button>
+        </form>
+    </div>
+    {{else}}
+    <div class="connect-form-wrapper">
+        <h3>Connect to central</h3>
+        {{if .ConnectError}}
+        <div class="alert alert-error">{{.ConnectError}}</div>
+        {{end}}
+        <form method="POST" action="/ui/connect"
+              hx-post="/ui/connect"
+              hx-target="#status-fragment"
+              hx-swap="outerHTML"
+              hx-headers='{"X-CSRF-Token": "{{.CSRFToken}}"}'>
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <div class="form-field">
+                <label for="central_url">Central URL</label>
+                <input type="text" id="central_url" name="central_url"
+                       value="{{.ConnectCentralURL}}"
+                       placeholder="https://central.example.com">
+            </div>
+            <div class="form-field">
+                <label for="writer_id">Writer ID</label>
+                <input type="text" id="writer_id" name="writer_id"
+                       value="{{.ConnectWriterID}}"
+                       placeholder="my-laptop">
+            </div>
+            <div class="form-field">
+                <label for="writer_key">Writer key</label>
+                <input type="password" id="writer_key" name="writer_key"
+                       autocomplete="new-password"
+                       placeholder="64-hex-char HMAC key">
+            </div>
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Connect</button>
+            </div>
+        </form>
+    </div>
+    {{end}}
 </div>
 {{end}}
