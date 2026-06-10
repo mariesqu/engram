@@ -929,7 +929,7 @@ func TestDaemonTool_MemSave_JudgmentEnvelope(t *testing.T) {
 
 	// The memory itself must have been saved — retrieve it via the store.
 	// id is the last inserted row; on this DB it will be > len(noise)+len(overlap).
-	results, searchErr := components.store.SearchMemoriesFiltered(
+	results, _, searchErr := components.store.SearchMemoriesFiltered(
 		"JWT auth middleware cookie session handling", project, 5, localstore.SearchFilter{},
 	)
 	if searchErr != nil {

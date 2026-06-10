@@ -241,3 +241,121 @@ func TestConfig_Save_CreatesDir(t *testing.T) {
 		t.Errorf("config.json not created: %v", err)
 	}
 }
+
+// --- Embedding provider tests (task 4.1) ---
+
+// TestConfig_EmbeddingProvider_RoundTrip verifies that EmbeddingProvider and
+// encryptedEmbeddingKey survive a Save+Load cycle.
+func TestConfig_EmbeddingProvider_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	fakeBlob := []byte{0xCA, 0xFE, 0xBA, 0xBE}
+	original := Config{
+		DB:                "test.db",
+		EmbeddingProvider: "openai",
+	}
+	original = original.WithEncryptedEmbeddingKey(fakeBlob)
+
+	if err := Save(dir, original); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if loaded.EmbeddingProvider != "openai" {
+		t.Errorf("EmbeddingProvider: got %q, want %q", loaded.EmbeddingProvider, "openai")
+	}
+	if string(loaded.EncryptedEmbeddingKey()) != string(fakeBlob) {
+		t.Errorf("EncryptedEmbeddingKey round-trip mismatch: got %v, want %v",
+			loaded.EncryptedEmbeddingKey(), fakeBlob)
+	}
+}
+
+// TestConfig_Redact_EmbeddingKeySet_True verifies EmbeddingKeySet=true when
+// an encrypted embedding key blob is present.
+func TestConfig_Redact_EmbeddingKeySet_True(t *testing.T) {
+	cfg := Config{EmbeddingProvider: "openai"}
+	cfg = cfg.WithEncryptedEmbeddingKey([]byte{0x01, 0x02})
+
+	rc := cfg.Redact()
+	if !rc.EmbeddingKeySet {
+		t.Error("Redact: EmbeddingKeySet should be true when encrypted key is present")
+	}
+	if rc.EmbeddingProvider != "openai" {
+		t.Errorf("Redact: EmbeddingProvider: got %q, want %q", rc.EmbeddingProvider, "openai")
+	}
+}
+
+// TestConfig_Redact_EmbeddingKeySet_False verifies EmbeddingKeySet=false when
+// no encrypted embedding key is stored.
+func TestConfig_Redact_EmbeddingKeySet_False(t *testing.T) {
+	cfg := Config{EmbeddingProvider: "openai"}
+
+	rc := cfg.Redact()
+	if rc.EmbeddingKeySet {
+		t.Error("Redact: EmbeddingKeySet should be false when no encrypted key is stored")
+	}
+}
+
+// TestConfig_Patch_EmbeddingProvider verifies that patching EmbeddingProvider
+// is runtime-mutable (no restart required) and applies the change.
+func TestConfig_Patch_EmbeddingProvider(t *testing.T) {
+	base := Config{EmbeddingProvider: ""}
+
+	provider := "openai"
+	p := ConfigPatch{EmbeddingProvider: &provider}
+
+	updated, restart := Patch(base, p)
+	if restart {
+		t.Error("Patch of EmbeddingProvider should not require restart")
+	}
+	if updated.EmbeddingProvider != "openai" {
+		t.Errorf("EmbeddingProvider: got %q, want %q", updated.EmbeddingProvider, "openai")
+	}
+}
+
+// TestConfig_Load_ValidProviders_OK verifies that all valid embedding_provider
+// values are accepted by Load without error.
+func TestConfig_Load_ValidProviders_OK(t *testing.T) {
+	validProviders := []string{"", "none", "openai"}
+
+	for _, provider := range validProviders {
+		t.Run("provider="+provider, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{EmbeddingProvider: provider}
+			if err := Save(dir, cfg); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			loaded, err := Load(dir)
+			if err != nil {
+				t.Fatalf("Load with provider %q: %v", provider, err)
+			}
+			if loaded.EmbeddingProvider != provider {
+				t.Errorf("EmbeddingProvider: got %q, want %q", loaded.EmbeddingProvider, provider)
+			}
+		})
+	}
+}
+
+// TestConfig_Load_InvalidEmbeddingProvider_ReturnsError verifies that Load
+// returns an error (startup-fatal) when an unrecognised embedding_provider is
+// present in the config file. This prevents silent noop fallback on
+// misconfiguration.
+func TestConfig_Load_InvalidEmbeddingProvider_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a config file directly with an invalid provider value.
+	raw := `{"embedding_provider": "ollama"}` // reserved for PR-2, not valid in PR-1
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(raw), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("Load with invalid embedding_provider should return error, got nil")
+	}
+}

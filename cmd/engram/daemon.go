@@ -25,6 +25,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/config"
 	"github.com/mariesqu/engram/internal/controlapi"
+	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/syncer"
@@ -97,6 +98,13 @@ type daemonCfg struct {
 	// PR-⑥: MCP transport selection. "stdio" (default) | "http".
 	// When "http" and httpMode=true, /mcp is mounted on the top-level ServeMux.
 	mcpTransport string
+
+	// Embedding provider (PR-①b).
+	// embeddingProvider is the validated provider name ("", "none", "openai").
+	// embeddingKey is the plaintext API key resolved at startup (in-memory only;
+	// NEVER written to disk, never logged). nil/empty → noop provider.
+	embeddingProvider string
+	embeddingKey      []byte // plaintext; nil when not needed
 }
 
 // resolveTransport resolves the MCP transport with the standard precedence
@@ -196,8 +204,11 @@ func runDaemonCmd(args []string) error {
 		var loadErr error
 		fileCfg, loadErr = config.Load(configDir)
 		if loadErr != nil {
-			log.Printf("warning: cannot load config file from %s: %v", configDir, loadErr)
-			fileCfg = config.Config{}
+			// An invalid embedding_provider (or any other enum/parse error) is a
+			// hard startup failure. A misconfigured value that silently falls back to
+			// noop would hide a configuration error — surface it immediately.
+			// (Missing file: Load returns (Config{}, nil) — never reaches here.)
+			return fmt.Errorf("daemon: config file error: %w", loadErr)
 		}
 	}
 
@@ -310,16 +321,49 @@ func runDaemonCmd(args []string) error {
 		return fmt.Errorf("--transport http requires --http (the HTTP control plane must be enabled)")
 	}
 
+	// ── Resolve embedding key: ENGRAM_EMBEDDING_KEY env always wins ──────────
+	//
+	// ENGRAM_EMBEDDING_KEY env ALWAYS wins over any stored ciphertext — same
+	// precedence contract as ENGRAM_WRITER_KEY. The key is hex-encoded.
+	// When neither source provides a key, the daemon starts with the Noop provider
+	// regardless of embedding_provider — no error, just no embedding capability.
+	embeddingProvider := fileCfg.EmbeddingProvider
+	var embeddingKey []byte
+	if embeddingKeyHex := strings.TrimSpace(os.Getenv("ENGRAM_EMBEDDING_KEY")); embeddingKeyHex != "" {
+		// Env var wins — decode and use directly. Invalid hex is a startup error.
+		decoded, err := hex.DecodeString(embeddingKeyHex)
+		if err != nil {
+			return fmt.Errorf("ENGRAM_EMBEDDING_KEY is not valid hex: %w", err)
+		}
+		embeddingKey = decoded
+	} else if blob := fileCfg.EncryptedEmbeddingKey(); len(blob) > 0 {
+		// No env var — attempt to decrypt the stored ciphertext.
+		secretBox := config.NewSecretBox()
+		plaintext, decryptErr := secretBox.Open(blob)
+		if decryptErr != nil {
+			// Decrypt failure is non-fatal for embedding: log a warning and fall
+			// back to Noop. Embedding is optional; a bad key should not prevent
+			// the daemon from starting — the user can still use FTS search.
+			log.Printf("warning: DPAPI decrypt failed for embedding key: %v", decryptErr)
+			log.Printf("  → embedding will use Noop provider; set ENGRAM_EMBEDDING_KEY or re-configure via the UI")
+			embeddingKey = nil
+		} else {
+			embeddingKey = plaintext
+		}
+	}
+
 	cfg := daemonCfg{
-		db:           *db,
-		centralURL:   *centralURL,
-		writerID:     *writerID,
-		writerKey:    writerKey,
-		syncInterval: *syncInterval,
-		httpMode:     *httpMode,
-		httpPort:     *httpPort,
-		configDir:    configDir,
-		mcpTransport: transport,
+		db:                *db,
+		centralURL:        *centralURL,
+		writerID:          *writerID,
+		writerKey:         writerKey,
+		syncInterval:      *syncInterval,
+		httpMode:          *httpMode,
+		httpPort:          *httpPort,
+		configDir:         configDir,
+		mcpTransport:      transport,
+		embeddingProvider: embeddingProvider,
+		embeddingKey:      embeddingKey,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -357,6 +401,31 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	// Wire the central-configured closure for policy default computation.
 	centralURL := cfg.centralURL
 	store.SetCentralConfiguredFn(func() bool { return centralURL != "" })
+
+	// ── Wire embedding provider (PR-①b) ──────────────────────────────────────
+	// Build the inner raw provider (OpenAI or Noop), then wrap it with the
+	// privacy gate. The gate is the ONLY path to the inner provider — raw
+	// providers never escape buildDaemon. store satisfies PolicyChecker.
+	//
+	// remote=true: the only remote provider in PR-1 is OpenAI. Future local
+	// providers (PR-2) will use remote=false.
+	var innerProvider embedding.EmbeddingProvider
+	switch cfg.embeddingProvider {
+	case "openai":
+		if len(cfg.embeddingKey) > 0 {
+			innerProvider = embedding.NewRemoteOpenAI(string(cfg.embeddingKey))
+		} else {
+			// Provider is configured but key is not available — log a warning and
+			// fall back to Noop. This is not a fatal error.
+			log.Printf("warning: embedding_provider=openai but no key found (ENGRAM_EMBEDDING_KEY not set and no stored key); falling back to noop")
+			innerProvider = embedding.NoopProvider{}
+		}
+	default:
+		// "", "none", or any value that passed validation → Noop.
+		innerProvider = embedding.NoopProvider{}
+	}
+	gated := embedding.NewGated(innerProvider, store, true /* remote */)
+	store.SetEmbedFn(gated.Embed, gated.Dimensions())
 
 	activity := NewSessionActivity()
 	registerTools(mcpSrv, store, loop, cfg.writerID, activity)
@@ -621,10 +690,12 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 		HTTPPort:     httpPort,
 		SyncInterval: daemonCfg.syncInterval,
 	}
-	// Re-load the file to recover EncryptedWriterKey for Redact reporting.
+	// Re-load the file to recover encrypted blobs and fields not in daemonCfg.
 	if daemonCfg.configDir != "" {
 		if fileCfg, err := config.Load(daemonCfg.configDir); err == nil {
 			cfg.EncryptedWriterKey = fileCfg.EncryptedWriterKey
+			cfg = cfg.WithEncryptedEmbeddingKey(fileCfg.EncryptedEmbeddingKey())
+			cfg.EmbeddingProvider = fileCfg.EmbeddingProvider
 			if cfg.LogLevel == "" {
 				cfg.LogLevel = fileCfg.LogLevel
 			}
@@ -664,6 +735,8 @@ func (a *configStoreAdapter) Load() (controlapi.RedactedConfig, error) {
 	if rc.WriterKey != "" {
 		result.WriterKey = &rc.WriterKey
 	}
+	result.EmbeddingProvider = rc.EmbeddingProvider
+	result.EmbeddingKeySet = rc.EmbeddingKeySet
 	return result, nil
 }
 
@@ -674,11 +747,12 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 
 	// Map controlapi.ConfigPatch → config.ConfigPatch.
 	cfgPatch := config.ConfigPatch{
-		SyncInterval: patch.SyncInterval,
-		LogLevel:     patch.LogLevel,
-		HTTPPort:     patch.HTTPPort,
-		DBPath:       patch.DBPath,
-		Transport:    patch.Transport,
+		SyncInterval:      patch.SyncInterval,
+		LogLevel:          patch.LogLevel,
+		HTTPPort:          patch.HTTPPort,
+		DBPath:            patch.DBPath,
+		Transport:         patch.Transport,
+		EmbeddingProvider: patch.EmbeddingProvider,
 	}
 
 	updated, restartRequired := config.Patch(a.cfg, cfgPatch)

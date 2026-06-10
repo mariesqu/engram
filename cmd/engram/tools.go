@@ -212,6 +212,9 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			mcp.WithNumber("limit",
 				mcp.Description("Max results (default: 10, max: 20)"),
 			),
+			mcp.WithString("mode",
+				mcp.Description(`Retrieval mode: "" or "fts" (keyword search, default), "semantic" (cosine only), "hybrid" (FTS + cosine fused via RRF). Semantic modes require an embedding provider to be configured; they degrade gracefully to FTS when unavailable.`),
+			),
 		),
 		handleSearch(store),
 	)
@@ -684,9 +687,18 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 	}
 }
 
-// handleSearch returns the handler for mem_search. It performs an FTS search
-// with optional type/scope filters, using the LENIENT read-project policy so a
+// handleSearch returns the handler for mem_search. It performs a search with
+// optional type/scope/mode filters, using the LENIENT read-project policy so a
 // search never hard-errors on an ambiguous or misconfigured cwd.
+//
+// Mode values: "" / "fts" → FTS only (default, byte-identical to before);
+// "semantic" → cosine only; "hybrid" → FTS + cosine fused via RRF.
+// An unknown mode is treated as "fts" by SearchMemoriesFiltered.
+//
+// When mode is "semantic" or "hybrid" and semantic search was unavailable (no
+// provider, gated project, provider error, no vectors), the result includes an
+// explanatory note — but ONLY when the user explicitly requested a semantic mode.
+// The "" / "fts" path NEVER emits a note (keyless byte-identical constraint).
 //
 // Read tools do NOT use transactions (query-only) and do NOT trigger autosync.
 func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
@@ -702,6 +714,7 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		typ, _ := args["type"].(string)
 		explicitProject, _ := args["project"].(string)
 		scope, _ := args["scope"].(string)
+		mode, _ := args["mode"].(string)
 
 		// Lenient limit: accept float64 (JSON number), default 10, cap at 20.
 		limit := 10
@@ -720,9 +733,10 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			project = ""
 		}
 
-		results, err := store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{
+		results, degradation, err := store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{
 			Type:  typ,
 			Scope: scope,
+			Mode:  mode,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("mem_search: search error: %s. Try simpler keywords.", err)), nil
@@ -753,6 +767,15 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 		if anyTruncated {
 			b.WriteString("---\nResults above are previews (300 chars). To read the full content of a specific memory, call mem_get_observation(id: <ID>).\n")
+		}
+
+		// Emit the degradation note ONLY when the user explicitly requested a
+		// semantic mode (never on the default "" / "fts" path — keyless users must
+		// see byte-identical behavior).
+		if degradation.Reason != "" && (mode == "semantic" || mode == "hybrid") {
+			b.WriteString("\n(")
+			b.WriteString(degradation.Reason)
+			b.WriteString(")\n")
 		}
 
 		return mcp.NewToolResultText(b.String()), nil

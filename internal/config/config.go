@@ -31,6 +31,17 @@ import (
 // as "storage unavailable — use the env var instead."
 var ErrNoSecretStore = errors.New("secret store not available on this platform; use ENGRAM_WRITER_KEY env var")
 
+// ValidEmbeddingProviders is the set of accepted embedding_provider values.
+// "ollama" is reserved for PR-2 and is NOT valid in PR-1.
+// Write-time validation (handleConfigPut) and startup validation (Load) both
+// use this set — the PR-③ lesson: an invalid value persisted to disk would
+// hard-error the next startup if we only validated at startup.
+var ValidEmbeddingProviders = map[string]bool{
+	"":       true, // zero value → NoopProvider
+	"none":   true, // explicit no-op
+	"openai": true,
+}
+
 // SecretBox is the platform-specific encryption interface for the writer key.
 // Windows uses DPAPI (user-scoped CryptProtectData / CryptUnprotectData).
 // Other platforms return ErrNoSecretStore so callers know to fall back to the
@@ -64,6 +75,16 @@ type fileConfig struct {
 	SyncInterval       string `json:"sync_interval,omitempty"` // e.g. "30s"
 	LogLevel           string `json:"log_level,omitempty"`
 	Transport          string `json:"transport,omitempty"`
+	// EmbeddingProvider selects the embedding backend. Valid values: "", "none",
+	// "openai". "ollama" is reserved for PR-2. An unrecognised value causes Load
+	// to return an error (startup-fatal on daemon startup).
+	EmbeddingProvider string `json:"embedding_provider,omitempty"`
+	// EncryptedEmbeddingKey is a base64-encoded DPAPI blob (Windows only) holding
+	// the embedding API key. Absent on non-Windows or when the key has not been
+	// set. The plaintext key MUST NEVER appear in this struct or any JSON output.
+	// Tag is "encrypted_embedding_key" to mirror "encrypted_writer_key" and to
+	// keep the raw key name ("embedding_key") available as a redaction sentinel.
+	EncryptedEmbeddingKey string `json:"encrypted_embedding_key,omitempty"` // base64(DPAPI blob)
 }
 
 // Config is the resolved, decoded in-memory configuration. The writer key is
@@ -79,31 +100,60 @@ type Config struct {
 	SyncInterval       time.Duration // 0 → caller uses default
 	LogLevel           string
 	Transport          string
+
+	// EmbeddingProvider is the embedding backend name after validation.
+	// Valid values: "", "none", "openai". Load returns an error for any other value.
+	EmbeddingProvider string
+
+	// encryptedEmbeddingKey is the decrypted ciphertext blob for the embedding API
+	// key. The plaintext key is NEVER stored here — only the ciphertext, to be
+	// opened by SecretBox.Open at daemon startup. Unexported, no json tag.
+	encryptedEmbeddingKey []byte
+}
+
+// EncryptedEmbeddingKey returns the encrypted embedding key ciphertext blob.
+// This is the sealed blob, NOT the plaintext key. Used by the daemon to decrypt
+// at startup via SecretBox.Open. Returns nil when not set.
+func (c Config) EncryptedEmbeddingKey() []byte {
+	return c.encryptedEmbeddingKey
+}
+
+// WithEncryptedEmbeddingKey returns a copy of c with the encrypted embedding
+// key set. Used by Save and by test helpers that need to inject a ciphertext.
+func (c Config) WithEncryptedEmbeddingKey(blob []byte) Config {
+	c.encryptedEmbeddingKey = blob
+	return c
 }
 
 // RedactedConfig is the config view returned by GET /api/v1/config.
 // WriterKeySet is true when an encrypted key is stored; the key itself is
-// never present.
+// never present. EmbeddingKeySet is true when an encrypted embedding API key is
+// stored; the key itself is never present.
 type RedactedConfig struct {
-	DB           string `json:"db_path,omitempty"`
-	CentralURL   string `json:"central_url,omitempty"`
-	WriterID     string `json:"writer_id,omitempty"`
-	WriterKey    string `json:"writer_key,omitempty"` // "***REDACTED***" or absent
-	HTTPPort     int    `json:"http_port,omitempty"`
-	SyncInterval string `json:"sync_interval,omitempty"`
-	LogLevel     string `json:"log_level,omitempty"`
-	Transport    string `json:"transport,omitempty"`
+	DB               string `json:"db_path,omitempty"`
+	CentralURL       string `json:"central_url,omitempty"`
+	WriterID         string `json:"writer_id,omitempty"`
+	WriterKey        string `json:"writer_key,omitempty"` // "***REDACTED***" or absent
+	HTTPPort         int    `json:"http_port,omitempty"`
+	SyncInterval     string `json:"sync_interval,omitempty"`
+	LogLevel         string `json:"log_level,omitempty"`
+	Transport        string `json:"transport,omitempty"`
+	EmbeddingProvider string `json:"embedding_provider,omitempty"`
+	EmbeddingKeySet  bool   `json:"embedding_key_set,omitempty"` // true when encrypted key present
 }
 
 // ConfigPatch is a partial update applied by PUT /api/v1/config.
-// Only non-nil fields are merged. writer_key and central_url are rejected
-// at the handler level — they must never appear in a ConfigPatch.
+// Only non-nil fields are merged. writer_key, central_url, and
+// encrypted_embedding_key are rejected at the handler level — they must never
+// appear in a ConfigPatch (encrypted_embedding_key must be set via the dedicated
+// key-management endpoint to ensure proper sealing).
 type ConfigPatch struct {
-	SyncInterval *string `json:"sync_interval,omitempty"`
-	LogLevel     *string `json:"log_level,omitempty"`
-	HTTPPort     *int    `json:"http_port,omitempty"`
-	DBPath       *string `json:"db_path,omitempty"`
-	Transport    *string `json:"transport,omitempty"`
+	SyncInterval      *string `json:"sync_interval,omitempty"`
+	LogLevel          *string `json:"log_level,omitempty"`
+	HTTPPort          *int    `json:"http_port,omitempty"`
+	DBPath            *string `json:"db_path,omitempty"`
+	Transport         *string `json:"transport,omitempty"`
+	EmbeddingProvider *string `json:"embedding_provider,omitempty"`
 }
 
 // DefaultConfigDir returns the directory where config.json is stored:
@@ -160,6 +210,22 @@ func Load(dir string) (Config, error) {
 		cfg.EncryptedWriterKey = blob
 	}
 
+	// Validate embedding provider. An unrecognised value is startup-fatal so that
+	// a bad value persisted to disk is caught immediately rather than silently
+	// falling back to noop (hiding a misconfiguration).
+	if !ValidEmbeddingProviders[fc.EmbeddingProvider] {
+		return Config{}, fmt.Errorf("config.Load: unsupported embedding_provider %q (valid: \"\", \"none\", \"openai\")", fc.EmbeddingProvider)
+	}
+	cfg.EmbeddingProvider = fc.EmbeddingProvider
+
+	if fc.EncryptedEmbeddingKey != "" {
+		blob, err := base64.StdEncoding.DecodeString(fc.EncryptedEmbeddingKey)
+		if err != nil {
+			return Config{}, fmt.Errorf("config.Load: embedding_key base64 decode: %w", err)
+		}
+		cfg.encryptedEmbeddingKey = blob
+	}
+
 	return cfg, nil
 }
 
@@ -186,6 +252,12 @@ func Save(dir string, cfg Config) error {
 
 	if len(cfg.EncryptedWriterKey) > 0 {
 		fc.EncryptedWriterKey = base64.StdEncoding.EncodeToString(cfg.EncryptedWriterKey)
+	}
+
+	fc.EmbeddingProvider = cfg.EmbeddingProvider
+
+	if len(cfg.encryptedEmbeddingKey) > 0 {
+		fc.EncryptedEmbeddingKey = base64.StdEncoding.EncodeToString(cfg.encryptedEmbeddingKey)
 	}
 
 	data, err := json.MarshalIndent(fc, "", "  ")
@@ -237,6 +309,10 @@ func (c Config) Redact() RedactedConfig {
 	if len(c.EncryptedWriterKey) > 0 {
 		rc.WriterKey = "***REDACTED***"
 	}
+	rc.EmbeddingProvider = c.EmbeddingProvider
+	if len(c.encryptedEmbeddingKey) > 0 {
+		rc.EmbeddingKeySet = true
+	}
 	return rc
 }
 
@@ -278,6 +354,12 @@ func Patch(base Config, p ConfigPatch) (Config, bool) {
 	if p.Transport != nil && *p.Transport != base.Transport {
 		out.Transport = *p.Transport
 		restartRequired = true
+	}
+
+	// EmbeddingProvider is runtime-mutable (no restart needed). The handler must
+	// validate against ValidEmbeddingProviders before calling Patch.
+	if p.EmbeddingProvider != nil {
+		out.EmbeddingProvider = *p.EmbeddingProvider
 	}
 
 	return out, restartRequired

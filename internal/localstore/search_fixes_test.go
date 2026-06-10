@@ -13,7 +13,7 @@ func TestSearchMemoriesFiltered_PopulatesID(t *testing.T) {
 		t.Fatalf("AddObservation: %v", err)
 	}
 
-	hits, err := s.SearchMemoriesFiltered("findme", "p", 10, SearchFilter{})
+	hits, _, err := s.SearchMemoriesFiltered("findme", "p", 10, SearchFilter{})
 	if err != nil {
 		t.Fatalf("SearchMemoriesFiltered: %v", err)
 	}
