@@ -663,12 +663,12 @@ type runtimeSyncAdapter struct {
 	mu         sync.Mutex
 	store      *localstore.Store
 	cfgAdapter *configStoreAdapter
-	loop       *syncer.Loop   // nil in local-only mode; replaced on Reconnect
+	loop       *syncer.Loop    // nil in local-only mode; replaced on Reconnect
 	ctx        context.Context // daemon's root context (for new Loop.Start on reconnect)
 	node       *syncer.Node
 	// lastSyncResult is updated by the loop callbacks (future PR — for now zero value).
 	// PR-③ wires the loop to report results; for the daemon test this is enough.
-	connected bool // mirrors loop != nil && centralURL != ""
+	connected  bool // mirrors loop != nil && centralURL != ""
 	centralURL string
 	actualPort int // the actual bound port (for Status.CentralURL etc.)
 }
