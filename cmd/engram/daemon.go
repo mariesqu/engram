@@ -137,11 +137,16 @@ func resolveTransport(flagVal, envVal, fileVal string) (string, error) {
 type daemonComponents struct {
 	store     *localstore.Store
 	mcpServer *mcpserver.MCPServer
-	loop      *syncer.Loop // nil when running in local-only mode
+	loop      *syncer.Loop                // nil when running in local-only mode
+	embedLoop *embedding.Loop             // nil when provider is Noop or key absent
+	gated     embedding.EmbeddingProvider // always non-nil (at least NoopProvider via gate)
 }
 
-// Close stops the autosync loop (if any) and closes the local store.
+// Close stops the embedding backfill loop, the autosync loop, and the store —
+// in that order so no in-flight UpdateEmbedding can race the store close.
 func (d *daemonComponents) Close() {
+	// embedding.Loop.Stop() is nil-safe and blocks until the goroutine exits.
+	d.embedLoop.Stop()
 	if d.loop != nil {
 		d.loop.Stop()
 	}
@@ -427,13 +432,29 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	gated := embedding.NewGated(innerProvider, store, true /* remote */)
 	store.SetEmbedFn(gated.Embed, gated.Dimensions())
 
+	// ── Construct embedding backfill loop (PR-①b) ─────────────────────────────
+	// The embedLoop is non-nil only when the provider is not Noop (i.e., a real
+	// key+provider is active). A nil embedLoop means the feature is inert: Trigger()
+	// and Stop() on a nil *embedding.Loop are no-ops (nil-safe by design).
+	var embedLoop *embedding.Loop
+	if _, isNoop := innerProvider.(embedding.NoopProvider); !isNoop {
+		embedLoop = embedding.NewLoop(store, gated, embedding.LoopConfig{
+			// Use the same sync interval for embedding as for sync, capped to 60s min.
+			// Production default is 60s; tests override via Config fields.
+			Interval:   60 * time.Second,
+			BatchPause: 1 * time.Second, // rate-limit guard: 1s between batch Embed calls
+		})
+	}
+
 	activity := NewSessionActivity()
-	registerTools(mcpSrv, store, loop, cfg.writerID, activity)
+	registerTools(mcpSrv, store, loop, embedLoop, cfg.writerID, activity)
 
 	return &daemonComponents{
 		store:     store,
 		mcpServer: mcpSrv,
 		loop:      loop,
+		embedLoop: embedLoop,
+		gated:     gated,
 	}, nil
 }
 
@@ -457,6 +478,12 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	if components.loop != nil {
 		components.loop.Start(ctx)
 		autosync = "on"
+	}
+
+	// Start the embedding backfill loop alongside the autosync loop.
+	// embedLoop is nil when provider is Noop — Start on nil panics, so guard.
+	if components.embedLoop != nil {
+		components.embedLoop.Start(ctx)
 	}
 
 	log.Printf("engram daemon: MCP over stdio (db=%s, autosync=%s)", cfg.db, autosync)
@@ -505,6 +532,10 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	if components.loop != nil {
 		components.loop.Start(ctx)
 	}
+	// Start the embedding backfill loop alongside the autosync loop.
+	if components.embedLoop != nil {
+		components.embedLoop.Start(ctx)
+	}
 	defer func() {
 		_ = controlapi.RemoveDaemonJSON(dir)
 	}()
@@ -527,6 +558,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		components.loop,
 		cfgAdapter,
 		actualPort,
+		components.gated,
 	)
 
 	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion)
@@ -834,6 +866,10 @@ type runtimeSyncAdapter struct {
 	connected  bool // mirrors loop != nil && centralURL != ""
 	centralURL string
 	actualPort int // the actual bound port (for Status.CentralURL etc.)
+
+	// embeddingProvider is the provider name for Status.EmbeddingBackfill.Provider.
+	// Populated by newRuntimeSyncAdapter when an embedLoop is active.
+	embeddingProvider string
 }
 
 func newRuntimeSyncAdapter(
@@ -843,6 +879,7 @@ func newRuntimeSyncAdapter(
 	loop *syncer.Loop,
 	cfgAdapter *configStoreAdapter,
 	actualPort int,
+	gated embedding.EmbeddingProvider, // non-nil always; NoopProvider when inactive
 ) *runtimeSyncAdapter {
 	if ctx == nil {
 		// Defensive: a runtime-created loop must always be startable.
@@ -857,6 +894,9 @@ func newRuntimeSyncAdapter(
 		connected:  cfg.centralURL != "" && loop != nil,
 		centralURL: cfg.centralURL,
 		actualPort: actualPort,
+		// Track the model name for Status.EmbeddingBackfill.Provider.
+		// gated delegates ModelName() to the inner provider unconditionally.
+		embeddingProvider: gated.ModelName(),
 	}
 	// Wire the configStoreAdapter callback for live SyncInterval updates.
 	cfgAdapter.applyCb = a.applyLiveConfig
@@ -876,6 +916,17 @@ func (a *runtimeSyncAdapter) Status() controlapi.Status {
 		u := a.centralURL
 		st.CentralURL = &u
 	}
+
+	// Populate embedding_backfill sub-object (spec: observability requirement).
+	// The pending count is best-effort (±1 race with concurrent writes is acceptable).
+	// The field is always present when an embedding provider is configured — even
+	// for the Noop case (provider="noop", pending=N shows what would be backfilled).
+	pending, _ := a.store.CountPendingEmbeddings(a.embeddingProvider) // eligible rows only; error → 0 (best-effort)
+	st.EmbeddingBackfill = &controlapi.EmbeddingBackfill{
+		Pending:  pending,
+		Provider: a.embeddingProvider,
+	}
+
 	return st
 }
 

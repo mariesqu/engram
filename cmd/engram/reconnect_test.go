@@ -19,6 +19,7 @@ import (
 	"errors"
 	"github.com/mariesqu/engram/internal/config"
 	"github.com/mariesqu/engram/internal/controlapi"
+	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 )
 
@@ -61,7 +62,7 @@ func newReconnectFixture(t *testing.T, centralURL string) (*runtimeSyncAdapter, 
 		configDir:    dir,
 	}
 	cfgAdapter := newConfigStoreAdapter(cfg, 0)
-	a := newRuntimeSyncAdapter(t.Context(), cfg, st, nil, cfgAdapter, 0)
+	a := newRuntimeSyncAdapter(t.Context(), cfg, st, nil, cfgAdapter, 0, embedding.NoopProvider{})
 	_ = centralURL
 	return a, st, dir
 }

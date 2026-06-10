@@ -303,14 +303,14 @@ func TestSelectEmbeddable_PicksNullAndStale(t *testing.T) {
 		t.Fatalf("insert stale row: %v", err)
 	}
 
-	rows, err := SelectEmbeddable(db, "new-model", 100)
+	rows, err := SelectEmbeddable(db, "new-model", 100, 0)
 	if err != nil {
 		t.Fatalf("SelectEmbeddable: %v", err)
 	}
 
 	ids := make(map[string]bool)
 	for _, r := range rows {
-		ids[r.syncID] = true
+		ids[r.SyncID] = true
 	}
 
 	if !ids["null-row"] {
@@ -338,12 +338,12 @@ func TestSelectEmbeddable_SkipsAlreadyEmbedded(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
-	rows, err := SelectEmbeddable(db, "cur-model", 100)
+	rows, err := SelectEmbeddable(db, "cur-model", 100, 0)
 	if err != nil {
 		t.Fatalf("SelectEmbeddable: %v", err)
 	}
 	for _, r := range rows {
-		if r.syncID == "up-to-date" {
+		if r.SyncID == "up-to-date" {
 			t.Errorf("up-to-date row should be excluded, but was returned")
 		}
 	}

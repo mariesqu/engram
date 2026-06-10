@@ -47,8 +47,17 @@ func decodeVector(b []byte, dims int) ([]float32, error) {
 	return v, nil
 }
 
-// l2Normalize returns a new vector with unit L2 norm.
+// L2Normalize returns a new vector with unit L2 norm.
 // A zero-magnitude vector is returned as-is (all zeros → cosine undefined).
+//
+// Exported so the embedding backfill loop (internal/embedding) can normalize
+// raw provider output before writing it via UpdateEmbedding. The codec stores
+// vectors L2-normalized so cosine similarity equals dot product (decision 4).
+func L2Normalize(v []float32) []float32 {
+	return l2Normalize(v)
+}
+
+// l2Normalize is the unexported implementation used within this package.
 func l2Normalize(v []float32) []float32 {
 	var sum float64
 	for _, f := range v {
@@ -271,11 +280,13 @@ func rrfFuse(ftsRanks []string, cosineRanks []string, k, limit int) []string {
 
 // ── SelectEmbeddable ─────────────────────────────────────────────────────────
 
-// embeddableRow represents a row eligible for embedding.
-type embeddableRow struct {
-	syncID  string
-	project string
-	text    string // title + " " + content for embedding
+// EmbeddableRow represents a row eligible for embedding, returned by SelectEmbeddable.
+// Fields are exported so the embedding backfill loop (internal/embedding) can read them.
+type EmbeddableRow struct {
+	ID      int64 // rowid keyset cursor — the backfill pages with id > afterID
+	SyncID  string
+	Project string
+	Text    string // title + " " + content for embedding
 }
 
 // SelectEmbeddable returns rows that need (re-)embedding:
@@ -283,39 +294,49 @@ type embeddableRow struct {
 //   - embedding_model != currentModel (stale — model changed).
 //
 // Deleted rows are excluded. limit caps the batch size.
-func SelectEmbeddable(db *sql.DB, currentModel string, limit int) ([]embeddableRow, error) {
+//
+// afterID is a KEYSET CURSOR: only rows with id > afterID are returned, in id
+// order. The backfill loop threads the last-seen id between pages so the tick
+// always ADVANCES past permanently-gated rows — without it, 100+ gated rows
+// with the lowest ids would fill every page and STARVE all eligible rows
+// behind them forever. Pass 0 to start from the beginning.
+func SelectEmbeddable(db *sql.DB, currentModel string, limit int, afterID int64) ([]EmbeddableRow, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	const q = `
-		SELECT sync_id, project, title, content
+		SELECT id, sync_id, project, title, content
 		FROM memories
 		WHERE deleted_at IS NULL
+		  AND id > ?
 		  AND (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?)
+		ORDER BY id ASC
 		LIMIT ?`
 
-	rows, err := db.Query(q, currentModel, limit)
+	rows, err := db.Query(q, afterID, currentModel, limit)
 	if err != nil {
 		return nil, fmt.Errorf("SelectEmbeddable: %w", err)
 	}
 	defer rows.Close()
 
-	var result []embeddableRow
+	var result []EmbeddableRow
 	for rows.Next() {
+		var id int64
 		var syncID, project, title, content string
-		if err := rows.Scan(&syncID, &project, &title, &content); err != nil {
+		if err := rows.Scan(&id, &syncID, &project, &title, &content); err != nil {
 			return nil, fmt.Errorf("SelectEmbeddable scan: %w", err)
 		}
 		text := title
 		if content != "" {
 			text = title + " " + content
 		}
-		result = append(result, embeddableRow{syncID: syncID, project: project, text: text})
+		result = append(result, EmbeddableRow{ID: id, SyncID: syncID, Project: project, Text: text})
 	}
 	return result, rows.Err()
 }
 
-// UpdateEmbedding updates the embedding for a single row identified by syncID.
+// UpdateEmbedding updates the embedding for a single row identified by syncID
+// only when the row has no existing embedding (embedding IS NULL).
 //
 // The UPDATE is intentionally a SINGLE STATEMENT and does NOT take s.mu.
 // Rationale (design decision 3): AddObservation holds s.mu across the
@@ -324,13 +345,13 @@ func SelectEmbeddable(db *sql.DB, currentModel string, limit int) ([]embeddableR
 // UpdateEmbedding is a single-statement UPDATE on derived columns
 // (embedding, embedding_model, embedding_created_at) that no reconciliation
 // path reads. SQLite WAL + SetMaxOpenConns(1) serialize the physical write.
-// The AND embedding IS NULL guard makes this idempotent: if a concurrent re-write
-// of the same row already cleared/filled the embedding column, this UPDATE is a
-// safe no-op (0 rows affected). The backfill loop detects 0-row results as
-// "already handled" and moves on.
+// The AND embedding IS NULL guard makes this idempotent: if a concurrent write
+// already embedded this row, this UPDATE is a safe no-op (0 rows affected).
 //
-// vec must be L2-normalized before calling UpdateEmbedding. Call l2Normalize
-// before passing the raw provider output.
+// For model-change re-embedding use UpdateEmbeddingStale, which also overwrites
+// rows whose embedding_model no longer matches the active model.
+//
+// vec must be L2-normalized before calling UpdateEmbedding.
 func UpdateEmbedding(db *sql.DB, syncID string, vec []float32, model, ts string) error {
 	blob := encodeVector(vec)
 	_, err := db.Exec(
@@ -344,6 +365,33 @@ func UpdateEmbedding(db *sql.DB, syncID string, vec []float32, model, ts string)
 	)
 	if err != nil {
 		return fmt.Errorf("UpdateEmbedding %q: %w", syncID, err)
+	}
+	return nil
+}
+
+// UpdateEmbeddingStale is identical to UpdateEmbedding but also overwrites rows
+// whose embedding_model differs from model (i.e. stale — model changed).
+//
+// Used exclusively by the backfill loop, which selects rows where embedding IS
+// NULL OR embedding_model != currentModel and must be able to re-embed both.
+//
+// A concurrent write that already stored the new model causes 0 rows affected,
+// which is a safe no-op.
+//
+// vec must be L2-normalized before calling UpdateEmbeddingStale.
+func UpdateEmbeddingStale(db *sql.DB, syncID string, vec []float32, model, ts string) error {
+	blob := encodeVector(vec)
+	_, err := db.Exec(
+		`UPDATE memories
+		    SET embedding = ?,
+		        embedding_model = ?,
+		        embedding_created_at = ?
+		  WHERE sync_id = ?
+		    AND (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?)`,
+		blob, model, ts, syncID, model,
+	)
+	if err != nil {
+		return fmt.Errorf("UpdateEmbeddingStale %q: %w", syncID, err)
 	}
 	return nil
 }

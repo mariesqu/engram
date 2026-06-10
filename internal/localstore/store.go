@@ -175,6 +175,78 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
+// RawDB satisfies the EmbeddableStore port used by the embedding backfill loop.
+// It is identical to DB() but distinguishes the caller's intent (embedding helpers
+// only — SelectEmbeddable + UpdateEmbedding — vs general raw query access).
+func (s *Store) RawDB() *sql.DB {
+	return s.db
+}
+
+// CountNullEmbeddings returns the count of live (non-deleted) rows whose
+// embedding column is NULL. This is the "pending backfill" count surfaced in
+// GET /api/v1/status as embedding_backfill.pending (spec: observability requirement).
+//
+// Best-effort: a ±1 race with a concurrent write is acceptable per spec.
+func (s *Store) CountNullEmbeddings() (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memories WHERE embedding IS NULL AND deleted_at IS NULL`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("CountNullEmbeddings: %w", err)
+	}
+	return n, nil
+}
+
+// CountPendingEmbeddings counts rows the backfill loop will ACTUALLY embed:
+// live rows without a current-model embedding whose project policy permits
+// embedding (synced — PR-1: remote provider, no sidecar consent). Without the
+// eligibility filter a store full of omitted-project rows would report a
+// forever-nonzero pending count for work the loop will never (correctly) do.
+func (s *Store) CountPendingEmbeddings(currentModel string) (int, error) {
+	projects, err := s.ListProjectsWithPolicy()
+	if err != nil {
+		return 0, fmt.Errorf("CountPendingEmbeddings: %w", err)
+	}
+	total := 0
+	for _, pp := range projects {
+		if pp.Policy != PolicySynced {
+			continue // gated for a remote provider — the loop skips these rows
+		}
+		var n int
+		err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM memories
+			 WHERE deleted_at IS NULL AND LOWER(project) = LOWER(?)
+			   AND (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?)`,
+			pp.Name, currentModel,
+		).Scan(&n)
+		if err != nil {
+			return 0, fmt.Errorf("CountPendingEmbeddings %q: %w", pp.Name, err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// EmbeddableStore is the narrow data-access port used by the embedding backfill
+// loop (internal/embedding.Loop). It is satisfied by *Store and by test doubles.
+//
+// The loop calls the package-level SelectEmbeddable and UpdateEmbedding helpers
+// directly with the *sql.DB returned by RawDB(), keeping those helpers testable
+// without a full Store and keeping the loop free of the full Store surface.
+type EmbeddableStore interface {
+	// RawDB returns the underlying *sql.DB for use with SelectEmbeddable and UpdateEmbedding.
+	// The loop MUST only call these two helpers — never raw writes that bypass s.mu.
+	RawDB() *sql.DB
+
+	// GetPolicy returns the effective policy for a project (cached, O(1) typical).
+	// The loop calls this before embedding each project group in the backfill pass.
+	GetPolicy(project string) (Policy, error)
+}
+
+// ensure *Store satisfies EmbeddableStore at compile time.
+var _ EmbeddableStore = (*Store)(nil)
+
 // ── domain.Reader implementation ─────────────────────────────────────────────
 
 // rowQuerier is the minimal interface shared by *sql.DB and *sql.Tx that is
