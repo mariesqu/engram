@@ -163,18 +163,47 @@ The `--http` flag switches the daemon from stdio MCP mode to a long-running HTTP
 
 The bearer token rotates on every daemon start. CLI clients re-read `daemon.json` automatically on a `401` response.
 
+### Config file
+
+The resident daemon persists its configuration to a `config.json` file in a platform-specific directory:
+
+| Platform | Default location                                          |
+|----------|-----------------------------------------------------------|
+| Linux    | `$XDG_CONFIG_HOME/engram/config.json` (or `~/.config/engram/config.json`) |
+| macOS    | `~/Library/Application Support/engram/config.json`        |
+| Windows  | `%APPDATA%\engram\config.json`                            |
+
+Override the directory with `ENGRAM_CONFIG_DIR`.
+
+The file is written atomically (temp file + rename) so a crash during a write never produces a partial read. Absent file is not an error — the daemon uses defaults.
+
+**Writer key storage:** on Windows the writer key is encrypted with DPAPI (user-scope `CryptProtectData`) before being written to `config.json`. The ciphertext is base64-encoded in the `encrypted_writer_key` field. The plaintext never touches disk. On other platforms the writer key must be supplied via `ENGRAM_WRITER_KEY` each time; it is not stored in `config.json`.
+
+`ENGRAM_WRITER_KEY` always takes precedence over the file-stored (DPAPI-encrypted) key.
+
+**Precedence order (highest to lowest):**
+
+1. CLI flags
+2. Environment variables (`ENGRAM_WRITER_KEY`, `ENGRAM_CENTRAL_URL`, …)
+3. `config.json`
+4. Built-in defaults
+
 ### Control API
 
 All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-Control: no-store`.
 
-| Method | Path                                       | Description                                     |
-|--------|--------------------------------------------|-------------------------------------------------|
-| `GET`  | `/api/v1/status`                           | Connection state, last sync result, version     |
-| `GET`  | `/api/v1/config`                           | Redacted daemon configuration (key masked)      |
-| `GET`  | `/api/v1/projects`                         | List of projects with their effective policy    |
-| `PUT`  | `/api/v1/projects/{project}/policy`        | Set the policy for a project (requires auth)    |
+| Method  | Path                                       | Description                                            |
+|---------|--------------------------------------------|--------------------------------------------------------|
+| `GET`   | `/api/v1/status`                           | Connection state, last sync result, version            |
+| `GET`   | `/api/v1/config`                           | Redacted daemon configuration (writer key masked)      |
+| `PUT`   | `/api/v1/config`                           | Patch runtime-mutable or restart-required config       |
+| `GET`   | `/api/v1/projects`                         | List of projects with their effective policy           |
+| `PUT`   | `/api/v1/projects/{project}/policy`        | Set the sync policy for a project                      |
+| `POST`  | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
+| `POST`  | `/api/v1/central/disconnect`               | Disconnect from central (clears credentials)           |
+| `POST`  | `/api/v1/sync/trigger`                     | Trigger an immediate sync cycle (202; 409 if offline)  |
 
-Additional routes (sync trigger, config mutation) are added in later PRs.
+Mutating endpoints (`PUT`, `POST`) additionally require an `Origin: http://127.0.0.1:<port>` header.
 
 ### CLI subcommands
 
@@ -184,9 +213,31 @@ Additional routes (sync trigger, config mutation) are added in later PRs.
 
 # Open the web UI in the default browser
 ./engram ui --db ~/.engram/memories.db
+
+# Read current daemon configuration (writer key is redacted)
+./engram config get --db ~/.engram/memories.db
+
+# Change a runtime-mutable setting (takes effect immediately, no restart)
+./engram config set sync_interval 45s --db ~/.engram/memories.db
+./engram config set log_level debug    --db ~/.engram/memories.db
+
+# Trigger an immediate sync cycle
+./engram sync now --db ~/.engram/memories.db
 ```
 
-Both subcommands read `daemon.json` from the same directory as `--db`. If no daemon is running, they exit non-zero with a clear error message.
+All subcommands read `daemon.json` from the same directory as `--db`. If no daemon is running, they exit non-zero with a clear error message.
+
+**Config keys**
+
+| Key             | Mutable at runtime | Description                                    |
+|-----------------|--------------------|------------------------------------------------|
+| `sync_interval` | Yes                | Autosync cadence (Go duration, e.g. `30s`)     |
+| `log_level`     | Yes                | Log verbosity: `debug`, `info`, `warn`, `error`|
+| `db_path`       | No (restart)       | Path to the local SQLite database              |
+| `http_port`     | No (restart)       | Control API TCP port                           |
+| `transport`     | No (restart)       | MCP transport mode: `stdio` or `http`          |
+
+`writer_key` and `central_url` are managed exclusively via `engram central connect / disconnect` — they are rejected by `PUT /api/v1/config`.
 
 ### Per-project policy
 
@@ -246,21 +297,25 @@ engram status   [--db <path>]
 engram ui       [--db <path>]
 engram projects list   [--db <path>]
 engram projects policy [--db <path>] <project> <policy>
+engram config   get          [--db <path>]
+engram config   set <key> <value>  [--db <path>]
+engram sync     now          [--db <path>]
 ```
 
 ### Environment variables
 
-| Variable              | Used by                   | Default  | Description                                                      |
-|-----------------------|---------------------------|----------|------------------------------------------------------------------|
-| `ENGRAM_ADDR`         | `serve`                   | `:8080`  | Listen address for the central HTTP server                       |
-| `ENGRAM_DSN`          | `serve`, `keys`           | —        | Postgres DSN (required)                                          |
-| `ENGRAM_DB`           | `daemon`, `status`, `ui`  | —        | Path to the local SQLite database (required)                     |
-| `ENGRAM_CENTRAL_URL`  | `daemon`                  | —        | Central server URL; omit for local-only mode                     |
-| `ENGRAM_WRITER_ID`    | `daemon`                  | —        | Writer identity; required when `ENGRAM_CENTRAL_URL` is set       |
-| `ENGRAM_WRITER_KEY`   | `daemon`                  | —        | Hex-encoded 32-byte HMAC key; **env only**; required with sync   |
-| `ENGRAM_SYNC_INTERVAL`| `daemon`                  | `30s`    | Autosync cadence (Go duration string, e.g. `1m`, `30s`)          |
+| Variable              | Used by                              | Default  | Description                                                      |
+|-----------------------|--------------------------------------|----------|------------------------------------------------------------------|
+| `ENGRAM_ADDR`         | `serve`                              | `:8080`  | Listen address for the central HTTP server                       |
+| `ENGRAM_DSN`          | `serve`, `keys`                      | —        | Postgres DSN (required)                                          |
+| `ENGRAM_DB`           | `daemon`, `status`, `ui`, `projects`, `config`, `sync` | — | Path to the local SQLite database (required) |
+| `ENGRAM_CENTRAL_URL`  | `daemon`                             | —        | Central server URL; omit for local-only mode                     |
+| `ENGRAM_WRITER_ID`    | `daemon`                             | —        | Writer identity; required when `ENGRAM_CENTRAL_URL` is set       |
+| `ENGRAM_WRITER_KEY`   | `daemon`                             | —        | Hex-encoded 32-byte HMAC key; **env only**; required with sync   |
+| `ENGRAM_SYNC_INTERVAL`| `daemon`                             | `30s`    | Autosync cadence (Go duration string, e.g. `1m`, `30s`)          |
+| `ENGRAM_CONFIG_DIR`   | `daemon`                             | platform | Override the config file directory (see Config file section)     |
 
-Flags take precedence over environment variables. `ENGRAM_WRITER_KEY` has no corresponding flag.
+Flags take precedence over environment variables. `ENGRAM_WRITER_KEY` has no corresponding flag and always takes precedence over the file-stored key.
 
 ### Exit codes
 
