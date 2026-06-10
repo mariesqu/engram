@@ -178,7 +178,7 @@ func newRelSyncID() string {
 //
 // Errors from FindCandidates should be logged and swallowed by callers —
 // candidate detection failure must never fail the originating save.
-func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidate, error) {
+func (s *Store) FindCandidates(ctx context.Context, savedID int64, opts CandidateOptions) ([]Candidate, error) {
 	// Apply defaults.
 	limit := opts.Limit
 	if limit <= 0 {
@@ -276,7 +276,11 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 	//
 	// All SELECTs here must complete and close before Phase 3 (INSERTs) to
 	// respect the SetMaxOpenConns(1) cursor discipline.
-	if opts.EmbedFn != nil && opts.EmbedDims > 0 && len(raw) < limit {
+	// TRUE union: the cosine pass runs whenever it is wired — NOT only when FTS
+	// came up short. A paraphrase sharing no keywords must surface even when FTS
+	// already filled the limit with weaker lexical matches; the combined set is
+	// truncated to the limit after dedup.
+	if opts.EmbedFn != nil && opts.EmbedDims > 0 {
 		// Build the source text: title + content (same as SelectEmbeddable).
 		var srcContent string
 		_ = s.db.QueryRow(`SELECT ifnull(content,'') FROM memories WHERE id = ?`, savedID).Scan(&srcContent)
@@ -293,7 +297,7 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 
 		// Embed the source text via the injected gated function. A gated or noop
 		// response is treated as "cosine unavailable" — fall through silently.
-		vecs, embedErr := opts.EmbedFn(context.Background(), project, []string{srcText})
+		vecs, embedErr := opts.EmbedFn(ctx, project, []string{srcText})
 		if embedErr == nil && len(vecs) > 0 && len(vecs[0]) == opts.EmbedDims {
 			queryVec := l2Normalize(vecs[0])
 			filter := SearchFilter{} // scope the scan to the same project only

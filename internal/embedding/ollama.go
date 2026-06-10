@@ -13,7 +13,12 @@ import (
 const (
 	ollamaDefaultHost    = "http://localhost:11434"
 	ollamaDefaultTimeout = 30 * time.Second
-	ollamaEmbeddPath     = "/api/embeddings"
+	// NOTE: /api/embeddings is ollama's LEGACY single-prompt endpoint (request
+	// {model, prompt} → {embedding}). The newer /api/embed takes batched input
+	// and returns {embeddings}. Both work today; migrate to /api/embed before
+	// ollama removes the legacy route (TODO, tracked in the change's deferred
+	// inventory).
+	ollamaEmbedPath = "/api/embeddings"
 )
 
 // OllamaSidecarProvider sends embedding requests to a local Ollama sidecar.
@@ -105,7 +110,7 @@ func (p *OllamaSidecarProvider) Embed(ctx context.Context, _ string, texts []str
 			return nil, fmt.Errorf("embedding/ollama: marshal request: %w", err)
 		}
 
-		url := p.host + ollamaEmbeddPath
+		url := p.host + ollamaEmbedPath
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("embedding/ollama: build request: %w", err)
@@ -118,16 +123,21 @@ func (p *OllamaSidecarProvider) Embed(ctx context.Context, _ string, texts []str
 			// Return as a provider error so the loop backs off.
 			return nil, fmt.Errorf("embedding/ollama: request failed: %w", err)
 		}
-		defer resp.Body.Close() //nolint:gocritic // loop deferral acceptable: N is small and we return on error
-
+		// Close the body BEFORE the next iteration — a deferred close inside a
+		// loop holds every connection open until the function returns (the
+		// interface contract allows large batches even though current callers
+		// pass single texts).
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 			return nil, fmt.Errorf("embedding/ollama: API returned status %d", resp.StatusCode)
 		}
 
 		var result ollamaResponse
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, fmt.Errorf("embedding/ollama: decode response: %w", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("embedding/ollama: decode response: %w", decodeErr)
 		}
 		out[i] = result.Embedding
 	}

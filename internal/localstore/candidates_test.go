@@ -100,7 +100,7 @@ func TestSanitizeFTSCandidates_InteriorQuote(t *testing.T) {
 	s := openTestStore(t)
 	insertMemory(t, s, "obs-q", "JWTauth handling", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", `Fixed JWT"auth bug`, "proj", "project")
-	if _, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()}); err != nil {
+	if _, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()}); err != nil {
 		t.Errorf("FindCandidates with an interior-quote title errored: %v", err)
 	}
 }
@@ -129,7 +129,7 @@ func TestFindCandidates_OverlappingTitles(t *testing.T) {
 
 	savedID := insertMemory(t, s, "obs-new", "JWT authentication session bug", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestFindCandidates_RelationRowsInserted(t *testing.T) {
 	insertMemory(t, s, "obs-b", "auth token refresh", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestFindCandidates_SkipInsert(t *testing.T) {
 	insertMemory(t, s, "obs-a", "JWT auth middleware", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true, BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{SkipInsert: true, BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates(SkipInsert=true): %v", err)
 	}
@@ -229,7 +229,7 @@ func TestFindCandidates_SoftDeletedExcluded(t *testing.T) {
 
 	// Lenient floor so the ONLY reason obs-a can be excluded is the deleted_at
 	// filter (not the BM25 floor dropping everything in a tiny corpus).
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestFindCandidates_CrossProjectExcluded(t *testing.T) {
 	insertMemory(t, s, "obs-other-proj", "JWT auth middleware", "other-proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestFindCandidates_CrossScopeExcluded(t *testing.T) {
 	insertMemory(t, s, "obs-personal", "JWT auth middleware", "proj", "personal")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestFindCandidates_LimitHonored(t *testing.T) {
 	limit := 2
 	savedID := insertMemory(t, s, "obs-new", "JWT auth session token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{Limit: limit, BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{Limit: limit, BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestFindCandidates_BM25FloorFilters(t *testing.T) {
 
 	// Default floor (−2.0): strong multi-word matches pass; the single-word weak
 	// match (closer to 0) is excluded.
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{SkipInsert: true})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestFindCandidates_BM25FloorFilters(t *testing.T) {
 func TestFindCandidates_ObservationNotFound(t *testing.T) {
 	s := openTestStore(t)
 
-	_, err := s.FindCandidates(999999, CandidateOptions{})
+	_, err := s.FindCandidates(context.Background(), 999999, CandidateOptions{})
 	if err == nil {
 		t.Error("expected error for non-existent savedID, got nil")
 	}
@@ -559,7 +559,7 @@ func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// Lenient floor so the write phase (INSERT) is actually exercised.
-			_, errs[i] = s.FindCandidates(savedIDs[i], CandidateOptions{BM25Floor: lenientFloor()})
+			_, errs[i] = s.FindCandidates(context.Background(), savedIDs[i], CandidateOptions{BM25Floor: lenientFloor()})
 		}()
 	}
 
@@ -593,7 +593,7 @@ func TestFindCandidates_NilGate_FTSOnly(t *testing.T) {
 	savedID := insertMemory(t, s, "src", "JWT auth login bug fix", "proj", "project")
 
 	// EmbedFn is nil — cosine pass must not run.
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{
 		BM25Floor:  lenientFloor(),
 		SkipInsert: true,
 		EmbedFn:    nil, // explicit nil
@@ -664,7 +664,7 @@ func TestFindCandidates_CosineSurfaces_Paraphrase(t *testing.T) {
 
 	// The FTS query for "authentication failure event" should NOT match
 	// "login error occurrence" (no shared words). Verify FTS finds nothing first.
-	ftsOnlyCands, err := s.FindCandidates(savedID, CandidateOptions{
+	ftsOnlyCands, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{
 		BM25Floor:  lenientFloor(),
 		SkipInsert: true,
 		EmbedFn:    nil,
@@ -690,7 +690,7 @@ func TestFindCandidates_CosineSurfaces_Paraphrase(t *testing.T) {
 		return out, nil
 	})
 
-	cosineCands, err := s.FindCandidates(savedID, CandidateOptions{
+	cosineCands, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{
 		BM25Floor:  lenientFloor(),
 		SkipInsert: true,
 		EmbedFn:    embedFn,

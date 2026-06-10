@@ -59,6 +59,9 @@ func (s *Server) handleEmbeddingKeyPost(w http.ResponseWriter, r *http.Request) 
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "embedding key stored",
+		// Honest contract: the live provider is constructed at startup — a key
+		// stored now activates on the NEXT daemon start, not immediately.
+		"note": "restart the daemon for the key to take effect",
 	})
 }
 

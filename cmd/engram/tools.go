@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -149,7 +150,7 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
 		),
-		handleSave(store, loop, embedLoop, writerID, activity),
+		handleSave(store, loop, embedLoop, gated, writerID, activity),
 	)
 
 	// ── mem_save_prompt ──────────────────────────────────────────────────────
@@ -493,8 +494,8 @@ func resolveSaveProject(store *localstore.Store, explicitProject string) (string
 // embedLoop (may be nil): after a successful save, embedLoop.Trigger() is called
 // nil-safely so the backfill loop picks up the new row without waiting for the
 // next periodic 60s tick. The Trigger is non-blocking (coalesced, size-1 channel).
-func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
-	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
 		title, _ := args["title"].(string)
@@ -570,9 +571,17 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		// Post-save conflict candidate detection (REQ-001).
 		// Errors are logged to stderr and swallowed — detection failure MUST NOT fail
 		// the save. The save already succeeded; candidate detection is advisory only.
-		candidates, candErr := store.FindCandidates(result.ID, localstore.CandidateOptions{
+		// The cosine paraphrase pass is wired through the SAME gated provider as
+		// search and backfill (gated/omitted projects: the embed errors and the
+		// pass silently degrades to FTS-only candidates). A bounded context keeps
+		// a stalled local sidecar from hanging the save path.
+		candCtx, candCancel := context.WithTimeout(ctx, 10*time.Second)
+		candidates, candErr := store.FindCandidates(candCtx, result.ID, localstore.CandidateOptions{
 			// nil BM25Floor → store default (-2.0); nil/0 Limit → store default (3).
+			EmbedFn:   gated.Embed,
+			EmbedDims: gated.Dimensions(),
 		})
+		candCancel()
 		if candErr != nil {
 			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
 		}

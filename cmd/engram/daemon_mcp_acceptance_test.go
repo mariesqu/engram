@@ -23,7 +23,7 @@ import (
 // via the Streamable HTTP MCP transport.
 //
 // Proves: the /mcp endpoint is reachable with the bearer token, the tool
-// surface is identical to stdio (same 9 tools), and a saved observation is
+// surface is identical to stdio (same 10 tools), and a saved observation is
 // returned by a subsequent search.
 func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 	dir := t.TempDir()

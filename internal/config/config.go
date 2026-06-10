@@ -94,6 +94,9 @@ type fileConfig struct {
 	// Must match the model's actual output dimensions; mismatched stored BLOBs are
 	// treated as stale and re-embedded by the backfill loop.
 	EmbeddingDims int `json:"embedding_dims,omitempty"`
+	// OllamaModel is the ollama embedding model name. Default "nomic-embed-text".
+	// Restart-required (the provider is constructed at startup).
+	OllamaModel string `json:"ollama_model,omitempty"`
 	// OllamaHost is the base URL of the local Ollama sidecar. Default "http://localhost:11434".
 	// Only used when EmbeddingProvider = "ollama".
 	OllamaHost string `json:"ollama_host,omitempty"`
@@ -128,6 +131,10 @@ type Config struct {
 	// OllamaHost is the base URL of the local Ollama sidecar.
 	// Empty means "use default" (http://localhost:11434).
 	OllamaHost string
+
+	// OllamaModel is the ollama embedding model name.
+	// Empty means "use default" (nomic-embed-text).
+	OllamaModel string
 
 	// embeddingKeyActive records whether an embedding key is available at
 	// runtime — either from ENGRAM_EMBEDDING_KEY env var OR from the stored
@@ -178,16 +185,16 @@ func (c Config) WithEncryptedEmbeddingKey(blob []byte) Config {
 // never present. EmbeddingKeySet is true when an encrypted embedding API key is
 // stored; the key itself is never present.
 type RedactedConfig struct {
-	DB               string `json:"db_path,omitempty"`
-	CentralURL       string `json:"central_url,omitempty"`
-	WriterID         string `json:"writer_id,omitempty"`
-	WriterKey        string `json:"writer_key,omitempty"` // "***REDACTED***" or absent
-	HTTPPort         int    `json:"http_port,omitempty"`
-	SyncInterval     string `json:"sync_interval,omitempty"`
-	LogLevel         string `json:"log_level,omitempty"`
-	Transport        string `json:"transport,omitempty"`
+	DB                string `json:"db_path,omitempty"`
+	CentralURL        string `json:"central_url,omitempty"`
+	WriterID          string `json:"writer_id,omitempty"`
+	WriterKey         string `json:"writer_key,omitempty"` // "***REDACTED***" or absent
+	HTTPPort          int    `json:"http_port,omitempty"`
+	SyncInterval      string `json:"sync_interval,omitempty"`
+	LogLevel          string `json:"log_level,omitempty"`
+	Transport         string `json:"transport,omitempty"`
 	EmbeddingProvider string `json:"embedding_provider,omitempty"`
-	EmbeddingKeySet  bool   `json:"embedding_key_set,omitempty"` // true when encrypted key present
+	EmbeddingKeySet   bool   `json:"embedding_key_set,omitempty"` // true when encrypted key present
 }
 
 // ConfigPatch is a partial update applied by PUT /api/v1/config.
@@ -265,7 +272,7 @@ func Load(dir string) (Config, error) {
 	// a bad value persisted to disk is caught immediately rather than silently
 	// falling back to noop (hiding a misconfiguration).
 	if !ValidEmbeddingProviders[fc.EmbeddingProvider] {
-		return Config{}, fmt.Errorf("config.Load: unsupported embedding_provider %q (valid: \"\", \"none\", \"openai\")", fc.EmbeddingProvider)
+		return Config{}, fmt.Errorf("config.Load: unsupported embedding_provider %q (valid: \"\", \"none\", \"openai\", \"ollama\")", fc.EmbeddingProvider)
 	}
 	cfg.EmbeddingProvider = fc.EmbeddingProvider
 
@@ -280,6 +287,7 @@ func Load(dir string) (Config, error) {
 	cfg.EmbeddingLocalConsent = fc.EmbeddingLocalConsent
 	cfg.EmbeddingDims = fc.EmbeddingDims
 	cfg.OllamaHost = fc.OllamaHost
+	cfg.OllamaModel = fc.OllamaModel
 
 	return cfg, nil
 }
@@ -313,6 +321,7 @@ func Save(dir string, cfg Config) error {
 	fc.EmbeddingLocalConsent = cfg.EmbeddingLocalConsent
 	fc.EmbeddingDims = cfg.EmbeddingDims
 	fc.OllamaHost = cfg.OllamaHost
+	fc.OllamaModel = cfg.OllamaModel
 
 	if len(cfg.encryptedEmbeddingKey) > 0 {
 		fc.EncryptedEmbeddingKey = base64.StdEncoding.EncodeToString(cfg.encryptedEmbeddingKey)

@@ -376,6 +376,7 @@ func runDaemonCmd(args []string) error {
 		embeddingLocalConsent: fileCfg.EmbeddingLocalConsent,
 		embeddingDims:         fileCfg.EmbeddingDims,
 		ollamaHost:            fileCfg.OllamaHost,
+		ollamaModel:           fileCfg.OllamaModel,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

@@ -234,6 +234,7 @@ All subcommands read `daemon.json` from the same directory as `--db`. If no daem
 | `sync_interval` | Yes                | Autosync cadence (Go duration, e.g. `30s`)     |
 | `log_level`     | Yes                | Log verbosity: `debug`, `info`, `warn`, `error`|
 | `db_path`       | No (restart)       | Path to the local SQLite database              |
+| `ollama_model`  | No (restart)       | Ollama embedding model (default `nomic-embed-text`) |
 | `http_port`     | No (restart)       | Control API TCP port                           |
 | `transport`     | No (restart)       | MCP transport mode: `stdio` or `http`          |
 
