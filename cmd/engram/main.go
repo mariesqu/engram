@@ -33,28 +33,31 @@ import (
 const usage = `engram — central sync server and local daemon
 
 Usage:
-  engram serve  [--addr <addr>] [--dsn <dsn>]
-  engram keys   provision [--dsn <dsn>] <writer-id>
-  engram keys   revoke    [--dsn <dsn>] <writer-id>
-  engram daemon [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
-  engram status [--db <path>]
-  engram ui     [--db <path>]
+  engram serve    [--addr <addr>] [--dsn <dsn>]
+  engram keys     provision [--dsn <dsn>] <writer-id>
+  engram keys     revoke    [--dsn <dsn>] <writer-id>
+  engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
+  engram status   [--db <path>]
+  engram ui       [--db <path>]
+  engram projects list
+  engram projects policy <project> <synced|local-only|omitted>
 
 Environment:
   ENGRAM_ADDR            default listen address for 'serve' (default ":8080")
   ENGRAM_DSN             Postgres DSN (required for 'serve' and 'keys provision/revoke')
-  ENGRAM_DB              path to local SQLite database (required for 'daemon', 'status', 'ui')
+  ENGRAM_DB              path to local SQLite database (required for 'daemon', 'status', 'ui', 'projects')
   ENGRAM_CENTRAL_URL     central server URL for autosync (optional for 'daemon')
   ENGRAM_WRITER_ID       writer identity for autosync (required when ENGRAM_CENTRAL_URL is set)
   ENGRAM_WRITER_KEY      hex-encoded 32-byte HMAC key (env only; required when ENGRAM_CENTRAL_URL is set)
   ENGRAM_SYNC_INTERVAL   autosync cadence for 'daemon' (default "30s")
 
 Subcommands:
-  serve   Run the central HTTP server (plain HTTP — terminate TLS upstream).
-  keys    Provision or revoke per-writer HMAC keys.
-  daemon  Run the local MCP daemon (stdio MCP by default; use --http for resident control plane).
-  status  Print status of the running resident daemon (requires daemon --http).
-  ui      Open the web UI in the default browser (requires daemon --http).
+  serve     Run the central HTTP server (plain HTTP — terminate TLS upstream).
+  keys      Provision or revoke per-writer HMAC keys.
+  daemon    Run the local MCP daemon (stdio MCP by default; use --http for resident control plane).
+  status    Print status of the running resident daemon (requires daemon --http).
+  ui        Open the web UI in the default browser (requires daemon --http).
+  projects  List and manage per-project sync policies (requires daemon --http).
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
 `
@@ -102,6 +105,12 @@ func run(args []string) int {
 	case "ui":
 		if err := runUICmd(args[1:]); err != nil {
 			log.Printf("engram ui: %v", err)
+			return 1
+		}
+		return 0
+	case "projects":
+		if err := runProjectsCmd(args[1:]); err != nil {
+			log.Printf("engram projects: %v", err)
 			return 1
 		}
 		return 0

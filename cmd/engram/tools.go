@@ -487,6 +487,16 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string, act
 			return toolErr, nil
 		}
 
+		// Policy check: refuse writes for omitted projects BEFORE any store write.
+		// Returns a clear MCP error; writes nothing (no row, no outbox entry).
+		pol, polErr := store.GetPolicy(project)
+		if polErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_save: policy check for project %q: %v", project, polErr)), nil
+		}
+		if pol == localstore.PolicyOmitted {
+			return mcp.NewToolResultError(fmt.Sprintf("project %q is omitted: capture refused", project)), nil
+		}
+
 		result, err := store.AddObservation(localstore.AddObservationParams{
 			SessionID: sessionID,
 			Type:      typ,
@@ -863,6 +873,15 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		project, toolErr := resolveSaveProject(store, explicitProject)
 		if toolErr != nil {
 			return toolErr, nil
+		}
+
+		// Policy check: refuse writes for omitted projects BEFORE any store write.
+		pol, polErr := store.GetPolicy(project)
+		if polErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_save_prompt: policy check for project %q: %v", project, polErr)), nil
+		}
+		if pol == localstore.PolicyOmitted {
+			return mcp.NewToolResultError(fmt.Sprintf("project %q is omitted: capture refused", project)), nil
 		}
 
 		if _, err := store.AddPrompt(localstore.AddPromptParams{

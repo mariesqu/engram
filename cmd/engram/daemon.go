@@ -247,6 +247,13 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 		})
 	}
 
+	// Wire the central-configured closure for policy default computation (PR-②).
+	// The closure captures cfg.centralURL by value at build time — it does not
+	// change for the lifetime of this daemon process.  PR-③ will replace this
+	// with a dynamic closure that reflects runtime connect/disconnect state.
+	centralURL := cfg.centralURL // immutable for this daemon instance
+	store.SetCentralConfiguredFn(func() bool { return centralURL != "" })
+
 	// Create in-memory session activity tracker. Shared across all write handlers
 	// so mem_save_prompt can record the current prompt and mem_save can auto-capture it.
 	activity := NewSessionActivity()
