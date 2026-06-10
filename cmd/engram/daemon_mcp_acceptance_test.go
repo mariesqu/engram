@@ -119,6 +119,7 @@ func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 		"mem_context",
 		"mem_judge",
 		"mem_save_prompt",
+		"mem_similar",
 	}
 	if len(toolsResult.Tools) != len(wantTools) {
 		names := make([]string, len(toolsResult.Tools))
