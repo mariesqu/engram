@@ -1,6 +1,7 @@
 package localstore
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -21,6 +22,18 @@ import (
 // reflects the daemon's current connectivity state even after a connect or
 // disconnect operation.
 type IsCentralConfiguredFn func() bool
+
+// EmbedQueryFn is the function signature for embedding a search query.
+// It is called by SearchMemoriesFiltered when mode is "semantic" or "hybrid"
+// to embed the query string for cosine comparison.
+//
+// The function must enforce the privacy gate: it must not embed query text for
+// omitted or (in PR-1) local-only projects. The daemon wires the gated provider
+// behind this function, so localstore does not need to import internal/embedding.
+//
+// Returns (nil, nil) when the provider is the Noop provider or when the query
+// project's policy gates the embedding (the caller degrades to FTS).
+type EmbedQueryFn func(ctx context.Context, project string, texts []string) ([][]float32, error)
 
 // Store is the local SQLite adapter. It implements domain.Reader.
 //
@@ -59,6 +72,16 @@ type Store struct {
 	// policyMu serializes cache reads/writes independently of the write-queue mu.
 	policyCache map[string]Policy
 	policyMu    sync.RWMutex
+
+	// embedFn is the function used by SearchMemoriesFiltered to embed a query
+	// string for semantic/hybrid search. It is nil when no provider is configured
+	// (NoopProvider) and the search degrades to FTS. Set via SetEmbedFn after Open.
+	embedFn     EmbedQueryFn
+	embedFnMu   sync.RWMutex
+
+	// embedDims is the dimensionality expected from embedFn. Used by SelectVectors
+	// to filter out dimension-mismatched BLOBs. Set alongside embedFn.
+	embedDims int
 }
 
 // Open opens (or creates) the SQLite database at path, applies WAL pragmas,
@@ -114,6 +137,18 @@ func (s *Store) SetCentralConfiguredFn(fn IsCentralConfiguredFn) {
 	s.policyMu.Lock()
 	s.isCentralConfigured = fn
 	s.policyMu.Unlock()
+}
+
+// SetEmbedFn installs the embedding function used by SearchMemoriesFiltered
+// for semantic/hybrid search modes. fn may be nil (Noop — search degrades to FTS).
+// dims is the expected vector dimensionality; pass 0 when fn is nil.
+//
+// SAFE for concurrent use: guarded by embedFnMu.
+func (s *Store) SetEmbedFn(fn EmbedQueryFn, dims int) {
+	s.embedFnMu.Lock()
+	s.embedFn = fn
+	s.embedDims = dims
+	s.embedFnMu.Unlock()
 }
 
 // Close releases the underlying database connection.

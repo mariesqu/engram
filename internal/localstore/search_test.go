@@ -45,7 +45,7 @@ func TestSearchMemoriesFiltered_TypeFilter(t *testing.T) {
 	seedObservation(t, s, "sf-decision-2", "auth pattern", "established auth pattern", "proj-a", "decision", "project")
 
 	// Search for "auth" with type=decision — should return 2, not 3.
-	results, err := s.SearchMemoriesFiltered("auth", "proj-a", 10, SearchFilter{Type: "decision"})
+	results, _, err := s.SearchMemoriesFiltered("auth", "proj-a", 10, SearchFilter{Type: "decision"})
 	if err != nil {
 		t.Fatalf("SearchMemoriesFiltered type filter: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestSearchMemoriesFiltered_ScopeFilter(t *testing.T) {
 	seedObservation(t, s, "sf-personal-1", "personal scoped memory", "personal note", "myproject", "manual", "personal")
 
 	// Scope=project must not return the personal row.
-	projResults, err := s.SearchMemoriesFiltered("scoped memory", "myproject", 10, SearchFilter{Scope: "project"})
+	projResults, _, err := s.SearchMemoriesFiltered("scoped memory", "myproject", 10, SearchFilter{Scope: "project"})
 	if err != nil {
 		t.Fatalf("scope=project filter: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestSearchMemoriesFiltered_ScopeFilter(t *testing.T) {
 	}
 
 	// Scope=personal must not return the project row.
-	personalResults, err := s.SearchMemoriesFiltered("scoped memory", "myproject", 10, SearchFilter{Scope: "personal"})
+	personalResults, _, err := s.SearchMemoriesFiltered("scoped memory", "myproject", 10, SearchFilter{Scope: "personal"})
 	if err != nil {
 		t.Fatalf("scope=personal filter: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestSearchMemoriesFiltered_ProjectFilter(t *testing.T) {
 	seedObservation(t, s, "sf-pa-1", "cache architecture", "redis caching layer", "project-a", "architecture", "project")
 	seedObservation(t, s, "sf-pb-1", "cache architecture", "memcache layer", "project-b", "architecture", "project")
 
-	results, err := s.SearchMemoriesFiltered("cache architecture", "project-a", 10, SearchFilter{})
+	results, _, err := s.SearchMemoriesFiltered("cache architecture", "project-a", 10, SearchFilter{})
 	if err != nil {
 		t.Fatalf("project filter: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestSearchMemoriesFiltered_LimitHonored(t *testing.T) {
 		seedObservation(t, s, syncID, "limit test memory", "content for limit test", "limitproj", "manual", "project")
 	}
 
-	results, err := s.SearchMemoriesFiltered("limit test", "limitproj", 3, SearchFilter{})
+	results, _, err := s.SearchMemoriesFiltered("limit test", "limitproj", 3, SearchFilter{})
 	if err != nil {
 		t.Fatalf("limit filter: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestSearchMemoriesFiltered_FTSMatchesTitleAndContent(t *testing.T) {
 	seedObservation(t, s, "sf-title", "hexagonal match in title", "other content", "fts-test", "manual", "project")
 	seedObservation(t, s, "sf-content", "other title", "hexagonal match in content body", "fts-test", "manual", "project")
 
-	results, err := s.SearchMemoriesFiltered("hexagonal", "fts-test", 10, SearchFilter{})
+	results, _, err := s.SearchMemoriesFiltered("hexagonal", "fts-test", 10, SearchFilter{})
 	if err != nil {
 		t.Fatalf("FTS title+content: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestSearchMemoriesFiltered_ExcludesDeleted(t *testing.T) {
 	seedObservation(t, s, "sf-del-gone", "deleted test memory", "gone content", "deltest", "manual", "project")
 	softDelete(t, s, "sf-del-gone")
 
-	results, err := s.SearchMemoriesFiltered("deleted test memory", "deltest", 10, SearchFilter{})
+	results, _, err := s.SearchMemoriesFiltered("deleted test memory", "deltest", 10, SearchFilter{})
 	if err != nil {
 		t.Fatalf("deleted exclusion: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestSearchMemoriesFiltered_CombinedFilters(t *testing.T) {
 	// Wrong scope.
 	seedObservation(t, s, "sf-combo-3", "combined filter match", "arch project scoped", "comboproject", "architecture", "project")
 
-	results, err := s.SearchMemoriesFiltered("combined filter", "comboproject", 10, SearchFilter{
+	results, _, err := s.SearchMemoriesFiltered("combined filter", "comboproject", 10, SearchFilter{
 		Type:  "architecture",
 		Scope: "personal",
 	})
