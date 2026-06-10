@@ -78,25 +78,38 @@ type SyncResult struct {
 	Pulled int        `json:"pulled"`
 }
 
+// EmbeddingBackfill holds the embedding backfill status included in
+// GET /api/v1/status. Pending is the count of observations that have no
+// embedding yet (embedding IS NULL). Provider is the active provider name.
+type EmbeddingBackfill struct {
+	Pending  int    `json:"pending"`
+	Provider string `json:"provider,omitempty"` // "", "none", "openai"
+}
+
 // Status holds the runtime state snapshot returned by GET /api/v1/status.
 type Status struct {
-	CentralConnected bool       `json:"central_connected"`
-	CentralURL       *string    `json:"central_url,omitempty"` // omitted when not configured
-	LastSyncResult   SyncResult `json:"last_sync_result"`
-	DaemonVersion    string     `json:"daemon_version"`
+	CentralConnected  bool              `json:"central_connected"`
+	CentralURL        *string           `json:"central_url,omitempty"` // omitted when not configured
+	LastSyncResult    SyncResult        `json:"last_sync_result"`
+	DaemonVersion     string            `json:"daemon_version"`
+	EmbeddingBackfill EmbeddingBackfill `json:"embedding_backfill"`
 }
 
 // RedactedConfig is the config view returned by GET /api/v1/config.
 // The writer key is never present as a raw value — it is either
 // "***REDACTED***" (when set) or absent entirely (when not set).
+// EmbeddingKeySet indicates whether an embedding API key is stored (true) without
+// revealing the key itself.
 type RedactedConfig struct {
-	DB           string            `json:"db,omitempty"`
-	Central      *CentralConfig    `json:"central,omitempty"`
-	WriterKey    *string           `json:"writer_key,omitempty"` // "***REDACTED***" or absent
-	HTTP         *HTTPConfig       `json:"http,omitempty"`
-	SyncInterval string            `json:"sync_interval,omitempty"`
-	LogLevel     string            `json:"log_level,omitempty"`
-	Extra        map[string]string `json:"extra,omitempty"`
+	DB                string            `json:"db,omitempty"`
+	Central           *CentralConfig    `json:"central,omitempty"`
+	WriterKey         *string           `json:"writer_key,omitempty"` // "***REDACTED***" or absent
+	HTTP              *HTTPConfig       `json:"http,omitempty"`
+	SyncInterval      string            `json:"sync_interval,omitempty"`
+	LogLevel          string            `json:"log_level,omitempty"`
+	Extra             map[string]string `json:"extra,omitempty"`
+	EmbeddingProvider string            `json:"embedding_provider,omitempty"`
+	EmbeddingKeySet   bool              `json:"embedding_key_set,omitempty"`
 }
 
 // CentralConfig holds the central server coordinates visible in config reads
@@ -121,15 +134,17 @@ type HTTPConfig struct {
 }
 
 // ConfigPatch is a partial update to the persistent config. Only non-zero fields
-// are applied. The caller must never set WriterKey or CentralURL here — those are
-// managed by the connect/disconnect endpoints (PR-③).
+// are applied. The caller must never set WriterKey, CentralURL, or
+// EncryptedEmbeddingKey here — those are managed by dedicated endpoints.
 type ConfigPatch struct {
-	SyncInterval *string `json:"sync_interval,omitempty"`
-	LogLevel     *string `json:"log_level,omitempty"`
-	HTTPPort     *int    `json:"http_port,omitempty"`
-	DBPath       *string `json:"db_path,omitempty"`
-	Transport    *string `json:"transport,omitempty"`
-	// WriterKey and CentralURL must NEVER appear here — rejected at the handler.
+	SyncInterval      *string `json:"sync_interval,omitempty"`
+	LogLevel          *string `json:"log_level,omitempty"`
+	HTTPPort          *int    `json:"http_port,omitempty"`
+	DBPath            *string `json:"db_path,omitempty"`
+	Transport         *string `json:"transport,omitempty"`
+	EmbeddingProvider *string `json:"embedding_provider,omitempty"`
+	// WriterKey, CentralURL, and EncryptedEmbeddingKey must NEVER appear here —
+	// rejected at the handler.
 }
 
 // Store is the node-local persistence port. PR-① uses ListProjectsWithPolicy

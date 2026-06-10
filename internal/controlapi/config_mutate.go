@@ -6,6 +6,15 @@ import (
 	"time"
 )
 
+// validEmbeddingProviders mirrors config.ValidEmbeddingProviders. It is
+// duplicated here to avoid an upward import of config from controlapi —
+// controlapi is a port-based package that MUST NOT depend on infrastructure.
+var validEmbeddingProviders = map[string]bool{
+	"":       true, // zero value → noop
+	"none":   true,
+	"openai": true,
+}
+
 // handleConfigPut handles PUT /api/v1/config.
 //
 // Accepts a partial merge-patch JSON body (RFC 7396 semantics). Fields not
@@ -26,9 +35,14 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject forbidden fields: writer_key and central_url are managed by the
-	// connect/disconnect endpoints and must never be changed here.
-	forbidden := []string{"writer_key", "central_url", "writerKey", "centralUrl"}
+	// Reject forbidden fields: writer_key, central_url, and
+	// encrypted_embedding_key are managed by dedicated endpoints and must never
+	// be changed here. encrypted_embedding_key must go through the key-management
+	// endpoint so it is properly sealed before being written to disk.
+	forbidden := []string{
+		"writer_key", "central_url", "writerKey", "centralUrl",
+		"encrypted_embedding_key", "encryptedEmbeddingKey",
+	}
 	for _, f := range forbidden {
 		if _, ok := raw[f]; ok {
 			writeError(w, http.StatusBadRequest,
@@ -41,7 +55,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	// fat-fingered key name returning 200-no-op would mislead the caller.
 	known := map[string]bool{
 		"sync_interval": true, "log_level": true, "http_port": true,
-		"db_path": true, "transport": true,
+		"db_path": true, "transport": true, "embedding_provider": true,
 	}
 	for k := range raw {
 		if !known[k] {
@@ -86,6 +100,17 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		case "stdio", "http":
 		default:
 			writeError(w, http.StatusBadRequest, "invalid transport: must be \"stdio\" or \"http\"")
+			return
+		}
+	}
+
+	// Validate embedding_provider: an unrecognised value persisted to disk would
+	// hard-error the next startup (Load validates against ValidEmbeddingProviders).
+	// PR-③ lesson: validate at write time so bad values never reach the file.
+	if patch.EmbeddingProvider != nil {
+		if !validEmbeddingProviders[*patch.EmbeddingProvider] {
+			writeError(w, http.StatusBadRequest,
+				"invalid embedding_provider: must be one of \"\", \"none\", \"openai\"")
 			return
 		}
 	}
