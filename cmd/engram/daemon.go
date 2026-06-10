@@ -28,6 +28,7 @@ import (
 	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/syncer"
+	"github.com/mariesqu/engram/internal/webui"
 	"github.com/mariesqu/engram/internal/wireauth"
 )
 
@@ -411,8 +412,32 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 
 	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion)
 
+	// ── PR-④a: build the top-level mux (one listener, path-routed) ───────────
+	// The control API and the web UI share a single net.Listener. We mount:
+	//   /api/v1/…  → controlapi.Handler() (bearer-token auth)
+	//   /ui/…      → webui.Mount (session-cookie auth, token→cookie exchange)
+	// A future PR mounts /mcp here as well (PR-⑥).
+	topMux := http.NewServeMux()
+
+	// Mount all /api/v1/ routes from the control API handler.
+	// We re-register each route from the controlapi mux rather than mounting the
+	// mux as a sub-handler, so that the top-level mux has the exact same routing
+	// behaviour. The simplest approach: let controlapi.Handler() own /api/v1/ and
+	// register the webui on /ui/ — both on the SAME top-level mux.
+	ctrlHandler := ctrlSrv.Handler()
+	topMux.Handle("/api/", ctrlHandler)
+
+	// Mount the web UI on the same mux and listener.
+	webui.Mount(topMux, webui.WebUIDeps{
+		SyncCtrl: syncAdapter,
+		Store:    storeAdapter,
+		Secret:   token,
+		Port:     actualPort,
+		Version:  daemonVersion,
+	})
+
 	httpSrv := &http.Server{
-		Handler:           ctrlSrv.Handler(),
+		Handler:           topMux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
