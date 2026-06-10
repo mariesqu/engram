@@ -375,6 +375,9 @@ func TestConfig_OllamaFields_RoundTrip(t *testing.T) {
 	if loaded.OllamaHost != "http://localhost:11434" {
 		t.Errorf("OllamaHost: got %q, want %q", loaded.OllamaHost, "http://localhost:11434")
 	}
+	if loaded.OllamaModel != "mxbai-embed-large" {
+		t.Errorf("OllamaModel round-trip: got %q, want %q", loaded.OllamaModel, "mxbai-embed-large")
+	}
 }
 
 // TestConfig_EmbeddingKeySet_FromEnv verifies that WithEmbeddingKeyActive(true)
@@ -430,5 +433,41 @@ func TestConfig_Load_InvalidEmbeddingProvider_ReturnsError(t *testing.T) {
 	_, err := Load(dir)
 	if err == nil {
 		t.Fatal("Load with invalid embedding_provider should return error, got nil")
+	}
+}
+
+// TestConfig_Patch_EmbeddingKeys_SameValue_NoRestart proves the only-on-change
+// guard for every restart-required embedding key: PUTting the value the config
+// already holds must not claim a restart is needed.
+func TestConfig_Patch_EmbeddingKeys_SameValue_NoRestart(t *testing.T) {
+	base := Config{
+		EmbeddingProvider:     "openai",
+		EmbeddingLocalConsent: true,
+		EmbeddingDims:         256,
+		OllamaHost:            "http://localhost:11434",
+		OllamaModel:           "nomic-embed-text",
+	}
+	sameProvider := "openai"
+	sameConsent := true
+	sameDims := 256
+	sameHost := "http://localhost:11434"
+	sameModel := "nomic-embed-text"
+
+	_, restart := Patch(base, ConfigPatch{
+		EmbeddingProvider:     &sameProvider,
+		EmbeddingLocalConsent: &sameConsent,
+		EmbeddingDims:         &sameDims,
+		OllamaHost:            &sameHost,
+		OllamaModel:           &sameModel,
+	})
+	if restart {
+		t.Error("same-value patch of embedding keys must not require restart")
+	}
+
+	// And each key flips the flag when it actually CHANGES.
+	newConsent := false
+	_, restart = Patch(base, ConfigPatch{EmbeddingLocalConsent: &newConsent})
+	if !restart {
+		t.Error("changed embedding_local_consent must require restart (the live gate is startup-constructed)")
 	}
 }
