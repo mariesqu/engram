@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"text/tabwriter"
 
@@ -135,7 +136,9 @@ func runProjectsPolicyCmd(args []string) error {
 		return err
 	}
 
-	path := fmt.Sprintf("/api/v1/projects/%s/policy", project)
+	// PathEscape: a project name containing "/" (or other reserved chars) must
+	// arrive at the {project} route segment as ONE segment, not split the path.
+	path := fmt.Sprintf("/api/v1/projects/%s/policy", url.PathEscape(project))
 	body := map[string]string{"policy": policyStr}
 	if err := client.Put(path, body, nil); err != nil {
 		if errors.Is(err, ErrDaemonNotRunning) {

@@ -104,15 +104,16 @@ func Open(path string) (*Store, error) {
 
 // SetCentralConfiguredFn installs the closure that GetPolicy and
 // ListProjectsWithPolicy use to compute the read-time default policy.
-// Call this once during daemon wiring, after Open and before serving requests.
 //
 // The fn is called at read time so it always reflects the live connectivity
 // state.  A nil fn is accepted and treated as "not configured" (local-only
-// default).  This method is NOT safe for concurrent use with GetPolicy or
-// ListProjectsWithPolicy; call it once during startup, before any goroutines
-// access those methods.
+// default).  SAFE for concurrent use: the pointer is guarded by policyMu, and
+// computed defaults are never cached, so PR-③'s runtime connect/disconnect can
+// re-install the closure and the very next GetPolicy read reflects it.
 func (s *Store) SetCentralConfiguredFn(fn IsCentralConfiguredFn) {
+	s.policyMu.Lock()
 	s.isCentralConfigured = fn
+	s.policyMu.Unlock()
 }
 
 // Close releases the underlying database connection.

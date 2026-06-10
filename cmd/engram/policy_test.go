@@ -198,3 +198,52 @@ func TestRun_ProjectsPolicyInvalidValue(t *testing.T) {
 		t.Errorf("run([projects policy ... invalid-policy-value]): expected non-zero exit code, got 0")
 	}
 }
+
+// TestHandleSessionSummary_Omitted_ReturnsError verifies that
+// mem_session_summary — which writes to the memories table like any
+// observation — is refused for omitted projects too, not just
+// mem_save/mem_save_prompt.
+func TestHandleSessionSummary_Omitted_ReturnsError(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "omit_summary.db")
+	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	// Start a session so the summary resolves its project from the session row.
+	startTool := components.mcpServer.ListTools()["mem_session_start"]
+	if _, err := startTool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
+		"id": "sess-omit", "directory": t.TempDir(),
+	})); err != nil {
+		t.Fatalf("session start: %v", err)
+	}
+	sess, err := components.store.GetSession("sess-omit")
+	if err != nil || sess.Project == "" {
+		t.Fatalf("GetSession: %v (project=%q)", err, sess.Project)
+	}
+	if err := components.store.SetPolicy(sess.Project, localstore.PolicyOmitted); err != nil {
+		t.Fatalf("SetPolicy omitted: %v", err)
+	}
+
+	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
+	result, err := sumTool.Handler(t.Context(), newToolRequest("mem_session_summary", map[string]any{
+		"content": "## Goal\nmust be refused", "session_id": "sess-omit",
+	}))
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Errorf("expected tool error for omitted project, got success: %v", result.Content)
+	}
+
+	// Zero outbox entries beyond the session-start write (sessions are not
+	// memories — assert no memory row materialized).
+	rows, searchErr := components.store.SearchMemories("must be refused", sess.Project, 10)
+	if searchErr != nil {
+		t.Fatalf("SearchMemories: %v", searchErr)
+	}
+	if len(rows) != 0 {
+		t.Errorf("want 0 summary rows for omitted project; got %d", len(rows))
+	}
+}

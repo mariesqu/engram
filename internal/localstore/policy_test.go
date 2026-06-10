@@ -4,7 +4,11 @@ package localstore
 // read-time central-aware default (design decision #4).
 
 import (
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/mariesqu/engram/internal/domain"
 )
 
 // TestGetPolicy_AbsentRow_DefaultSynced verifies that GetPolicy returns
@@ -208,5 +212,110 @@ func seedMemory(t *testing.T, st *Store, project, syncID string) {
 	`, syncID, project)
 	if err != nil {
 		t.Fatalf("seedMemory(%q): %v", project, err)
+	}
+}
+
+// TestGetPolicy_DefaultNotCached_RuntimeFlip proves two things at once:
+//  1. The computed default is NOT cached — only explicit rows are.
+//  2. SetCentralConfiguredFn can be re-installed at runtime (PR-③ relies on
+//     this for connect/disconnect) and the very next read reflects it.
+func TestGetPolicy_DefaultNotCached_RuntimeFlip(t *testing.T) {
+	st := openTempStore(t)
+
+	// Not configured → local-only default.
+	pol, err := st.GetPolicy("flip-proj")
+	if err != nil {
+		t.Fatalf("GetPolicy: %v", err)
+	}
+	if pol != PolicyLocalOnly {
+		t.Fatalf("before flip: got %q, want %q", pol, PolicyLocalOnly)
+	}
+
+	// Runtime central connect (no SetPolicy in between). If the default had
+	// been cached above, this would still return local-only.
+	st.SetCentralConfiguredFn(func() bool { return true })
+	pol, err = st.GetPolicy("flip-proj")
+	if err != nil {
+		t.Fatalf("GetPolicy after flip: %v", err)
+	}
+	if pol != PolicySynced {
+		t.Errorf("after central connect: got %q, want %q (stale cached default?)", pol, PolicySynced)
+	}
+
+	// And back: runtime disconnect must surface immediately too.
+	st.SetCentralConfiguredFn(func() bool { return false })
+	pol, err = st.GetPolicy("flip-proj")
+	if err != nil {
+		t.Fatalf("GetPolicy after disconnect: %v", err)
+	}
+	if pol != PolicyLocalOnly {
+		t.Errorf("after central disconnect: got %q, want %q", pol, PolicyLocalOnly)
+	}
+}
+
+// TestPolicy_ProjectNormalized verifies GetPolicy/SetPolicy normalize the
+// project name (trim + lowercase) so mixed-case callers — the control API PUT
+// endpoint, the CLI — hit the same row and cache entry as the write path.
+func TestPolicy_ProjectNormalized(t *testing.T) {
+	st := openTempStore(t)
+
+	if err := st.SetPolicy("  MixedCase ", PolicyOmitted); err != nil {
+		t.Fatalf("SetPolicy: %v", err)
+	}
+	pol, err := st.GetPolicy("mixedcase")
+	if err != nil {
+		t.Fatalf("GetPolicy lowercase: %v", err)
+	}
+	if pol != PolicyOmitted {
+		t.Errorf("GetPolicy(\"mixedcase\") = %q, want %q (project not normalized on write?)", pol, PolicyOmitted)
+	}
+	pol, err = st.GetPolicy("MIXEDCASE")
+	if err != nil {
+		t.Fatalf("GetPolicy uppercase: %v", err)
+	}
+	if pol != PolicyOmitted {
+		t.Errorf("GetPolicy(\"MIXEDCASE\") = %q, want %q (project not normalized on read?)", pol, PolicyOmitted)
+	}
+}
+
+// TestApplyPulled_Omitted_RefusedWithError verifies the defensive guard: a
+// pulled mutation for an omitted project is refused with ErrOmittedProject (an
+// error, NOT a silent nil) so syncer.Pull keeps the per-project cursor BEHIND
+// the mutation — a later flip back to synced re-pulls it instead of silently
+// losing it forever.
+func TestApplyPulled_Omitted_RefusedWithError(t *testing.T) {
+	st := openTempStore(t)
+	if err := st.SetPolicy("omit-pull", PolicyOmitted); err != nil {
+		t.Fatalf("SetPolicy: %v", err)
+	}
+
+	m := domain.Mutation{
+		Op:         domain.OpUpsert,
+		SyncID:     "sync-omit-pull-1",
+		SessionID:  "sess",
+		EntityType: domain.EntityMemory,
+		Type:       "manual",
+		Title:      "pulled into omitted",
+		Content:    "must be refused",
+		Project:    "omit-pull",
+		Scope:      "project",
+		Version:    1,
+		UpdatedAt:  time.Now().UTC(),
+		WriterID:   "writer-remote",
+		Seq:        42,
+	}
+
+	err := st.ApplyPulled(m)
+	if !errors.Is(err, ErrOmittedProject) {
+		t.Fatalf("ApplyPulled for omitted project: err = %v, want errors.Is(_, ErrOmittedProject)", err)
+	}
+
+	// Nothing materialized.
+	rows, searchErr := st.SearchMemories("pulled into omitted", "omit-pull", 10)
+	if searchErr != nil {
+		t.Fatalf("SearchMemories: %v", searchErr)
+	}
+	if len(rows) != 0 {
+		t.Errorf("want 0 rows, got %d (pulled mutation must be refused)", len(rows))
 	}
 }

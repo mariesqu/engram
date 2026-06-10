@@ -2,8 +2,14 @@ package localstore
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 )
+
+// ErrOmittedProject is returned by write paths that refuse a mutation because
+// the target project's policy is omitted.  ApplyPulled wraps it so syncer.Pull
+// can keep the per-project cursor BEHIND the refused mutation (errors.Is).
+var ErrOmittedProject = errors.New("project policy is omitted")
 
 // Policy is the per-project sync policy. Three canonical values match the
 // CHECK constraint in the project_policy table (schema v10).
@@ -30,25 +36,38 @@ type ProjectPolicy struct {
 //   - Central configured → default is synced  (pushes + pulls as normal).
 //   - Central NOT configured → default is local-only  (no outbound traffic).
 //
-// The closure is queried at read time so flipping central connect/disconnect
-// is reflected immediately without any migration or cache invalidation.
-func (s *Store) defaultPolicy() Policy {
+// The closure is queried at read time AND the computed default is NEVER cached
+// (see GetPolicy), so flipping central connect/disconnect is reflected on the
+// very next read — no migration, no cache flush.
+//
+// Callers must hold policyMu (read or write) — the closure pointer is guarded
+// by it so SetCentralConfiguredFn is safe to call at runtime.
+func (s *Store) defaultPolicyLocked() Policy {
 	if s.isCentralConfigured != nil && s.isCentralConfigured() {
 		return PolicySynced
 	}
 	return PolicyLocalOnly
 }
 
-// GetPolicy returns the effective policy for the named project.
+// GetPolicy returns the effective policy for the named project. The project
+// name is normalized (normalizeProject) so callers with mixed-case/untrimmed
+// names hit the same row and cache entry as the write path.
 //
 // Lookup order:
-//  1. In-memory policy cache (cache hit → return immediately).
-//  2. project_policy table (absent row → read-time default from defaultPolicy).
+//  1. In-memory policy cache — EXPLICIT rows only (cache hit → return).
+//  2. project_policy table; absent row → read-time central-aware default.
 //
-// The returned policy is cached so subsequent calls (e.g. the outbox drain
-// hot path) avoid repeated DB round-trips.
+// Only explicit rows are cached. The computed default depends on external
+// state (central configured or not) that can change at runtime; caching it
+// would freeze the default at its first-read value.
+//
+// The slow path holds the write lock across the DB read AND the cache fill so
+// a concurrent SetPolicy can never be interleaved between them (which would
+// re-cache a value SetPolicy just invalidated).
 func (s *Store) GetPolicy(project string) (Policy, error) {
-	// Fast path: check the cache under a read lock.
+	project = normalizeProject(project)
+
+	// Fast path: explicit-row cache hit under a read lock.
 	s.policyMu.RLock()
 	if p, ok := s.policyCache[project]; ok {
 		s.policyMu.RUnlock()
@@ -56,7 +75,13 @@ func (s *Store) GetPolicy(project string) (Policy, error) {
 	}
 	s.policyMu.RUnlock()
 
-	// Slow path: query the DB.
+	// Slow path: full lock across query + cache fill (see doc above).
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	if p, ok := s.policyCache[project]; ok { // re-check after lock upgrade
+		return p, nil
+	}
+
 	var policy Policy
 	err := s.db.QueryRow(
 		`SELECT policy FROM project_policy WHERE project = ?`, project,
@@ -64,26 +89,24 @@ func (s *Store) GetPolicy(project string) (Policy, error) {
 
 	switch {
 	case err == nil:
-		// Row found: explicit policy stored.
+		// Explicit row: safe to cache (invalidated by SetPolicy on change).
+		s.policyCache[project] = policy
+		return policy, nil
 	case err == sql.ErrNoRows:
-		// No row: apply the read-time default.
-		policy = s.defaultPolicy()
+		// No row: compute the read-time default. NOT cached.
+		return s.defaultPolicyLocked(), nil
 	default:
 		return "", fmt.Errorf("GetPolicy %q: %w", project, err)
 	}
-
-	// Cache the result under a write lock.
-	s.policyMu.Lock()
-	s.policyCache[project] = policy
-	s.policyMu.Unlock()
-
-	return policy, nil
 }
 
 // SetPolicy persists the policy for the named project (upsert) and invalidates
-// the in-memory policy cache for that project so the next GetPolicy read reflects
-// the new value immediately.
+// the in-memory policy cache for that project so the next GetPolicy read
+// reflects the new value immediately. The project name is normalized the same
+// way GetPolicy normalizes it.
 func (s *Store) SetPolicy(project string, p Policy) error {
+	project = normalizeProject(project)
+
 	_, err := s.db.Exec(
 		`INSERT INTO project_policy (project, policy, updated_at)
 		 VALUES (?, ?, datetime('now'))
@@ -115,7 +138,9 @@ func (s *Store) SetPolicy(project string, p Policy) error {
 // memories row) via a UNION with project_policy rows, so explicitly-set
 // policies are always visible even for projects not yet written to memories.
 func (s *Store) ListProjectsWithPolicy() ([]ProjectPolicy, error) {
-	def := s.defaultPolicy()
+	s.policyMu.RLock()
+	def := s.defaultPolicyLocked()
+	s.policyMu.RUnlock()
 
 	// UNION of:
 	//   (a) all projects in memories with their policy (or default when absent)

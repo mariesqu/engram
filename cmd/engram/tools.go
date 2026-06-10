@@ -653,6 +653,16 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 			}
 		}
 
+		// Policy check: refuse writes for omitted projects BEFORE any store write —
+		// session summaries land in the memories table like any observation.
+		pol, polErr := store.GetPolicy(project)
+		if polErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_session_summary: policy check for project %q: %v", project, polErr)), nil
+		}
+		if pol == localstore.PolicyOmitted {
+			return mcp.NewToolResultError(fmt.Sprintf("project %q is omitted: capture refused", project)), nil
+		}
+
 		result, err := store.AddObservation(localstore.AddObservationParams{
 			SessionID: sessionID,
 			Type:      "session_summary",
