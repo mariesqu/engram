@@ -74,34 +74,10 @@ func (g *gatedProvider) Dimensions() int { return g.inner.Dimensions() }
 // Used by the backfill loop to record the producing model in embedding_model.
 func (g *gatedProvider) ModelName() string { return g.inner.ModelName() }
 
-// gatedWithConsent is the internal constructor used by PR-2 to inject the
-// consent flag. Kept unexported so PR-1 callers cannot accidentally enable
-// sidecar consent prematurely.
-//
-// Note: this function is declared but only used by tests and PR-2 wiring.
-// The compiler will complain if neither uses it; add a blank-import guard or
-// use it in the acceptance test.
-func gatedWithConsent(inner EmbeddingProvider, checker PolicyChecker, remote, consent bool) EmbeddingProvider {
-	return &gatedProvider{
-		inner:   inner,
-		checker: checker,
-		remote:  remote,
-		consent: consent,
-	}
-}
-
-// localOnlyEligible reports whether a local-only project may be embedded
-// given the current consent and remote flags. Extracted for clarity in the
-// gate and for use by PR-2 tests.
-//
-// In PR-1: always false (no consent mechanism).
-// In PR-2: true only when !remote && consent.
-func localOnlyEligible(remote, consent bool) bool {
-	if remote {
-		return false // never send local-only text to a remote provider
-	}
-	return consent // requires explicit consent for a local sidecar
-}
+// NOTE (PR-2 seam): the consent flag on gatedProvider is wired but always
+// false in PR-1 — there is deliberately NO constructor that sets it. PR-2
+// adds the consent-aware constructor alongside the sidecar provider and the
+// explicit consent setting.
 
 // ensure gatedProvider satisfies EmbeddingProvider at compile time.
 var _ EmbeddingProvider = (*gatedProvider)(nil)

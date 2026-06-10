@@ -2,6 +2,7 @@ package localstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -51,7 +52,7 @@ type SearchDegradation struct {
 //   - scope:   exact match on the scope column (normalized to lower)
 //   - limit:   defaults to 10; max is not enforced here (caller is responsible)
 //   - mode:    "" or "fts" → FTS only (byte-identical to before); "semantic" →
-//              cosine only; "hybrid" → FTS + cosine → RRF(k=60); unknown → fts
+//     cosine only; "hybrid" → FTS + cosine → RRF(k=60); unknown → fts
 //
 // FTS injection prevention: the query string is passed through sanitizeFTS
 // (wraps each token in double-quotes) before reaching the FTS5 engine.
@@ -156,9 +157,14 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	if embedErr != nil || len(vecs) == 0 || len(vecs[0]) == 0 {
 		results, err := runFTS()
 		var reason string
-		if embedErr != nil {
+		switch {
+		case errors.Is(embedErr, ErrEmbeddingGated):
 			reason = "semantic search unavailable for this project's policy; showing keyword results"
-		} else {
+		case embedErr != nil:
+			// Transient provider failure (network, 5xx, timeout) — NOT a policy
+			// denial; telling the user "policy" here would be a lie.
+			reason = "semantic search unavailable: provider error; showing keyword results"
+		default:
 			reason = "semantic search unavailable: provider returned no vector; showing keyword results"
 		}
 		return results, SearchDegradation{Reason: reason}, err

@@ -3,6 +3,7 @@ package localstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -22,6 +23,13 @@ import (
 // reflects the daemon's current connectivity state even after a connect or
 // disconnect operation.
 type IsCentralConfiguredFn func() bool
+
+// ErrEmbeddingGated is returned by an EmbedQueryFn when the project's policy
+// forbids embedding (omitted, or local-only with a remote provider). It lives
+// HERE — next to the EmbedQueryFn contract it belongs to — so the search path
+// can distinguish a policy denial from a transient provider failure without
+// importing internal/embedding (which imports this package).
+var ErrEmbeddingGated = errors.New("embedding gated by project policy")
 
 // EmbedQueryFn is the function signature for embedding a search query.
 // It is called by SearchMemoriesFiltered when mode is "semantic" or "hybrid"
@@ -76,8 +84,8 @@ type Store struct {
 	// embedFn is the function used by SearchMemoriesFiltered to embed a query
 	// string for semantic/hybrid search. It is nil when no provider is configured
 	// (NoopProvider) and the search degrades to FTS. Set via SetEmbedFn after Open.
-	embedFn     EmbedQueryFn
-	embedFnMu   sync.RWMutex
+	embedFn   EmbedQueryFn
+	embedFnMu sync.RWMutex
 
 	// embedDims is the dimensionality expected from embedFn. Used by SelectVectors
 	// to filter out dimension-mismatched BLOBs. Set alongside embedFn.

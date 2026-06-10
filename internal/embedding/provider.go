@@ -13,7 +13,6 @@ package embedding
 
 import (
 	"context"
-	"errors"
 
 	"github.com/mariesqu/engram/internal/localstore"
 )
@@ -49,7 +48,11 @@ type PolicyChecker interface {
 // policy forbids embedding (omitted, or local-only with a remote provider).
 // Callers (the backfill loop, the search path) must treat this as a silent
 // skip, NOT as a transient error to be retried.
-var ErrEmbeddingGated = errors.New("embedding gated by project policy")
+//
+// The canonical sentinel lives in localstore next to the EmbedQueryFn
+// contract (this package imports localstore; the reverse import would cycle).
+// This alias keeps the natural name available to embedding callers.
+var ErrEmbeddingGated = localstore.ErrEmbeddingGated
 
 // EligibleForEmbedding is a pure, zero-IO function that reports whether a
 // memory with the given project policy may be embedded by the configured

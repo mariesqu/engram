@@ -118,6 +118,10 @@ func SelectVectors(db *sql.DB, project string, filter SearchFilter, dims int) ([
 		q += "\n  AND scope = ?"
 		args = append(args, strings.ToLower(strings.TrimSpace(filter.Scope)))
 	}
+	if filter.TopicKey != "" {
+		q += " AND topic_key = ?"
+		args = append(args, filter.TopicKey)
+	}
 
 	rows, err := db.Query(q, args...)
 	if err != nil {
@@ -343,4 +347,3 @@ func UpdateEmbedding(db *sql.DB, syncID string, vec []float32, model, ts string)
 	}
 	return nil
 }
-

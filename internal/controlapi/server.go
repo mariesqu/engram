@@ -88,11 +88,14 @@ type EmbeddingBackfill struct {
 
 // Status holds the runtime state snapshot returned by GET /api/v1/status.
 type Status struct {
-	CentralConnected  bool              `json:"central_connected"`
-	CentralURL        *string           `json:"central_url,omitempty"` // omitted when not configured
-	LastSyncResult    SyncResult        `json:"last_sync_result"`
-	DaemonVersion     string            `json:"daemon_version"`
-	EmbeddingBackfill EmbeddingBackfill `json:"embedding_backfill"`
+	CentralConnected bool       `json:"central_connected"`
+	CentralURL       *string    `json:"central_url,omitempty"` // omitted when not configured
+	LastSyncResult   SyncResult `json:"last_sync_result"`
+	DaemonVersion    string     `json:"daemon_version"`
+	// EmbeddingBackfill is POPULATED BY PR-1b (the backfill loop). Pointer +
+	// omitempty so the field is ABSENT from responses until then — a permanent
+	// {"pending":0} would misreport thousands of unembedded rows as done.
+	EmbeddingBackfill *EmbeddingBackfill `json:"embedding_backfill,omitempty"`
 }
 
 // RedactedConfig is the config view returned by GET /api/v1/config.

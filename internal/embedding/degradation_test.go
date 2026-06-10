@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 )
 
@@ -35,6 +36,13 @@ type degradationCase struct {
 	// gatedProject, if true, sets the project policy to "omitted" (gate blocks embed).
 	gatedProject bool
 
+	// useRealGate, if true, wires the embed fn through the REAL gated provider
+	// (NewGated + recording mock) instead of a policy-ignoring closure, and the
+	// test additionally asserts the inner provider received ZERO calls. This is
+	// the end-to-end query-side privacy proof — a closure that ignores policy
+	// exercises the wrong degradation path entirely (round-1 review HIGH).
+	useRealGate bool
+
 	// wantReason is the expected SearchDegradation.Reason value.
 	// Empty string means "no degradation note expected".
 	wantReason string
@@ -43,15 +51,15 @@ type degradationCase struct {
 var degradationMatrix = []degradationCase{
 	// ── FTS baseline (MUST never set Reason) ─────────────────────────────────
 	{
-		name:      "fts_mode_no_embed_fn",
-		mode:      "fts",
-		noEmbedFn: true,
+		name:       "fts_mode_no_embed_fn",
+		mode:       "fts",
+		noEmbedFn:  true,
 		wantReason: "", // FTS path — never sets Reason
 	},
 	{
-		name:      "empty_mode_no_embed_fn",
-		mode:      "",
-		noEmbedFn: true,
+		name:       "empty_mode_no_embed_fn",
+		mode:       "",
+		noEmbedFn:  true,
 		wantReason: "", // same byte-identical FTS path
 	},
 	{
@@ -72,16 +80,16 @@ var degradationMatrix = []degradationCase{
 		name:       "semantic_embed_fn_error",
 		mode:       "semantic",
 		embedFnErr: errors.New("provider timeout"),
-		// Error from embed fn causes the same "policy" degradation path because
-		// ErrEmbeddingGated check happens after the call — see search.go.
-		// Actual reason produced by the search path:
-		wantReason: "semantic search unavailable for this project's policy; showing keyword results",
+		// A transient provider failure is NOT a policy denial — the search path
+		// distinguishes ErrEmbeddingGated (policy) from any other error.
+		wantReason: "semantic search unavailable: provider error; showing keyword results",
 	},
 	{
 		name:         "semantic_gated_project",
 		mode:         "semantic",
 		gatedProject: true,
-		wantReason:   "semantic results not ready; showing keyword results",
+		useRealGate:  true,
+		wantReason:   "semantic search unavailable for this project's policy; showing keyword results",
 	},
 	{
 		name: "semantic_no_vectors_in_db",
@@ -101,14 +109,14 @@ var degradationMatrix = []degradationCase{
 		name:       "hybrid_embed_fn_error",
 		mode:       "hybrid",
 		embedFnErr: errors.New("network error"),
-		wantReason: "semantic search unavailable for this project's policy; showing keyword results",
+		wantReason: "semantic search unavailable: provider error; showing keyword results",
 	},
 	{
 		name:         "hybrid_gated_project",
 		mode:         "hybrid",
 		gatedProject: true,
-		// "1 pending" because we add one observation with no embedding.
-		wantReason: "semantic results not ready (1 pending); showing keyword results",
+		useRealGate:  true,
+		wantReason:   "semantic search unavailable for this project's policy; showing keyword results",
 	},
 	{
 		name: "hybrid_no_vectors_in_db",
@@ -142,7 +150,18 @@ func TestDegradation_Matrix(t *testing.T) {
 				t.Fatalf("SetPolicy: %v", err)
 			}
 
-			if !tc.noEmbedFn {
+			var mock *recordingMockProvider
+			switch {
+			case tc.useRealGate:
+				// End-to-end query-side gate: the REAL gated provider wrapping a
+				// recording mock, exactly as the daemon wires it. The store's own
+				// policy table is the checker, so the gate sees the live policy.
+				mock = &recordingMockProvider{}
+				gated := embedding.NewGated(mock, st, true /* remote */)
+				st.SetEmbedFn(func(ctx context.Context, proj string, texts []string) ([][]float32, error) {
+					return gated.Embed(ctx, proj, texts)
+				}, 256)
+			case !tc.noEmbedFn:
 				embedErr := tc.embedFnErr
 				st.SetEmbedFn(func(_ context.Context, _ string, texts []string) ([][]float32, error) {
 					if embedErr != nil {
@@ -179,6 +198,13 @@ func TestDegradation_Matrix(t *testing.T) {
 			)
 			if err != nil {
 				t.Fatalf("SearchMemoriesFiltered: %v", err)
+			}
+
+			// The query-side privacy proof: with the real gate on an omitted
+			// project, the inner provider must have received ZERO calls — the
+			// query text never left the building.
+			if tc.useRealGate && mock != nil && mock.callCount() != 0 {
+				t.Errorf("PRIVACY VIOLATION: gated project query reached the provider (%d calls)", mock.callCount())
 			}
 
 			if tc.wantReason == "" {
