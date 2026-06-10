@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags acceptance ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Unit tests
+        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: "0"
+
+      # Acceptance tests spin up embedded-postgres, which pulls a ~30 MB binary
+      # on first run.  They are excluded from CI to keep minutes cheap — they run
+      # locally via `make test-acceptance` and in the release workflow before
+      # tagging.  See RELEASING.md for the full pre-release checklist.

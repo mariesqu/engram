@@ -42,6 +42,41 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 - **Project auto-detection** — resolves project name from git remote, repo root, or `.engram/config.json`
 - **Pure Go, CGO_ENABLED=0** — no C toolchain required
 
+## Install from release
+
+Pre-built binaries for Linux, macOS, and Windows are published on the
+[Releases page](https://github.com/mariesqu/engram/releases).
+
+1. Download the binary for your platform:
+
+   | Platform | File |
+   |----------|------|
+   | Linux amd64  | `engram-vX.Y.Z-linux-amd64` |
+   | Linux arm64  | `engram-vX.Y.Z-linux-arm64` |
+   | macOS amd64  | `engram-vX.Y.Z-darwin-amd64` |
+   | macOS arm64 (Apple Silicon) | `engram-vX.Y.Z-darwin-arm64` |
+   | Windows amd64 | `engram-vX.Y.Z-windows-amd64.exe` |
+
+2. Verify the checksum (download `SHA256SUMS` from the same release):
+
+   ```bash
+   sha256sum --check SHA256SUMS
+   ```
+
+3. Make executable and move to your PATH (Linux/macOS):
+
+   ```bash
+   chmod +x engram-vX.Y.Z-linux-amd64
+   mv engram-vX.Y.Z-linux-amd64 /usr/local/bin/engram
+   ```
+
+4. Confirm the version:
+
+   ```bash
+   engram version
+   # engram vX.Y.Z linux/amd64 go1.26.x
+   ```
+
 ## Build from source
 
 Requires Go 1.26.1 or later (see `go.mod`).
@@ -466,7 +501,12 @@ engram projects policy [--db <path>] <project> <policy>
 engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
+engram version
 ```
+
+`engram version` prints the binary version, GOOS/GOARCH, and Go runtime version.
+Local dev builds print `dev` as the version; release binaries are stamped at
+link time (see [RELEASING.md](RELEASING.md)).
 
 ### Environment variables
 

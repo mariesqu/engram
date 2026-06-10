@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for git describe
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags acceptance ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # Unit tests only — acceptance tests use embedded-postgres which downloads
+      # a ~30 MB binary per run and adds ~60 s.  The full acceptance suite must
+      # pass locally (make test-acceptance) before pushing the release tag.
+      # See RELEASING.md for the pre-release checklist.
+      - name: Unit tests
+        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-build release matrix
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist
+
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-linux-amd64"        ./cmd/engram
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-linux-arm64"        ./cmd/engram
+          GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-darwin-amd64"       ./cmd/engram
+          GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-darwin-arm64"       ./cmd/engram
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-windows-amd64.exe"  ./cmd/engram
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum engram-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body: |
+            See [RELEASING.md](https://github.com/${{ github.repository }}/blob/main/RELEASING.md) for the full release process.
+
+            ## Verify checksums
+
+            ```
+            sha256sum --check SHA256SUMS
+            ```
+          files: |
+            dist/engram-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
