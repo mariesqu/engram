@@ -569,7 +569,7 @@ The daemon exposes 9 tools to the connected agent.
 | `mem_save`            | Save an observation (decision, bug fix, discovery, …) to persistent memory           |
 | `mem_save_prompt`     | Save the user's prompt text so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID                |
-| `mem_search`          | Full-text search across all observations; filterable by type, project, scope         |
+| `mem_search`          | Search observations; supports `mode` param: `""` (FTS), `"semantic"`, or `"hybrid"` |
 | `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
@@ -588,6 +588,57 @@ judgment_id: rel-<hex>
 ```
 
 The agent calls `mem_judge` with the `judgment_id` and one of: `related`, `compatible`, `scoped`, `conflicts_with`, `supersedes`, `not_conflict`.
+
+## Semantic search
+
+`mem_search` supports an optional `mode` parameter that controls how results are ranked.
+
+| Mode | Behaviour |
+|------|-----------|
+| `""` (default) | Keyword full-text search (FTS5). Byte-identical to pre-1.0 behaviour. |
+| `"fts"` | Explicit keyword search — same as the default. |
+| `"semantic"` | Vector cosine similarity only. Requires a configured embedding provider. |
+| `"hybrid"` | FTS + cosine similarity fused via Reciprocal Rank Fusion (RRF, k=60). Best recall. |
+
+### Configuring an embedding provider
+
+Set `embedding_provider` in `config.json` (or via `PUT /api/v1/config`):
+
+```json
+{
+  "embedding_provider": "openai"
+}
+```
+
+Valid values: `""` (noop, default), `"none"` (explicit noop), `"openai"`.
+
+Supply the API key via the `ENGRAM_EMBEDDING_KEY` environment variable (hex-encoded). On Windows the key can also be stored as a DPAPI-encrypted blob via the UI. The environment variable always wins over the stored blob.
+
+```bash
+export ENGRAM_EMBEDDING_KEY=<hex-encoded-openai-key>
+```
+
+The key is kept in process memory only and is **never written to disk in plaintext, never logged, and never included in error messages**.
+
+### Privacy gate
+
+The embedding provider is wrapped by a privacy gate that enforces per-project sync policy before any text leaves the node:
+
+| Policy | Provider type | Embed allowed? |
+|--------|---------------|----------------|
+| `omitted` | any | No — text never leaves the node |
+| `local-only` | remote (OpenAI) | No — remote provider forbidden for local-only projects |
+| `synced` | remote (OpenAI) | Yes |
+
+The gate is structural: the raw provider is never exposed outside the `internal/embedding` package. Bypass is architecturally impossible.
+
+### Graceful degradation
+
+When semantic or hybrid search is requested but the embedding provider is unavailable (not configured, gated by policy, or provider error), the search automatically falls back to FTS and the response includes a `degradation` note explaining why. The default FTS path (`mode=""`) never sets a degradation note regardless of embedding configuration.
+
+### Backfill
+
+New observations are written with `embedding IS NULL`. The backfill loop (PR-1b) fills embeddings in the background. Until a row is embedded it participates in FTS but not in cosine ranking.
 
 ## Development
 
