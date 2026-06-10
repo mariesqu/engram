@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -12,25 +13,63 @@ const (
 	sessionCookieTTL  = 8 * time.Hour
 )
 
+// sessionStore holds the single active UI session for ONE mounted web UI.
+//
+// It is created per Mount call (per daemon instance), NOT package-level:
+//   - net/http serves each connection on its own goroutine, so reads and
+//     writes must be synchronized (RWMutex) — package-level bare strings were
+//     a data race.
+//   - Two daemons in one process (the test suite does this) must not share
+//     session state: a cookie minted by daemon A must never authenticate
+//     against daemon B.
+//
+// Single-user loopback semantics: exactly one live session; a second
+// `engram ui` exchange replaces the first. Expiry is enforced SERVER-side
+// (issuedAt + TTL) — the cookie MaxAge alone is client-side advice a stolen
+// cookie value would ignore.
+type sessionStore struct {
+	mu       sync.RWMutex
+	value    string // random hex session value; "" → no active session
+	issuedAt time.Time
+}
+
+// set records a new active session, replacing any previous one.
+func (s *sessionStore) set(val string) {
+	s.mu.Lock()
+	s.value = val
+	s.issuedAt = time.Now()
+	s.mu.Unlock()
+}
+
+// valid reports whether val matches the live, unexpired session.
+func (s *sessionStore) valid(val string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if val == "" || s.value == "" || val != s.value {
+		return false
+	}
+	return time.Since(s.issuedAt) <= sessionCookieTTL
+}
+
 // exchangeToken returns an http.Handler that:
 //  1. Reads the ?token= query parameter.
-//  2. Validates it against the daemon bearer secret (constant-length string
-//     comparison — timing side-channels on loopback are negligible, but we
-//     generate equal-length tokens so the comparison length is always 64 chars).
-//  3. Issues an HttpOnly, SameSite=Strict, Secure=false session cookie.
-//  4. Redirects to /ui/ stripping the token from the address bar / browser history.
+//  2. Validates it against the daemon bearer secret (equal-length hex strings;
+//     timing side-channels on loopback are negligible).
+//  3. Issues an HttpOnly, SameSite=Strict, Secure=false session cookie whose
+//     value is a FRESH random string — the bearer token never lands in the
+//     cookie jar.
+//  4. Redirects to /ui/ stripping the token from the address bar / history.
 //
-// On a bad or missing token it returns a 401 page.
-func exchangeToken(secret string) http.Handler {
+// On a bad or missing token it returns a 401 page. An EMPTY configured secret
+// always 401s — the exchange must never be satisfiable by an empty ?token=.
+func exchangeToken(secret string, sessions *sessionStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := r.URL.Query().Get("token")
-		if tok == "" || tok != secret {
+		if secret == "" || tok == "" || tok != secret {
 			render401(w)
 			return
 		}
 
-		// Generate a random session value (not the bearer token itself — we do
-		// not want the bearer token landing in the cookie jar).
 		sessVal, err := randomHex(16)
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -47,10 +86,7 @@ func exchangeToken(secret string) http.Handler {
 			MaxAge:   int(sessionCookieTTL.Seconds()),
 		})
 
-		// Store the session → secret mapping so requireSession can verify it.
-		// For this single-user loopback daemon we use a package-level session store
-		// (a single active session at a time is the expected UX).
-		setSession(sessVal, secret)
+		sessions.set(sessVal)
 
 		// Redirect to /ui/ — token is gone from the URL and therefore from
 		// browser history and the referrer header.
@@ -59,47 +95,18 @@ func exchangeToken(secret string) http.Handler {
 }
 
 // requireSession is middleware that validates the session cookie set by
-// exchangeToken. If the cookie is missing or stale it returns a 401 page
-// (NOT a redirect to the exchange — the user must run `engram ui` to get a
-// fresh tokenized URL, so we cannot silently redirect them there).
-func requireSession(next http.Handler) http.Handler {
+// exchangeToken. If the cookie is missing, stale, or expired it returns a 401
+// page (NOT a redirect to the exchange — the user must run `engram ui` to get
+// a fresh tokenized URL, so we cannot silently redirect them there).
+func requireSession(sessions *sessionStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(sessionCookieName)
-		if err != nil || cookie.Value == "" || !validateSession(cookie.Value) {
+		if err != nil || !sessions.valid(cookie.Value) {
 			render401(w)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// ── In-process single-session store ─────────────────────────────────────────
-//
-// The loopback daemon is single-user. We keep exactly one live session at a
-// time. The session value is a random hex string; the "secret" here is the
-// daemon bearer token (used only to verify that the session was issued by this
-// daemon — it is never returned to the client).
-//
-// No sync primitives needed because all HTTP handlers run on a single goroutine
-// pool and the session value is set atomically (a single pointer swap). In
-// practice even with concurrent requests this is safe: the worst case is a
-// brief window where two sessions are both valid (e.g. `engram ui` opened
-// twice). That is acceptable for a loopback single-user tool.
-
-var (
-	activeSession string // random hex session value
-	activeSecret  string // daemon bearer token that issued this session
-)
-
-// setSession records a new active session.
-func setSession(sessVal, secret string) {
-	activeSession = sessVal
-	activeSecret = secret
-}
-
-// validateSession returns true if sessVal matches the active session.
-func validateSession(sessVal string) bool {
-	return sessVal != "" && sessVal == activeSession
 }
 
 // randomHex returns n random bytes as a lowercase hex string.
@@ -109,10 +116,4 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-// CurrentSecret returns the bearer secret stored in the active session.
-// Used by webui.go to confirm the session references the live daemon token.
-func currentSecret() string {
-	return activeSecret
 }

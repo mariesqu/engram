@@ -37,10 +37,10 @@
         <span class="field-value">
             {{if .LastSyncError}}
                 <span class="badge badge-disconnected">error</span>
-                <span class="muted mono" style="font-size:0.8rem;">{{.LastSyncError}}</span>
+                <span class="muted mono small">{{.LastSyncError}}</span>
             {{else if .LastSyncAt}}
                 <span class="badge badge-connected">ok</span>
-                <span class="muted mono" style="font-size:0.8rem;">pushed {{.LastSyncPushed}} / pulled {{.LastSyncPulled}}</span>
+                <span class="muted mono small">pushed {{.LastSyncPushed}} / pulled {{.LastSyncPulled}}</span>
             {{else}}
                 <span class="muted">—</span>
             {{end}}

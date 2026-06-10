@@ -40,7 +40,8 @@ func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 }
 
 // newTestServer builds a fresh httptest.Server with a real webui.Mount.
-// Each call resets the package-level session store so tests are independent.
+// Mount creates a PER-INSTANCE session store, so every test server is fully
+// isolated - a cookie minted by one test cannot authenticate against another.
 func newTestServer(t *testing.T, secret string, status controlapi.Status, projects []controlapi.ProjectPolicy) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -262,10 +263,10 @@ func TestWebUI_PollingPartial_Status(t *testing.T) {
 	}
 }
 
-// TestWebUI_NoSession_RedirectsToExchange verifies that /ui/ without a session
+// TestWebUI_NoSession_Returns401 verifies that /ui/ without a session
 // cookie returns 401 (not a redirect, since we can't auto-redirect to the
 // exchange — the user must run `engram ui` for a fresh token).
-func TestWebUI_NoSession_RedirectsToExchange(t *testing.T) {
+func TestWebUI_NoSession_Returns401(t *testing.T) {
 	srv := newTestServer(t, "tok", controlapi.Status{}, nil)
 
 	resp, err := http.Get(srv.URL + "/ui/")
@@ -484,4 +485,115 @@ func (j *simpleCookieJar) Cookies(_ *url.URL) []*http.Cookie {
 		return nil
 	}
 	return []*http.Cookie{j.cookie}
+}
+
+// ─── Round-1 review additions ───────────────────────────────────────────────
+
+// TestExchange_DeepLinkWithToken_DoesNotExchange: the token-accepting surface
+// is ONLY the canonical /ui/ entry point - a stray ?token= on a sub-path must
+// not mint a session (it 401s like any unauthenticated request).
+func TestExchange_DeepLinkWithToken_DoesNotExchange(t *testing.T) {
+	ts := newTestServer(t, "sekrit-token", controlapi.Status{}, nil)
+	client := noRedirectClient()
+
+	resp, err := client.Get(ts.URL + "/ui/projects?token=sekrit-token")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("deep link with token: got %d, want 401 (no exchange outside /ui/)", resp.StatusCode)
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == "engram_session" {
+			t.Error("deep link with token minted a session cookie")
+		}
+	}
+}
+
+// TestExchange_EmptySecret_NeverExchanges: a daemon misconfigured with an
+// empty secret must not let ?token= (any value, including empty) mint a session.
+func TestExchange_EmptySecret_NeverExchanges(t *testing.T) {
+	ts := newTestServer(t, "", controlapi.Status{}, nil)
+	client := noRedirectClient()
+
+	for _, q := range []string{"?token=", "?token=anything"} {
+		resp, err := client.Get(ts.URL + "/ui/" + q)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("empty-secret exchange %q: got %d, want 401", q, resp.StatusCode)
+		}
+	}
+}
+
+// TestSessionIsolation_TwoServers: a cookie minted by server A must NOT
+// authenticate against server B (per-instance session stores - this was a
+// package-level global before round 1).
+func TestSessionIsolation_TwoServers(t *testing.T) {
+	a := newTestServer(t, "secret-a", controlapi.Status{}, nil)
+	b := newTestServer(t, "secret-b", controlapi.Status{}, nil)
+	client := noRedirectClient()
+
+	resp, err := client.Get(a.URL + "/ui/?token=secret-a")
+	if err != nil {
+		t.Fatalf("exchange on A: %v", err)
+	}
+	resp.Body.Close()
+	var sess *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "engram_session" {
+			sess = c
+		}
+	}
+	if sess == nil {
+		t.Fatal("no session cookie from A")
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, b.URL+"/ui/", nil)
+	req.AddCookie(sess)
+	resp2, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("replay on B: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("cookie from server A accepted by server B: got %d, want 401 (session state leaked)", resp2.StatusCode)
+	}
+}
+
+// TestSecurityHeaders_OnUIResponses: every /ui response (page and static
+// asset alike) carries the browser security headers.
+func TestSecurityHeaders_OnUIResponses(t *testing.T) {
+	ts := newTestServer(t, "tok-sec", controlapi.Status{}, nil)
+	client := noRedirectClient()
+
+	for _, path := range []string{"/ui/", "/ui/static/styles.css"} {
+		resp, err := client.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("%s: X-Frame-Options = %q, want DENY", path, got)
+		}
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+		if got := resp.Header.Get("Content-Security-Policy"); !strings.Contains(got, "default-src "+"'self'") {
+			t.Errorf("%s: CSP = %q, want self-only policy", path, got)
+		}
+	}
+}
+
+// noRedirectClient returns an http.Client that does not follow redirects, so
+// tests can assert on the 303 exchange response itself.
+func noRedirectClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }

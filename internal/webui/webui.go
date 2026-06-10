@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"io/fs"
 	"net/http"
 	"time"
 
@@ -42,27 +43,54 @@ type WebUIDeps struct {
 func Mount(mux *http.ServeMux, deps WebUIDeps) {
 	// Static assets — no auth. The browser needs htmx.min.js and styles.css
 	// before any session cookie is established, including on the 401 page.
-	staticServer := http.FileServer(http.FS(StaticFS))
-	mux.Handle("/ui/static/", http.StripPrefix("/ui", staticServer))
+	// fs.Sub roots the FileServer at the static/ directory so the stripped
+	// prefix maps 1:1 onto file names (no accidental exposure of siblings).
+	staticRoot, err := fs.Sub(StaticFS, "static")
+	if err != nil {
+		panic("webui: static sub-FS: " + err.Error()) // embed is compile-time; unreachable
+	}
+	staticServer := http.FileServer(http.FS(staticRoot))
+	mux.Handle("/ui/static/", secHeaders(http.StripPrefix("/ui/static/", staticServer)))
 
 	// All other /ui/ routes: token exchange + session-gated handlers.
-	mux.Handle("/ui/", routeUI(deps))
+	// The session store is PER MOUNT — two daemons in one process (tests!)
+	// must never share session state.
+	sessions := &sessionStore{}
+	mux.Handle("/ui/", secHeaders(routeUI(deps, sessions)))
+}
+
+// secHeaders sets browser-facing security headers on every /ui response.
+// Loopback-only, but the UI renders strings influenced by a remote central
+// (sync error text), so defense-in-depth is cheap and worth it:
+//   - frame-ancestors/X-Frame-Options: no local page may iframe the dashboard.
+//   - CSP self-only sources: no external fetches, no inline/eval'd script
+//     (htmx.min.js is served same-origin from /ui/static/).
+//   - nosniff: assets are typed correctly; never content-sniffed.
+func secHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // routeUI returns a handler that dispatches /ui/ sub-paths, running the token
 // exchange before the session guard.
-func routeUI(deps WebUIDeps) http.Handler {
+func routeUI(deps WebUIDeps, sessions *sessionStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Token exchange: any /ui/* path with ?token= triggers the exchange.
-		// This handles both /ui/?token=... (the canonical entry point from
-		// cmd/engram/ui.go) and accidental deep links with a token param.
-		if r.URL.Query().Get("token") != "" {
-			exchangeToken(deps.Secret).ServeHTTP(w, r)
+		// Token exchange: ONLY at the canonical entry point /ui/ (the URL
+		// cmd/engram/ui.go opens). Deep links with a stray ?token= do NOT
+		// exchange — keeping the token-accepting surface as small as possible.
+		if (r.URL.Path == "/ui/" || r.URL.Path == "/ui") && r.URL.Query().Get("token") != "" {
+			exchangeToken(deps.Secret, sessions).ServeHTTP(w, r)
 			return
 		}
 
 		// All other /ui/* routes require a valid session cookie.
-		requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireSession(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			dispatchUI(w, r, deps)
 		})).ServeHTTP(w, r)
 	})

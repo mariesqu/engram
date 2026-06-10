@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"bytes"
 	"html/template"
 	"net/http"
 )
@@ -78,26 +79,37 @@ func mustParsePage(files ...string) *pageTmpl {
 
 // renderPage executes the "layout" template (which includes the page-specific
 // "content" block) and writes a full HTML page to w.
+//
+// The template is executed into a BUFFER first: executing straight into w
+// would commit a 200 status on the first byte, so a mid-stream template error
+// could only append "template error" to half-written HTML — a corrupted 200
+// instead of a clean 500. Buffer-then-write makes the error path atomic.
 // Cache-Control: no-store prevents any proxy or browser cache from serving a
 // stale version of the dashboard.
 func renderPage(w http.ResponseWriter, tmpl *pageTmpl, data any) {
+	var buf bytes.Buffer
+	if err := tmpl.t.ExecuteTemplate(&buf, "layout", data); err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	if err := tmpl.t.ExecuteTemplate(w, "layout", data); err != nil {
-		// Execution error after headers are written — best-effort fallback.
-		http.Error(w, "template error", http.StatusInternalServerError)
-	}
+	_, _ = buf.WriteTo(w)
 }
 
 // renderPartial executes a named {{define}} block as an HTMX partial fragment.
+// Buffered for the same atomic-error reason as renderPage.
 // Cache-Control: no-store is mandatory — polled HTMX fragments must never be
 // served from an HTTP or browser cache or the status display stops updating.
 func renderPartial(w http.ResponseWriter, name string, data any) {
+	var buf bytes.Buffer
+	if err := partialTmpl.ExecuteTemplate(&buf, name, data); err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	if err := partialTmpl.ExecuteTemplate(w, name, data); err != nil {
-		http.Error(w, "template error", http.StatusInternalServerError)
-	}
+	_, _ = buf.WriteTo(w)
 }
 
 // render401 writes a plain 401 HTML page that hints the user to run `engram ui`.
