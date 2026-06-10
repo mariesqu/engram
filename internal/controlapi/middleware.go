@@ -9,9 +9,9 @@ import (
 // control API must carry Authorization: Bearer <token>. Requests with a missing
 // or incorrect token receive 401 Unauthorized with no further processing.
 //
-// Constant-time comparison is not needed here: the token is 32 random bytes
-// (64 hex chars), the comparison is between two same-length hex strings, and
-// timing side-channels on a loopback interface provide no meaningful attack surface.
+// Constant-time comparison is not needed here: the configured token is a
+// fixed-length random hex string, and timing side-channels on a loopback
+// interface provide no meaningful attack surface.
 // If this concern ever arises, replace with subtle.ConstantTimeCompare.
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

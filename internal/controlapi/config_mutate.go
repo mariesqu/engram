@@ -78,6 +78,18 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Validate transport up front: an invalid value persisted to the config
+	// file would hard-error the NEXT daemon startup (resolveTransport refuses
+	// unknown values) — a PUT must not be able to brick the restart.
+	if patch.Transport != nil {
+		switch *patch.Transport {
+		case "stdio", "http":
+		default:
+			writeError(w, http.StatusBadRequest, "invalid transport: must be \"stdio\" or \"http\"")
+			return
+		}
+	}
+
 	restartRequired, err := s.cfgStore.Apply(patch)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
