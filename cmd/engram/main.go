@@ -41,6 +41,8 @@ Usage:
   engram ui       [--db <path>]
   engram projects list
   engram projects policy <project> <synced|local-only|omitted>
+  engram config   get | set <key> <value>
+  engram sync     now
 
 Environment:
   ENGRAM_ADDR            default listen address for 'serve' (default ":8080")
@@ -58,6 +60,8 @@ Subcommands:
   status    Print status of the running resident daemon (requires daemon --http).
   ui        Open the web UI in the default browser (requires daemon --http).
   projects  List and manage per-project sync policies (requires daemon --http).
+  config    Get or set daemon configuration values (requires daemon --http).
+  sync      Trigger an immediate sync cycle (requires daemon --http).
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
 `
@@ -111,6 +115,18 @@ func run(args []string) int {
 	case "projects":
 		if err := runProjectsCmd(args[1:]); err != nil {
 			log.Printf("engram projects: %v", err)
+			return 1
+		}
+		return 0
+	case "config":
+		if err := runConfigCmd(args[1:]); err != nil {
+			log.Printf("engram config: %v", err)
+			return 1
+		}
+		return 0
+	case "sync":
+		if err := runSyncCmd(args[1:]); err != nil {
+			log.Printf("engram sync: %v", err)
 			return 1
 		}
 		return 0

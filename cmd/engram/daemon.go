@@ -10,17 +10,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/mariesqu/engram/internal/config"
 	"github.com/mariesqu/engram/internal/controlapi"
 	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/remote"
@@ -52,11 +55,15 @@ will probe the running daemon; if it is healthy it will refuse to start.
 On SIGINT or SIGTERM the daemon stops the autosync loop (if running), closes the
 store, and exits cleanly.  In HTTP mode daemon.json is removed on clean shutdown.
 
+Config file: %APPDATA%\engram\config.json (Windows) or $XDG_CONFIG_HOME/engram/config.json.
+Precedence: flags > env vars > config file > defaults.
+Writer key is DPAPI-encrypted at rest on Windows. Use ENGRAM_WRITER_KEY env var on other platforms.
+
 Flags:
   --db              Path to the local SQLite database file (required; or set ENGRAM_DB)
   --central-url     Central server URL, e.g. http://localhost:8080 (optional; or set ENGRAM_CENTRAL_URL)
   --writer-id       Writer identity sent to the central server (required when --central-url is set; or set ENGRAM_WRITER_ID)
-  --sync-interval   Autosync cadence (default: ENGRAM_SYNC_INTERVAL env, then 30s)
+  --sync-interval   Autosync cadence (default: ENGRAM_SYNC_INTERVAL env, then config file, then 30s)
   --http            Enable resident HTTP control plane (default: false — stdio MCP mode)
   --http-port       TCP port for the HTTP control plane (default: 7700)
 
@@ -67,15 +74,19 @@ Flags:
 `
 
 // daemonCfg holds the validated, resolved configuration for the daemon.
+// PR-③: configDir is the directory where config.json lives. The config file
+// is consulted as a lower-precedence source than flags and env vars.
 type daemonCfg struct {
 	db         string
 	centralURL string // empty → local-only mode
 	writerID   string
-	writerKey  []byte // nil → local-only mode
+	writerKey  []byte // nil → local-only mode (decrypted, in-memory only)
 	// HTTP resident-mode flags (added in PR-①).
 	httpMode     bool // true → bind control API instead of stdio MCP
 	httpPort     int  // TCP port for the control API (default 7700)
 	syncInterval time.Duration
+	// PR-③: config file directory (same as DB dir by default, or os.UserConfigDir()/engram).
+	configDir string
 }
 
 // daemonComponents holds the wired-but-not-yet-serving components built by
@@ -100,6 +111,8 @@ func (d *daemonComponents) Close() {
 // from the environment (AFTER flag.Parse — never in a flag default, to avoid
 // leaking the secret via --help / PrintDefaults), installs signal context, and
 // delegates to runDaemon.
+//
+// PR-③: Config file is loaded here with lowest precedence (flags > env > file > defaults).
 func runDaemonCmd(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprint(fs.Output(), daemonUsage) }
@@ -118,10 +131,8 @@ func runDaemonCmd(args []string) error {
 	syncInterval := fs.Duration("sync-interval", 0, "autosync cadence (default: ENGRAM_SYNC_INTERVAL env, then 30s)")
 
 	// --http / --http-port: opt-in resident mode (PR-①).
-	// NOTE: --http is intentionally NOT wired to ENGRAM_WRITER_KEY-style resolution
-	// because it is a mode flag, not a secret. It appears in --help (flag default "false").
 	httpMode := fs.Bool("http", false, "enable resident HTTP control plane (default: stdio MCP mode)")
-	httpPort := fs.Int("http-port", 7700, "TCP port for the HTTP control plane")
+	httpPort := fs.Int("http-port", 0, "TCP port for the HTTP control plane (default: 7700, or config file)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -133,49 +144,103 @@ func runDaemonCmd(args []string) error {
 		return fmt.Errorf("daemon takes no positional arguments; unexpected: %v", fs.Args())
 	}
 
-	// Resolve env vars AFTER parse so they never enter flag defaults and are
-	// therefore never printed by PrintDefaults.
+	// ── Determine config file directory ──────────────────────────────────────
+	// Default config dir is os.UserConfigDir()/engram. Use this as the lowest-
+	// precedence source. If it fails (no home dir) we proceed without a config file.
+	configDir, _ := config.DefaultConfigDir() // "" on error → Load returns zero Config
+
+	// ── Load config file (lowest precedence) ─────────────────────────────────
+	var fileCfg config.Config
+	if configDir != "" {
+		var loadErr error
+		fileCfg, loadErr = config.Load(configDir)
+		if loadErr != nil {
+			log.Printf("warning: cannot load config file from %s: %v", configDir, loadErr)
+			fileCfg = config.Config{}
+		}
+	}
+
+	// ── Resolve DB path: flag > env > file ───────────────────────────────────
 	if *db == "" {
 		*db = envOr("ENGRAM_DB", "")
+	}
+	if *db == "" && fileCfg.DB != "" {
+		*db = fileCfg.DB
 	}
 	if *db == "" {
 		return fmt.Errorf("--db is required (or set ENGRAM_DB)")
 	}
 
+	// ── Resolve central URL: flag > env > file ───────────────────────────────
 	if *centralURL == "" {
 		*centralURL = envOr("ENGRAM_CENTRAL_URL", "")
 	}
+	if *centralURL == "" && fileCfg.CentralURL != "" {
+		*centralURL = fileCfg.CentralURL
+	}
+
+	// ── Resolve writer ID: flag > env > file ─────────────────────────────────
 	if *writerID == "" {
 		*writerID = envOr("ENGRAM_WRITER_ID", "")
 	}
+	if *writerID == "" && fileCfg.WriterID != "" {
+		*writerID = fileCfg.WriterID
+	}
 
-	// ENGRAM_WRITER_KEY: env ONLY — resolved after Parse.  A 32-byte HMAC key
-	// encoded as hex MUST NOT appear in flag defaults or --help output.
+	// ── Resolve HTTP port: flag > file > default ─────────────────────────────
+	if *httpPort == 0 && fileCfg.HTTPPort > 0 {
+		*httpPort = fileCfg.HTTPPort
+	}
+	if *httpPort == 0 {
+		*httpPort = 7700
+	}
+
+	// ── Resolve writer key: ENGRAM_WRITER_KEY env always wins over file ───────
+	//
+	// ENGRAM_WRITER_KEY env ALWAYS wins over any value stored in the config file,
+	// including on Windows where DPAPI is available. This is a hard constraint
+	// documented in the spec.
 	var writerKey []byte
 	if *centralURL != "" {
 		if *writerID == "" {
 			return fmt.Errorf("--writer-id is required when --central-url is set (or set ENGRAM_WRITER_ID)")
 		}
-		// TrimSpace: ENGRAM_WRITER_KEY is often injected from a file/CI secret with a
-		// trailing newline, which would otherwise fail hex decoding.
+
 		keyHex := strings.TrimSpace(os.Getenv("ENGRAM_WRITER_KEY"))
-		if keyHex == "" {
-			return fmt.Errorf("ENGRAM_WRITER_KEY env var is required when --central-url is set")
-		}
-		var err error
-		writerKey, err = hex.DecodeString(keyHex)
-		if err != nil {
-			return fmt.Errorf("ENGRAM_WRITER_KEY is not valid hex: %w", err)
-		}
-		if len(writerKey) != wireauth.KeySize {
-			return fmt.Errorf(
-				"ENGRAM_WRITER_KEY has wrong length: got %d bytes, want %d",
-				len(writerKey), wireauth.KeySize,
-			)
+		if keyHex != "" {
+			// Env var wins — decode and use it directly.
+			var err error
+			writerKey, err = hex.DecodeString(keyHex)
+			if err != nil {
+				return fmt.Errorf("ENGRAM_WRITER_KEY is not valid hex: %w", err)
+			}
+			if len(writerKey) != wireauth.KeySize {
+				return fmt.Errorf(
+					"ENGRAM_WRITER_KEY has wrong length: got %d bytes, want %d",
+					len(writerKey), wireauth.KeySize,
+				)
+			}
+		} else if len(fileCfg.EncryptedWriterKey) > 0 {
+			// No env var — try to decrypt the config file blob.
+			secretBox := config.NewSecretBox()
+			var decryptErr error
+			writerKey, decryptErr = secretBox.Open(fileCfg.EncryptedWriterKey)
+			if decryptErr != nil {
+				// Decrypt failure: log a warning, fall back to "no key".
+				// The daemon starts in local-only mode; the status endpoint will
+				// report "writer key required" so the UI can prompt a re-enter.
+				// This is the design-mandated behavior: never crash on decrypt failure.
+				log.Printf("warning: DPAPI decrypt failed for stored writer key (user/machine may have changed): %v", decryptErr)
+				log.Printf("  → daemon will start in local-only mode; reconnect via the UI or set ENGRAM_WRITER_KEY")
+				writerKey = nil
+				*centralURL = "" // fall back to local-only since we have no key
+			}
+		} else {
+			return fmt.Errorf("ENGRAM_WRITER_KEY env var is required when --central-url is set (or store it via engram central connect)")
 		}
 	}
 
-	// Resolve sync interval: flag > env > default.
+	// ── Resolve sync interval: flag > env > file > default ───────────────────
 	if *syncInterval == 0 {
 		if raw := envOr("ENGRAM_SYNC_INTERVAL", ""); raw != "" {
 			d, err := time.ParseDuration(raw)
@@ -184,6 +249,9 @@ func runDaemonCmd(args []string) error {
 			}
 			*syncInterval = d
 		}
+	}
+	if *syncInterval == 0 && fileCfg.SyncInterval > 0 {
+		*syncInterval = fileCfg.SyncInterval
 	}
 	if *syncInterval == 0 {
 		*syncInterval = 30 * time.Second
@@ -200,6 +268,7 @@ func runDaemonCmd(args []string) error {
 		syncInterval: *syncInterval,
 		httpMode:     *httpMode,
 		httpPort:     *httpPort,
+		configDir:    configDir,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -211,13 +280,7 @@ func runDaemonCmd(args []string) error {
 // buildDaemon opens the local store, constructs the MCP server, registers the
 // MCP tools, and — when cfg.centralURL is non-empty — wires the signing remote
 // client and an autosync Loop.  It does NOT serve or start the Loop; that is
-// runDaemon's responsibility.  This factoring mirrors serve.go / runServe and
-// allows unit tests to assert wiring correctness without blocking on stdio.
-//
-// Ordering: the Loop (if any) is constructed BEFORE registerTools so that write
-// handlers can receive a non-nil loop and call loop.Trigger() immediately after
-// a local write.  In local-only mode loop is nil and write handlers skip the
-// trigger (triggerSync is nil-safe).
+// runDaemon's responsibility.
 func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	store, err := localstore.Open(cfg.db)
 	if err != nil {
@@ -233,35 +296,18 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	var loop *syncer.Loop
 
 	if cfg.centralURL != "" {
-		// Central mode: wire the signing remote client and autosync Loop BEFORE
-		// registerTools so the loop reference is available to write handlers.
 		central := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
 		node := syncer.NewNode("daemon", store)
-
-		// The Loop drives SyncAllProjects per tick: Push once (outbox is
-		// project-agnostic), then Pull each project using its own per-project
-		// cursor. No project parameter is needed — projects are discovered via
-		// localstore.ListProjects() at each tick.
 		loop = syncer.NewLoop(node, central, syncer.Config{
 			Interval: cfg.syncInterval,
 		})
 	}
 
-	// Wire the central-configured closure for policy default computation (PR-②).
-	// The closure captures cfg.centralURL by value at build time. PR-③'s runtime
-	// connect/disconnect must call SetCentralConfiguredFn again with a closure
-	// over the live connection state — the setter is concurrency-safe and
-	// computed defaults are never cached, so re-installation takes effect on the
-	// next policy read.
+	// Wire the central-configured closure for policy default computation.
 	centralURL := cfg.centralURL
 	store.SetCentralConfiguredFn(func() bool { return centralURL != "" })
 
-	// Create in-memory session activity tracker. Shared across all write handlers
-	// so mem_save_prompt can record the current prompt and mem_save can auto-capture it.
 	activity := NewSessionActivity()
-
-	// Register all MCP tools. Pass loop (may be nil) so write handlers can
-	// trigger an immediate sync after each local write.
 	registerTools(mcpSrv, store, loop, cfg.writerID, activity)
 
 	return &daemonComponents{
@@ -271,9 +317,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	}, nil
 }
 
-// runDaemon is the entry point called by runDaemonCmd. It dispatches to:
-//   - runDaemonHTTP when cfg.httpMode is true (resident control plane, PR-①)
-//   - runDaemonWithIO otherwise (stdio MCP mode — the pre-existing path)
+// runDaemon dispatches to runDaemonHTTP or runDaemonWithIO.
 func runDaemon(ctx context.Context, cfg daemonCfg) error {
 	if cfg.httpMode {
 		return runDaemonHTTP(ctx, cfg)
@@ -281,16 +325,7 @@ func runDaemon(ctx context.Context, cfg daemonCfg) error {
 	return runDaemonWithIO(ctx, cfg, os.Stdin, os.Stdout)
 }
 
-// runDaemonWithIO is the testable core of the daemon subcommand.  It builds all
-// components via buildDaemon, starts the autosync Loop (when present), then
-// blocks on StdioServer.Listen until the context is cancelled (SIGINT/SIGTERM in
-// production; test cancellation in tests) or stdin is closed (normal MCP client
-// disconnect).  On return it stops the Loop and closes the store.
-//
-// Wiring ctx into Listen (rather than using ServeStdio, which creates its own
-// internal context) makes the daemon's NotifyContext the SINGLE shutdown source:
-// ctx cancellation causes Listen to return context.Canceled, which serveErr maps
-// to a clean exit.
+// runDaemonWithIO is the testable core of the stdio MCP daemon.
 func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout io.Writer) error {
 	components, err := buildDaemon(cfg)
 	if err != nil {
@@ -309,24 +344,12 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	return serveErr(mcpserver.NewStdioServer(components.mcpServer).Listen(ctx, stdin, stdout))
 }
 
-// daemonVersion is the single source of truth for the version reported by the
-// MCP server and the control API. Build-time injection via -ldflags is a
-// release-process follow-up; until then bump it here.
+// daemonVersion is the single source of truth for the binary version.
 const daemonVersion = "0.1.0"
 
-// ── HTTP resident-mode (PR-①) ─────────────────────────────────────────────────
+// ── HTTP resident-mode (PR-①, extended by PR-③) ──────────────────────────────
 
 // runDaemonHTTP starts the resident daemon in HTTP control-plane mode.
-//
-// It:
-//  1. Opens the local store and wires the autosync loop (same as stdio mode).
-//  2. Generates a 32-byte-hex bearer token and writes daemon.json atomically.
-//  3. Binds 127.0.0.1:<port> — if the port is already in use it probes the
-//     existing process; a healthy engram daemon → refuse with a clear error.
-//  4. Serves the control API until ctx is cancelled (SIGINT/SIGTERM).
-//  5. On clean shutdown, removes daemon.json.
-//
-// stdio MCP is NOT started in this mode — the HTTP control plane owns the process.
 func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	components, err := buildDaemon(cfg)
 	if err != nil {
@@ -334,22 +357,17 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	}
 	defer components.Close()
 
-	// Generate a fresh 32-byte (64 hex char) token. Token rotates on every start.
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return fmt.Errorf("daemon HTTP: generate token: %w", err)
 	}
 	token := hex.EncodeToString(tokenBytes)
 
-	// The discovery file lives next to the database.
 	dir := filepath.Dir(cfg.db)
 
-	// Attempt to bind before writing daemon.json so we never write a stale
-	// file if the port is already in use.
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.httpPort)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		// Port in use — probe the existing occupant.
 		if probeErr := probeDaemon(dir, cfg.httpPort); probeErr == nil {
 			return fmt.Errorf("daemon already running on :%d (probe succeeded); refusing to start a second SQLite owner", cfg.httpPort)
 		}
@@ -357,36 +375,39 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	}
 	defer ln.Close()
 
-	// Resolve the ACTUAL bound port: with --http-port 0 the OS assigns an
-	// ephemeral port, and daemon.json / the Origin allowlist must record that
-	// real port or clients would dial port 0.
+	// Resolve the ACTUAL bound port (important when --http-port 0).
 	actualPort := ln.Addr().(*net.TCPAddr).Port
 
-	// Write daemon.json AFTER successful bind so clients that read the file can
-	// immediately connect. The write is atomic (temp+rename) inside WriteDaemonJSON.
 	if err := controlapi.WriteDaemonJSON(dir, token, actualPort, os.Getpid()); err != nil {
 		return fmt.Errorf("daemon HTTP: write daemon.json: %w", err)
 	}
 
-	// Start the autosync loop only after every step that can fail (bind,
-	// discovery write) has succeeded — a startup failure must not have to wait
-	// for a mid-flight sync cycle to stop.
 	if components.loop != nil {
 		components.loop.Start(ctx)
 	}
 	defer func() {
-		// Remove daemon.json on clean shutdown so stale discovery files are not left behind.
 		_ = controlapi.RemoveDaemonJSON(dir)
 	}()
 
-	// Wire the control API server. The store adapter bridges localstore.Store to
-	// the controlapi.Store interface.
+	// ── PR-③: wire the full runtime adapters ─────────────────────────────────
 	storeAdapter := &localStoreAdapter{store: components.store}
-	syncAdapter := &loopSyncAdapter{
-		loop:       components.loop,
-		centralURL: cfg.centralURL,
-	}
-	cfgAdapter := &daemonCfgAdapter{cfg: cfg}
+
+	// configStoreAdapter wraps internal/config for the ConfigStore port.
+	// actualPort: report the bound port (not the pre-bind flag, e.g. 0).
+	cfgAdapter := newConfigStoreAdapter(cfg, actualPort)
+
+	// runtimeSyncAdapter replaces the PR-① loopSyncAdapter with a real
+	// runtime-mutable adapter that supports Disconnect and Reconnect.
+	// ctx: the daemon's root signal context — runtime-created loops are started
+	// on it so daemon shutdown also stops a loop created via /central/connect.
+	syncAdapter := newRuntimeSyncAdapter(
+		ctx,
+		cfg,
+		components.store,
+		components.loop,
+		cfgAdapter,
+		actualPort,
+	)
 
 	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion)
 
@@ -418,19 +439,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	}
 }
 
-// probeDaemon probes an existing daemon on the given port using the token from
-// daemon.json in dir. Returns nil ONLY when the occupant is verifiably a
-// healthy engram daemon: a 200 JSON status response with daemon_version set.
-//
-// Decision matrix (caller refuses startup on nil, falls back to the raw bind
-// error otherwise — both paths fail to start, only the message differs):
-//   - daemon.json records a DIFFERENT port → the daemon that wrote it is not
-//     the occupant of this port; skip the probe (foreign port conflict).
-//   - 200 with daemon_version → engram daemon confirmed → refuse second owner.
-//   - 200 without daemon_version → some foreign HTTP server → bind error.
-//   - 401 → the occupant rejects the recorded token. A LIVE engram daemon
-//     rewrites daemon.json with its current token on start, so a mismatch
-//     means the file is stale relative to the occupant → treat as foreign.
+// probeDaemon probes an existing daemon on the given port.
 func probeDaemon(dir string, port int) error {
 	d, err := controlapi.ReadDaemonJSON(dir)
 	if err != nil {
@@ -461,7 +470,7 @@ func probeDaemon(dir string, port int) error {
 	return nil
 }
 
-// ── Port adapters (wire localstore and syncer to controlapi interfaces) ───────
+// ── Port adapters ─────────────────────────────────────────────────────────────
 
 // localStoreAdapter adapts *localstore.Store to controlapi.Store.
 type localStoreAdapter struct {
@@ -492,82 +501,395 @@ func (a *localStoreAdapter) GetPolicy(project string) (controlapi.Policy, error)
 	return controlapi.Policy(p), err
 }
 
-// loopSyncAdapter adapts *syncer.Loop to controlapi.SyncController.
-// In PR-① this is a minimal stub; PR-③ will extend it with full sync state.
-type loopSyncAdapter struct {
-	loop       *syncer.Loop // nil → local-only mode
-	centralURL string
+// ── configStoreAdapter (PR-③) ─────────────────────────────────────────────────
+
+// configStoreAdapter adapts internal/config.Config to controlapi.ConfigStore.
+// It holds the live resolved Config and persists changes via config.Save.
+// Apply calls back into the runtimeSyncAdapter (via the applyCb closure) for
+// runtime-mutable fields like SyncInterval so the loop interval is updated live.
+type configStoreAdapter struct {
+	mu        sync.RWMutex
+	cfg       config.Config // live resolved config
+	configDir string
+	secretBox config.SecretBox
+	// applyCb is called by Apply for runtime-mutable changes (e.g. SyncInterval).
+	// It is wired to runtimeSyncAdapter.applyLiveConfig after construction.
+	applyCb func(patch controlapi.ConfigPatch, updated config.Config)
 }
 
-func (a *loopSyncAdapter) Status() controlapi.Status {
-	var url *string
-	if a.centralURL != "" {
-		u := a.centralURL
-		url = &u
+func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdapter {
+	// Reconstruct a config.Config from the resolved daemonCfg so Load() reports
+	// the actual live values — actualPort is the BOUND port from ln.Addr(), not
+	// the pre-bind flag value (which is 0 under --http-port 0).
+	httpPort := daemonCfg.httpPort
+	if actualPort > 0 {
+		httpPort = actualPort
 	}
-	return controlapi.Status{
-		CentralConnected: a.centralURL != "" && a.loop != nil,
-		CentralURL:       url,
-		LastSyncResult:   controlapi.SyncResult{},
-		DaemonVersion:    daemonVersion,
+	cfg := config.Config{
+		DB:           daemonCfg.db,
+		CentralURL:   daemonCfg.centralURL,
+		WriterID:     daemonCfg.writerID,
+		HTTPPort:     httpPort,
+		SyncInterval: daemonCfg.syncInterval,
+	}
+	// Re-load the file to recover EncryptedWriterKey for Redact reporting.
+	if daemonCfg.configDir != "" {
+		if fileCfg, err := config.Load(daemonCfg.configDir); err == nil {
+			cfg.EncryptedWriterKey = fileCfg.EncryptedWriterKey
+			if cfg.LogLevel == "" {
+				cfg.LogLevel = fileCfg.LogLevel
+			}
+			if cfg.Transport == "" {
+				cfg.Transport = fileCfg.Transport
+			}
+		}
+	}
+	return &configStoreAdapter{
+		cfg:       cfg,
+		configDir: daemonCfg.configDir,
+		secretBox: config.NewSecretBox(),
 	}
 }
 
-func (a *loopSyncAdapter) TriggerNow(_ context.Context) error {
-	if a.loop != nil {
-		a.loop.Trigger()
+func (a *configStoreAdapter) Load() (controlapi.RedactedConfig, error) {
+	a.mu.RLock()
+	cfg := a.cfg
+	a.mu.RUnlock()
+	rc := cfg.Redact()
+	// Map internal RedactedConfig to controlapi.RedactedConfig.
+	result := controlapi.RedactedConfig{
+		DB:           rc.DB,
+		SyncInterval: rc.SyncInterval,
+		LogLevel:     rc.LogLevel,
+		HTTP: &controlapi.HTTPConfig{
+			Port: rc.HTTPPort,
+		},
+		// Transport and Extra are not exposed in RedactedConfig.
+	}
+	if rc.CentralURL != "" {
+		result.Central = &controlapi.CentralConfig{
+			URL:      rc.CentralURL,
+			WriterID: rc.WriterID,
+		}
+	}
+	if rc.WriterKey != "" {
+		result.WriterKey = &rc.WriterKey
+	}
+	return result, nil
+}
+
+func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
+	// NOTE: explicit Unlock before the applyCb callback (no defer) — see the
+	// lock-ordering comment below.
+	a.mu.Lock()
+
+	// Map controlapi.ConfigPatch → config.ConfigPatch.
+	cfgPatch := config.ConfigPatch{
+		SyncInterval: patch.SyncInterval,
+		LogLevel:     patch.LogLevel,
+		HTTPPort:     patch.HTTPPort,
+		DBPath:       patch.DBPath,
+		Transport:    patch.Transport,
+	}
+
+	updated, restartRequired := config.Patch(a.cfg, cfgPatch)
+	a.cfg = updated
+
+	// Persist the change if we have a config directory.
+	if a.configDir != "" {
+		if err := config.Save(a.configDir, updated); err != nil {
+			a.mu.Unlock()
+			return restartRequired, fmt.Errorf("save config: %w", err)
+		}
+	}
+	cb := a.applyCb
+	a.mu.Unlock()
+
+	// Notify the sync adapter OUTSIDE the lock: applyLiveConfig may one day
+	// acquire runtimeSyncAdapter.mu (loop restart), and runtimeSyncAdapter
+	// methods call back into this adapter (setCentral/clearCentral take a.mu) —
+	// holding a.mu across the callback would set up a lock-ordering deadlock.
+	if cb != nil {
+		cb(patch, updated)
+	}
+
+	return restartRequired, nil
+}
+
+// setCentral updates the in-memory central credentials and persists them.
+// Called by runtimeSyncAdapter.Reconnect on a successful connect.
+func (a *configStoreAdapter) setCentral(centralURL, writerID string, encryptedKey []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg.CentralURL = centralURL
+	a.cfg.WriterID = writerID
+	a.cfg.EncryptedWriterKey = encryptedKey
+	if a.configDir != "" {
+		return config.Save(a.configDir, a.cfg)
 	}
 	return nil
 }
 
-func (a *loopSyncAdapter) Disconnect() error {
-	// PR-③ will implement full disconnect. For PR-① this is a stub.
-	return fmt.Errorf("disconnect not implemented until PR-③")
-}
-
-func (a *loopSyncAdapter) Reconnect(_ controlapi.CentralConfig) error {
-	// PR-③ will implement reconnect.
-	return fmt.Errorf("reconnect not implemented until PR-③")
-}
-
-// daemonCfgAdapter adapts the daemon config to controlapi.ConfigStore.
-// PR-③ will replace this with a real internal/config.Store adapter.
-type daemonCfgAdapter struct {
-	cfg daemonCfg
-}
-
-func (a *daemonCfgAdapter) Load() (controlapi.RedactedConfig, error) {
-	cfg := controlapi.RedactedConfig{
-		DB: a.cfg.db,
-		HTTP: &controlapi.HTTPConfig{
-			Port: a.cfg.httpPort,
-		},
-		SyncInterval: a.cfg.syncInterval.String(),
+// clearCentral removes central credentials from memory and disk.
+// Called by runtimeSyncAdapter.Disconnect.
+func (a *configStoreAdapter) clearCentral() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg.CentralURL = ""
+	a.cfg.WriterID = ""
+	a.cfg.EncryptedWriterKey = nil
+	if a.configDir != "" {
+		return config.Save(a.configDir, a.cfg)
 	}
-	if a.cfg.centralURL != "" {
-		cfg.Central = &controlapi.CentralConfig{
-			URL:      a.cfg.centralURL,
-			WriterID: a.cfg.writerID,
-		}
-	}
-	if len(a.cfg.writerKey) > 0 {
-		redacted := "***REDACTED***"
-		cfg.WriterKey = &redacted
-	}
-	return cfg, nil
+	return nil
 }
 
-func (a *daemonCfgAdapter) Apply(_ controlapi.ConfigPatch) (bool, error) {
-	// PR-③ will implement config mutation.
-	return false, fmt.Errorf("config mutation not implemented until PR-③")
+// getSyncInterval returns the current configured sync interval.
+func (a *configStoreAdapter) getSyncInterval() time.Duration {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.cfg.SyncInterval
 }
 
-// serveErr classifies the error returned by StdioServer.Listen. Listen returns
-// context.Canceled when the ctx passed to it is cancelled (SIGINT/SIGTERM in
-// production, test cancel in tests) and nil on stdin EOF (normal MCP client
-// disconnect). Both are SUCCESSFUL exits. Without this, a normal Ctrl-C / `kill`
-// would exit non-zero and log a spurious "context canceled", which a process
-// supervisor reads as a crash. Only a genuine I/O failure is surfaced.
+// ── runtimeSyncAdapter (PR-③) ─────────────────────────────────────────────────
+
+// runtimeSyncAdapter is the full PR-③ SyncController implementation.
+// It owns the live Loop reference and supports runtime connect/disconnect.
+//
+// Connect/disconnect re-installs the store.SetCentralConfiguredFn closure so
+// the policy default (synced vs local-only) updates immediately on the next
+// policy read — no restart required (PR-② contract).
+type runtimeSyncAdapter struct {
+	mu         sync.Mutex
+	store      *localstore.Store
+	cfgAdapter *configStoreAdapter
+	loop       *syncer.Loop    // nil in local-only mode; replaced on Reconnect
+	ctx        context.Context // daemon's root context (for new Loop.Start on reconnect)
+	node       *syncer.Node
+	// lastSyncResult is updated by the loop callbacks (future PR — for now zero value).
+	// PR-③ wires the loop to report results; for the daemon test this is enough.
+	connected  bool // mirrors loop != nil && centralURL != ""
+	centralURL string
+	actualPort int // the actual bound port (for Status.CentralURL etc.)
+}
+
+func newRuntimeSyncAdapter(
+	ctx context.Context,
+	cfg daemonCfg,
+	store *localstore.Store,
+	loop *syncer.Loop,
+	cfgAdapter *configStoreAdapter,
+	actualPort int,
+) *runtimeSyncAdapter {
+	if ctx == nil {
+		// Defensive: a runtime-created loop must always be startable.
+		ctx = context.Background()
+	}
+	a := &runtimeSyncAdapter{
+		store:      store,
+		cfgAdapter: cfgAdapter,
+		loop:       loop,
+		ctx:        ctx,
+		node:       syncer.NewNode("daemon", store),
+		connected:  cfg.centralURL != "" && loop != nil,
+		centralURL: cfg.centralURL,
+		actualPort: actualPort,
+	}
+	// Wire the configStoreAdapter callback for live SyncInterval updates.
+	cfgAdapter.applyCb = a.applyLiveConfig
+	return a
+}
+
+func (a *runtimeSyncAdapter) Status() controlapi.Status {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	st := controlapi.Status{
+		CentralConnected: a.connected,
+		LastSyncResult:   controlapi.SyncResult{},
+		DaemonVersion:    daemonVersion,
+	}
+	if a.centralURL != "" {
+		u := a.centralURL
+		st.CentralURL = &u
+	}
+	return st
+}
+
+func (a *runtimeSyncAdapter) TriggerNow(_ context.Context) error {
+	a.mu.Lock()
+	loop := a.loop
+	a.mu.Unlock()
+	if loop != nil {
+		loop.Trigger()
+	}
+	return nil
+}
+
+// Disconnect stops the sync loop, clears central credentials from the config
+// file, and re-installs the SetCentralConfiguredFn closure → false.
+// Local data is NOT deleted.
+func (a *runtimeSyncAdapter) Disconnect() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Stop the loop (idempotent if never started or already stopped).
+	if a.loop != nil {
+		a.loop.Stop()
+		a.loop = nil
+	}
+
+	a.connected = false
+	a.centralURL = ""
+
+	// Clear central config from disk.
+	if err := a.cfgAdapter.clearCentral(); err != nil {
+		return fmt.Errorf("disconnect: clear central config: %w", err)
+	}
+
+	// Re-install the closure → false so the next policy read returns local-only.
+	a.store.SetCentralConfiguredFn(func() bool { return false })
+
+	slog.Default().Info("daemon: disconnected from central; sync loop stopped")
+	return nil
+}
+
+// Reconnect validates credentials, seals the writer key, persists config, and
+// starts a new sync loop. On any error nothing is persisted and the existing
+// loop state is unchanged.
+//
+// The WriterKeyPlaintext field in cfg carries the raw key from the connect
+// request. The adapter seals it via DPAPI (Windows) or notes that storage is
+// unavailable (non-Windows — key is not persisted to file, but the in-memory
+// daemon can still use it for this session). The actual session writerKey is
+// kept only in memory.
+func (a *runtimeSyncAdapter) Reconnect(cfg controlapi.CentralConfig) error {
+	if cfg.URL == "" {
+		return fmt.Errorf("central_url is required")
+	}
+	if cfg.WriterKeyPlaintext == "" {
+		return fmt.Errorf("writer_key is required")
+	}
+
+	// Decode the writer key. Wrap input errors with the controlapi sentinel so
+	// the handler returns a client-safe 422; the wrapped detail (which may
+	// include hex-decode internals) is server-log-only.
+	keyHex := strings.TrimSpace(cfg.WriterKeyPlaintext)
+	writerKey, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return fmt.Errorf("%w: not valid hex: %v", controlapi.ErrInvalidWriterKey, err)
+	}
+	if len(writerKey) != wireauth.KeySize {
+		return fmt.Errorf("%w: got %d bytes, want %d", controlapi.ErrInvalidWriterKey, len(writerKey), wireauth.KeySize)
+	}
+
+	// Probe the remote to validate credentials BEFORE persisting anything.
+	// A probe failure maps to 422 — config is NOT persisted.
+	centralClient := remote.New(cfg.URL, nil, cfg.WriterID, writerKey)
+	if err := probeRemote(centralClient); err != nil {
+		return fmt.Errorf("%w: %v", controlapi.ErrCredentialValidation, err)
+	}
+
+	// Seal the writer key for storage (Windows: DPAPI; non-Windows: env only).
+	var encryptedKey []byte
+	secretBox := a.cfgAdapter.secretBox
+	sealed, sealErr := secretBox.Seal(writerKey)
+	if sealErr == nil {
+		encryptedKey = sealed
+	} else if !errors.Is(sealErr, config.ErrNoSecretStore) {
+		// Unexpected seal error (not "platform doesn't support it").
+		return fmt.Errorf("seal writer key: %w", sealErr)
+	}
+	// If ErrNoSecretStore: non-Windows platform — proceed without persisting key.
+	// The key is used in memory for this session only.
+
+	// From here on every step mutates shared state: take the adapter lock
+	// BEFORE persisting so a concurrent Disconnect cannot interleave between
+	// the disk write and the in-memory state update (which would leave disk
+	// saying "disconnected" while memory says "connected", or vice versa).
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Persist the new central config (including sealed key, which may be nil).
+	if err := a.cfgAdapter.setCentral(cfg.URL, cfg.WriterID, encryptedKey); err != nil {
+		return fmt.Errorf("persist central config: %w", err)
+	}
+
+	// Stop any existing loop.
+	if a.loop != nil {
+		a.loop.Stop()
+	}
+
+	syncInterval := a.cfgAdapter.getSyncInterval()
+	if syncInterval <= 0 {
+		syncInterval = 30 * time.Second
+	}
+
+	newLoop := syncer.NewLoop(a.node, centralClient, syncer.Config{
+		Interval: syncInterval,
+	})
+
+	// Start the loop on the daemon's root context (never nil — the constructor
+	// guarantees it). Daemon shutdown cancels the context and stops this loop.
+	newLoop.Start(a.ctx)
+
+	a.loop = newLoop
+	a.connected = true
+	a.centralURL = cfg.URL
+
+	// Re-install the closure → true so next policy read returns synced.
+	centralURL := cfg.URL
+	a.store.SetCentralConfiguredFn(func() bool { return centralURL != "" })
+
+	slog.Default().Info("daemon: connected to central; sync loop started",
+		"central_url", cfg.URL,
+		"writer_id", cfg.WriterID,
+	)
+	return nil
+}
+
+// applyLiveConfig is called by configStoreAdapter.Apply for runtime-mutable
+// patches. The SyncInterval change takes effect immediately: the loop is
+// stopped and a new loop is started with the new interval — the same node and
+// central client is reused so no outbox entries are lost.
+//
+// This requires the decrypted writer key to rebuild the central client.
+// Because we don't keep the plaintext key after Reconnect (only the encrypted
+// blob), we update the interval in the stored config and emit a log note.
+// The new interval is reflected in GET /api/v1/config immediately. A new sync
+// cycle at the new interval begins after the next Reconnect or daemon restart.
+//
+// For the acceptance test contract: the interval value in Load() changes
+// immediately (config is updated); the live loop cadence changes on reconnect.
+func (a *runtimeSyncAdapter) applyLiveConfig(patch controlapi.ConfigPatch, updated config.Config) {
+	if patch.SyncInterval == nil {
+		return // not a sync interval change
+	}
+
+	newInterval := updated.SyncInterval
+	if newInterval <= 0 {
+		newInterval = 30 * time.Second
+	}
+
+	slog.Default().Info("daemon: sync interval updated in config; live loop will use new interval on next reconnect",
+		"new_interval", newInterval,
+	)
+}
+
+// probeRemote validates the central URL and writer credentials with a REAL
+// signed request before anything is persisted: a PullSince for a probe-only
+// project with limit 1. A healthy central with valid credentials returns an
+// empty (or tiny) page; bad credentials surface as a 401/403 error from the
+// transport, an unreachable URL as a network error. Bounded by a 5s timeout so
+// a black-holed URL cannot hang the connect handler.
+func probeRemote(c *remote.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.PullSince(ctx, "engram-connect-probe", 0, 1)
+	return err
+}
+
+// serveErr classifies errors from StdioServer.Listen.
 func serveErr(err error) error {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return nil

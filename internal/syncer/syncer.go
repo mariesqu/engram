@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/localstore"
@@ -88,6 +89,9 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 	}
 
 	pushed := 0
+	// skipped accumulates per-project skip counts for one summary debug line per
+	// drain cycle. Logging per-entry would be too noisy for large outboxes.
+	skipped := map[string]int{}
 	for _, e := range entries {
 		// Policy filter: skip (do not ack) entries for non-synced projects.
 		// Skipped entries remain unacked; they are re-evaluated on the next drain.
@@ -97,6 +101,7 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 				n.Name, e.Mutation.Project, e.LocalSeq, polErr)
 		}
 		if pol != localstore.PolicySynced {
+			skipped[e.Mutation.Project]++
 			continue // leave unacked — eligible again when policy flips to synced
 		}
 
@@ -108,6 +113,16 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 			return pushed, fmt.Errorf("push %s: ack(local_seq=%d): %w", n.Name, e.LocalSeq, err)
 		}
 		pushed++
+	}
+	// One debug line per drain cycle summarises all skipped projects — not per entry.
+	for proj, count := range skipped {
+		pol, _ := n.Store.GetPolicy(proj)
+		slog.Debug("syncer.Push: skipped project (non-synced policy)",
+			"node", n.Name,
+			"project", proj,
+			"policy", string(pol),
+			"skipped_entries", count,
+		)
 	}
 	return pushed, nil
 }
@@ -227,6 +242,12 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 			continue
 		}
 		if pol != localstore.PolicySynced {
+			// One debug line per skipped project per sync cycle — not per entry.
+			slog.Debug("syncer.SyncAllProjects: skipping pull for non-synced project",
+				"node", n.Name,
+				"project", proj,
+				"policy", string(pol),
+			)
 			continue // local-only or omitted: no pull for this project
 		}
 
