@@ -182,6 +182,10 @@ func autoNode(t *testing.T, name string) *syncer.Node {
 	if err != nil {
 		t.Fatalf("autoNode %s: localstore.Open: %v", name, err)
 	}
+	// These nodes sync against a real central — wire central-configured so the
+	// PR-② policy default is "synced" (otherwise push/pull filters skip
+	// everything). Mirrors the daemon's production wiring.
+	st.SetCentralConfiguredFn(func() bool { return true })
 	t.Cleanup(func() { _ = st.Close() })
 	return syncer.NewNode(name, st)
 }
@@ -205,6 +209,8 @@ func autoNodeForProjects(t *testing.T, name, writerID string, projects []string)
 	if err != nil {
 		t.Fatalf("autoNodeForProjects %s: localstore.Open: %v", name, err)
 	}
+	// Central-configured wiring — see autoNode.
+	st.SetCentralConfiguredFn(func() bool { return true })
 	t.Cleanup(func() { _ = st.Close() })
 	n := syncer.NewNode(name, st)
 	for i, proj := range projects {

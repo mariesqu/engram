@@ -198,6 +198,9 @@ func TestMultiProject_InterleavedSeqs_BothProjectsConverge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("localstore.Open: %v", err)
 	}
+	// Central-configured wiring so the PR-② policy default is "synced" —
+	// without it the pull filter skips every project. Mirrors daemon wiring.
+	st.SetCentralConfiguredFn(func() bool { return true })
 	t.Cleanup(func() { _ = st.Close() })
 	node := syncer.NewNode("pull-node", st)
 
