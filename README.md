@@ -234,6 +234,7 @@ All subcommands read `daemon.json` from the same directory as `--db`. If no daem
 | `sync_interval` | Yes                | Autosync cadence (Go duration, e.g. `30s`)     |
 | `log_level`     | Yes                | Log verbosity: `debug`, `info`, `warn`, `error`|
 | `db_path`       | No (restart)       | Path to the local SQLite database              |
+| `ollama_model`  | No (restart)       | Ollama embedding model (default `nomic-embed-text`) |
 | `http_port`     | No (restart)       | Control API TCP port                           |
 | `transport`     | No (restart)       | MCP transport mode: `stdio` or `http`          |
 
@@ -602,7 +603,7 @@ The agent calls `mem_judge` with the `judgment_id` and one of: `related`, `compa
 
 ### Configuring an embedding provider
 
-Set `embedding_provider` in `config.json` (or via `PUT /api/v1/config`):
+Set `embedding_provider` in `config.json` (or via `PUT /api/v1/config`). All embedding settings are RESTART-REQUIRED — the provider and its privacy gate are constructed at daemon startup:
 
 ```json
 {
@@ -610,9 +611,11 @@ Set `embedding_provider` in `config.json` (or via `PUT /api/v1/config`):
 }
 ```
 
-Valid values: `""` (noop, default), `"none"` (explicit noop), `"openai"`.
+Valid values: `""` (noop, default), `"none"` (explicit noop), `"openai"`, `"ollama"`.
 
-Supply the API key via the `ENGRAM_EMBEDDING_KEY` environment variable (hex-encoded). On Windows the key can also be stored as a DPAPI-encrypted blob via the UI. The environment variable always wins over the stored blob.
+#### OpenAI
+
+Supply the API key via the `ENGRAM_EMBEDDING_KEY` environment variable (hex-encoded). On Windows the key can also be stored as a DPAPI-encrypted blob via the key-management API (see below). The environment variable always wins over the stored blob.
 
 ```bash
 export ENGRAM_EMBEDDING_KEY=<hex-encoded-openai-key>
@@ -620,17 +623,84 @@ export ENGRAM_EMBEDDING_KEY=<hex-encoded-openai-key>
 
 The key is kept in process memory only and is **never written to disk in plaintext, never logged, and never included in error messages**.
 
+#### Ollama sidecar
+
+Ollama runs on the same node, so no text ever leaves the machine. Set `embedding_provider` to `"ollama"` and optionally configure the host and dimension count:
+
+```json
+{
+  "embedding_provider": "ollama",
+  "ollama_host": "http://localhost:11434",
+  "embedding_dims": 768
+}
+```
+
+`ollama_host` defaults to `http://localhost:11434`. `embedding_dims` must match the model's output dimensionality (e.g. 768 for `nomic-embed-text`). No API key is required.
+
+Because Ollama is local, embedding local-only projects requires explicit consent (see Privacy gate below).
+
+#### Embedding key management API
+
+The embedding API key can be stored as a platform-encrypted blob (DPAPI on Windows) via the control-plane API, without restarting the daemon:
+
+```bash
+# Store key (hex-encoded plaintext — never echoed in response)
+curl -s -X POST http://127.0.0.1:<port>/api/v1/embedding/key \
+  -H "Authorization: Bearer <token>" \
+  -H "Origin: http://127.0.0.1:<port>" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"<hex-encoded-key>"}'
+
+# Clear key (falls back to ENGRAM_EMBEDDING_KEY env var or Noop)
+curl -s -X DELETE http://127.0.0.1:<port>/api/v1/embedding/key \
+  -H "Authorization: Bearer <token>" \
+  -H "Origin: http://127.0.0.1:<port>"
+```
+
+On non-Windows platforms without a secret store the POST returns `422 Unprocessable Entity`; use `ENGRAM_EMBEDDING_KEY` instead.
+
+`GET /api/v1/config` reports `"embedding_key_set": true` when a key is active from either source (env var or stored blob), without revealing the key itself.
+
 ### Privacy gate
 
 The embedding provider is wrapped by a privacy gate that enforces per-project sync policy before any text leaves the node:
 
-| Policy | Provider type | Embed allowed? |
-|--------|---------------|----------------|
-| `omitted` | any | No — text never leaves the node |
-| `local-only` | remote (OpenAI) | No — remote provider forbidden for local-only projects |
-| `synced` | remote (OpenAI) | Yes |
+| Policy | Provider type | Local consent | Embed allowed? |
+|--------|---------------|---------------|----------------|
+| `omitted` | any | any | No |
+| `local-only` | remote (OpenAI) | any | No — text must not leave the node |
+| `local-only` | local (Ollama) | `false` (default) | No — explicit opt-in required |
+| `local-only` | local (Ollama) | `true` | Yes — local-only data stays local |
+| `synced` | any | any | Yes |
+
+Enable local embedding of local-only projects by setting `embedding_local_consent: true` in `config.json` or via `PUT /api/v1/config`:
+
+```json
+{
+  "embedding_provider": "ollama",
+  "embedding_local_consent": true
+}
+```
 
 The gate is structural: the raw provider is never exposed outside the `internal/embedding` package. Bypass is architecturally impossible.
+
+### mem_similar — find semantically similar memories
+
+`mem_similar` finds memories near a source memory using its stored embedding vector. Unlike `mem_search` (which embeds a query string on the fly), `mem_similar` reads the pre-computed vector from the source row and runs a cosine scan — no re-embedding cost.
+
+```
+mem_similar(sync_id="<sync_id>", project="<optional>", limit=5)
+```
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `sync_id` | yes | — | The sync_id of the source memory |
+| `project` | no | source row's project | Scope the scan to a specific project |
+| `limit` | no | 5 (max 20) | Number of results |
+
+Returns an error when:
+- The source row has no stored embedding (backfill not yet complete).
+- No embedding provider is configured (`dims = 0`).
 
 ### Graceful degradation
 

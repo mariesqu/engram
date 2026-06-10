@@ -31,19 +31,28 @@ type gatedProvider struct {
 // ever receives a reference to inner directly.
 //
 // remote should be true for RemoteOpenAIProvider (text leaves the node) and
-// false for NoopProvider or a future local sidecar provider.
-func NewGated(inner EmbeddingProvider, checker PolicyChecker, remote bool) EmbeddingProvider {
+// false for NoopProvider or a local sidecar provider (OllamaSidecarProvider).
+//
+// consent is the separate embedding_local_consent config flag. It is only
+// relevant when remote=false (local provider): a local-only project is
+// embeddable only when consent=true. For remote providers consent has no
+// effect — local-only projects are always gated regardless of consent.
+func NewGated(inner EmbeddingProvider, checker PolicyChecker, remote bool, consent ...bool) EmbeddingProvider {
+	c := false
+	if len(consent) > 0 {
+		c = consent[0]
+	}
 	return &gatedProvider{
 		inner:   inner,
 		checker: checker,
 		remote:  remote,
-		consent: false, // PR-2 will expose this parameter
+		consent: c,
 	}
 }
 
 // Embed enforces the privacy gate before delegating to the inner provider.
 //
-// Gate logic (mirrors EligibleForEmbedding + PolicyChecker):
+// Gate logic:
 //   - Fetches the project's policy via checker.GetPolicy.
 //   - Returns ErrEmbeddingGated when EligibleForEmbedding returns false.
 //   - Delegates to inner.Embed only when eligible.
@@ -58,7 +67,7 @@ func (g *gatedProvider) Embed(ctx context.Context, project string, texts []strin
 		return nil, err
 	}
 
-	if !EligibleForEmbedding(pol, g.remote) {
+	if !EligibleForEmbedding(pol, g.remote, g.consent) {
 		return nil, ErrEmbeddingGated
 	}
 
@@ -73,11 +82,6 @@ func (g *gatedProvider) Dimensions() int { return g.inner.Dimensions() }
 // ModelName delegates unconditionally to the inner provider.
 // Used by the backfill loop to record the producing model in embedding_model.
 func (g *gatedProvider) ModelName() string { return g.inner.ModelName() }
-
-// NOTE (PR-2 seam): the consent flag on gatedProvider is wired but always
-// false in PR-1 — there is deliberately NO constructor that sets it. PR-2
-// adds the consent-aware constructor alongside the sidecar provider and the
-// explicit consent setting.
 
 // ensure gatedProvider satisfies EmbeddingProvider at compile time.
 var _ EmbeddingProvider = (*gatedProvider)(nil)

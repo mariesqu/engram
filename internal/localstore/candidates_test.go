@@ -1,6 +1,7 @@
 package localstore
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -99,7 +100,7 @@ func TestSanitizeFTSCandidates_InteriorQuote(t *testing.T) {
 	s := openTestStore(t)
 	insertMemory(t, s, "obs-q", "JWTauth handling", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", `Fixed JWT"auth bug`, "proj", "project")
-	if _, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()}); err != nil {
+	if _, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()}); err != nil {
 		t.Errorf("FindCandidates with an interior-quote title errored: %v", err)
 	}
 }
@@ -128,7 +129,7 @@ func TestFindCandidates_OverlappingTitles(t *testing.T) {
 
 	savedID := insertMemory(t, s, "obs-new", "JWT authentication session bug", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -155,7 +156,7 @@ func TestFindCandidates_RelationRowsInserted(t *testing.T) {
 	insertMemory(t, s, "obs-b", "auth token refresh", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -200,7 +201,7 @@ func TestFindCandidates_SkipInsert(t *testing.T) {
 	insertMemory(t, s, "obs-a", "JWT auth middleware", "proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true, BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{SkipInsert: true, BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates(SkipInsert=true): %v", err)
 	}
@@ -228,7 +229,7 @@ func TestFindCandidates_SoftDeletedExcluded(t *testing.T) {
 
 	// Lenient floor so the ONLY reason obs-a can be excluded is the deleted_at
 	// filter (not the BM25 floor dropping everything in a tiny corpus).
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -245,7 +246,7 @@ func TestFindCandidates_CrossProjectExcluded(t *testing.T) {
 	insertMemory(t, s, "obs-other-proj", "JWT auth middleware", "other-proj", "project")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -264,7 +265,7 @@ func TestFindCandidates_CrossScopeExcluded(t *testing.T) {
 	insertMemory(t, s, "obs-personal", "JWT auth middleware", "proj", "personal")
 	savedID := insertMemory(t, s, "obs-new", "JWT auth token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -289,7 +290,7 @@ func TestFindCandidates_LimitHonored(t *testing.T) {
 	limit := 2
 	savedID := insertMemory(t, s, "obs-new", "JWT auth session token", "proj", "project")
 
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{Limit: limit, BM25Floor: lenientFloor()})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{Limit: limit, BM25Floor: lenientFloor()})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -320,7 +321,7 @@ func TestFindCandidates_BM25FloorFilters(t *testing.T) {
 
 	// Default floor (−2.0): strong multi-word matches pass; the single-word weak
 	// match (closer to 0) is excluded.
-	candidates, err := s.FindCandidates(savedID, CandidateOptions{SkipInsert: true})
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{SkipInsert: true})
 	if err != nil {
 		t.Fatalf("FindCandidates: %v", err)
 	}
@@ -351,7 +352,7 @@ func TestFindCandidates_BM25FloorFilters(t *testing.T) {
 func TestFindCandidates_ObservationNotFound(t *testing.T) {
 	s := openTestStore(t)
 
-	_, err := s.FindCandidates(999999, CandidateOptions{})
+	_, err := s.FindCandidates(context.Background(), 999999, CandidateOptions{})
 	if err == nil {
 		t.Error("expected error for non-existent savedID, got nil")
 	}
@@ -558,7 +559,7 @@ func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// Lenient floor so the write phase (INSERT) is actually exercised.
-			_, errs[i] = s.FindCandidates(savedIDs[i], CandidateOptions{BM25Floor: lenientFloor()})
+			_, errs[i] = s.FindCandidates(context.Background(), savedIDs[i], CandidateOptions{BM25Floor: lenientFloor()})
 		}()
 	}
 
@@ -577,5 +578,136 @@ func TestFindCandidates_ConcurrentNoDead(t *testing.T) {
 		if err != nil {
 			t.Errorf("worker %d: FindCandidates error: %v", i, err)
 		}
+	}
+}
+
+// ── FindCandidates cosine pass (task 2.8) ────────────────────────────────────
+
+// TestFindCandidates_NilGate_FTSOnly verifies that passing EmbedFn=nil leaves
+// the existing FTS-only path completely unchanged — the cosine pass is skipped.
+func TestFindCandidates_NilGate_FTSOnly(t *testing.T) {
+	s := openTestStore(t)
+
+	// Insert a candidate that shares keywords with the source.
+	insertMemory(t, s, "cand-fts", "JWT auth login bug", "proj", "project")
+	savedID := insertMemory(t, s, "src", "JWT auth login bug fix", "proj", "project")
+
+	// EmbedFn is nil — cosine pass must not run.
+	candidates, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{
+		BM25Floor:  lenientFloor(),
+		SkipInsert: true,
+		EmbedFn:    nil, // explicit nil
+	})
+	if err != nil {
+		t.Fatalf("FindCandidates: %v", err)
+	}
+	// FTS should still surface the keyword match.
+	found := false
+	for _, c := range candidates {
+		if c.SyncID == "cand-fts" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("FTS candidate not found with nil EmbedFn")
+	}
+}
+
+// TestFindCandidates_CosineSurfaces_Paraphrase proves the cosine pass surfaces a
+// paraphrase that shares NO keywords with the source (FTS returns 0 results),
+// provided it has a similar embedding vector.
+//
+// Setup:
+//   - Source:    "authentication failure event" (stored + distinct embedding)
+//   - Paraphrase: "login error occurrence" (no shared words → FTS miss)
+//   - Noise:      "completely unrelated infrastructure note"
+//
+// The paraphrase gets an embedding nearly identical to the source (high cosine).
+// The noise row gets an orthogonal embedding.
+// The injected EmbedFn returns the source's own stored vector for any input,
+// simulating a semantic model that would embed the paraphrase similarly.
+func TestFindCandidates_CosineSurfaces_Paraphrase(t *testing.T) {
+	s := openTestStore(t)
+
+	dims := 4
+
+	// Insert rows.
+	paraphraseID := insertMemory(t, s, "cand-paraphrase", "login error occurrence", "proj", "project")
+	noiseID := insertMemory(t, s, "cand-noise", "completely unrelated infrastructure note", "proj", "project")
+	savedID := insertMemory(t, s, "src", "authentication failure event", "proj", "project")
+
+	// Build L2-normalized embeddings. Source and paraphrase are nearly identical;
+	// noise is orthogonal.
+	srcVec := l2Normalize([]float32{0.9, 0.1, 0.1, 0.1})
+	paraVec := l2Normalize([]float32{0.85, 0.12, 0.09, 0.08}) // high cosine with src
+	noiseVec := l2Normalize([]float32{0.0, 0.0, 0.0, 1.0})    // orthogonal
+
+	now := "2025-01-01T00:00:00Z"
+
+	// Write embeddings directly (bypass the loop — tests only need the stored BLOB).
+	for _, row := range []struct {
+		id  int64
+		vec []float32
+	}{
+		{savedID, srcVec},
+		{paraphraseID, paraVec},
+		{noiseID, noiseVec},
+	} {
+		blob := encodeVector(row.vec)
+		if _, err := s.db.Exec(
+			`UPDATE memories SET embedding=?, embedding_model='test', embedding_created_at=? WHERE id=?`,
+			blob, now, row.id,
+		); err != nil {
+			t.Fatalf("store embedding for id=%d: %v", row.id, err)
+		}
+	}
+
+	// The FTS query for "authentication failure event" should NOT match
+	// "login error occurrence" (no shared words). Verify FTS finds nothing first.
+	ftsOnlyCands, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{
+		BM25Floor:  lenientFloor(),
+		SkipInsert: true,
+		EmbedFn:    nil,
+	})
+	if err != nil {
+		t.Fatalf("FTS-only FindCandidates: %v", err)
+	}
+	for _, c := range ftsOnlyCands {
+		if c.SyncID == "cand-paraphrase" {
+			t.Error("FTS should NOT surface the paraphrase (no keyword overlap)")
+		}
+	}
+
+	// Now inject an EmbedFn that returns srcVec for any text (simulates the
+	// semantic model embedding the source title into a similar vector space).
+	embedFn := EmbedQueryFn(func(_ context.Context, _ string, texts []string) ([][]float32, error) {
+		out := make([][]float32, len(texts))
+		for i := range texts {
+			cp := make([]float32, dims)
+			copy(cp, srcVec)
+			out[i] = cp
+		}
+		return out, nil
+	})
+
+	cosineCands, err := s.FindCandidates(context.Background(), savedID, CandidateOptions{
+		BM25Floor:  lenientFloor(),
+		SkipInsert: true,
+		EmbedFn:    embedFn,
+		EmbedDims:  dims,
+	})
+	if err != nil {
+		t.Fatalf("cosine-pass FindCandidates: %v", err)
+	}
+
+	// The paraphrase must be in the result set.
+	foundParaphrase := false
+	for _, c := range cosineCands {
+		if c.SyncID == "cand-paraphrase" {
+			foundParaphrase = true
+		}
+	}
+	if !foundParaphrase {
+		t.Error("cosine pass should surface cand-paraphrase (high cosine, no keyword overlap)")
 	}
 }

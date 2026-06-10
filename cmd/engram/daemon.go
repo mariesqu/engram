@@ -99,12 +99,16 @@ type daemonCfg struct {
 	// When "http" and httpMode=true, /mcp is mounted on the top-level ServeMux.
 	mcpTransport string
 
-	// Embedding provider (PR-①b).
-	// embeddingProvider is the validated provider name ("", "none", "openai").
+	// Embedding provider fields.
+	// embeddingProvider is the validated provider name ("", "none", "openai", "ollama").
 	// embeddingKey is the plaintext API key resolved at startup (in-memory only;
 	// NEVER written to disk, never logged). nil/empty → noop provider.
-	embeddingProvider string
-	embeddingKey      []byte // plaintext; nil when not needed
+	embeddingProvider     string
+	embeddingKey          []byte // plaintext; nil when not needed
+	embeddingLocalConsent bool   // PR-2: explicit consent for local-only projects with sidecar
+	embeddingDims         int    // 0 → provider default (256)
+	ollamaHost            string // "" → "http://localhost:11434"
+	ollamaModel           string // "" → "nomic-embed-text"
 }
 
 // resolveTransport resolves the MCP transport with the standard precedence
@@ -358,17 +362,21 @@ func runDaemonCmd(args []string) error {
 	}
 
 	cfg := daemonCfg{
-		db:                *db,
-		centralURL:        *centralURL,
-		writerID:          *writerID,
-		writerKey:         writerKey,
-		syncInterval:      *syncInterval,
-		httpMode:          *httpMode,
-		httpPort:          *httpPort,
-		configDir:         configDir,
-		mcpTransport:      transport,
-		embeddingProvider: embeddingProvider,
-		embeddingKey:      embeddingKey,
+		db:                    *db,
+		centralURL:            *centralURL,
+		writerID:              *writerID,
+		writerKey:             writerKey,
+		syncInterval:          *syncInterval,
+		httpMode:              *httpMode,
+		httpPort:              *httpPort,
+		configDir:             configDir,
+		mcpTransport:          transport,
+		embeddingProvider:     embeddingProvider,
+		embeddingKey:          embeddingKey,
+		embeddingLocalConsent: fileCfg.EmbeddingLocalConsent,
+		embeddingDims:         fileCfg.EmbeddingDims,
+		ollamaHost:            fileCfg.OllamaHost,
+		ollamaModel:           fileCfg.OllamaModel,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -407,16 +415,19 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	centralURL := cfg.centralURL
 	store.SetCentralConfiguredFn(func() bool { return centralURL != "" })
 
-	// ── Wire embedding provider (PR-①b) ──────────────────────────────────────
-	// Build the inner raw provider (OpenAI or Noop), then wrap it with the
-	// privacy gate. The gate is the ONLY path to the inner provider — raw
+	// ── Wire embedding provider ───────────────────────────────────────────────
+	// Build the inner raw provider (OpenAI, Ollama, or Noop), then wrap it with
+	// the privacy gate. The gate is the ONLY path to the inner provider — raw
 	// providers never escape buildDaemon. store satisfies PolicyChecker.
 	//
-	// remote=true: the only remote provider in PR-1 is OpenAI. Future local
-	// providers (PR-2) will use remote=false.
+	// remote=true for OpenAI (text leaves the node).
+	// remote=false for Ollama (local sidecar — text stays on the node).
+	// consent=cfg.embeddingLocalConsent is passed to the gate for local providers.
 	var innerProvider embedding.EmbeddingProvider
+	isRemote := false
 	switch cfg.embeddingProvider {
 	case "openai":
+		isRemote = true
 		if len(cfg.embeddingKey) > 0 {
 			innerProvider = embedding.NewRemoteOpenAI(string(cfg.embeddingKey))
 		} else {
@@ -425,11 +436,24 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 			log.Printf("warning: embedding_provider=openai but no key found (ENGRAM_EMBEDDING_KEY not set and no stored key); falling back to noop")
 			innerProvider = embedding.NoopProvider{}
 		}
+	case "ollama":
+		// Ollama is a local sidecar — remote=false. The gate requires
+		// embedding_local_consent=true for local-only projects.
+		ollamaHost := cfg.ollamaHost
+		if ollamaHost == "" {
+			ollamaHost = "http://localhost:11434"
+		}
+		ollamaModel := cfg.ollamaModel
+		if ollamaModel == "" {
+			ollamaModel = "nomic-embed-text"
+		}
+		dims := cfg.embeddingDims
+		innerProvider = embedding.NewOllamaSidecar(ollamaModel, dims, embedding.WithOllamaHost(ollamaHost))
 	default:
 		// "", "none", or any value that passed validation → Noop.
 		innerProvider = embedding.NoopProvider{}
 	}
-	gated := embedding.NewGated(innerProvider, store, true /* remote */)
+	gated := embedding.NewGated(innerProvider, store, isRemote, cfg.embeddingLocalConsent)
 	store.SetEmbedFn(gated.Embed, gated.Dimensions())
 
 	// ── Construct embedding backfill loop (PR-①b) ─────────────────────────────
@@ -447,7 +471,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	}
 
 	activity := NewSessionActivity()
-	registerTools(mcpSrv, store, loop, embedLoop, cfg.writerID, activity)
+	registerTools(mcpSrv, store, loop, embedLoop, gated, cfg.writerID, activity)
 
 	return &daemonComponents{
 		store:     store,
@@ -561,7 +585,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		components.gated,
 	)
 
-	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion)
+	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion, cfgAdapter)
 
 	// ── PR-④a: build the top-level mux (one listener, path-routed) ───────────
 	// The control API and the web UI share a single net.Listener. We mount:
@@ -728,6 +752,9 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 			cfg.EncryptedWriterKey = fileCfg.EncryptedWriterKey
 			cfg = cfg.WithEncryptedEmbeddingKey(fileCfg.EncryptedEmbeddingKey())
 			cfg.EmbeddingProvider = fileCfg.EmbeddingProvider
+			cfg.EmbeddingLocalConsent = fileCfg.EmbeddingLocalConsent
+			cfg.EmbeddingDims = fileCfg.EmbeddingDims
+			cfg.OllamaHost = fileCfg.OllamaHost
 			if cfg.LogLevel == "" {
 				cfg.LogLevel = fileCfg.LogLevel
 			}
@@ -735,6 +762,10 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 				cfg.Transport = fileCfg.Transport
 			}
 		}
+	}
+	// Mark the key active when we resolved one at daemon startup (env or file).
+	if len(daemonCfg.embeddingKey) > 0 {
+		cfg = cfg.WithEmbeddingKeyActive(true)
 	}
 	return &configStoreAdapter{
 		cfg:       cfg,
@@ -779,12 +810,16 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 
 	// Map controlapi.ConfigPatch → config.ConfigPatch.
 	cfgPatch := config.ConfigPatch{
-		SyncInterval:      patch.SyncInterval,
-		LogLevel:          patch.LogLevel,
-		HTTPPort:          patch.HTTPPort,
-		DBPath:            patch.DBPath,
-		Transport:         patch.Transport,
-		EmbeddingProvider: patch.EmbeddingProvider,
+		SyncInterval:          patch.SyncInterval,
+		LogLevel:              patch.LogLevel,
+		HTTPPort:              patch.HTTPPort,
+		DBPath:                patch.DBPath,
+		Transport:             patch.Transport,
+		EmbeddingProvider:     patch.EmbeddingProvider,
+		EmbeddingLocalConsent: patch.EmbeddingLocalConsent,
+		EmbeddingDims:         patch.EmbeddingDims,
+		OllamaHost:            patch.OllamaHost,
+		OllamaModel:           patch.OllamaModel,
 	}
 
 	updated, restartRequired := config.Patch(a.cfg, cfgPatch)
@@ -844,6 +879,49 @@ func (a *configStoreAdapter) getSyncInterval() time.Duration {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.cfg.SyncInterval
+}
+
+// SealEmbeddingKey encrypts plaintext via the platform SecretBox and persists
+// the ciphertext to the config file. The plaintext is not stored in memory
+// beyond this call. Satisfies controlapi.EmbeddingKeyStore.
+func (a *configStoreAdapter) SealEmbeddingKey(plaintext []byte) error {
+	ciphertext, err := a.secretBox.Seal(plaintext)
+	if err != nil {
+		// Map config.ErrNoSecretStore to controlapi.ErrNoSecretStore so the
+		// handler's errors.Is check in embedding_key.go returns 422.
+		if errors.Is(err, config.ErrNoSecretStore) {
+			return controlapi.ErrNoSecretStore
+		}
+		return err
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg = a.cfg.WithEncryptedEmbeddingKey(ciphertext)
+	a.cfg = a.cfg.WithEmbeddingKeyActive(true)
+	if a.configDir != "" {
+		return config.Save(a.configDir, a.cfg)
+	}
+	return nil
+}
+
+// ClearEmbeddingKey removes any stored encrypted embedding key from memory and
+// disk. After this call the daemon falls back to ENGRAM_EMBEDDING_KEY env var
+// (if set) or Noop. Satisfies controlapi.EmbeddingKeyStore.
+func (a *configStoreAdapter) clearEmbeddingKey() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg = a.cfg.WithEncryptedEmbeddingKey(nil)
+	a.cfg = a.cfg.WithEmbeddingKeyActive(false)
+	if a.configDir != "" {
+		return config.Save(a.configDir, a.cfg)
+	}
+	return nil
+}
+
+// ClearEmbeddingKey satisfies controlapi.EmbeddingKeyStore.
+func (a *configStoreAdapter) ClearEmbeddingKey() error {
+	return a.clearEmbeddingKey()
 }
 
 // ── runtimeSyncAdapter (PR-③) ─────────────────────────────────────────────────

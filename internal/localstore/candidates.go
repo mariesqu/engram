@@ -1,6 +1,7 @@
 package localstore
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -77,6 +78,16 @@ type CandidateOptions struct {
 	// SkipInsert controls whether FindCandidates inserts pending conflict_relations
 	// rows. When true, candidates are returned without any writes.
 	SkipInsert bool
+	// EmbedFn is an optional cosine-pass port. When non-nil, FindCandidates embeds
+	// the saved observation's text, runs a cosine scan over stored vectors scoped
+	// to the same project, and unions the cosine results with the FTS candidate set
+	// by sync_id — surfacing paraphrases that share no keywords.
+	// nil → FTS-only path unchanged (EmbedDims is ignored).
+	EmbedFn EmbedQueryFn
+	// EmbedDims is the expected embedding dimensionality. Required when EmbedFn is
+	// non-nil; ignored otherwise. Passing 0 when EmbedFn is non-nil disables the
+	// cosine pass (SelectVectors returns nil for dims ≤ 0).
+	EmbedDims int
 }
 
 // ConflictRelation represents a row in conflict_relations.
@@ -167,7 +178,7 @@ func newRelSyncID() string {
 //
 // Errors from FindCandidates should be logged and swallowed by callers —
 // candidate detection failure must never fail the originating save.
-func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidate, error) {
+func (s *Store) FindCandidates(ctx context.Context, savedID int64, opts CandidateOptions) ([]Candidate, error) {
 	// Apply defaults.
 	limit := opts.Limit
 	if limit <= 0 {
@@ -254,6 +265,97 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 	// EXPLICIT close before any write — releases the single connection.
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("FindCandidates: close rows: %w", err)
+	}
+
+	// ── Phase 1b: optional cosine pass — union with FTS results ──────────────
+	//
+	// When EmbedFn is set, embed the source observation's text and cosine-scan
+	// all stored vectors in the same project/scope. Candidates already in 'raw'
+	// (from FTS) are preserved; cosine-only hits are fetched by sync_id and
+	// appended up to 'limit'. This surfaces paraphrases that share no keywords.
+	//
+	// All SELECTs here must complete and close before Phase 3 (INSERTs) to
+	// respect the SetMaxOpenConns(1) cursor discipline.
+	// TRUE union: the cosine pass runs whenever it is wired — NOT only when FTS
+	// came up short. A paraphrase sharing no keywords must surface even when FTS
+	// already filled the limit with weaker lexical matches; the combined set is
+	// truncated to the limit after dedup.
+	if opts.EmbedFn != nil && opts.EmbedDims > 0 {
+		// Build the source text: title + content (same as SelectEmbeddable).
+		var srcContent string
+		_ = s.db.QueryRow(`SELECT ifnull(content,'') FROM memories WHERE id = ?`, savedID).Scan(&srcContent)
+		srcText := title
+		if srcContent != "" {
+			srcText = title + " " + srcContent
+		}
+
+		// Build a set of sync_ids already in the FTS result so we skip duplicates.
+		inFTS := make(map[string]bool, len(raw))
+		for _, rc := range raw {
+			inFTS[rc.syncID] = true
+		}
+
+		// Embed the source text via the injected gated function. A gated or noop
+		// response is treated as "cosine unavailable" — fall through silently.
+		vecs, embedErr := opts.EmbedFn(ctx, project, []string{srcText})
+		if embedErr == nil && len(vecs) > 0 && len(vecs[0]) == opts.EmbedDims {
+			queryVec := l2Normalize(vecs[0])
+			filter := SearchFilter{} // scope the scan to the same project only
+
+			// SelectVectors opens and closes its own cursor before returning.
+			storedVecs, _ := SelectVectors(s.db, project, filter, opts.EmbedDims)
+
+			// Remove the source row itself from the cosine scan.
+			var sourceSyncIDForCosine string
+			_ = s.db.QueryRow(`SELECT ifnull(sync_id,'') FROM memories WHERE id = ?`, savedID).Scan(&sourceSyncIDForCosine)
+			filtered := storedVecs[:0]
+			for _, vr := range storedVecs {
+				if vr.syncID != sourceSyncIDForCosine {
+					filtered = append(filtered, vr)
+				}
+			}
+
+			// Top-K cosine candidates (fetch up to limit*3 so we have enough after
+			// dedup with the FTS set).
+			cosineHits := cosineTopK(queryVec, filtered, limit*3)
+
+			// Collect sync_ids that are new (not in FTS set).
+			var newSyncIDs []string
+			for _, cc := range cosineHits {
+				if !inFTS[cc.syncID] {
+					newSyncIDs = append(newSyncIDs, cc.syncID)
+					if len(newSyncIDs) >= limit-len(raw) {
+						break
+					}
+				}
+			}
+
+			// Fetch metadata for the cosine-only additions.  Build placeholders.
+			if len(newSyncIDs) > 0 {
+				placeholders := make([]string, len(newSyncIDs))
+				args := make([]any, len(newSyncIDs))
+				for i, sid := range newSyncIDs {
+					placeholders[i] = "?"
+					args[i] = sid
+				}
+				q := `SELECT id, sync_id, title, type, topic_key FROM memories
+				       WHERE sync_id IN (` + strings.Join(placeholders, ",") + `)
+				         AND deleted_at IS NULL`
+				metaRows, metaErr := s.db.Query(q, args...)
+				if metaErr == nil {
+					for metaRows.Next() && len(raw) < limit {
+						var rc rawCandidate
+						if scanErr := metaRows.Scan(&rc.id, &rc.syncID, &rc.title, &rc.obsType, &rc.topicKey); scanErr == nil {
+							// Assign a synthetic BM25 score of 0 so the cosine-only
+							// candidates sort after FTS hits (BM25 is negative; 0 = weakest).
+							rc.score = 0
+							raw = append(raw, rc)
+						}
+					}
+					_ = metaRows.Close()
+				}
+			}
+		}
 	}
 
 	if len(raw) == 0 {

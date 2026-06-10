@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -57,7 +58,7 @@ func resolveReadProject(explicitProject string) string {
 //
 // activity must be non-nil; it is shared across all write handlers so that
 // mem_save_prompt can record the current prompt and mem_save can auto-capture it.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, writerID string, activity *SessionActivity) {
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) {
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -149,7 +150,7 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
 		),
-		handleSave(store, loop, embedLoop, writerID, activity),
+		handleSave(store, loop, embedLoop, gated, writerID, activity),
 	)
 
 	// ── mem_save_prompt ──────────────────────────────────────────────────────
@@ -290,6 +291,29 @@ Re-judging an already-judged ID overwrites the verdict (deliberate revision).`),
 			),
 		),
 		handleJudge(store),
+	)
+
+	// ── mem_similar ──────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_similar",
+			mcp.WithDescription("Find memories semantically similar to a source memory, using its stored embedding vector. Requires an embedding provider to be configured and the source memory to have an embedding."),
+			mcp.WithTitleAnnotation("Find Similar Memories"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("sync_id",
+				mcp.Required(),
+				mcp.Description("The sync_id of the source memory whose neighbours to find"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Filter results to a specific project (default: same project as the source memory)"),
+			),
+			mcp.WithNumber("limit",
+				mcp.Description("Max results to return (default: 5, max: 20)"),
+			),
+		),
+		handleMemSimilar(store, gated),
 	)
 
 	// ── mem_session_summary ──────────────────────────────────────────────────
@@ -470,8 +494,8 @@ func resolveSaveProject(store *localstore.Store, explicitProject string) (string
 // embedLoop (may be nil): after a successful save, embedLoop.Trigger() is called
 // nil-safely so the backfill loop picks up the new row without waiting for the
 // next periodic 60s tick. The Trigger is non-blocking (coalesced, size-1 channel).
-func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
-	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
 		title, _ := args["title"].(string)
@@ -547,9 +571,17 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		// Post-save conflict candidate detection (REQ-001).
 		// Errors are logged to stderr and swallowed — detection failure MUST NOT fail
 		// the save. The save already succeeded; candidate detection is advisory only.
-		candidates, candErr := store.FindCandidates(result.ID, localstore.CandidateOptions{
+		// The cosine paraphrase pass is wired through the SAME gated provider as
+		// search and backfill (gated/omitted projects: the embed errors and the
+		// pass silently degrades to FTS-only candidates). A bounded context keeps
+		// a stalled local sidecar from hanging the save path.
+		candCtx, candCancel := context.WithTimeout(ctx, 10*time.Second)
+		candidates, candErr := store.FindCandidates(candCtx, result.ID, localstore.CandidateOptions{
 			// nil BM25Floor → store default (-2.0); nil/0 Limit → store default (3).
+			EmbedFn:   gated.Embed,
+			EmbedDims: gated.Dimensions(),
 		})
+		candCancel()
 		if candErr != nil {
 			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
 		}
@@ -952,5 +984,90 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 func triggerSync(loop *syncer.Loop) {
 	if loop != nil {
 		loop.Trigger()
+	}
+}
+
+// handleMemSimilar returns the handler for mem_similar.
+//
+// It looks up the stored embedding for the source row (by sync_id), then runs
+// a cosine top-K against all other live rows in the same project, returning
+// the nearest neighbours.
+//
+// Error cases:
+//   - sync_id not found in the store → tool error
+//   - source row has no embedding vector → tool error (clear message)
+//   - no embedding provider configured (dims=0) → tool error
+//
+// Project policy for the LOOKUP (reading vectors) is LOCAL — no text crosses a
+// provider boundary, so the gate is not involved in the similarity scan itself.
+// The stored vectors are already derived data on this node.
+func handleMemSimilar(store *localstore.Store, gated embedding.EmbeddingProvider) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		syncID, _ := args["sync_id"].(string)
+		syncID = strings.TrimSpace(syncID)
+		if syncID == "" {
+			return mcp.NewToolResultError("mem_similar: sync_id is required"), nil
+		}
+
+		explicitProject, _ := args["project"].(string)
+
+		limit := 5
+		if raw, ok := args["limit"].(float64); ok && raw > 0 {
+			limit = int(raw)
+			if limit > 20 {
+				limit = 20
+			}
+		}
+
+		dims := gated.Dimensions()
+		if dims <= 0 {
+			return mcp.NewToolResultError("mem_similar: no embedding provider configured; mem_similar requires vectors"), nil
+		}
+
+		// Retrieve the source row's stored embedding.
+		srcVec, err := localstore.GetEmbeddingBySyncID(store.RawDB(), syncID, dims)
+		if err != nil {
+			if errors.Is(err, localstore.ErrNoEmbedding) {
+				return mcp.NewToolResultError(fmt.Sprintf("mem_similar: observation %q has no embedding vector yet; wait for the backfill loop or check embedding_provider config", syncID)), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("mem_similar: %s", err)), nil
+		}
+
+		// Resolve the project for scoping: explicit arg, or source row's project.
+		project := strings.TrimSpace(explicitProject)
+		if project == "" {
+			// Look up the source row to get its project.
+			if rec, recErr := store.FindBySyncID(syncID); recErr == nil && rec != nil {
+				project = rec.Project
+			}
+		}
+
+		// Fetch all embeddings scoped to project.
+		rows, selErr := localstore.SelectVectors(store.RawDB(), project, localstore.SearchFilter{}, dims)
+		if selErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_similar: vector scan error: %s", selErr)), nil
+		}
+
+		// Exclude the source row itself.
+		filtered := rows[:0]
+		for _, r := range rows {
+			if r.SyncID() != syncID {
+				filtered = append(filtered, r)
+			}
+		}
+
+		candidates := localstore.CosineTopK(srcVec, filtered, limit)
+		if len(candidates) == 0 {
+			return mcp.NewToolResultText(fmt.Sprintf("No similar memories found for sync_id %q", syncID)), nil
+		}
+
+		var b strings.Builder
+		fmt.Fprintf(&b, "Found %d similar memories (cosine similarity):\n\n", len(candidates))
+		for i, c := range candidates {
+			fmt.Fprintf(&b, "[%d] sync_id=%s score=%.4f\n", i+1, c.SyncID(), c.Score())
+		}
+		return mcp.NewToolResultText(b.String()), nil
 	}
 }

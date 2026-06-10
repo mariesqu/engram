@@ -42,22 +42,21 @@ func TestRun_DaemonHelp_DoesNotLeakEmbeddingKey(t *testing.T) {
 //
 // This is the PR-③ lesson applied to embedding: a bad value persisted to disk
 // must hard-error the next startup rather than silently falling back to noop.
-// "ollama" is the canary — reserved for PR-2, invalid in PR-1.
 func TestDaemon_InvalidEmbeddingProvider_FatalAtStartup(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write config.json with an invalid embedding_provider.
+	// Write config.json with a genuinely invalid embedding_provider.
 	cfgFile := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(cfgFile, []byte(`{"embedding_provider":"ollama"}`), 0600); err != nil {
+	if err := os.WriteFile(cfgFile, []byte(`{"embedding_provider":"gpt-embeddings"}`), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// config.Load must return an error for "ollama".
+	// config.Load must return an error for an unrecognised provider.
 	_, err := config.Load(dir)
 	if err == nil {
-		t.Fatal("config.Load with embedding_provider=ollama should return error, got nil")
+		t.Fatal("config.Load with embedding_provider=gpt-embeddings should return error, got nil")
 	}
-	if !strings.Contains(err.Error(), "ollama") {
+	if !strings.Contains(err.Error(), "gpt-embeddings") {
 		t.Errorf("error message should contain the invalid value; got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "embedding_provider") {
