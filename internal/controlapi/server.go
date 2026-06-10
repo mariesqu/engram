@@ -21,6 +21,10 @@
 //	GET /api/v1/status   → handleStatus
 //	GET /api/v1/config   → handleConfig   (writer key REDACTED)
 //	GET /api/v1/projects → handleProjects (policy per project)
+//
+// PR-⑥ exports:
+//
+//	MountMCP — registers /mcp on an existing ServeMux with bearer-token auth
 package controlapi
 
 import (
@@ -399,4 +403,42 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// ── PR-⑥: MCP HTTP transport helper ──────────────────────────────────────────
+
+// MCPHandler is the interface satisfied by *mcpserver.StreamableHTTPServer.
+// Using an interface keeps internal/controlapi free of the mcp-go import so
+// the dependency stays in cmd/engram (the wiring layer).
+type MCPHandler interface {
+	ServeHTTP(http.ResponseWriter, *http.Request)
+}
+
+// MountMCP registers the MCP Streamable HTTP server at /mcp on mux, wrapped
+// with bearer-token authentication that mirrors the /api/v1 contract.
+//
+// The handler is the *mcpserver.StreamableHTTPServer constructed by buildDaemon
+// (it satisfies MCPHandler via its ServeHTTP method). The same token used for
+// /api/v1 is reused — a single credential for the whole loopback daemon.
+//
+// Auth contract (mirrors withAuth):
+//   - Missing or wrong Authorization: Bearer <token> → 401, no routing.
+//   - Correct token → request forwarded to the streamable handler unchanged.
+func MountMCP(mux *http.ServeMux, token string, h MCPHandler) {
+	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Constant-time comparison is not required for loopback-only tokens, but
+		// we apply the same simple check as withAuth to keep the contract identical.
+		got := r.Header.Get("Authorization")
+		want := "Bearer " + token
+		if got != want {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+	// Mount at /mcp — the ServeMux strips the prefix when forwarding, but the
+	// StreamableHTTPServer's ServeHTTP dispatches on method (POST/GET/DELETE),
+	// not on the path, so no path stripping is needed.
+	mux.Handle("/mcp", authed)
+	mux.Handle("/mcp/", authed)
 }
