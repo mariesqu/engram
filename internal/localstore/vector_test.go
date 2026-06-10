@@ -310,7 +310,7 @@ func TestSelectEmbeddable_PicksNullAndStale(t *testing.T) {
 
 	ids := make(map[string]bool)
 	for _, r := range rows {
-		ids[r.syncID] = true
+		ids[r.SyncID] = true
 	}
 
 	if !ids["null-row"] {
@@ -343,7 +343,7 @@ func TestSelectEmbeddable_SkipsAlreadyEmbedded(t *testing.T) {
 		t.Fatalf("SelectEmbeddable: %v", err)
 	}
 	for _, r := range rows {
-		if r.syncID == "up-to-date" {
+		if r.SyncID == "up-to-date" {
 			t.Errorf("up-to-date row should be excluded, but was returned")
 		}
 	}
