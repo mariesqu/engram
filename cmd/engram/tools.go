@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 	projectpkg "github.com/mariesqu/engram/internal/project"
 	"github.com/mariesqu/engram/internal/syncer"
@@ -50,9 +51,13 @@ func resolveReadProject(explicitProject string) string {
 // when loop is non-nil, so the autosync runs immediately after a local write
 // when central is configured.
 //
+// embedLoop may be nil (Noop provider / no key). Write handlers call
+// embedLoop.Trigger() nil-safely after a successful save so the backfill loop
+// picks up newly written rows without waiting for the next periodic tick.
+//
 // activity must be non-nil; it is shared across all write handlers so that
 // mem_save_prompt can record the current prompt and mem_save can auto-capture it.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) {
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, writerID string, activity *SessionActivity) {
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -144,7 +149,7 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
 		),
-		handleSave(store, loop, writerID, activity),
+		handleSave(store, loop, embedLoop, writerID, activity),
 	)
 
 	// ── mem_save_prompt ──────────────────────────────────────────────────────
@@ -461,7 +466,11 @@ func resolveSaveProject(store *localstore.Store, explicitProject string) (string
 // recorded prompt via RecordPrompt that matches this project, it is persisted via
 // AddPromptIfMissing. This is BEST-EFFORT: any error is logged to stderr and
 // swallowed — it never alters the mem_save result or fails the save.
-func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+//
+// embedLoop (may be nil): after a successful save, embedLoop.Trigger() is called
+// nil-safely so the backfill loop picks up the new row without waiting for the
+// next periodic 60s tick. The Trigger is non-blocking (coalesced, size-1 channel).
+func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -530,6 +539,10 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, writerID string, act
 		}
 
 		triggerSync(loop)
+		// Nudge the embedding backfill loop so the new row is embedded promptly
+		// without waiting for the next 60s periodic tick. Nil-safe: no-op when
+		// no embedding provider is configured (embedLoop is nil).
+		embedLoop.Trigger()
 
 		// Post-save conflict candidate detection (REQ-001).
 		// Errors are logged to stderr and swallowed — detection failure MUST NOT fail
