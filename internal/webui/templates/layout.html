@@ -1,0 +1,26 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>engram daemon</title>
+    <link rel="stylesheet" href="/ui/static/styles.css">
+    <!-- htmx 2.0.4 — vendored, no CDN. Source: https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js -->
+    <script src="/ui/static/htmx.min.js"></script>
+</head>
+<body>
+<div class="page">
+    <header>
+        <span class="brand">engram</span>
+        <nav>
+            <a href="/ui/">Status</a>
+            <a href="/ui/projects">Projects</a>
+        </nav>
+    </header>
+    <main>
+        {{block "content" .}}{{end}}
+    </main>
+    <footer>engram daemon {{.DaemonVersion}}</footer>
+</div>
+</body>
+</html>{{end}}

@@ -1,0 +1,54 @@
+{{define "status-partial"}}
+<div class="card"
+     id="status-fragment"
+     hx-get="/ui/status"
+     hx-trigger="every 3s"
+     hx-target="#status-fragment"
+     hx-swap="outerHTML">
+    <h2>Daemon Status</h2>
+    <div class="field">
+        <span class="field-label">Central connected</span>
+        <span class="field-value">
+            {{if .CentralConnected}}
+                <span class="badge badge-connected">connected</span>
+            {{else}}
+                <span class="badge badge-disconnected">disconnected</span>
+            {{end}}
+        </span>
+    </div>
+    {{if .CentralURL}}
+    <div class="field">
+        <span class="field-label">Central URL</span>
+        <span class="field-value">{{.CentralURL}}</span>
+    </div>
+    {{end}}
+    <div class="field">
+        <span class="field-label">Last sync at</span>
+        <span class="field-value">
+            {{if .LastSyncAt}}
+                <span class="mono">{{.LastSyncAt}}</span>
+            {{else}}
+                <span class="muted">never</span>
+            {{end}}
+        </span>
+    </div>
+    <div class="field">
+        <span class="field-label">Last sync result</span>
+        <span class="field-value">
+            {{if .LastSyncError}}
+                <span class="badge badge-disconnected">error</span>
+                <span class="muted mono" style="font-size:0.8rem;">{{.LastSyncError}}</span>
+            {{else if .LastSyncAt}}
+                <span class="badge badge-connected">ok</span>
+                <span class="muted mono" style="font-size:0.8rem;">pushed {{.LastSyncPushed}} / pulled {{.LastSyncPulled}}</span>
+            {{else}}
+                <span class="muted">—</span>
+            {{end}}
+        </span>
+    </div>
+    <div class="field">
+        <span class="field-label">Daemon version</span>
+        <span class="field-value mono">{{.DaemonVersion}}</span>
+    </div>
+</div>
+{{end}}

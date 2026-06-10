@@ -1,0 +1,215 @@
+/*
+ * engram daemon loopback dashboard — minimal embedded CSS.
+ * No external fonts, no CDN. System font stack only.
+ */
+
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+:root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3a;
+    --text:     #e2e8f0;
+    --muted:    #8892a4;
+    --accent:   #6c8ebf;
+    --green:    #4ade80;
+    --red:      #f87171;
+    --yellow:   #facc15;
+    --radius:   6px;
+    --mono:     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans:     system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.6;
+}
+
+a {
+    color: var(--accent);
+    text-decoration: none;
+}
+a:hover {
+    text-decoration: underline;
+}
+
+/* ── Layout ─────────────────────────────────────────────── */
+
+.page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 0 1rem;
+}
+
+header {
+    border-bottom: 1px solid var(--border);
+    padding: 0.75rem 0;
+    margin-bottom: 1.5rem;
+}
+
+header .brand {
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: var(--text);
+    letter-spacing: 0.02em;
+}
+
+nav {
+    display: inline-flex;
+    gap: 1.5rem;
+    margin-left: 2rem;
+}
+
+nav a {
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+nav a:hover, nav a.active {
+    color: var(--text);
+}
+
+/* ── Cards ──────────────────────────────────────────────── */
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.25rem;
+}
+
+.card h2 {
+    margin: 0 0 1rem 0;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* ── Status fields ──────────────────────────────────────── */
+
+.field {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid var(--border);
+}
+.field:last-child { border-bottom: none; }
+
+.field-label {
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-width: 160px;
+    flex-shrink: 0;
+}
+
+.field-value {
+    font-family: var(--mono);
+    font-size: 0.875rem;
+    word-break: break-all;
+}
+
+/* ── Badges ─────────────────────────────────────────────── */
+
+.badge {
+    display: inline-block;
+    padding: 0.1em 0.55em;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    font-family: var(--mono);
+    letter-spacing: 0.03em;
+}
+
+.badge-synced      { background: #164e2e; color: var(--green); }
+.badge-local-only  { background: #422006; color: var(--yellow); }
+.badge-omitted     { background: #3b1515; color: var(--red); }
+.badge-connected   { background: #164e2e; color: var(--green); }
+.badge-disconnected{ background: #3b1515; color: var(--red); }
+
+/* ── Table ──────────────────────────────────────────────── */
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+}
+th {
+    text-align: left;
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+}
+td {
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+}
+tr:last-child td { border-bottom: none; }
+
+.project-name {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+}
+
+/* ── 401 error page ─────────────────────────────────────── */
+
+.error-page {
+    text-align: center;
+    padding: 4rem 1rem;
+}
+.error-page h1 {
+    font-size: 1.4rem;
+    color: var(--red);
+    margin-bottom: 0.5rem;
+}
+.error-page p {
+    color: var(--muted);
+    margin-bottom: 0.25rem;
+}
+.error-page code {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    background: var(--surface);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+}
+
+/* ── HTMX in-flight indicator ───────────────────────────── */
+
+.htmx-indicator { opacity: 0; transition: opacity 0.2s; }
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator { opacity: 1; }
+
+/* ── Misc ───────────────────────────────────────────────── */
+
+.muted { color: var(--muted); }
+.mono  { font-family: var(--mono); }
+
+hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 1.5rem 0;
+}
+
+footer {
+    padding: 1.5rem 0;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 2rem;
+}
