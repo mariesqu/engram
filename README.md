@@ -167,13 +167,14 @@ The bearer token rotates on every daemon start. CLI clients re-read `daemon.json
 
 All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-Control: no-store`.
 
-| Method | Path                | Description                                  |
-|--------|---------------------|----------------------------------------------|
-| `GET`  | `/api/v1/status`    | Connection state, last sync result, version  |
-| `GET`  | `/api/v1/config`    | Redacted daemon configuration (key masked)   |
-| `GET`  | `/api/v1/projects`  | List of projects with their sync policy      |
+| Method | Path                                       | Description                                     |
+|--------|--------------------------------------------|-------------------------------------------------|
+| `GET`  | `/api/v1/status`                           | Connection state, last sync result, version     |
+| `GET`  | `/api/v1/config`                           | Redacted daemon configuration (key masked)      |
+| `GET`  | `/api/v1/projects`                         | List of projects with their effective policy    |
+| `PUT`  | `/api/v1/projects/{project}/policy`        | Set the policy for a project (requires auth)    |
 
-Additional routes (sync trigger, config mutation, per-project policy) are added in later PRs.
+Additional routes (sync trigger, config mutation) are added in later PRs.
 
 ### CLI subcommands
 
@@ -187,15 +188,64 @@ Additional routes (sync trigger, config mutation, per-project policy) are added 
 
 Both subcommands read `daemon.json` from the same directory as `--db`. If no daemon is running, they exit non-zero with a clear error message.
 
+### Per-project policy
+
+Each project has an effective sync policy that controls how its observations move between the local store and central. The policy is evaluated at push/pull time — changing it takes effect on the next sync cycle with no schema migration.
+
+| Policy      | Default when                   | Behaviour                                                                                      |
+|-------------|-------------------------------|-----------------------------------------------------------------------------------------------|
+| `synced`    | Central is configured         | Normal bidirectional sync: local writes are pushed to central; central writes are pulled down. |
+| `local-only`| Central is **not** configured | Observations are written to the local SQLite file only. Push and pull are suppressed. Accumulated outbox entries drain automatically if the policy is later flipped to `synced`. |
+| `omitted`   | Never (explicit only)         | `mem_save` and `mem_save_prompt` refuse writes for this project with a clear MCP error. Nothing is written, no outbox entry is created. |
+
+**Flip behaviour**
+
+- `local-only` → `synced`: queued outbox entries drain on the next push cycle. No manual intervention required.
+- `synced` → `local-only`: push and pull stop immediately. Observations already on central remain there unchanged.
+- Any → `omitted`: future writes are refused. Pre-existing data is unaffected.
+
+**CLI**
+
+List all known projects and their effective policies:
+
+```bash
+engram projects list --db ~/.engram/memories.db
+# OUTPUT:
+# PROJECT        POLICY
+# my-project     synced
+# private-notes  local-only
+```
+
+Set the policy for a project:
+
+```bash
+engram projects policy my-project local-only --db ~/.engram/memories.db
+engram projects policy my-project synced      --db ~/.engram/memories.db
+engram projects policy my-project omitted     --db ~/.engram/memories.db
+```
+
+The `--db` flag can be replaced by the `ENGRAM_DB` environment variable for all `projects` subcommands.
+
+**Control API**
+
+```
+GET  /api/v1/projects                        → list of {name, policy} for all known projects
+PUT  /api/v1/projects/{project}/policy       → {"policy": "synced|local-only|omitted"}
+```
+
+`PUT` requires a valid `Authorization: Bearer <token>` header. The token is read from the `daemon.json` file written by the running daemon.
+
 ## CLI reference
 
 ```
-engram serve  [--addr <addr>] [--dsn <dsn>]
-engram keys   provision [--dsn <dsn>] <writer-id>
-engram keys   revoke    [--dsn <dsn>] <writer-id>
-engram daemon [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
-engram status [--db <path>]
-engram ui     [--db <path>]
+engram serve    [--addr <addr>] [--dsn <dsn>]
+engram keys     provision [--dsn <dsn>] <writer-id>
+engram keys     revoke    [--dsn <dsn>] <writer-id>
+engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
+engram status   [--db <path>]
+engram ui       [--db <path>]
+engram projects list   [--db <path>]
+engram projects policy [--db <path>] <project> <policy>
 ```
 
 ### Environment variables
