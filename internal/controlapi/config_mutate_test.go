@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -245,8 +246,10 @@ func TestConnect_ValidCreds_200_StatusConnected(t *testing.T) {
 }
 
 func TestConnect_InvalidCreds_422_ConfigNotPersisted(t *testing.T) {
+	// The adapter contract: credential failures WRAP ErrCredentialValidation so
+	// the handler maps them to a client-safe 422 (anything unwrapped is a 500).
 	sync := &mockSyncControllerFull{
-		reconnectErr: connectTestError("invalid credentials"),
+		reconnectErr: fmt.Errorf("%w: probe got 403 from central", controlapi.ErrCredentialValidation),
 	}
 	srv := newServerPR3(t, sync, nil)
 

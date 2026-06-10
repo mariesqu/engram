@@ -393,16 +393,20 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	storeAdapter := &localStoreAdapter{store: components.store}
 
 	// configStoreAdapter wraps internal/config for the ConfigStore port.
-	cfgAdapter := newConfigStoreAdapter(cfg, components.store)
+	// actualPort: report the bound port (not the pre-bind flag, e.g. 0).
+	cfgAdapter := newConfigStoreAdapter(cfg, actualPort)
 
 	// runtimeSyncAdapter replaces the PR-① loopSyncAdapter with a real
 	// runtime-mutable adapter that supports Disconnect and Reconnect.
+	// ctx: the daemon's root signal context — runtime-created loops are started
+	// on it so daemon shutdown also stops a loop created via /central/connect.
 	syncAdapter := newRuntimeSyncAdapter(
+		ctx,
 		cfg,
 		components.store,
 		components.loop,
 		cfgAdapter,
-		actualPort, // carry-forward: report the actual bound port (not httpPort=0)
+		actualPort,
 	)
 
 	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion)
@@ -513,14 +517,19 @@ type configStoreAdapter struct {
 	applyCb func(patch controlapi.ConfigPatch, updated config.Config)
 }
 
-func newConfigStoreAdapter(daemonCfg daemonCfg, _ *localstore.Store) *configStoreAdapter {
+func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdapter {
 	// Reconstruct a config.Config from the resolved daemonCfg so Load() reports
-	// the actual live values (including the actual port, not httpPort=0).
+	// the actual live values — actualPort is the BOUND port from ln.Addr(), not
+	// the pre-bind flag value (which is 0 under --http-port 0).
+	httpPort := daemonCfg.httpPort
+	if actualPort > 0 {
+		httpPort = actualPort
+	}
 	cfg := config.Config{
 		DB:           daemonCfg.db,
 		CentralURL:   daemonCfg.centralURL,
 		WriterID:     daemonCfg.writerID,
-		HTTPPort:     daemonCfg.httpPort,
+		HTTPPort:     httpPort,
 		SyncInterval: daemonCfg.syncInterval,
 	}
 	// Re-load the file to recover EncryptedWriterKey for Redact reporting.
@@ -570,8 +579,9 @@ func (a *configStoreAdapter) Load() (controlapi.RedactedConfig, error) {
 }
 
 func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
+	// NOTE: explicit Unlock before the applyCb callback (no defer) — see the
+	// lock-ordering comment below.
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	// Map controlapi.ConfigPatch → config.ConfigPatch.
 	cfgPatch := config.ConfigPatch{
@@ -588,13 +598,19 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 	// Persist the change if we have a config directory.
 	if a.configDir != "" {
 		if err := config.Save(a.configDir, updated); err != nil {
+			a.mu.Unlock()
 			return restartRequired, fmt.Errorf("save config: %w", err)
 		}
 	}
+	cb := a.applyCb
+	a.mu.Unlock()
 
-	// Notify the sync adapter of live-applicable changes.
-	if a.applyCb != nil {
-		a.applyCb(patch, updated)
+	// Notify the sync adapter OUTSIDE the lock: applyLiveConfig may one day
+	// acquire runtimeSyncAdapter.mu (loop restart), and runtimeSyncAdapter
+	// methods call back into this adapter (setCentral/clearCentral take a.mu) —
+	// holding a.mu across the callback would set up a lock-ordering deadlock.
+	if cb != nil {
+		cb(patch, updated)
 	}
 
 	return restartRequired, nil
@@ -658,16 +674,22 @@ type runtimeSyncAdapter struct {
 }
 
 func newRuntimeSyncAdapter(
+	ctx context.Context,
 	cfg daemonCfg,
 	store *localstore.Store,
 	loop *syncer.Loop,
 	cfgAdapter *configStoreAdapter,
 	actualPort int,
 ) *runtimeSyncAdapter {
+	if ctx == nil {
+		// Defensive: a runtime-created loop must always be startable.
+		ctx = context.Background()
+	}
 	a := &runtimeSyncAdapter{
 		store:      store,
 		cfgAdapter: cfgAdapter,
 		loop:       loop,
+		ctx:        ctx,
 		node:       syncer.NewNode("daemon", store),
 		connected:  cfg.centralURL != "" && loop != nil,
 		centralURL: cfg.centralURL,
@@ -749,21 +771,23 @@ func (a *runtimeSyncAdapter) Reconnect(cfg controlapi.CentralConfig) error {
 		return fmt.Errorf("writer_key is required")
 	}
 
-	// Decode the writer key.
+	// Decode the writer key. Wrap input errors with the controlapi sentinel so
+	// the handler returns a client-safe 422; the wrapped detail (which may
+	// include hex-decode internals) is server-log-only.
 	keyHex := strings.TrimSpace(cfg.WriterKeyPlaintext)
 	writerKey, err := hex.DecodeString(keyHex)
 	if err != nil {
-		return fmt.Errorf("invalid writer_key: not valid hex: %w", err)
+		return fmt.Errorf("%w: not valid hex: %v", controlapi.ErrInvalidWriterKey, err)
 	}
 	if len(writerKey) != wireauth.KeySize {
-		return fmt.Errorf("invalid writer_key: got %d bytes, want %d", len(writerKey), wireauth.KeySize)
+		return fmt.Errorf("%w: got %d bytes, want %d", controlapi.ErrInvalidWriterKey, len(writerKey), wireauth.KeySize)
 	}
 
 	// Probe the remote to validate credentials BEFORE persisting anything.
-	// A probe failure returns 422 — config is NOT persisted.
+	// A probe failure maps to 422 — config is NOT persisted.
 	centralClient := remote.New(cfg.URL, nil, cfg.WriterID, writerKey)
-	if err := probeRemote(centralClient, cfg.URL); err != nil {
-		return fmt.Errorf("credential validation failed: %w", err)
+	if err := probeRemote(centralClient); err != nil {
+		return fmt.Errorf("%w: %v", controlapi.ErrCredentialValidation, err)
 	}
 
 	// Seal the writer key for storage (Windows: DPAPI; non-Windows: env only).
@@ -779,14 +803,17 @@ func (a *runtimeSyncAdapter) Reconnect(cfg controlapi.CentralConfig) error {
 	// If ErrNoSecretStore: non-Windows platform — proceed without persisting key.
 	// The key is used in memory for this session only.
 
+	// From here on every step mutates shared state: take the adapter lock
+	// BEFORE persisting so a concurrent Disconnect cannot interleave between
+	// the disk write and the in-memory state update (which would leave disk
+	// saying "disconnected" while memory says "connected", or vice versa).
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	// Persist the new central config (including sealed key, which may be nil).
 	if err := a.cfgAdapter.setCentral(cfg.URL, cfg.WriterID, encryptedKey); err != nil {
 		return fmt.Errorf("persist central config: %w", err)
 	}
-
-	// Wire the new loop under the lock.
-	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	// Stop any existing loop.
 	if a.loop != nil {
@@ -802,10 +829,9 @@ func (a *runtimeSyncAdapter) Reconnect(cfg controlapi.CentralConfig) error {
 		Interval: syncInterval,
 	})
 
-	// Start the loop with the daemon's root context if available.
-	if a.ctx != nil {
-		newLoop.Start(a.ctx)
-	}
+	// Start the loop on the daemon's root context (never nil — the constructor
+	// guarantees it). Daemon shutdown cancels the context and stops this loop.
+	newLoop.Start(a.ctx)
 
 	a.loop = newLoop
 	a.connected = true
@@ -850,21 +876,17 @@ func (a *runtimeSyncAdapter) applyLiveConfig(patch controlapi.ConfigPatch, updat
 	)
 }
 
-// probeRemote does a lightweight credential validation against the central server.
-// It calls central.PullSince for an arbitrary project with a high seq so nothing
-// is returned; a 401/403 means bad credentials.
-func probeRemote(_ *remote.Client, _ string) error {
-	// For PR-③ the probe is a lightweight no-op since we don't have a standard
-	// "health check" endpoint in the remote API. The actual credential validation
-	// happens on the first sync cycle. If credentials are wrong the loop will
-	// fail with a 4xx (non-retryable) error and the UI can prompt re-entry.
-	//
-	// This matches the spec: "probe connection (head request or status check)".
-	// A more thorough probe is deferred to when the remote.Client exposes a
-	// dedicated health method (planned for PR-⑥). For now we accept valid
-	// credentials at the connect step and rely on the first sync cycle to fail
-	// fast on 4xx.
-	return nil
+// probeRemote validates the central URL and writer credentials with a REAL
+// signed request before anything is persisted: a PullSince for a probe-only
+// project with limit 1. A healthy central with valid credentials returns an
+// empty (or tiny) page; bad credentials surface as a 401/403 error from the
+// transport, an unreachable URL as a network error. Bounded by a 5s timeout so
+// a black-holed URL cannot hang the connect handler.
+func probeRemote(c *remote.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.PullSince(ctx, "engram-connect-probe", 0, 1)
+	return err
 }
 
 // serveErr classifies errors from StdioServer.Listen.

@@ -3,6 +3,7 @@ package controlapi
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 )
 
 // handleConfigPut handles PUT /api/v1/config.
@@ -36,6 +37,19 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Reject UNKNOWN keys with 400 rather than silently ignoring them — a
+	// fat-fingered key name returning 200-no-op would mislead the caller.
+	known := map[string]bool{
+		"sync_interval": true, "log_level": true, "http_port": true,
+		"db_path": true, "transport": true,
+	}
+	for k := range raw {
+		if !known[k] {
+			writeError(w, http.StatusBadRequest, "unknown config key: "+k)
+			return
+		}
+	}
+
 	// Re-encode the filtered map as JSON and decode into a typed ConfigPatch.
 	// This two-step decode lets us use the raw map for field presence checks
 	// while still benefiting from the typed struct for the patch fields.
@@ -48,6 +62,20 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(filtered, &patch); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid patch fields: "+err.Error())
 		return
+	}
+
+	// Validate sync_interval up front: config.Patch silently skips unparseable
+	// durations, which would turn a typo into a 200 no-op.
+	if patch.SyncInterval != nil {
+		d, err := time.ParseDuration(*patch.SyncInterval)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid sync_interval: must be a Go duration (e.g. \"30s\")")
+			return
+		}
+		if d <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid sync_interval: must be positive")
+			return
+		}
 	}
 
 	restartRequired, err := s.cfgStore.Apply(patch)

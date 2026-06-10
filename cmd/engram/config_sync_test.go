@@ -37,16 +37,46 @@ func TestCLI_ConfigGet(t *testing.T) {
 	// and the subcommand dispatch instead.
 
 	t.Run("buildConfigPatch_SyncInterval", func(t *testing.T) {
-		patch := buildConfigPatch("sync_interval", "30s")
+		patch, err := buildConfigPatch("sync_interval", "30s")
+		if err != nil {
+			t.Fatalf("buildConfigPatch: %v", err)
+		}
 		if v, ok := patch["sync_interval"]; !ok || v != "30s" {
 			t.Errorf("buildConfigPatch: sync_interval = %v, want \"30s\"", v)
 		}
 	})
 
 	t.Run("buildConfigPatch_LogLevel", func(t *testing.T) {
-		patch := buildConfigPatch("log_level", "debug")
+		patch, err := buildConfigPatch("log_level", "debug")
+		if err != nil {
+			t.Fatalf("buildConfigPatch: %v", err)
+		}
 		if v, ok := patch["log_level"]; !ok || v != "debug" {
 			t.Errorf("buildConfigPatch: log_level = %v, want \"debug\"", v)
+		}
+	})
+
+	t.Run("buildConfigPatch_HTTPPort_Int", func(t *testing.T) {
+		// http_port is an INTEGER in the ConfigPatch schema — sending the raw
+		// string would 400 at the server's typed unmarshal.
+		patch, err := buildConfigPatch("http_port", "7701")
+		if err != nil {
+			t.Fatalf("buildConfigPatch: %v", err)
+		}
+		if v, ok := patch["http_port"]; !ok || v != 7701 {
+			t.Errorf("buildConfigPatch: http_port = %v (%T), want int 7701", v, v)
+		}
+	})
+
+	t.Run("buildConfigPatch_HTTPPort_BadInt", func(t *testing.T) {
+		if _, err := buildConfigPatch("http_port", "not-a-number"); err == nil {
+			t.Error("non-integer http_port should error client-side")
+		}
+	})
+
+	t.Run("buildConfigPatch_SyncInterval_BadDuration", func(t *testing.T) {
+		if _, err := buildConfigPatch("sync_interval", "soon"); err == nil {
+			t.Error("invalid duration should error client-side")
 		}
 	})
 
@@ -98,7 +128,10 @@ func TestCLI_ConfigSet_RuntimeMutable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.key, func(t *testing.T) {
-			patch := buildConfigPatch(tc.key, tc.value)
+			patch, err := buildConfigPatch(tc.key, tc.value)
+			if err != nil {
+				t.Fatalf("buildConfigPatch(%q, %q): %v", tc.key, tc.value, err)
+			}
 			v, ok := patch[tc.key]
 			if !ok {
 				t.Errorf("buildConfigPatch(%q, %q): key absent", tc.key, tc.value)

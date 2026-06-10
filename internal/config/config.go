@@ -55,7 +55,11 @@ type fileConfig struct {
 	DB                  string  `json:"db_path,omitempty"`
 	CentralURL          string  `json:"central_url,omitempty"`
 	WriterID            string  `json:"writer_id,omitempty"`
-	EncryptedWriterKey  string  `json:"writer_key,omitempty"` // base64(DPAPI blob)
+	// Tag deliberately "encrypted_writer_key" (NOT "writer_key"): the raw name is
+	// already used by the API for the redaction sentinel and the PUT forbidden
+	// list — sharing it for the on-disk ciphertext invites confusion and
+	// accidental crossover in future refactors.
+	EncryptedWriterKey  string  `json:"encrypted_writer_key,omitempty"` // base64(DPAPI blob)
 	HTTPPort            int     `json:"http_port,omitempty"`
 	SyncInterval        string  `json:"sync_interval,omitempty"` // e.g. "30s"
 	LogLevel            string  `json:"log_level,omitempty"`

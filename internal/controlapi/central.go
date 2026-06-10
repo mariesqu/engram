@@ -1,7 +1,22 @@
 package controlapi
 
 import (
+	"errors"
+	"log/slog"
 	"net/http"
+)
+
+// Sentinel errors the SyncController.Reconnect implementation wraps so the
+// connect handler can map failures to client-safe responses without echoing
+// internal error detail (paths, syscall messages, hex-decode dumps) to the
+// client. The full wrapped detail is logged server-side only.
+var (
+	// ErrInvalidWriterKey — the supplied writer_key is malformed (not hex /
+	// wrong length). Maps to 422.
+	ErrInvalidWriterKey = errors.New("invalid writer_key")
+	// ErrCredentialValidation — the remote probe rejected the credentials or
+	// the central URL is unreachable. Maps to 422.
+	ErrCredentialValidation = errors.New("credential validation failed")
 )
 
 // ConnectRequest is the JSON body for POST /api/v1/central/connect.
@@ -53,7 +68,17 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	cfg.WriterKeyPlaintext = req.WriterKey
 
 	if err := s.syncCtrl.Reconnect(cfg); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		// Full detail (wrapped paths/syscall messages) goes to the server log
+		// ONLY — the response carries the client-safe sentinel text.
+		slog.Default().Warn("central connect failed", "error", err)
+		switch {
+		case errors.Is(err, ErrInvalidWriterKey):
+			writeError(w, http.StatusUnprocessableEntity, ErrInvalidWriterKey.Error())
+		case errors.Is(err, ErrCredentialValidation):
+			writeError(w, http.StatusUnprocessableEntity, ErrCredentialValidation.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
 		return
 	}
 

@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/mariesqu/engram/internal/controlapi"
 )
@@ -129,7 +131,10 @@ func runConfigSetCmd(args []string) error {
 
 	// Build the single-field patch body.
 	// The handler will reject writer_key and central_url with a clear error.
-	patch := buildConfigPatch(key, value)
+	patch, err := buildConfigPatch(key, value)
+	if err != nil {
+		return fmt.Errorf("config set: %w", err)
+	}
 
 	client, err := NewControlClient(daemonDir(*db))
 	if err != nil {
@@ -157,6 +162,23 @@ func runConfigSetCmd(args []string) error {
 // buildConfigPatch constructs a single-field patch map for PUT /api/v1/config.
 // Using a map[string]any lets us send only the field the user specified,
 // which is the RFC-7396 partial-merge-patch semantics the handler expects.
-func buildConfigPatch(key, value string) map[string]any {
-	return map[string]any{key: value}
+//
+// Typed keys are converted before sending: http_port is an integer in the
+// ConfigPatch schema, so the string from the command line must be parsed here
+// (sending it as a JSON string would fail the server-side unmarshal with 400).
+// sync_interval is validated locally for a friendlier error than the server's.
+func buildConfigPatch(key, value string) (map[string]any, error) {
+	switch key {
+	case "http_port":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, fmt.Errorf("http_port must be an integer, got %q", value)
+		}
+		return map[string]any{key: n}, nil
+	case "sync_interval":
+		if _, err := time.ParseDuration(value); err != nil {
+			return nil, fmt.Errorf("sync_interval must be a Go duration (e.g. \"30s\"), got %q", value)
+		}
+	}
+	return map[string]any{key: value}, nil
 }
