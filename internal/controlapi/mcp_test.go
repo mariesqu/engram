@@ -130,3 +130,28 @@ func TestMCPMount_TrailingSlash_ForwardsToHandler(t *testing.T) {
 		t.Error("underlying handler must be called for /mcp/ with correct token")
 	}
 }
+
+// TestMCPMount_EmptyToken_NeverAuthenticates: a zero-value/misconfigured
+// server (token == "") must reject EVERY request — without the guard,
+// "Authorization: Bearer " (empty credential) would equal "Bearer " + "".
+func TestMCPMount_EmptyToken_NeverAuthenticates(t *testing.T) {
+	mux := http.NewServeMux()
+	controlapi.MountMCP(mux, "", &mockMCPHandler{})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	for _, auth := range []string{"", "Bearer ", "Bearer x"} {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("empty-token server, auth %q: got %d, want 401", auth, resp.StatusCode)
+		}
+	}
+}

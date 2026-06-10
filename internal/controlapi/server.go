@@ -33,6 +33,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -426,19 +427,32 @@ type MCPHandler interface {
 //   - Correct token → request forwarded to the streamable handler unchanged.
 func MountMCP(mux *http.ServeMux, token string, h MCPHandler) {
 	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Constant-time comparison is not required for loopback-only tokens, but
-		// we apply the same simple check as withAuth to keep the contract identical.
-		got := r.Header.Get("Authorization")
-		want := "Bearer " + token
-		if got != want {
+		if !checkBearer(r.Header.Get("Authorization"), token) {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
-	// Mount at /mcp — the ServeMux strips the prefix when forwarding, but the
-	// StreamableHTTPServer's ServeHTTP dispatches on method (POST/GET/DELETE),
-	// not on the path, so no path stripping is needed.
+	// Mount at both /mcp and /mcp/. NOTE: net/http.ServeMux does NOT strip
+	// prefixes (only http.StripPrefix does) — the handler receives the original
+	// path. That is fine: StreamableHTTPServer.ServeHTTP dispatches on the
+	// HTTP method (POST/GET/DELETE), not the path.
 	mux.Handle("/mcp", authed)
 	mux.Handle("/mcp/", authed)
+}
+
+// checkBearer reports whether the Authorization header carries exactly the
+// expected bearer token. An EMPTY configured token NEVER authenticates —
+// without this guard a zero-value server would accept "Authorization: Bearer "
+// (empty credential vs empty secret). Shared by withAuth and MountMCP so the
+// two auth gates cannot drift.
+func checkBearer(header, token string) bool {
+	if token == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	return strings.TrimPrefix(header, prefix) == token
 }

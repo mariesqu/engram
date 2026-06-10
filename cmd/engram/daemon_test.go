@@ -1351,20 +1351,41 @@ func findFreePort() (int, error) {
 
 // ─── PR-⑥: --transport flag tests ────────────────────────────────────────────
 
-// TestDaemon_Transport_Stdio_Default verifies that omitting --transport produces
-// the same behaviour as --transport stdio: the flag set parses without error and
-// the resolved mcpTransport field is "stdio".
-func TestDaemon_Transport_Stdio_Default(t *testing.T) {
-	t.Setenv("ENGRAM_CENTRAL_URL", "")
-	t.Setenv("ENGRAM_DB", "")
-
-	// --transport flag absent → default "stdio" → mcpTransport = "stdio".
-	// We parse via runDaemonCmd with --help to short-circuit without opening a store.
-	// The test just proves the flag resolves to "stdio" by asserting the exit code
-	// is 0 (help path) without erroring on the transport flag itself.
-	code := run([]string{"daemon", "--help"})
-	if code != 0 {
-		t.Errorf("daemon --help: exit code %d, want 0 (no transport flag should not error)", code)
+// TestResolveTransport proves the precedence chain (flag > env > file >
+// default "stdio") and the validation, including values arriving from the
+// config file. This replaced a --help-based test that exercised nothing.
+func TestResolveTransport(t *testing.T) {
+	cases := []struct {
+		name               string
+		flagV, envV, fileV string
+		want               string
+		wantErr            bool
+	}{
+		{"default", "", "", "", "stdio", false},
+		{"file http", "", "", "http", "http", false},
+		{"env beats file", "", "stdio", "http", "stdio", false},
+		{"flag beats env and file", "stdio", "http", "http", "stdio", false},
+		{"flag http", "http", "", "", "http", false},
+		{"env http", "", "http", "", "http", false},
+		{"invalid flag", "tcp", "", "", "", true},
+		{"invalid file value hard-errors", "", "", "carrier-pigeon", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveTransport(tc.flagV, tc.envV, tc.fileV)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("resolveTransport(%q,%q,%q) = %q, want %q", tc.flagV, tc.envV, tc.fileV, got, tc.want)
+			}
+		})
 	}
 }
 

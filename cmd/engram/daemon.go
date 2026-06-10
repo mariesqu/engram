@@ -99,6 +99,31 @@ type daemonCfg struct {
 	mcpTransport string
 }
 
+// resolveTransport resolves the MCP transport with the standard precedence
+// chain: explicit flag > ENGRAM_TRANSPORT env > config file > default "stdio".
+// flagVal is "" when --transport was not passed (the flag default is empty so
+// an EXPLICIT --transport stdio beats an env/file "http"). Any resolved value
+// outside {stdio, http} is a hard startup error — including a bad value coming
+// from the config file.
+func resolveTransport(flagVal, envVal, fileVal string) (string, error) {
+	v := flagVal
+	if v == "" {
+		v = envVal
+	}
+	if v == "" {
+		v = fileVal
+	}
+	if v == "" {
+		v = "stdio"
+	}
+	switch v {
+	case "stdio", "http":
+		return v, nil
+	default:
+		return "", fmt.Errorf("transport: unknown value %q (must be \"stdio\" or \"http\")", v)
+	}
+}
+
 // daemonComponents holds the wired-but-not-yet-serving components built by
 // buildDaemon. Callers must call Close to release resources.
 type daemonComponents struct {
@@ -144,10 +169,11 @@ func runDaemonCmd(args []string) error {
 	httpMode := fs.Bool("http", false, "enable resident HTTP control plane (default: stdio MCP mode)")
 	httpPort := fs.Int("http-port", 0, "TCP port for the HTTP control plane (default: 7700, or config file)")
 
-	// --transport: MCP transport selector (PR-⑥). "stdio" is the default and is
-	// identical to the pre-change behaviour. "http" mounts /mcp on the HTTP
-	// listener (requires --http). Any other value is a hard error.
-	mcpTransport := fs.String("transport", "stdio", `MCP transport: "stdio" (default) or "http" (requires --http)`)
+	// --transport: MCP transport selector (PR-⑥). EMPTY default so an explicit
+	// --transport stdio is distinguishable from "not set" and wins the
+	// precedence chain (flag > ENGRAM_TRANSPORT env > config file > "stdio");
+	// resolveTransport applies the chain + validation after Parse.
+	mcpTransport := fs.String("transport", "", `MCP transport: "stdio" (default) or "http" (requires --http; or set ENGRAM_TRANSPORT / config file)`)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -275,14 +301,12 @@ func runDaemonCmd(args []string) error {
 		return fmt.Errorf("--sync-interval must be positive (got %s)", *syncInterval)
 	}
 
-	// ── Validate --transport ──────────────────────────────────────────────────
-	switch *mcpTransport {
-	case "stdio", "http":
-		// valid
-	default:
-		return fmt.Errorf("--transport: unknown value %q (must be \"stdio\" or \"http\")", *mcpTransport)
+	// ── Resolve + validate transport (flag > env > file > default) ───────────
+	transport, err := resolveTransport(*mcpTransport, envOr("ENGRAM_TRANSPORT", ""), fileCfg.Transport)
+	if err != nil {
+		return err
 	}
-	if *mcpTransport == "http" && !*httpMode {
+	if transport == "http" && !*httpMode {
 		return fmt.Errorf("--transport http requires --http (the HTTP control plane must be enabled)")
 	}
 
@@ -295,7 +319,7 @@ func runDaemonCmd(args []string) error {
 		httpMode:     *httpMode,
 		httpPort:     *httpPort,
 		configDir:    configDir,
-		mcpTransport: *mcpTransport,
+		mcpTransport: transport,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

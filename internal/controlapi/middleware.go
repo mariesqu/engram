@@ -3,7 +3,6 @@ package controlapi
 import (
 	"fmt"
 	"net/http"
-	"strings"
 )
 
 // withAuth wraps next with bearer-token authentication. Every request to the
@@ -16,15 +15,10 @@ import (
 // If this concern ever arises, replace with subtle.ConstantTimeCompare.
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(auth, prefix) {
-			writeError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
-			return
-		}
-		token := strings.TrimPrefix(auth, prefix)
-		if token != s.token {
-			writeError(w, http.StatusUnauthorized, "invalid token")
+		// checkBearer is shared with MountMCP — one auth gate, no drift; it also
+		// guards the empty-configured-token case (never authenticates).
+		if !checkBearer(r.Header.Get("Authorization"), s.token) {
+			writeError(w, http.StatusUnauthorized, "missing or invalid Authorization header")
 			return
 		}
 		next(w, r)

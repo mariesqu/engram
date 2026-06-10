@@ -139,8 +139,12 @@ func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 		}
 	}
 
-	// Prove identical tool surface vs stdio: build the MCP server the same way
-	// buildDaemon does and compare tool names.
+	// Prove identical tool surface vs stdio: build a SECOND daemon the way the
+	// stdio path does and compare tool names. Both instances flow through the
+	// same registerTools call today, so this guards against a future CONDITIONAL
+	// registration path (e.g. a tool only registered in one transport mode)
+	// diverging the surfaces — it is not meant to prove anything about this
+	// specific serving instance (the HTTP listing above already does that).
 	stdioCfg := daemonCfg{db: filepath.Join(dir, "stdio_compare.db"), syncInterval: 30 * time.Second}
 	stdioComponents, err := buildDaemon(stdioCfg)
 	if err != nil {

@@ -282,6 +282,8 @@ Add an entry to your `claude_desktop_config.json` (or equivalent MCP host config
 
 Replace `7700` with the actual port and `<token>` with the value from `daemon.json`. Re-read `daemon.json` after every daemon restart — the token is rotated on start.
 
+The `"type": "http"` value matches the Claude Code `.mcp.json` schema; other MCP clients may name the Streamable HTTP transport differently (e.g. `"streamable-http"`) — check your client’s documentation.
+
 **Mode matrix**
 
 | Flags | MCP transport | `/mcp` endpoint |
