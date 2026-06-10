@@ -32,7 +32,6 @@ import (
 var ErrNoSecretStore = errors.New("secret store not available on this platform; use ENGRAM_WRITER_KEY env var")
 
 // ValidEmbeddingProviders is the set of accepted embedding_provider values.
-// "ollama" is reserved for PR-2 and is NOT valid in PR-1.
 // Write-time validation (handleConfigPut) and startup validation (Load) both
 // use this set — the PR-③ lesson: an invalid value persisted to disk would
 // hard-error the next startup if we only validated at startup.
@@ -40,6 +39,7 @@ var ValidEmbeddingProviders = map[string]bool{
 	"":       true, // zero value → NoopProvider
 	"none":   true, // explicit no-op
 	"openai": true,
+	"ollama": true, // local sidecar; requires embedding_local_consent=true for local-only projects
 }
 
 // SecretBox is the platform-specific encryption interface for the writer key.
@@ -76,8 +76,8 @@ type fileConfig struct {
 	LogLevel           string `json:"log_level,omitempty"`
 	Transport          string `json:"transport,omitempty"`
 	// EmbeddingProvider selects the embedding backend. Valid values: "", "none",
-	// "openai". "ollama" is reserved for PR-2. An unrecognised value causes Load
-	// to return an error (startup-fatal on daemon startup).
+	// "openai", "ollama". An unrecognised value causes Load to return an error
+	// (startup-fatal on daemon startup).
 	EmbeddingProvider string `json:"embedding_provider,omitempty"`
 	// EncryptedEmbeddingKey is a base64-encoded DPAPI blob (Windows only) holding
 	// the embedding API key. Absent on non-Windows or when the key has not been
@@ -85,6 +85,18 @@ type fileConfig struct {
 	// Tag is "encrypted_embedding_key" to mirror "encrypted_writer_key" and to
 	// keep the raw key name ("embedding_key") available as a redaction sentinel.
 	EncryptedEmbeddingKey string `json:"encrypted_embedding_key,omitempty"` // base64(DPAPI blob)
+	// EmbeddingLocalConsent is the explicit opt-in for embedding local-only projects
+	// with a local sidecar (ollama). When false (default), local-only project text
+	// is never sent to any provider. When true, a local sidecar may embed it.
+	// Has no effect for remote providers (OpenAI) — local-only is always denied there.
+	EmbeddingLocalConsent bool `json:"embedding_local_consent,omitempty"`
+	// EmbeddingDims is the expected embedding vector dimensionality. Default 256.
+	// Must match the model's actual output dimensions; mismatched stored BLOBs are
+	// treated as stale and re-embedded by the backfill loop.
+	EmbeddingDims int `json:"embedding_dims,omitempty"`
+	// OllamaHost is the base URL of the local Ollama sidecar. Default "http://localhost:11434".
+	// Only used when EmbeddingProvider = "ollama".
+	OllamaHost string `json:"ollama_host,omitempty"`
 }
 
 // Config is the resolved, decoded in-memory configuration. The writer key is
@@ -102,13 +114,49 @@ type Config struct {
 	Transport          string
 
 	// EmbeddingProvider is the embedding backend name after validation.
-	// Valid values: "", "none", "openai". Load returns an error for any other value.
+	// Valid values: "", "none", "openai", "ollama". Load returns an error for any other value.
 	EmbeddingProvider string
+
+	// EmbeddingLocalConsent is true when the user has explicitly opted in to
+	// embedding local-only project text with a local sidecar (ollama). Default false.
+	EmbeddingLocalConsent bool
+
+	// EmbeddingDims is the configured embedding vector dimensionality. 0 means
+	// "use provider default" (256 for OpenAI; 256 for Ollama when not specified).
+	EmbeddingDims int
+
+	// OllamaHost is the base URL of the local Ollama sidecar.
+	// Empty means "use default" (http://localhost:11434).
+	OllamaHost string
+
+	// embeddingKeyActive records whether an embedding key is available at
+	// runtime — either from ENGRAM_EMBEDDING_KEY env var OR from the stored
+	// encrypted blob. Set by the daemon after resolving the key. Used by
+	// Redact() to produce EmbeddingKeySet=true for either source.
+	//
+	// Unexported, no json tag — never serialised.
+	embeddingKeyActive bool
 
 	// encryptedEmbeddingKey is the decrypted ciphertext blob for the embedding API
 	// key. The plaintext key is NEVER stored here — only the ciphertext, to be
 	// opened by SecretBox.Open at daemon startup. Unexported, no json tag.
 	encryptedEmbeddingKey []byte
+}
+
+// WithEmbeddingKeyActive returns a copy of c with the runtime embedding-key
+// active flag set. Called by the daemon after resolving whether a key is
+// available (env var wins over file). The flag drives EmbeddingKeySet in
+// Redact() — true when a key is active from ANY source.
+func (c Config) WithEmbeddingKeyActive(active bool) Config {
+	c.embeddingKeyActive = active
+	return c
+}
+
+// EmbeddingKeyActive reports whether an embedding key is currently active
+// (resolved from env OR file). This is the value that Redact() surfaces as
+// EmbeddingKeySet.
+func (c Config) EmbeddingKeyActive() bool {
+	return c.embeddingKeyActive
 }
 
 // EncryptedEmbeddingKey returns the encrypted embedding key ciphertext blob.
@@ -148,12 +196,15 @@ type RedactedConfig struct {
 // appear in a ConfigPatch (encrypted_embedding_key must be set via the dedicated
 // key-management endpoint to ensure proper sealing).
 type ConfigPatch struct {
-	SyncInterval      *string `json:"sync_interval,omitempty"`
-	LogLevel          *string `json:"log_level,omitempty"`
-	HTTPPort          *int    `json:"http_port,omitempty"`
-	DBPath            *string `json:"db_path,omitempty"`
-	Transport         *string `json:"transport,omitempty"`
-	EmbeddingProvider *string `json:"embedding_provider,omitempty"`
+	SyncInterval          *string `json:"sync_interval,omitempty"`
+	LogLevel              *string `json:"log_level,omitempty"`
+	HTTPPort              *int    `json:"http_port,omitempty"`
+	DBPath                *string `json:"db_path,omitempty"`
+	Transport             *string `json:"transport,omitempty"`
+	EmbeddingProvider     *string `json:"embedding_provider,omitempty"`
+	EmbeddingLocalConsent *bool   `json:"embedding_local_consent,omitempty"`
+	EmbeddingDims         *int    `json:"embedding_dims,omitempty"`
+	OllamaHost            *string `json:"ollama_host,omitempty"`
 }
 
 // DefaultConfigDir returns the directory where config.json is stored:
@@ -226,6 +277,10 @@ func Load(dir string) (Config, error) {
 		cfg.encryptedEmbeddingKey = blob
 	}
 
+	cfg.EmbeddingLocalConsent = fc.EmbeddingLocalConsent
+	cfg.EmbeddingDims = fc.EmbeddingDims
+	cfg.OllamaHost = fc.OllamaHost
+
 	return cfg, nil
 }
 
@@ -255,6 +310,9 @@ func Save(dir string, cfg Config) error {
 	}
 
 	fc.EmbeddingProvider = cfg.EmbeddingProvider
+	fc.EmbeddingLocalConsent = cfg.EmbeddingLocalConsent
+	fc.EmbeddingDims = cfg.EmbeddingDims
+	fc.OllamaHost = cfg.OllamaHost
 
 	if len(cfg.encryptedEmbeddingKey) > 0 {
 		fc.EncryptedEmbeddingKey = base64.StdEncoding.EncodeToString(cfg.encryptedEmbeddingKey)
@@ -310,7 +368,10 @@ func (c Config) Redact() RedactedConfig {
 		rc.WriterKey = "***REDACTED***"
 	}
 	rc.EmbeddingProvider = c.EmbeddingProvider
-	if len(c.encryptedEmbeddingKey) > 0 {
+	// EmbeddingKeySet is true when a key is active from ANY source:
+	// ENGRAM_EMBEDDING_KEY env var (embeddingKeyActive set by daemon) OR
+	// encrypted blob stored in the config file.
+	if c.embeddingKeyActive || len(c.encryptedEmbeddingKey) > 0 {
 		rc.EmbeddingKeySet = true
 	}
 	return rc
@@ -360,6 +421,18 @@ func Patch(base Config, p ConfigPatch) (Config, bool) {
 	// validate against ValidEmbeddingProviders before calling Patch.
 	if p.EmbeddingProvider != nil {
 		out.EmbeddingProvider = *p.EmbeddingProvider
+	}
+
+	if p.EmbeddingLocalConsent != nil {
+		out.EmbeddingLocalConsent = *p.EmbeddingLocalConsent
+	}
+
+	if p.EmbeddingDims != nil {
+		out.EmbeddingDims = *p.EmbeddingDims
+	}
+
+	if p.OllamaHost != nil {
+		out.OllamaHost = *p.OllamaHost
 	}
 
 	return out, restartRequired

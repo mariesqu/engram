@@ -13,6 +13,7 @@ var validEmbeddingProviders = map[string]bool{
 	"":       true, // zero value → noop
 	"none":   true,
 	"openai": true,
+	"ollama": true,
 }
 
 // handleConfigPut handles PUT /api/v1/config.
@@ -56,6 +57,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	known := map[string]bool{
 		"sync_interval": true, "log_level": true, "http_port": true,
 		"db_path": true, "transport": true, "embedding_provider": true,
+		"embedding_local_consent": true, "embedding_dims": true, "ollama_host": true,
 	}
 	for k := range raw {
 		if !known[k] {
@@ -110,9 +112,15 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	if patch.EmbeddingProvider != nil {
 		if !validEmbeddingProviders[*patch.EmbeddingProvider] {
 			writeError(w, http.StatusBadRequest,
-				"invalid embedding_provider: must be one of \"\", \"none\", \"openai\"")
+				"invalid embedding_provider: must be one of \"\", \"none\", \"openai\", \"ollama\"")
 			return
 		}
+	}
+
+	// Validate embedding_dims: must be positive when set.
+	if patch.EmbeddingDims != nil && *patch.EmbeddingDims <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid embedding_dims: must be a positive integer")
+		return
 	}
 
 	restartRequired, err := s.cfgStore.Apply(patch)

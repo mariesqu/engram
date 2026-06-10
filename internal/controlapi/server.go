@@ -140,12 +140,15 @@ type HTTPConfig struct {
 // are applied. The caller must never set WriterKey, CentralURL, or
 // EncryptedEmbeddingKey here — those are managed by dedicated endpoints.
 type ConfigPatch struct {
-	SyncInterval      *string `json:"sync_interval,omitempty"`
-	LogLevel          *string `json:"log_level,omitempty"`
-	HTTPPort          *int    `json:"http_port,omitempty"`
-	DBPath            *string `json:"db_path,omitempty"`
-	Transport         *string `json:"transport,omitempty"`
-	EmbeddingProvider *string `json:"embedding_provider,omitempty"`
+	SyncInterval          *string `json:"sync_interval,omitempty"`
+	LogLevel              *string `json:"log_level,omitempty"`
+	HTTPPort              *int    `json:"http_port,omitempty"`
+	DBPath                *string `json:"db_path,omitempty"`
+	Transport             *string `json:"transport,omitempty"`
+	EmbeddingProvider     *string `json:"embedding_provider,omitempty"`
+	EmbeddingLocalConsent *bool   `json:"embedding_local_consent,omitempty"`
+	EmbeddingDims         *int    `json:"embedding_dims,omitempty"`
+	OllamaHost            *string `json:"ollama_host,omitempty"`
 	// WriterKey, CentralURL, and EncryptedEmbeddingKey must NEVER appear here —
 	// rejected at the handler.
 }
@@ -186,6 +189,25 @@ type ConfigStore interface {
 	Apply(patch ConfigPatch) (restartRequired bool, err error)
 }
 
+// EmbeddingKeyStore is the port for the embedding key management endpoints
+// (POST/DELETE /api/v1/embedding/key). It is separate from ConfigStore to keep
+// the sealing/unsealing logic out of the general config mutation path.
+//
+// Seal must encrypt the plaintext key and persist the ciphertext to the config
+// file. The plaintext key MUST NEVER be stored in memory beyond this call.
+// Returns ErrNoSecretStore when the platform cannot seal (non-Windows without a
+// secret store); callers should return 422 Unprocessable Entity in that case.
+//
+// ClearKey removes any stored encrypted embedding key from the config file.
+//
+// Implementations: configStoreAdapter (production), mock in tests.
+type EmbeddingKeyStore interface {
+	// SealEmbeddingKey encrypts plaintext and persists the ciphertext.
+	SealEmbeddingKey(plaintext []byte) error
+	// ClearEmbeddingKey removes any stored encrypted embedding key.
+	ClearEmbeddingKey() error
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 // Server is the loopback control plane HTTP server.
@@ -200,6 +222,7 @@ type Server struct {
 	store    Store
 	syncCtrl SyncController
 	cfgStore ConfigStore
+	keyStore EmbeddingKeyStore // nil when key management is not supported
 	version  string
 }
 
@@ -209,8 +232,9 @@ type Server struct {
 // embedded in GET /api/v1/status responses.
 //
 // All three dependency ports (store, syncCtrl, cfgStore) are required.
-// Passing a nil port panics at construction time (defensive guard).
-func New(token string, port int, store Store, syncCtrl SyncController, cfgStore ConfigStore, version string) *Server {
+// keyStore may be nil — when nil, POST/DELETE /api/v1/embedding/key return 501.
+// Passing nil for store, syncCtrl, or cfgStore panics at construction time.
+func New(token string, port int, store Store, syncCtrl SyncController, cfgStore ConfigStore, version string, keyStore ...EmbeddingKeyStore) *Server {
 	if store == nil {
 		panic("controlapi.New: store must not be nil")
 	}
@@ -220,12 +244,17 @@ func New(token string, port int, store Store, syncCtrl SyncController, cfgStore 
 	if cfgStore == nil {
 		panic("controlapi.New: cfgStore must not be nil")
 	}
+	var ks EmbeddingKeyStore
+	if len(keyStore) > 0 {
+		ks = keyStore[0]
+	}
 	return &Server{
 		token:    token,
 		port:     port,
 		store:    store,
 		syncCtrl: syncCtrl,
 		cfgStore: cfgStore,
+		keyStore: ks,
 		version:  version,
 	}
 }
@@ -237,19 +266,21 @@ func (s *Server) WithAuthAndOrigin(next http.HandlerFunc) http.HandlerFunc {
 	return s.withAuth(s.withOrigin(next))
 }
 
-// Handler returns a *http.ServeMux pre-wired with all PR-① + PR-② + PR-③ routes.
+// Handler returns a *http.ServeMux pre-wired with all routes.
 //
 // Route table:
 //
-//	GET  /api/v1/status                       → withAuth → handleStatus
-//	GET  /api/v1/config                       → withAuth → handleConfig
-//	PUT  /api/v1/config                       → withAuth+Origin → handleConfigPut
-//	GET  /api/v1/projects                     → withAuth → handleProjects (real policies)
-//	PUT  /api/v1/projects/{project}/policy    → withAuth+Origin → handleProjectPolicy
-//	POST /api/v1/central/connect              → withAuth+Origin → handleConnect
-//	POST /api/v1/central/disconnect           → withAuth+Origin → handleDisconnect
-//	POST /api/v1/sync/trigger                 → withAuth+Origin → handleSyncTrigger
-//	/                                         → withAuth → 404 JSON catch-all
+//	GET    /api/v1/status                       → withAuth → handleStatus
+//	GET    /api/v1/config                       → withAuth → handleConfig
+//	PUT    /api/v1/config                       → withAuth+Origin → handleConfigPut
+//	GET    /api/v1/projects                     → withAuth → handleProjects (real policies)
+//	PUT    /api/v1/projects/{project}/policy    → withAuth+Origin → handleProjectPolicy
+//	POST   /api/v1/central/connect              → withAuth+Origin → handleConnect
+//	POST   /api/v1/central/disconnect           → withAuth+Origin → handleDisconnect
+//	POST   /api/v1/sync/trigger                 → withAuth+Origin → handleSyncTrigger
+//	POST   /api/v1/embedding/key                → withAuth+Origin → handleEmbeddingKeyPost
+//	DELETE /api/v1/embedding/key                → withAuth+Origin → handleEmbeddingKeyDelete
+//	/                                           → withAuth → 404 JSON catch-all
 //
 // The catch-all is auth-wrapped too: unknown paths return 401 to
 // unauthenticated callers (no route enumeration), 404 only with a valid token.
@@ -265,6 +296,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/central/connect", s.WithAuthAndOrigin(s.handleConnect))
 	mux.HandleFunc("POST /api/v1/central/disconnect", s.WithAuthAndOrigin(s.handleDisconnect))
 	mux.HandleFunc("POST /api/v1/sync/trigger", s.WithAuthAndOrigin(s.handleSyncTrigger))
+	// PR-2 (semantic-search): embedding key management.
+	mux.HandleFunc("POST /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyPost))
+	mux.HandleFunc("DELETE /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyDelete))
 	mux.HandleFunc("/", s.withAuth(s.handleNotFound))
 	return mux
 }

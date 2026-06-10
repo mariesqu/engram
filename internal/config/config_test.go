@@ -340,6 +340,78 @@ func TestConfig_Load_ValidProviders_OK(t *testing.T) {
 	}
 }
 
+// TestConfig_OllamaFields_RoundTrip verifies that the three new PR-2 fields
+// (EmbeddingLocalConsent, EmbeddingDims, OllamaHost) survive a Save/Load cycle.
+func TestConfig_OllamaFields_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build a config with all three new fields set.
+	cfg := Config{
+		EmbeddingProvider:     "ollama",
+		EmbeddingLocalConsent: true,
+		EmbeddingDims:         768,
+		OllamaHost:            "http://localhost:11434",
+	}
+
+	if err := Save(dir, cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if loaded.EmbeddingProvider != "ollama" {
+		t.Errorf("EmbeddingProvider: got %q, want %q", loaded.EmbeddingProvider, "ollama")
+	}
+	if !loaded.EmbeddingLocalConsent {
+		t.Error("EmbeddingLocalConsent: got false, want true")
+	}
+	if loaded.EmbeddingDims != 768 {
+		t.Errorf("EmbeddingDims: got %d, want 768", loaded.EmbeddingDims)
+	}
+	if loaded.OllamaHost != "http://localhost:11434" {
+		t.Errorf("OllamaHost: got %q, want %q", loaded.OllamaHost, "http://localhost:11434")
+	}
+}
+
+// TestConfig_EmbeddingKeySet_FromEnv verifies that WithEmbeddingKeyActive(true)
+// causes Redact() to return EmbeddingKeySet=true even when no encrypted key is
+// stored in the file. This is the carry-forward fix: an env-var key must also
+// set the flag.
+func TestConfig_EmbeddingKeySet_FromEnv(t *testing.T) {
+	cfg := Config{}
+	cfg = cfg.WithEmbeddingKeyActive(true)
+
+	redacted := cfg.Redact()
+	if !redacted.EmbeddingKeySet {
+		t.Error("EmbeddingKeySet should be true when embeddingKeyActive=true (env-var key)")
+	}
+}
+
+// TestConfig_EmbeddingKeySet_FromFile verifies that EmbeddingKeySet=true is
+// set when an encrypted key blob is present in the config (file-stored key).
+func TestConfig_EmbeddingKeySet_FromFile(t *testing.T) {
+	cfg := Config{}
+	cfg = cfg.WithEncryptedEmbeddingKey([]byte("some-ciphertext"))
+
+	redacted := cfg.Redact()
+	if !redacted.EmbeddingKeySet {
+		t.Error("EmbeddingKeySet should be true when encryptedEmbeddingKey is non-empty")
+	}
+}
+
+// TestConfig_EmbeddingKeySet_Neither verifies EmbeddingKeySet=false when
+// neither env-var nor file key is active.
+func TestConfig_EmbeddingKeySet_Neither(t *testing.T) {
+	cfg := Config{}
+	redacted := cfg.Redact()
+	if redacted.EmbeddingKeySet {
+		t.Error("EmbeddingKeySet should be false when no key is active")
+	}
+}
+
 // TestConfig_Load_InvalidEmbeddingProvider_ReturnsError verifies that Load
 // returns an error (startup-fatal) when an unrecognised embedding_provider is
 // present in the config file. This prevents silent noop fallback on
@@ -348,7 +420,7 @@ func TestConfig_Load_InvalidEmbeddingProvider_ReturnsError(t *testing.T) {
 	dir := t.TempDir()
 
 	// Write a config file directly with an invalid provider value.
-	raw := `{"embedding_provider": "ollama"}` // reserved for PR-2, not valid in PR-1
+	raw := `{"embedding_provider": "gpt-embeddings"}` // not a valid provider
 	cfgPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(cfgPath, []byte(raw), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
