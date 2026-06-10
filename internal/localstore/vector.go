@@ -95,6 +95,14 @@ type vectorRow struct {
 	vec    []float32
 }
 
+// SyncID returns the sync_id of this vector row. Exported for callers outside
+// this package (e.g. mem_similar in cmd/engram/tools.go).
+func (v vectorRow) SyncID() string { return v.syncID }
+
+// VectorRow is an exported alias for vectorRow so package-external callers
+// (cmd/engram mem_similar) can receive slices from SelectVectors.
+type VectorRow = vectorRow
+
 // ── SelectVectors ────────────────────────────────────────────────────────────
 
 // SelectVectors queries all live (non-deleted) rows that have a non-NULL
@@ -174,6 +182,22 @@ func SelectVectors(db *sql.DB, project string, filter SearchFilter, dims int) ([
 type cosineCandidate struct {
 	syncID string
 	score  float32
+}
+
+// SyncID returns the candidate's sync_id.
+func (c cosineCandidate) SyncID() string { return c.syncID }
+
+// Score returns the candidate's cosine similarity score.
+func (c cosineCandidate) Score() float32 { return c.score }
+
+// CosineCandidate is an exported alias for cosineCandidate so package-external
+// callers (cmd/engram mem_similar) can receive slices from CosineTopK.
+type CosineCandidate = cosineCandidate
+
+// CosineTopK is the exported variant of cosineTopK for use by package-external
+// callers such as mem_similar in cmd/engram/tools.go.
+func CosineTopK(queryVec []float32, rows []VectorRow, k int) []CosineCandidate {
+	return cosineTopK(queryVec, rows, k)
 }
 
 // cosineTopK computes the dot product between queryVec (must be L2-normalized)
@@ -394,4 +418,33 @@ func UpdateEmbeddingStale(db *sql.DB, syncID string, vec []float32, model, ts st
 		return fmt.Errorf("UpdateEmbeddingStale %q: %w", syncID, err)
 	}
 	return nil
+}
+
+// ErrNoEmbedding is returned by GetEmbeddingBySyncID when the row exists but
+// has no embedding stored (embedding IS NULL).
+var ErrNoEmbedding = fmt.Errorf("observation has no embedding vector")
+
+// GetEmbeddingBySyncID returns the stored (L2-normalized) embedding vector for
+// the row with the given sync_id. dims is the expected dimensionality; a
+// mismatched BLOB returns an error.
+//
+// Returns ErrNoEmbedding when the row exists but has embedding = NULL.
+// Returns sql.ErrNoRows (wrapped) when the sync_id is not found.
+func GetEmbeddingBySyncID(db *sql.DB, syncID string, dims int) ([]float32, error) {
+	var blob []byte
+	err := db.QueryRow(
+		`SELECT embedding FROM memories WHERE sync_id = ? AND deleted_at IS NULL`,
+		syncID,
+	).Scan(&blob)
+	if err != nil {
+		return nil, fmt.Errorf("GetEmbeddingBySyncID %q: %w", syncID, err)
+	}
+	if blob == nil {
+		return nil, ErrNoEmbedding
+	}
+	v, decErr := decodeVector(blob, dims)
+	if decErr != nil {
+		return nil, fmt.Errorf("GetEmbeddingBySyncID %q: %w", syncID, decErr)
+	}
+	return v, nil
 }
