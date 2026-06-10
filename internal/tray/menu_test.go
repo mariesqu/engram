@@ -130,16 +130,18 @@ func TestActionDispatcher_UnknownID_NoSend(t *testing.T) {
 
 func TestActionDispatcher_FullChannel_DoesNotBlock(t *testing.T) {
 	// Unbuffered channel: any blocking send would deadlock the test.
+	// Uses a NON-quit action — MenuIDQuit takes the synchronous path and never
+	// touches the channel, so it cannot prove the drop-on-full contract.
 	ch := make(chan ActionFunc) // unbuffered
 	disp := NewActionDispatcher(map[MenuItemID]ActionFunc{
-		MenuIDQuit: func() {},
+		MenuIDSyncNow: func() {},
 	})
 	// If Dispatch blocks, this test will be caught by go test -timeout.
 	// The select in Dispatch must fall through to the default branch.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		disp.Dispatch(MenuIDQuit, ch)
+		disp.Dispatch(MenuIDSyncNow, ch)
 	}()
 	<-done // must complete without blocking
 }

@@ -62,9 +62,9 @@ const (
 	nifTip     = 0x00000004
 
 	wm_Null         = 0x0000
-	wm_Quit         = 0x0012
 	wm_User         = 0x0400
 	wm_TrayCallback = wm_User + 1 // private: tray callback message
+	wm_AppQuit      = wm_User + 2 // private: quit signal routed to the pump thread
 
 	mf_String    = 0x00000000
 	mf_Disabled  = 0x00000002
@@ -362,8 +362,15 @@ func (w *realWin32) ShowContextMenu(hwnd uintptr, items []MenuItem) (MenuItemID,
 
 func (w *realWin32) PumpMessages(hwnd uintptr, quit <-chan struct{}, onCallback func(uint32, uintptr, uintptr)) {
 	// Register a per-HWND callback that fires for tray messages.
+	// wm_AppQuit is handled HERE — this closure runs inside DispatchMessage on
+	// the locked pump thread, so PostQuitMessage targets the RIGHT thread queue
+	// and the next GetMessage returns 0.
 	wndProcMu.Lock()
 	wndProcMap[hwnd] = func(m uint32, wParam, lParam uintptr) {
+		if m == wm_AppQuit {
+			procPostQuitMessage.Call(0) //nolint:errcheck
+			return
+		}
 		onCallback(m, wParam, lParam)
 	}
 	wndProcMu.Unlock()
@@ -372,15 +379,20 @@ func (w *realWin32) PumpMessages(hwnd uintptr, quit <-chan struct{}, onCallback 
 	quitCh := make(chan struct{})
 
 	// Monitor quit channel on a separate goroutine (cannot select in a message
-	// loop). CRITICAL: PostQuitMessage posts WM_QUIT to the CALLING thread's
-	// queue — this goroutine runs on an arbitrary OS thread, never the locked
-	// pump thread, so PostQuitMessage here would deadlock the pump forever.
-	// PostMessageW(hwnd, ...) routes to the queue of the thread that OWNS hwnd
-	// (the pump thread), which is exactly what we need.
+	// loop). CRITICAL thread semantics, two traps deep:
+	//   1. PostQuitMessage posts to the CALLING thread's queue — this goroutine
+	//      runs on an arbitrary OS thread, never the locked pump thread, so
+	//      calling it here would deadlock the pump forever.
+	//   2. Posting WM_QUIT directly via PostMessageW(hwnd, ...) is ALSO unsound:
+	//      GetMessage's return-0 contract is tied to the thread-queue quit state
+	//      set by PostQuitMessage, not to retrieving a window-addressed WM_QUIT.
+	// The canonical pattern: post a PRIVATE message (wm_AppQuit) to hwnd; the
+	// WndProc closure (running inside DispatchMessage ON the pump thread) calls
+	// PostQuitMessage(0) — right thread, right semantics, next GetMessage → 0.
 	go func() {
 		select {
 		case <-quit:
-			procPostMessage.Call(hwnd, wm_Quit, 0, 0) //nolint:errcheck
+			procPostMessage.Call(hwnd, wm_AppQuit, 0, 0) //nolint:errcheck
 		case <-quitCh:
 		}
 	}()
