@@ -638,7 +638,32 @@ When semantic or hybrid search is requested but the embedding provider is unavai
 
 ### Backfill
 
-New observations are written with `embedding IS NULL`. The backfill loop (PR-1b) fills embeddings in the background. Until a row is embedded it participates in FTS but not in cosine ranking.
+New observations are written with `embedding IS NULL`. The backfill loop fills embeddings in the background so nodes that had no provider configured — or were offline — catch up automatically when a provider is added.
+
+**How it works:**
+
+- The loop runs every 60 seconds and also fires immediately after every `mem_save` write (debounced 1 s).
+- Each pass selects up to 100 rows where `embedding IS NULL` or `embedding_model != current_model`, groups them by project, and calls the gated provider once per project group.
+- The privacy gate is enforced: omitted and local-only projects are skipped silently. Their rows remain `NULL` and the loop does not spin on them (livelock-safe: once all eligible work is done, the tick terminates even if gated rows remain).
+- If the provider returns an error, the loop backs off exponentially (1 s → 2 min) and retries on the next interval.
+- Model changes are handled automatically: when `embedding_provider` is changed, stale rows (wrong `embedding_model`) are re-embedded on the next pass.
+
+**Observability:**
+
+`GET /api/v1/status` returns an `embedding_backfill` object:
+
+```json
+{
+  "embedding_backfill": {
+    "pending": 42,
+    "provider": "openai-text-embedding-3-small-256"
+  }
+}
+```
+
+`pending` is the live count of rows still needing embeddings. It reaches `0` once the backfill is complete. The field is absent when no embedding provider is configured.
+
+Until a row is embedded it participates in FTS but not in cosine ranking.
 
 ## Development
 
