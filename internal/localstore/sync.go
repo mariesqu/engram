@@ -141,9 +141,9 @@ func (s *Store) localWriteLocked(m domain.Mutation) (domain.Mutation, error) {
 //
 // NormalizeTopicKey runs FIRST so that when normalizeMutation derives the
 // canonical payload (and therefore the content-addressed MutationID), no-topic
-// writes always reflect nil — &"" and nil converge — and ” never reaches any
+// writes always reflect nil — &"" and nil converge — and '' never reaches any
 // index (every partial topic index uses `WHERE topic_key IS NOT NULL`, which is
-// complete once ” is normalised away at store entry).
+// complete once '' is normalised away at store entry).
 func normalizeMutation(m domain.Mutation) domain.Mutation {
 	m = domain.NormalizeTopicKey(m) // fold &"" → nil before payload/ID derivation
 	if len(m.Payload) == 0 {
