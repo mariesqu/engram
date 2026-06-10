@@ -65,14 +65,16 @@ func WriteDaemonJSON(dir, token string, port, pid int) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("controlapi.WriteDaemonJSON: close: %w", err)
 	}
+	// Apply the user-only DACL to the temp file BEFORE the rename so the file is
+	// never visible at the target path with the directory's inherited (broader)
+	// DACL. On Windows the 0o600 passed to OpenFile does NOT restrict access —
+	// only the DACL does. Non-fatal: if the DACL cannot be applied the file keeps
+	// the inherited directory DACL (degraded; single-user machines unaffected).
+	_ = setUserOnlyACL(tmp)
 	if err := os.Rename(tmp, target); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("controlapi.WriteDaemonJSON: rename: %w", err)
 	}
-
-	// Apply user-only DACL after the rename so the final file is protected.
-	// Non-fatal: the file still has 0600 from OpenFile above as a fallback.
-	_ = setUserOnlyACL(target)
 	return nil
 }
 

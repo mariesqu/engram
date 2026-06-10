@@ -32,10 +32,15 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // withOrigin wraps next with an Origin header check for mutating requests
-// (POST, PUT, PATCH, DELETE). The allowed origin is http://127.0.0.1:<port>.
-// GET, HEAD, and OPTIONS requests are exempt — they carry no Origin requirement.
+// (POST, PUT, PATCH, DELETE). GET, HEAD, and OPTIONS are exempt.
 //
-// This defends against cross-origin browser requests driving the control plane.
+// Contract (standard CSRF posture):
+//   - Origin ABSENT  → allow. Non-browser clients (the engram CLI, curl) do not
+//     send Origin; bearer-token auth is the gate for them. Browsers ALWAYS send
+//     Origin on cross-origin mutations, so absence cannot be a browser attack.
+//   - Origin present → must equal http://127.0.0.1:<port> exactly, else 403.
+//     This blocks cross-origin browser pages from driving the control plane.
+//
 // It is applied on top of withAuth so auth always runs first.
 func (s *Server) withOrigin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +48,7 @@ func (s *Server) withOrigin(next http.HandlerFunc) http.HandlerFunc {
 		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 			origin := r.Header.Get("Origin")
 			want := fmt.Sprintf("http://127.0.0.1:%d", s.port)
-			if origin != want {
+			if origin != "" && origin != want {
 				writeError(w, http.StatusForbidden, "origin not allowed")
 				return
 			}

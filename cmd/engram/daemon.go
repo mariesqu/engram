@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -225,7 +226,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 
 	mcpSrv := mcpserver.NewMCPServer(
 		"engram",
-		"0.1.0",
+		daemonVersion,
 		mcpserver.WithToolCapabilities(true),
 	)
 
@@ -299,6 +300,11 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	return serveErr(mcpserver.NewStdioServer(components.mcpServer).Listen(ctx, stdin, stdout))
 }
 
+// daemonVersion is the single source of truth for the version reported by the
+// MCP server and the control API. Build-time injection via -ldflags is a
+// release-process follow-up; until then bump it here.
+const daemonVersion = "0.1.0"
+
 // ── HTTP resident-mode (PR-①) ─────────────────────────────────────────────────
 
 // runDaemonHTTP starts the resident daemon in HTTP control-plane mode.
@@ -318,10 +324,6 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		return err
 	}
 	defer components.Close()
-
-	if components.loop != nil {
-		components.loop.Start(ctx)
-	}
 
 	// Generate a fresh 32-byte (64 hex char) token. Token rotates on every start.
 	tokenBytes := make([]byte, 32)
@@ -346,10 +348,22 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	}
 	defer ln.Close()
 
+	// Resolve the ACTUAL bound port: with --http-port 0 the OS assigns an
+	// ephemeral port, and daemon.json / the Origin allowlist must record that
+	// real port or clients would dial port 0.
+	actualPort := ln.Addr().(*net.TCPAddr).Port
+
 	// Write daemon.json AFTER successful bind so clients that read the file can
 	// immediately connect. The write is atomic (temp+rename) inside WriteDaemonJSON.
-	if err := controlapi.WriteDaemonJSON(dir, token, cfg.httpPort, os.Getpid()); err != nil {
+	if err := controlapi.WriteDaemonJSON(dir, token, actualPort, os.Getpid()); err != nil {
 		return fmt.Errorf("daemon HTTP: write daemon.json: %w", err)
+	}
+
+	// Start the autosync loop only after every step that can fail (bind,
+	// discovery write) has succeeded — a startup failure must not have to wait
+	// for a mid-flight sync cycle to stop.
+	if components.loop != nil {
+		components.loop.Start(ctx)
 	}
 	defer func() {
 		// Remove daemon.json on clean shutdown so stale discovery files are not left behind.
@@ -365,7 +379,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	}
 	cfgAdapter := &daemonCfgAdapter{cfg: cfg}
 
-	ctrlSrv := controlapi.New(token, cfg.httpPort, storeAdapter, syncAdapter, cfgAdapter, "0.1.0")
+	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion)
 
 	httpSrv := &http.Server{
 		Handler:           ctrlSrv.Handler(),
@@ -375,7 +389,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("engram daemon: HTTP control plane on %s (db=%s)", addr, cfg.db)
+	log.Printf("engram daemon: HTTP control plane on 127.0.0.1:%d (db=%s)", actualPort, cfg.db)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -396,12 +410,25 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 }
 
 // probeDaemon probes an existing daemon on the given port using the token from
-// daemon.json in dir. Returns nil if the probe returns a healthy response from
-// an engram daemon (i.e. a 200 JSON response with daemon_version set).
+// daemon.json in dir. Returns nil ONLY when the occupant is verifiably a
+// healthy engram daemon: a 200 JSON status response with daemon_version set.
+//
+// Decision matrix (caller refuses startup on nil, falls back to the raw bind
+// error otherwise — both paths fail to start, only the message differs):
+//   - daemon.json records a DIFFERENT port → the daemon that wrote it is not
+//     the occupant of this port; skip the probe (foreign port conflict).
+//   - 200 with daemon_version → engram daemon confirmed → refuse second owner.
+//   - 200 without daemon_version → some foreign HTTP server → bind error.
+//   - 401 → the occupant rejects the recorded token. A LIVE engram daemon
+//     rewrites daemon.json with its current token on start, so a mismatch
+//     means the file is stale relative to the occupant → treat as foreign.
 func probeDaemon(dir string, port int) error {
 	d, err := controlapi.ReadDaemonJSON(dir)
 	if err != nil {
 		return fmt.Errorf("read daemon.json: %w", err)
+	}
+	if d.Port != port {
+		return fmt.Errorf("probe: daemon.json records port %d, not %d (foreign process on the contested port)", d.Port, port)
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	req, err := http.NewRequest(http.MethodGet,
@@ -417,6 +444,10 @@ func probeDaemon(dir string, port int) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("probe: got %d", resp.StatusCode)
+	}
+	var st controlapi.Status
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil || st.DaemonVersion == "" {
+		return fmt.Errorf("probe: 200 but not an engram status response")
 	}
 	return nil
 }
@@ -469,7 +500,7 @@ func (a *loopSyncAdapter) Status() controlapi.Status {
 		CentralConnected: a.centralURL != "" && a.loop != nil,
 		CentralURL:       url,
 		LastSyncResult:   controlapi.SyncResult{},
-		DaemonVersion:    "0.1.0",
+		DaemonVersion:    daemonVersion,
 	}
 }
 

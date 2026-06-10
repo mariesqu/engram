@@ -80,6 +80,10 @@ func (s *Store) SetPolicy(project string, p Policy) error {
 // lookup against the v10 schema table, computing the correct default from the
 // central configuration state when no explicit row exists.
 func (s *Store) GetPolicy(_ string) (Policy, error) {
-	// Default before the project_policy table exists (PR-①). PR-② overrides.
+	// PR-① scaffold: always "synced". NOTE this is intentionally WRONG for
+	// local-only mode — the design's default rule is "synced when central is
+	// configured, local-only otherwise". PR-②'s table lookup + central-aware
+	// read-time default replaces this; its tests must cover the local-only
+	// default explicitly.
 	return PolicySynced, nil
 }

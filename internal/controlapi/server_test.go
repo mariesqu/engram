@@ -498,22 +498,67 @@ func TestNotFound_ReturnsJSONError(t *testing.T) {
 		t.Errorf("want 404, got %d", resp.StatusCode)
 	}
 	assertJSONContentType(t, resp)
+
+	// The body must not echo the request path (no reflection of caller input).
+	var body struct {
+		Error string `json:"error"`
+	}
+	resp2 := get(t, ts, "/api/v1/nonexistent", authHeader("tok"))
+	defer resp2.Body.Close()
+	if err := json.NewDecoder(resp2.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if strings.Contains(body.Error, "nonexistent") {
+		t.Errorf("404 body echoes the request path: %q", body.Error)
+	}
 }
 
-// TestOriginCheck_POST_WrongOrigin verifies that a POST with a wrong Origin
-// receives 403 Forbidden.
-// NOTE: This test exercises the withOrigin middleware but POST handlers for
-// mutating routes are PR-② and PR-③. We wire a test handler directly.
+// TestNotFound_Unauthenticated_401 verifies the catch-all is behind auth:
+// unknown paths must NOT be enumerable without a token (401, not 404).
+func TestNotFound_Unauthenticated_401(t *testing.T) {
+	_, ts := newTestServer(t, "tok", &mockStore{}, &mockSyncCtrl{}, &mockCfgStore{})
+	resp := get(t, ts, "/api/v1/nonexistent", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("unauthenticated unknown path: want 401, got %d", resp.StatusCode)
+	}
+}
+
+// TestOriginCheck_POST_WrongOrigin proves the exported WithAuthAndOrigin chain
+// (the one PR-② / PR-③ mutating routes will use) rejects a cross-site Origin
+// with exactly 403 and admits a same-origin-less loopback request.
 func TestOriginCheck_POST_WrongOrigin(t *testing.T) {
-	// Build a server and wire a custom mux that has withOrigin on a POST route.
 	srv := controlapi.New("tok", 7700, &mockStore{}, &mockSyncCtrl{}, &mockCfgStore{}, "v1")
 
-	// Use the existing Handler — none of the PR-① routes are POST. Instead,
-	// we verify via a dedicated test mux that exercises the middleware.
-	_ = srv // The middleware is tested via the exported handler in PR-②/③.
-	// For PR-①, the WithOriginMiddlewareExposed test in middleware_test.go
-	// covers the logic; this placeholder confirms the test slot is registered.
-	t.Log("withOrigin is unit-tested in middleware_test.go; POST routes land in PR-②")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/test/mutate", srv.WithAuthAndOrigin(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/test/mutate", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Origin", "http://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("wrong origin: want 403, got %d", resp.StatusCode)
+	}
+
+	okReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/test/mutate", nil)
+	okReq.Header.Set("Authorization", "Bearer tok")
+	okResp, err := http.DefaultClient.Do(okReq)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer okResp.Body.Close()
+	if okResp.StatusCode != http.StatusOK {
+		t.Errorf("originless loopback POST: want 200, got %d", okResp.StatusCode)
+	}
 }
 
 // Compile-time assertion that fmt is used (suppress unused-import error

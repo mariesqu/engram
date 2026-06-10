@@ -148,9 +148,19 @@ func TestAcceptance_ControlAPI_Suite(t *testing.T) {
 		}
 	})
 
-	// ── Sub-test 3: bad Origin on POST → 403 ─────────────────────────────────
+	// ── Sub-test 3: bad Origin on a mutating route → exactly 403 ─────────────
+	// PR-① ships no mutating routes, so mount a test-only POST handler through
+	// the SAME WithAuthAndOrigin chain PR-② / PR-③ will use, and prove the
+	// origin check fires with a 403 (not a coincidental 404 from the catch-all).
 	t.Run("BadOriginOnPost_403", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/sync/trigger", nil)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/test/mutate", srv.WithAuthAndOrigin(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		mts := httptest.NewServer(mux)
+		defer mts.Close()
+
+		req, _ := http.NewRequest(http.MethodPost, mts.URL+"/test/mutate", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Origin", "http://evil.example.com")
 		resp, err := http.DefaultClient.Do(req)
@@ -158,11 +168,20 @@ func TestAcceptance_ControlAPI_Suite(t *testing.T) {
 			t.Fatalf("do: %v", err)
 		}
 		defer resp.Body.Close()
-		// Route does not exist in PR-①, but origin check should still fire.
-		// The handler returns 403 from withOrigin or 404 from catch-all —
-		// either way it must not be 2xx.
-		if resp.StatusCode == http.StatusOK {
-			t.Errorf("wrong origin POST: got 200, want non-200")
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("wrong origin POST: got %d, want 403", resp.StatusCode)
+		}
+
+		// Same route with a good (loopback) Origin must pass the chain.
+		okReq, _ := http.NewRequest(http.MethodPost, mts.URL+"/test/mutate", nil)
+		okReq.Header.Set("Authorization", "Bearer "+token)
+		okResp, err := http.DefaultClient.Do(okReq)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		defer okResp.Body.Close()
+		if okResp.StatusCode != http.StatusOK {
+			t.Errorf("no-origin loopback POST: got %d, want 200", okResp.StatusCode)
 		}
 	})
 

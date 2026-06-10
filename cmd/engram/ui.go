@@ -50,12 +50,15 @@ func runUICmd(args []string) error {
 	// Include the bearer token in the URL so the browser can exchange it for a
 	// session cookie via the /ui/?token= exchange endpoint (PR-④).
 	uiURL := fmt.Sprintf("http://127.0.0.1:%d/ui/?token=%s", client.port, client.token)
-	fmt.Printf("Opening: %s\n", uiURL)
+	// Never print the token on the happy path — terminal scrollback and log
+	// capture would leak it. The browser gets it via the URL by design.
+	fmt.Printf("Opening: http://127.0.0.1:%d/ui/ in your browser\n", client.port)
 
 	if openErr := openBrowser(uiURL); openErr != nil {
-		// Non-fatal: print the URL so the user can open it manually.
+		// Fallback only: without a browser launch the tokenized URL is the sole
+		// way in, so print it — with a heads-up that it embeds a secret.
 		fmt.Printf("Could not open browser automatically: %v\n", openErr)
-		fmt.Printf("Open this URL in your browser: %s\n", uiURL)
+		fmt.Printf("Open this URL in your browser (contains your session token — do not share):\n%s\n", uiURL)
 	}
 	return nil
 }

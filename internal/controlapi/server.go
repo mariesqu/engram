@@ -211,13 +211,16 @@ func (s *Server) WithAuthAndOrigin(next http.HandlerFunc) http.HandlerFunc {
 //	GET /api/v1/status   → withAuth → handleStatus
 //	GET /api/v1/config   → withAuth → handleConfig
 //	GET /api/v1/projects → withAuth → handleProjects
-//	/                    → 404 JSON catch-all
+//	/                    → withAuth → 404 JSON catch-all
+//
+// The catch-all is auth-wrapped too: unknown paths return 401 to
+// unauthenticated callers (no route enumeration), 404 only with a valid token.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/status", s.withAuth(s.handleStatus))
 	mux.HandleFunc("/api/v1/config", s.withAuth(s.handleConfig))
 	mux.HandleFunc("/api/v1/projects", s.withAuth(s.handleProjects))
-	mux.HandleFunc("/", s.handleNotFound)
+	mux.HandleFunc("/", s.withAuth(s.handleNotFound))
 	return mux
 }
 
@@ -267,8 +270,9 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, projects)
 }
 
-func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotFound, "not found: "+r.URL.Path)
+func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+	// Fixed message: never echo the request path back into the response body.
+	writeError(w, http.StatusNotFound, "not found")
 }
 
 // ── HTTP helpers (mirrored from cloudserve — same patterns, separate package) ─
