@@ -204,20 +204,30 @@ minimum:
 
 ```json
 "embedding_backfill": {
-  "pending": <integer>,    // rows with embedding IS NULL (live, non-deleted)
+  "pending": <integer>,    // rows with embedding IS NULL AND policy-eligible (live, non-deleted)
   "provider": "<string>"   // ModelName() of the current provider, or "noop"
 }
 ```
 
-The `pending` count SHALL reflect the current store state at the time of the
-request. It is a best-effort count (it does not need to be transactionally
-exact); a ±1 race with a concurrent write is acceptable.
+The `pending` count SHALL reflect only rows that the backfill loop will actually
+process — i.e., rows with `embedding IS NULL AND deleted_at IS NULL` where the
+project's policy permits embedding. Omitted projects and non-consented local-only
+projects are excluded from the count. This ensures `pending` reflects work the
+loop will do, not forever-pending rows it correctly skips.
 
-A `pending` value of `0` means the backfill is caught up.
+The count reflects the current store state at the time of the request. It is a
+best-effort count (it does not need to be transactionally exact); a ±1 race with
+a concurrent write is acceptable.
+
+A `pending` value of `0` means the backfill is caught up (all eligible rows are embedded).
 
 If no provider is configured (NoopProvider), `provider` SHALL be `"noop"` and
 `pending` SHALL still be returned (allowing the user to see how many rows would
 be backfilled if they configure a provider).
+
+> RECONCILED at archive: per design decision 3 (policy-gated backfill), the pending
+> count must count only eligible rows the loop will embed, not raw NULL rows in
+> omitted/gated projects that the loop correctly never touches.
 
 > Headless testable: yes — integration test against embedded store.
 
