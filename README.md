@@ -60,7 +60,8 @@ Pre-built binaries for Linux, macOS, and Windows are published on the
 2. Verify the checksum (download `SHA256SUMS` from the same release):
 
    ```bash
-   sha256sum --check SHA256SUMS
+   sha256sum --check SHA256SUMS          # Linux
+   shasum -a 256 --check SHA256SUMS      # macOS (no sha256sum binary)
    ```
 
 3. Make executable and move to your PATH (Linux/macOS):

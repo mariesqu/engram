@@ -5,18 +5,28 @@ on:
     tags:
       - "v*"
 
+# Least privilege: the workflow defaults to read-only; only the release job
+# elevates to contents:write (needed by `gh release create`). No third-party
+# action ever holds the write token — release creation uses the FIRST-PARTY gh
+# CLI preinstalled on runners, so there is no mutable-tag supply-chain surface.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     name: Build & Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # full history for git describe
+          # The tag ref (including the annotated tag object that
+          # --notes-from-tag reads) is fetched with the ref itself — no full
+          # history needed: the version comes from GITHUB_REF_NAME, not from
+          # git describe.
+          fetch-depth: 1
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -62,20 +72,15 @@ jobs:
           sha256sum engram-* > SHA256SUMS
           cat SHA256SUMS
 
+      # First-party gh CLI (preinstalled on runners): no third-party action ever
+      # holds the write token. --notes-from-tag makes the ANNOTATED TAG MESSAGE
+      # the release body (the changelog convention documented in RELEASING.md);
+      # --verify-tag refuses to create a release for a tag absent on the remote.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: ${{ steps.version.outputs.version }}
-          body: |
-            See [RELEASING.md](https://github.com/${{ github.repository }}/blob/main/RELEASING.md) for the full release process.
-
-            ## Verify checksums
-
-            ```
-            sha256sum --check SHA256SUMS
-            ```
-          files: |
-            dist/engram-*
-            dist/SHA256SUMS
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/engram-* dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes-from-tag \
+            --verify-tag

@@ -36,8 +36,15 @@ engram v0.2.0
 - Add `engram version` subcommand (prints version, GOOS/GOARCH, Go runtime)
 - ldflags version injection via -X main.version=
 - Cross-compiled release binaries + SHA256SUMS via GitHub Actions
+
+Verify checksums: sha256sum --check SHA256SUMS (Linux) / shasum -a 256 --check SHA256SUMS (macOS)
 MSG
 )"
+
+The annotated tag message becomes the release body verbatim (the workflow uses
+gh release create --notes-from-tag), so include the highlights AND the
+checksum-verification line in every tag message — there is no separate
+changelog file by convention.
 
 git push origin v0.2.0
 ```
@@ -64,7 +71,7 @@ Download the binary for your platform from the Releases page and run:
 
 ```bash
 # Linux/macOS
-sha256sum --check SHA256SUMS
+sha256sum --check SHA256SUMS   # Linux; macOS: shasum -a 256 --check SHA256SUMS
 
 # Confirm the version prints correctly
 ./engram-v0.2.0-linux-amd64 version

@@ -90,7 +90,7 @@ func newTestServer(t *testing.T, secret string, status controlapi.Status, projec
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -103,7 +103,7 @@ func newTestServer(t *testing.T, secret string, status controlapi.Status, projec
 // GET /ui/?token=GOOD → 303 → /ui/, Set-Cookie with HttpOnly+SameSite=Strict.
 func TestTokenExchange_ValidToken_SetsCookieAndRedirects(t *testing.T) {
 	const secret = "correct-token-abc"
-	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	client := &http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -189,7 +189,7 @@ func TestTokenExchange_AbsentToken_NoCookieRequireSession_401(t *testing.T) {
 // session cookie allows subsequent requests.
 func TestRequireSession_ValidCookie_Passes(t *testing.T) {
 	const secret = "valid-session-token"
-	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	// Step 1: exchange the token to get a session cookie.
 	jar := &simpleCookieJar{}
@@ -252,14 +252,14 @@ func TestWebUI_GetStatus_200_HTML(t *testing.T) {
 			Pushed: 3,
 			Pulled: 1,
 		},
-		DaemonVersion: "0.1.0",
+		DaemonVersion: "test-version",
 	}
 	srv := newTestServer(t, secret, status, nil)
 	body := authenticatedGet(t, srv, secret, "/ui/")
 
 	assertContains(t, body, "connected")
 	assertContains(t, body, "Daemon Status")
-	assertContains(t, body, "0.1.0")
+	assertContains(t, body, "test-version")
 }
 
 // TestWebUI_GetProjects_200_HTML verifies GET /ui/projects returns 200 HTML with project rows.
@@ -270,7 +270,7 @@ func TestWebUI_GetProjects_200_HTML(t *testing.T) {
 		{Name: "beta", Policy: controlapi.PolicyLocalOnly},
 		{Name: "gamma", Policy: controlapi.PolicyOmitted},
 	}
-	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, projects)
+	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, projects)
 	body := authenticatedGet(t, srv, secret, "/ui/projects")
 
 	assertContains(t, body, "alpha")
@@ -289,7 +289,7 @@ func TestWebUI_PollingPartial_Status(t *testing.T) {
 	status := controlapi.Status{
 		CentralConnected: true,
 		CentralURL:       &centralURL,
-		DaemonVersion:    "0.1.0",
+		DaemonVersion:    "test-version",
 	}
 	srv := newTestServer(t, secret, status, nil)
 	body := authenticatedGet(t, srv, secret, "/ui/status")
@@ -367,7 +367,7 @@ func TestNoExternalAssetReferences(t *testing.T) {
 		CentralConnected: true,
 		CentralURL:       &centralURL,
 		LastSyncResult:   controlapi.SyncResult{At: &now},
-		DaemonVersion:    "0.1.0",
+		DaemonVersion:    "test-version",
 	}
 	srv := newTestServer(t, secret, status, projects)
 
@@ -410,7 +410,7 @@ func TestCookieDoesNotAuthenticateControlAPI(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"daemon_version":"0.1.0-test"}`))
+		_, _ = w.Write([]byte(`{"daemon_version":"test-version"}`))
 	})
 
 	webui.Mount(mux, webui.WebUIDeps{
@@ -418,7 +418,7 @@ func TestCookieDoesNotAuthenticateControlAPI(t *testing.T) {
 		Store:    &mockStore{},
 		Secret:   secret,
 		Port:     7700,
-		Version:  "0.1.0-test",
+		Version:  "test-version",
 	})
 
 	srv := httptest.NewServer(mux)
@@ -716,7 +716,7 @@ func TestWebUI_PolicyToggle_POST_Valid_200(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -766,7 +766,7 @@ func TestWebUI_PolicyToggle_POST_CSRFMissing_403(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -834,7 +834,7 @@ func TestWebUI_Origin_WrongOrigin_403(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -880,7 +880,7 @@ func TestWebUI_Sync_POST_Connected_202(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -911,7 +911,7 @@ func TestWebUI_Sync_POST_Disconnected_409(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -943,7 +943,7 @@ func TestWebUI_Disconnect_POST_Calls_Disconnect(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -978,7 +978,7 @@ func TestWebUI_Connect_POST_Happy(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -1033,7 +1033,7 @@ func TestWebUI_Connect_POST_CredentialValidationError(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -1088,7 +1088,7 @@ func TestWebUI_Connect_POST_InvalidWriterKeyError(t *testing.T) {
 		ConfigStore: &mockConfigStore{},
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -1127,7 +1127,7 @@ func TestWebUI_Config_POST_Valid_200(t *testing.T) {
 		ConfigStore: cfgStore,
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -1161,7 +1161,7 @@ func TestWebUI_Config_POST_InvalidDuration_422(t *testing.T) {
 		ConfigStore: cfgStore,
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -1205,7 +1205,7 @@ func TestWebUI_Config_GET_DoesNotEchoWriterKey(t *testing.T) {
 		ConfigStore: cfgStore,
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

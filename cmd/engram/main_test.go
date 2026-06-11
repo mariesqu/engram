@@ -286,6 +286,9 @@ func TestRun_Version_Output(t *testing.T) {
 // works: assigning version before calling runVersionCmd results in that value
 // appearing in the output. This proves the -X main.version=... injection path
 // without requiring a full cross-compiled binary.
+// NOTE: this test MUTATES the package-level version var (restored via
+// t.Cleanup). Do NOT add t.Parallel() to tests in this package — the CI race
+// lane (-race on ubuntu) will catch a violation, but better not to write one.
 func TestRun_Version_InjectedValue(t *testing.T) {
 	original := version
 	version = "v1.2.3-test"

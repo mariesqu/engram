@@ -9,7 +9,7 @@ BIN := engram$(if $(filter Windows_NT,$(OS)),.exe)
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 
 # LDFLAGS stamps the version and strips debug info for release builds.
-RELEASE_LDFLAGS := -s -w -X main.version=$(VERSION)
+RELEASE_LDFLAGS := -s -w -X 'main.version=$(VERSION)'
 
 # Build a development binary in the repo root (no version stamping).
 build:

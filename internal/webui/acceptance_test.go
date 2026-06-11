@@ -26,7 +26,7 @@ func newFullTestServer(t *testing.T, secret string, status controlapi.Status, pr
 	syncCtrl := &mockSyncCtrl{status: status}
 	cfgStore := &mockCfgStore{}
 
-	ctrlSrv := controlapi.New(secret, 7700, store, syncCtrl, cfgStore, "0.1.0-test")
+	ctrlSrv := controlapi.New(secret, 7700, store, syncCtrl, cfgStore, "test-version")
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", ctrlSrv.Handler())
@@ -36,7 +36,7 @@ func newFullTestServer(t *testing.T, secret string, status controlapi.Status, pr
 		ConfigStore: cfgStore,
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 
 	srv := httptest.NewServer(mux)
@@ -58,7 +58,7 @@ func (m *mockCfgStore) Apply(_ controlapi.ConfigPatch) (bool, error) {
 // GET /ui/?token=GOOD → Set-Cookie + 302 to /ui/ without token.
 func TestAcceptance_WebUI_TokenExchangeFlow(t *testing.T) {
 	const secret = "acc-exchange-tok"
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	client := &http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -120,7 +120,7 @@ func TestAcceptance_WebUI_CookieAuthedStatus_200(t *testing.T) {
 		CentralConnected: true,
 		CentralURL:       &centralURL,
 		LastSyncResult:   controlapi.SyncResult{At: &now, Pushed: 5, Pulled: 2},
-		DaemonVersion:    "0.1.0",
+		DaemonVersion:    "test-version",
 	}
 	srv := newFullTestServer(t, secret, status, nil)
 	body := authenticatedGet(t, srv, secret, "/ui/")
@@ -128,7 +128,7 @@ func TestAcceptance_WebUI_CookieAuthedStatus_200(t *testing.T) {
 	if !strings.Contains(body, "connected") {
 		t.Error("status page must show connected state")
 	}
-	if !strings.Contains(body, "0.1.0") {
+	if !strings.Contains(body, "test-version") {
 		t.Error("status page must show daemon version")
 	}
 }
@@ -141,7 +141,7 @@ func TestAcceptance_WebUI_ProjectsPageRendersPolicies(t *testing.T) {
 		{Name: "myproject", Policy: controlapi.PolicySynced},
 		{Name: "localproj", Policy: controlapi.PolicyLocalOnly},
 	}
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, projects)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, projects)
 	body := authenticatedGet(t, srv, secret, "/ui/projects")
 
 	if !strings.Contains(body, "myproject") {
@@ -160,7 +160,7 @@ func TestAcceptance_WebUI_ProjectsPageRendersPolicies(t *testing.T) {
 // bearer token must return 401. The cookie scope is /ui/ only.
 func TestAcceptance_WebUI_CookieDoesNotAuthControlAPI(t *testing.T) {
 	const secret = "acc-isolation-tok"
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	// Exchange to obtain a real session cookie.
 	jar := &simpleCookieJar{}
@@ -205,7 +205,7 @@ func TestAcceptance_WebUI_CookieDoesNotAuthControlAPI(t *testing.T) {
 // asset references (no http:// or https:// in src= or href= attributes).
 func TestAcceptance_WebUI_OfflineAssets(t *testing.T) {
 	const secret = "acc-offline-tok"
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	paths := []string{"/ui/", "/ui/projects", "/ui/status", "/ui/config"}
 	for _, p := range paths {
@@ -263,7 +263,7 @@ func TestAcceptance_WebUI_PolicyToggle_MutatesAndReturnsPartial(t *testing.T) {
 		{Name: "alpha", Policy: controlapi.PolicySynced},
 		{Name: "beta", Policy: controlapi.PolicySynced},
 	}
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, projects)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, projects)
 
 	status, body := accAuthPost(t, srv, secret, "/ui/projects/alpha/policy", map[string]string{
 		"policy": "local-only",
@@ -284,7 +284,7 @@ func TestAcceptance_WebUI_PolicyToggle_MutatesAndReturnsPartial(t *testing.T) {
 // all mutating routes — 403 with no effect.
 func TestAcceptance_WebUI_CSRFRejection_MutatingRoutes(t *testing.T) {
 	const secret = "acc-csrf-reject-tok"
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	sessionCookie := exchangeGetSessionCookie(t, srv, secret)
 
@@ -325,7 +325,7 @@ func TestAcceptance_WebUI_OriginRejection(t *testing.T) {
 	store := &mockStore{}
 	cfgStore := &mockCfgStore{}
 
-	ctrlSrv := controlapi.New(secret, 7700, store, syncCtrl, cfgStore, "0.1.0-test")
+	ctrlSrv := controlapi.New(secret, 7700, store, syncCtrl, cfgStore, "test-version")
 	mux := http.NewServeMux()
 	mux.Handle("/api/", ctrlSrv.Handler())
 	webui.Mount(mux, webui.WebUIDeps{
@@ -334,7 +334,7 @@ func TestAcceptance_WebUI_OriginRejection(t *testing.T) {
 		ConfigStore: cfgStore,
 		Secret:      secret,
 		Port:        7700,
-		Version:     "0.1.0-test",
+		Version:     "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -362,7 +362,7 @@ func TestAcceptance_WebUI_OriginRejection(t *testing.T) {
 // connect form does not echo writer_key in any response — even on error.
 func TestAcceptance_WebUI_ConnectForm_WriterKeyNotEchoed(t *testing.T) {
 	const secret = "acc-no-echo-tok"
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	const theKey = "aaabbbcccdddeee000111222333444555666777888999aaabbbcccdddeee00011"
 	// On the full test server the mockSyncCtrl.Reconnect returns nil (success).
@@ -384,7 +384,7 @@ func TestAcceptance_WebUI_ConnectForm_WriterKeyNotEchoed(t *testing.T) {
 // CSRF cookie is NOT HttpOnly (double-submit pattern requires it accessible).
 func TestAcceptance_WebUI_ExchangeSetsCSRFCookie(t *testing.T) {
 	const secret = "acc-csrf-cookie-tok"
-	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newFullTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	client := noRedirectClient()
 	resp, err := client.Get(srv.URL + "/ui/?token=" + secret)
