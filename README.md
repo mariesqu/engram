@@ -754,6 +754,21 @@ go test -tags acceptance ./... -count=1 -timeout 120s
 
 The acceptance suite uses [`github.com/fergusstrange/embedded-postgres`](https://github.com/fergusstrange/embedded-postgres) to spin up a real Postgres instance in-process. No Docker or external database is required.
 
+## Acknowledgments
+
+This project stands on the shoulders of **[Engram](https://github.com/Gentleman-Programming/engram)** by
+**[Alan Buscaglia](https://github.com/Gentleman-Programming)** (Gentleman Programming) — *"One Brain. Local or
+Cloud."* — the original persistent-memory engine for AI coding agents, generously published under the MIT license.
+
+That project was the inspiration and the reference for this one. Many of the ideas that define this engine were
+born there and carried forward here: the local-first SQLite + FTS5 memory store, the agent-facing MCP tool
+surface, prompt capture, post-save conflict detection, the cloud dashboard patterns, and countless smaller
+design decisions mined from reading its code. This codebase is an independent reimplementation built around a
+different reconciliation core, but it would not exist — and would not have taken this shape — without Alan's
+work to learn from.
+
+Gracias, Alan. Honor a quien honor merece.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
