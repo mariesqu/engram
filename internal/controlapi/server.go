@@ -104,16 +104,26 @@ type Status struct {
 // EmbeddingKeySet indicates whether an embedding API key is stored (true) without
 // revealing the key itself.
 type RedactedConfig struct {
-	DB                string            `json:"db,omitempty"`
-	Central           *CentralConfig    `json:"central,omitempty"`
-	WriterKey         *string           `json:"writer_key,omitempty"` // "***REDACTED***" or absent
-	HTTP              *HTTPConfig       `json:"http,omitempty"`
-	SyncInterval      string            `json:"sync_interval,omitempty"`
-	LogLevel          string            `json:"log_level,omitempty"`
-	Extra             map[string]string `json:"extra,omitempty"`
-	EmbeddingProvider string            `json:"embedding_provider,omitempty"`
-	EmbeddingKeySet   bool              `json:"embedding_key_set,omitempty"`
+	DB                  string            `json:"db,omitempty"`
+	Central             *CentralConfig    `json:"central,omitempty"`
+	WriterKey           *string           `json:"writer_key,omitempty"` // "***REDACTED***" or absent
+	HTTP                *HTTPConfig       `json:"http,omitempty"`
+	SyncInterval        string            `json:"sync_interval,omitempty"`
+	LogLevel            string            `json:"log_level,omitempty"`
+	Extra               map[string]string `json:"extra,omitempty"`
+	EmbeddingProvider   string            `json:"embedding_provider,omitempty"`
+	EmbeddingKeySet     bool              `json:"embedding_key_set,omitempty"`
+	EmbeddingBaseURL    string            `json:"embedding_base_url,omitempty"`
+	EmbeddingModel      string            `json:"embedding_model,omitempty"`
+	EmbeddingAuthHeader string            `json:"embedding_auth_header,omitempty"`
 }
+
+// ErrConfigInvalid is wrapped by ConfigStore.Apply implementations when a
+// patch would persist a configuration the next daemon startup REJECTS — the
+// PUT must fail (400) instead of bricking the restart (config keys are
+// restart-required; a persisted-but-fatal value cannot be corrected via the
+// API once the daemon refuses to boot).
+var ErrConfigInvalid = errors.New("invalid configuration")
 
 // CentralConfig holds the central server coordinates visible in config reads
 // and as the argument to SyncController.Reconnect.

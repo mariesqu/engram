@@ -59,7 +59,10 @@ var ValidEmbeddingAuthHeaders = map[string]bool{
 // Returns an error when the value is non-empty but not an absolute http(s) URL.
 // isLoopbackHost reports whether host is a loopback address — the only hosts
 // for which a plain-http embedding_base_url is acceptable (the API key would
-// otherwise cross the network cleartext).
+// otherwise cross the network cleartext). Deliberately NO DNS resolution: a
+// hostname that merely resolves to loopback (an /etc/hosts alias) is rejected
+// for http — resolution can change after validation, the literal address
+// cannot.
 func isLoopbackHost(host string) bool {
 	if host == "localhost" {
 		return true

@@ -782,7 +782,11 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 			cfg.EmbeddingProvider = fileCfg.EmbeddingProvider
 			cfg.EmbeddingLocalConsent = fileCfg.EmbeddingLocalConsent
 			cfg.EmbeddingDims = fileCfg.EmbeddingDims
+			cfg.EmbeddingBaseURL = fileCfg.EmbeddingBaseURL
+			cfg.EmbeddingModel = fileCfg.EmbeddingModel
+			cfg.EmbeddingAuthHeader = fileCfg.EmbeddingAuthHeader
 			cfg.OllamaHost = fileCfg.OllamaHost
+			cfg.OllamaModel = fileCfg.OllamaModel
 			if cfg.LogLevel == "" {
 				cfg.LogLevel = fileCfg.LogLevel
 			}
@@ -828,6 +832,9 @@ func (a *configStoreAdapter) Load() (controlapi.RedactedConfig, error) {
 	}
 	result.EmbeddingProvider = rc.EmbeddingProvider
 	result.EmbeddingKeySet = rc.EmbeddingKeySet
+	result.EmbeddingBaseURL = rc.EmbeddingBaseURL
+	result.EmbeddingModel = rc.EmbeddingModel
+	result.EmbeddingAuthHeader = rc.EmbeddingAuthHeader
 	return result, nil
 }
 
@@ -854,6 +861,17 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 	}
 
 	updated, restartRequired := config.Patch(a.cfg, cfgPatch)
+
+	// BRICK GUARD (the release-pipeline lesson, third application): every
+	// embedding key is restart-required, so a persisted value the next startup
+	// REJECTS would leave a daemon that cannot boot — and no API to fix it.
+	// The pairing rule startup enforces (custom model needs explicit dims) is
+	// cross-field, so it must be checked HERE against the EFFECTIVE config,
+	// before anything reaches disk.
+	if updated.EmbeddingModel != "" && updated.EmbeddingDims == 0 {
+		a.mu.Unlock()
+		return false, fmt.Errorf("%w: embedding_model requires embedding_dims (the store must know the vector size); set embedding_dims first", controlapi.ErrConfigInvalid)
+	}
 	a.cfg = updated
 
 	// Persist the change if we have a config directory.

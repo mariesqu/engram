@@ -2,6 +2,7 @@ package controlapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -18,12 +19,9 @@ var validEmbeddingProviders = map[string]bool{
 	"ollama": true,
 }
 
-// validEmbeddingAuthHeaders mirrors config.ValidEmbeddingAuthHeaders.
-var validEmbeddingAuthHeaders = map[string]bool{
-	"":              true, // default → Authorization: Bearer
-	"authorization": true,
-	"api-key":       true,
-}
+// validEmbeddingAuthHeaders DELEGATES to the canonical set in internal/config
+// (same one-truth rationale as the base-URL validator delegation).
+var validEmbeddingAuthHeaders = config.ValidEmbeddingAuthHeaders
 
 // validateEmbeddingBaseURL mirrors config.ValidateEmbeddingBaseURL.
 // Returns "" (no error message) when valid, or a human-readable error string.
@@ -170,6 +168,12 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 
 	restartRequired, err := s.cfgStore.Apply(patch)
 	if err != nil {
+		if errors.Is(err, ErrConfigInvalid) {
+			// Cross-field validation (e.g. embedding_model without
+			// embedding_dims) — our own safe message, the caller can fix it.
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
