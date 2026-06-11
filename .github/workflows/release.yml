@@ -22,10 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The tag ref (including the annotated tag object that
-          # --notes-from-tag reads) is fetched with the ref itself — no full
-          # history needed: the version comes from GITHUB_REF_NAME, not from
-          # git describe.
+          # Shallow is fine: the version comes from GITHUB_REF_NAME (the Actions
+          # environment, not local git), and gh's --notes-from-tag reads the tag
+          # annotation from the GitHub API — the operator pushed the annotated
+          # tag before this workflow fired — NOT from the local clone.
           fetch-depth: 1
 
       - name: Set up Go
@@ -57,7 +57,7 @@ jobs:
       - name: Cross-build release matrix
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          LDFLAGS="-s -w -X main.version=${VERSION}"
+          LDFLAGS="-s -w -X 'main.version=${VERSION}'"
           mkdir -p dist
 
           GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-linux-amd64"        ./cmd/engram

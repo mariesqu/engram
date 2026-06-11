@@ -54,6 +54,6 @@ jobs:
         run: go test -race ./... -count=1
 
       # Acceptance tests spin up embedded-postgres, which pulls a ~30 MB binary
-      # on first run.  They are excluded from CI to keep minutes cheap — they run
-      # locally via `make test-acceptance` and in the release workflow before
-      # tagging.  See RELEASING.md for the full pre-release checklist.
+      # on first run.  They are excluded from ALL CI (this workflow AND the
+      # release workflow) to keep minutes cheap — the operator runs them locally
+      # via `make test-acceptance` before tagging.  See RELEASING.md.
