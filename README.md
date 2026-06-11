@@ -664,6 +664,55 @@ export ENGRAM_EMBEDDING_KEY=<hex-encoded-openai-key>
 
 The key is kept in process memory only and is **never written to disk in plaintext, never logged, and never included in error messages**.
 
+#### Custom OpenAI-compatible endpoints
+
+The `openai` provider supports any OpenAI-compatible API (Azure OpenAI, Mistral, vLLM, LiteLLM, OpenRouter, or a private gateway). Three additional config keys control this:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `embedding_base_url` | `""` → `https://api.openai.com` | Absolute `http(s)` URL that is the version-prefixed base of the endpoint. The provider appends `/embeddings` to this base (or `/v1/embeddings` when the base has no path). |
+| `embedding_model` | `""` → `text-embedding-3-small` | Model name sent verbatim in the request `"model"` field. Switching the model automatically re-embeds all existing observations (the backfill loop re-embeds rows whose stored `embedding_model` differs from the current value). **Requires `embedding_dims` when non-empty** — see below. |
+| `embedding_auth_header` | `""` → `Authorization: Bearer` | How the API key is sent. `""` or `"authorization"` → `Authorization: Bearer <key>`. `"api-key"` → `api-key: <key>` (Azure classic surface). |
+
+All three keys are **restart-required** — the provider is constructed at startup.
+
+**Model and dims pairing rule**: a custom `embedding_model` MUST be paired with an explicit `embedding_dims`. The daemon refuses to start without it — the store's length guard and cosine similarity math need to know the exact vector size at startup. The default pair (`text-embedding-3-small` + implicit 256) is keyless-simple and exempt.
+
+**URL joining rule**: the provider always appends `/embeddings` to the configured base URL. If the base URL has no path (bare host like the default), `/v1/embeddings` is appended instead. Configure the base URL as the full version-prefixed root — do not include `/embeddings` in the base.
+
+**Privacy gate unchanged**: a custom base URL is still `remote=true`. Text leaving the machine to ANY endpoint violates the local-only project contract. `local-only` projects are always gated regardless of which endpoint is configured.
+
+**Example — Mistral:**
+
+```json
+{
+  "embedding_provider": "openai",
+  "embedding_base_url": "https://api.mistral.ai/v1",
+  "embedding_model": "mistral-embed",
+  "embedding_dims": 1024
+}
+```
+
+Request path: `https://api.mistral.ai/v1/embeddings`. Auth: `Authorization: Bearer <key>` (default). The `"dimensions"` field is omitted from the request body because `mistral-embed` has fixed 1024-dim output and some providers reject unknown fields.
+
+Note: if you route through a private Mistral gateway, set `embedding_base_url` to your gateway's URL with the same path prefix (e.g. `https://your-gateway.example.com/v1`).
+
+**Example — Azure OpenAI (v1 surface):**
+
+```json
+{
+  "embedding_provider": "openai",
+  "embedding_base_url": "https://<resource>.openai.azure.com/openai/v1",
+  "embedding_model": "text-embedding-3-small",
+  "embedding_dims": 1536,
+  "embedding_auth_header": "api-key"
+}
+```
+
+Request path: `https://<resource>.openai.azure.com/openai/v1/embeddings`. Auth: `api-key: <key>`. Set `embedding_dims` to match your deployment's configured dimensionality (Azure allows 256–3072 for `text-embedding-3-small`; `text-embedding-ada-002` is fixed 1536).
+
+Note: `ollama_model` and `ollama_host` are irrelevant when `embedding_provider` is `"openai"`. Engram never calls chat completions — only the embeddings endpoint is used.
+
 #### Ollama sidecar
 
 Ollama runs on the same node, so no text ever leaves the machine. Set `embedding_provider` to `"ollama"` and optionally configure the host and dimension count:
