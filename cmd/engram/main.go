@@ -44,6 +44,7 @@ Usage:
   engram projects policy <project> <synced|local-only|omitted>
   engram config   get | set <key> <value>
   engram sync     now
+  engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
   engram version
 
 Environment:
@@ -66,6 +67,7 @@ Subcommands:
   projects  List and manage per-project sync policies (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).
   sync      Trigger an immediate sync cycle (requires daemon --http).
+  import    Import memories, prompts, and sessions from an old-generation engram database.
   version   Print binary version, GOOS/GOARCH, and Go runtime version.
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
@@ -138,6 +140,12 @@ func run(args []string) int {
 	case "sync":
 		if err := runSyncCmd(args[1:]); err != nil {
 			log.Printf("engram sync: %v", err)
+			return 1
+		}
+		return 0
+	case "import":
+		if err := runImportCmd(args[1:]); err != nil {
+			log.Printf("engram import: %v", err)
 			return 1
 		}
 		return 0

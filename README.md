@@ -844,6 +844,68 @@ go test -tags acceptance ./... -count=1 -timeout 120s
 
 The acceptance suite uses [`github.com/fergusstrange/embedded-postgres`](https://github.com/fergusstrange/embedded-postgres) to spin up a real Postgres instance in-process. No Docker or external database is required.
 
+## Importing from the original Engram
+
+If you used the [original Engram](https://github.com/Gentleman-Programming/engram) by Alan Buscaglia before migrating to this engine, you can carry your memories forward with a single command:
+
+```bash
+engram import \
+  --from ~/.engram/engram.db \
+  --db   ~/.engram/memories.db
+```
+
+The command migrates sessions, memories (observations), and captured prompts from the old-generation SQLite database into the current-generation local store.
+
+### What is migrated
+
+| Entity | Notes |
+|--------|-------|
+| **Sessions** | Carried over with their original IDs, project, directory, start time, and summary. |
+| **Memories** | All non-deleted observations — including type, title, content, project, scope, and topic key. Existing `sync_id` values are reused; rows without one get a deterministic CONTENT-ADDRESSED ID (`import-obs-<hash>`, SHA-256 over title/content/created_at/session — so re-imports and multi-machine imports never collide; byte-identical duplicate rows dedupe to one). |
+| **Prompts** | User prompts captured via `mem_save_prompt`. Existing `sync_id` values are reused; rows without one get `import-prompt-<hash>` (same content-addressed scheme). |
+
+Soft-deleted rows (`deleted_at IS NOT NULL`) in the source are always skipped and counted separately in the summary.
+
+Rows whose project has a **policy of "omitted"** in the destination store are warned and skipped — the import honors the same policy rules as the live daemon.
+
+### Idempotency
+
+The import is safe to re-run. On every row the importer performs two pre-checks before writing:
+
+1. **Sync-ID match** — if a row with the same `sync_id` already exists in the destination, the row is skipped.
+2. **Topic-key convergence** — if a row carries a `topic_key` and the destination already holds a version with an equal or newer `updated_at`, the row is skipped. This ensures last-write-wins semantics are preserved even across repeated imports.
+
+Re-running the command against a fully-imported destination produces zero new writes:
+
+```
+import summary
+table                imported   skipped   deleted   omitted
+--------------------  --------  --------  --------  --------
+sessions                     0        3         -         -
+memories                     0       42         2         0
+prompts                      0       17         -         0
+```
+
+### Dry run
+
+Add `--dry-run` to count what would be imported without writing anything:
+
+```bash
+engram import --from ~/.engram/engram.db --db ~/.engram/memories.db --dry-run
+```
+
+### Embeddings
+
+Imported rows arrive with `NULL` embeddings. The embedding backfill loop (which runs automatically on every daemon start when an embedding provider is configured) picks them up and embeds them in the background. No manual step is required.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--from` | `~/.engram/engram.db` | Path to the old-generation source database. |
+| `--db` | _(required)_ | Path to the current-generation destination database (or set `ENGRAM_DB`). |
+| `--dry-run` | `false` | Count what would be imported without writing anything. |
+
 ## Acknowledgments
 
 This project stands on the shoulders of **[Engram](https://github.com/Gentleman-Programming/engram)** by
