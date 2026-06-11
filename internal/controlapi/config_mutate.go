@@ -2,8 +2,11 @@ package controlapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/mariesqu/engram/internal/config"
 )
 
 // validEmbeddingProviders mirrors config.ValidEmbeddingProviders. It is
@@ -14,6 +17,23 @@ var validEmbeddingProviders = map[string]bool{
 	"none":   true,
 	"openai": true,
 	"ollama": true,
+}
+
+// validEmbeddingAuthHeaders DELEGATES to the canonical set in internal/config
+// (same one-truth rationale as the base-URL validator delegation).
+var validEmbeddingAuthHeaders = config.ValidEmbeddingAuthHeaders
+
+// validateEmbeddingBaseURL mirrors config.ValidateEmbeddingBaseURL.
+// Returns "" (no error message) when valid, or a human-readable error string.
+func validateEmbeddingBaseURL(value string) string {
+	// DELEGATES to the canonical validator in internal/config — a second
+	// hand-rolled copy here drifted from it once already (round-1: both copies
+	// missed userinfo/query/suffix/http-cleartext checks). One validator, one
+	// truth; config is a leaf package so no import cycle.
+	if err := config.ValidateEmbeddingBaseURL(value); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // handleConfigPut handles PUT /api/v1/config.
@@ -58,6 +78,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		"sync_interval": true, "log_level": true, "http_port": true,
 		"db_path": true, "transport": true, "embedding_provider": true,
 		"embedding_local_consent": true, "embedding_dims": true, "ollama_host": true, "ollama_model": true,
+		"embedding_base_url": true, "embedding_model": true, "embedding_auth_header": true,
 	}
 	for k := range raw {
 		if !known[k] {
@@ -123,8 +144,36 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate embedding_base_url: must be an absolute http(s) URL when non-empty.
+	// This prevents a bad URL from persisting to the config file and bricking the
+	// next daemon startup (Load validates at startup; PUT validates at write time).
+	if patch.EmbeddingBaseURL != nil {
+		if msg := validateEmbeddingBaseURL(*patch.EmbeddingBaseURL); msg != "" {
+			writeError(w, http.StatusBadRequest, "invalid "+msg)
+			return
+		}
+	}
+
+	// Validate embedding_auth_header enum.
+	// Note: the model×dims pairing rule (custom model requires explicit dims) cannot
+	// be enforced here — the PUT sees one key at a time and cannot observe the
+	// combined state. That rule is enforced at daemon startup in config.Load.
+	if patch.EmbeddingAuthHeader != nil {
+		if !validEmbeddingAuthHeaders[*patch.EmbeddingAuthHeader] {
+			writeError(w, http.StatusBadRequest,
+				"invalid embedding_auth_header: must be one of \"\", \"authorization\", \"api-key\"")
+			return
+		}
+	}
+
 	restartRequired, err := s.cfgStore.Apply(patch)
 	if err != nil {
+		if errors.Is(err, ErrConfigInvalid) {
+			// Cross-field validation (e.g. embedding_model without
+			// embedding_dims) — our own safe message, the caller can fix it.
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}

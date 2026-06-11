@@ -139,6 +139,12 @@ func (p *OllamaSidecarProvider) Embed(ctx context.Context, _ string, texts []str
 		if decodeErr != nil {
 			return nil, fmt.Errorf("embedding/ollama: decode response: %w", decodeErr)
 		}
+		// Vector-store integrity (mirrors the OpenAI provider): a wrong-length
+		// vector would be stored and then silently dropped by the length guard
+		// at query time. Fail loudly with the actionable fix instead.
+		if p.dims > 0 && len(result.Embedding) != p.dims {
+			return nil, fmt.Errorf("embedding/ollama: provider returned %d-dim vector, configured %d — set embedding_dims to the model's native output size", len(result.Embedding), p.dims)
+		}
 		out[i] = result.Embedding
 	}
 	return out, nil

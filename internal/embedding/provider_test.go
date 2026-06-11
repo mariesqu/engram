@@ -185,8 +185,12 @@ func fakeOpenAIResponseN(n, dims int) string {
 	return sb.String()
 }
 
-// TestOpenAI_RequestShape asserts the exact request body shape and Authorization header.
-func TestOpenAI_RequestShape(t *testing.T) {
+// TestOpenAI_RequestShape_DefaultConfig asserts the request body when using the
+// default configuration (no explicit model or dims). The "dimensions" field MUST
+// be absent from the JSON body — omitting it lets the API return the model's
+// full-dimensionality output, and some OpenAI-compatible providers reject the
+// field entirely if they don't support matryoshka shortening.
+func TestOpenAI_RequestShape_DefaultConfig(t *testing.T) {
 	const apiKey = "sk-test-request-shape"
 
 	var capturedBody []byte
@@ -211,17 +215,17 @@ func TestOpenAI_RequestShape(t *testing.T) {
 		t.Fatalf("expected 1×256 vector, got %d vectors", len(vecs))
 	}
 
-	// Assert Authorization header.
+	// Assert Authorization: Bearer header.
 	if capturedAuth != "Bearer "+apiKey {
 		t.Errorf("Authorization header = %q, want %q", capturedAuth, "Bearer "+apiKey)
 	}
 
 	// Decode and verify request body fields.
 	var reqBody struct {
-		Model          string   `json:"model"`
-		Input          []string `json:"input"`
-		Dimensions     int      `json:"dimensions"`
-		EncodingFormat string   `json:"encoding_format"`
+		Model          string          `json:"model"`
+		Input          []string        `json:"input"`
+		Dimensions     json.RawMessage `json:"dimensions"` // nil/absent when not configured
+		EncodingFormat string          `json:"encoding_format"`
 	}
 	if err := json.Unmarshal(capturedBody, &reqBody); err != nil {
 		t.Fatalf("decode request body: %v", err)
@@ -229,8 +233,11 @@ func TestOpenAI_RequestShape(t *testing.T) {
 	if reqBody.Model != "text-embedding-3-small" {
 		t.Errorf("model = %q, want text-embedding-3-small", reqBody.Model)
 	}
-	if reqBody.Dimensions != 256 {
-		t.Errorf("dimensions = %d, want 256", reqBody.Dimensions)
+	// Default-model contract: dimensions=256 is ALWAYS sent for
+	// text-embedding-3-small (omitting it would silently flip the API to
+	// 1536-dim output against a 256-dim store).
+	if string(reqBody.Dimensions) != "256" {
+		t.Errorf("dimensions field must be 256 for the default config, got: %s", reqBody.Dimensions)
 	}
 	if reqBody.EncodingFormat != "float" {
 		t.Errorf("encoding_format = %q, want float", reqBody.EncodingFormat)
@@ -238,6 +245,52 @@ func TestOpenAI_RequestShape(t *testing.T) {
 	if len(reqBody.Input) != 1 || reqBody.Input[0] != "some text" {
 		t.Errorf("input = %v, want [some text]", reqBody.Input)
 	}
+}
+
+// TestOpenAI_RequestShape_WithDims asserts that when dims are explicitly configured,
+// the "dimensions" field IS present in the request body with the correct value.
+func TestOpenAI_RequestShape_WithDims(t *testing.T) {
+	const apiKey = "sk-test-dims"
+	const explicitDims = 512
+
+	var capturedBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		capturedBody = body
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(fakeOpenAIResponseN(1, explicitDims)))
+	}))
+	defer srv.Close()
+
+	p := embedding.NewRemoteOpenAI(apiKey,
+		embedding.WithBaseURL(srv.URL),
+		embedding.WithDims(explicitDims),
+	)
+	if _, err := p.Embed(context.Background(), "proj", []string{"text"}); err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+
+	var reqBody struct {
+		Dimensions *int `json:"dimensions"`
+	}
+	if err := json.Unmarshal(capturedBody, &reqBody); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if reqBody.Dimensions == nil {
+		t.Fatal("dimensions field must be present when dims explicitly configured")
+	}
+	if *reqBody.Dimensions != explicitDims {
+		t.Errorf("dimensions = %d, want %d", *reqBody.Dimensions, explicitDims)
+	}
+}
+
+// TestOpenAI_RequestShape (retained for backward compat label) is now covered by
+// TestOpenAI_RequestShape_DefaultConfig. This alias keeps the original test name
+// discoverable in test output.
+func TestOpenAI_RequestShape(t *testing.T) {
+	TestOpenAI_RequestShape_DefaultConfig(t)
 }
 
 // TestOpenAI_Non2xx_Error_KeyNotLeaked asserts non-2xx returns an error that
@@ -294,11 +347,25 @@ func TestOpenAI_Timeout_Returns_DeadlineExceeded(t *testing.T) {
 	}
 }
 
-// TestOpenAI_Dimensions_256 asserts Dimensions() returns 256.
-func TestOpenAI_Dimensions_256(t *testing.T) {
+// TestOpenAI_Dimensions_DefaultIs256 asserts Dimensions() returns 256 when no
+// explicit dims are configured (the default model's native shortening target).
+func TestOpenAI_Dimensions_DefaultIs256(t *testing.T) {
 	p := embedding.NewRemoteOpenAI("key")
 	if p.Dimensions() != 256 {
 		t.Errorf("Dimensions() = %d, want 256", p.Dimensions())
+	}
+}
+
+// TestOpenAI_Dimensions_256 is the original test name; delegates to the renamed test.
+func TestOpenAI_Dimensions_256(t *testing.T) {
+	TestOpenAI_Dimensions_DefaultIs256(t)
+}
+
+// TestOpenAI_Dimensions_WithExplicitDims asserts Dimensions() returns the configured value.
+func TestOpenAI_Dimensions_WithExplicitDims(t *testing.T) {
+	p := embedding.NewRemoteOpenAI("key", embedding.WithDims(1024))
+	if p.Dimensions() != 1024 {
+		t.Errorf("Dimensions() = %d, want 1024", p.Dimensions())
 	}
 }
 

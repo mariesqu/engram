@@ -7,12 +7,15 @@ package main
 //   - Invalid embedding_provider in config.json is startup-fatal (not a warning)
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mariesqu/engram/internal/config"
+	"github.com/mariesqu/engram/internal/controlapi"
 )
 
 // TestRun_DaemonHelp_DoesNotLeakEmbeddingKey verifies that the daemon --help
@@ -90,5 +93,41 @@ func TestDaemon_OpenAIProvider_BuildsWithoutKey(t *testing.T) {
 
 	if components.store == nil {
 		t.Fatal("buildDaemon: store is nil")
+	}
+}
+
+// TestConfigApply_ModelWithoutDims_RejectedNotBricked: the brick guard. Every
+// embedding key is restart-required, so a persisted value the next startup
+// REJECTS (custom model without dims is startup-fatal) would leave a daemon
+// that cannot boot and no API to fix it. The adapter must refuse the patch
+// with controlapi.ErrConfigInvalid BEFORE anything reaches disk.
+func TestConfigApply_ModelWithoutDims_RejectedNotBricked(t *testing.T) {
+	dir := t.TempDir()
+	cfg := daemonCfg{db: filepath.Join(dir, "x.db"), configDir: dir, syncInterval: 30 * time.Second}
+	a := newConfigStoreAdapter(cfg, 0)
+
+	model := "mistral-embed"
+	_, err := a.Apply(controlapi.ConfigPatch{EmbeddingModel: &model})
+	if !errors.Is(err, controlapi.ErrConfigInvalid) {
+		t.Fatalf("Apply(model without dims) err = %v, want ErrConfigInvalid", err)
+	}
+
+	// Nothing persisted — the next startup must NOT see the fatal pairing.
+	loaded, loadErr := config.Load(dir)
+	if loadErr != nil {
+		t.Fatalf("config.Load: %v", loadErr)
+	}
+	if loaded.EmbeddingModel != "" {
+		t.Errorf("invalid model was persisted (%q) — the restart is bricked", loaded.EmbeddingModel)
+	}
+
+	// The valid sequence works: dims first (or together), then the model.
+	dims := 1024
+	if _, err := a.Apply(controlapi.ConfigPatch{EmbeddingDims: &dims, EmbeddingModel: &model}); err != nil {
+		t.Fatalf("Apply(model+dims together): %v", err)
+	}
+	loaded, _ = config.Load(dir)
+	if loaded.EmbeddingModel != "mistral-embed" || loaded.EmbeddingDims != 1024 {
+		t.Errorf("valid pairing not persisted: model=%q dims=%d", loaded.EmbeddingModel, loaded.EmbeddingDims)
 	}
 }

@@ -109,6 +109,9 @@ type daemonCfg struct {
 	embeddingDims         int    // 0 → provider default (256)
 	ollamaHost            string // "" → "http://localhost:11434"
 	ollamaModel           string // "" → "nomic-embed-text"
+	embeddingBaseURL      string // "" → https://api.openai.com
+	embeddingModel        string // "" → text-embedding-3-small
+	embeddingAuthHeader   string // "" or "authorization" → Bearer; "api-key" → api-key header
 }
 
 // resolveTransport resolves the MCP transport with the standard precedence
@@ -134,6 +137,28 @@ func resolveTransport(flagVal, envVal, fileVal string) (string, error) {
 	default:
 		return "", fmt.Errorf("transport: unknown value %q (must be \"stdio\" or \"http\")", v)
 	}
+}
+
+// buildOpenAIOpts converts the embedding-related fields of daemonCfg into
+// Option values for NewRemoteOpenAI. Separated to keep buildDaemon readable.
+func buildOpenAIOpts(cfg daemonCfg) []embedding.Option {
+	var opts []embedding.Option
+	if cfg.embeddingBaseURL != "" {
+		opts = append(opts, embedding.WithBaseURL(cfg.embeddingBaseURL))
+	}
+	if cfg.embeddingModel != "" {
+		opts = append(opts, embedding.WithModel(cfg.embeddingModel))
+	}
+	if cfg.embeddingDims != 0 {
+		opts = append(opts, embedding.WithDims(cfg.embeddingDims))
+	}
+	switch cfg.embeddingAuthHeader {
+	case "api-key":
+		opts = append(opts, embedding.WithAuthHeader(embedding.AuthHeaderAPIKey))
+	default:
+		// "" or "authorization" → default Bearer (no option needed; it is the zero value)
+	}
+	return opts
 }
 
 // daemonComponents holds the wired-but-not-yet-serving components built by
@@ -377,6 +402,9 @@ func runDaemonCmd(args []string) error {
 		embeddingDims:         fileCfg.EmbeddingDims,
 		ollamaHost:            fileCfg.OllamaHost,
 		ollamaModel:           fileCfg.OllamaModel,
+		embeddingBaseURL:      fileCfg.EmbeddingBaseURL,
+		embeddingModel:        fileCfg.EmbeddingModel,
+		embeddingAuthHeader:   fileCfg.EmbeddingAuthHeader,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -428,8 +456,11 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	switch cfg.embeddingProvider {
 	case "openai":
 		isRemote = true
+		// A custom base URL is still remote: text leaves the machine regardless of
+		// which endpoint it is sent to. The gate posture is unchanged.
 		if len(cfg.embeddingKey) > 0 {
-			innerProvider = embedding.NewRemoteOpenAI(string(cfg.embeddingKey))
+			opts := buildOpenAIOpts(cfg)
+			innerProvider = embedding.NewRemoteOpenAI(string(cfg.embeddingKey), opts...)
 		} else {
 			// Provider is configured but key is not available — log a warning and
 			// fall back to Noop. This is not a fatal error.
@@ -514,7 +545,6 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 
 	return serveErr(mcpserver.NewStdioServer(components.mcpServer).Listen(ctx, stdin, stdout))
 }
-
 
 // ── HTTP resident-mode (PR-①, extended by PR-③) ──────────────────────────────
 
@@ -752,7 +782,11 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 			cfg.EmbeddingProvider = fileCfg.EmbeddingProvider
 			cfg.EmbeddingLocalConsent = fileCfg.EmbeddingLocalConsent
 			cfg.EmbeddingDims = fileCfg.EmbeddingDims
+			cfg.EmbeddingBaseURL = fileCfg.EmbeddingBaseURL
+			cfg.EmbeddingModel = fileCfg.EmbeddingModel
+			cfg.EmbeddingAuthHeader = fileCfg.EmbeddingAuthHeader
 			cfg.OllamaHost = fileCfg.OllamaHost
+			cfg.OllamaModel = fileCfg.OllamaModel
 			if cfg.LogLevel == "" {
 				cfg.LogLevel = fileCfg.LogLevel
 			}
@@ -798,6 +832,9 @@ func (a *configStoreAdapter) Load() (controlapi.RedactedConfig, error) {
 	}
 	result.EmbeddingProvider = rc.EmbeddingProvider
 	result.EmbeddingKeySet = rc.EmbeddingKeySet
+	result.EmbeddingBaseURL = rc.EmbeddingBaseURL
+	result.EmbeddingModel = rc.EmbeddingModel
+	result.EmbeddingAuthHeader = rc.EmbeddingAuthHeader
 	return result, nil
 }
 
@@ -816,11 +853,25 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 		EmbeddingProvider:     patch.EmbeddingProvider,
 		EmbeddingLocalConsent: patch.EmbeddingLocalConsent,
 		EmbeddingDims:         patch.EmbeddingDims,
+		EmbeddingBaseURL:      patch.EmbeddingBaseURL,
+		EmbeddingModel:        patch.EmbeddingModel,
+		EmbeddingAuthHeader:   patch.EmbeddingAuthHeader,
 		OllamaHost:            patch.OllamaHost,
 		OllamaModel:           patch.OllamaModel,
 	}
 
 	updated, restartRequired := config.Patch(a.cfg, cfgPatch)
+
+	// BRICK GUARD (the release-pipeline lesson, third application): every
+	// embedding key is restart-required, so a persisted value the next startup
+	// REJECTS would leave a daemon that cannot boot — and no API to fix it.
+	// The pairing rule startup enforces (custom model needs explicit dims) is
+	// cross-field, so it must be checked HERE against the EFFECTIVE config,
+	// before anything reaches disk.
+	if updated.EmbeddingModel != "" && updated.EmbeddingDims == 0 {
+		a.mu.Unlock()
+		return false, fmt.Errorf("%w: embedding_model requires embedding_dims (the store must know the vector size); set embedding_dims first", controlapi.ErrConfigInvalid)
+	}
 	a.cfg = updated
 
 	// Persist the change if we have a config directory.
