@@ -233,9 +233,11 @@ func TestOpenAI_RequestShape_DefaultConfig(t *testing.T) {
 	if reqBody.Model != "text-embedding-3-small" {
 		t.Errorf("model = %q, want text-embedding-3-small", reqBody.Model)
 	}
-	// "dimensions" MUST be absent from the JSON when no explicit dims are configured.
-	if len(reqBody.Dimensions) != 0 {
-		t.Errorf("dimensions field must be absent when dims not configured, got: %s", reqBody.Dimensions)
+	// Default-model contract: dimensions=256 is ALWAYS sent for
+	// text-embedding-3-small (omitting it would silently flip the API to
+	// 1536-dim output against a 256-dim store).
+	if string(reqBody.Dimensions) != "256" {
+		t.Errorf("dimensions field must be 256 for the default config, got: %s", reqBody.Dimensions)
 	}
 	if reqBody.EncodingFormat != "float" {
 		t.Errorf("encoding_format = %q, want float", reqBody.EncodingFormat)

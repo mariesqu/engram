@@ -3,8 +3,9 @@ package controlapi
 import (
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"time"
+
+	"github.com/mariesqu/engram/internal/config"
 )
 
 // validEmbeddingProviders mirrors config.ValidEmbeddingProviders. It is
@@ -27,18 +28,12 @@ var validEmbeddingAuthHeaders = map[string]bool{
 // validateEmbeddingBaseURL mirrors config.ValidateEmbeddingBaseURL.
 // Returns "" (no error message) when valid, or a human-readable error string.
 func validateEmbeddingBaseURL(value string) string {
-	if value == "" {
-		return ""
-	}
-	u, err := url.ParseRequestURI(value)
-	if err != nil {
-		return "embedding_base_url must be a valid absolute URL (e.g. https://api.mistral.ai/v1)"
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "embedding_base_url must use http or https scheme"
-	}
-	if u.Host == "" {
-		return "embedding_base_url has no host"
+	// DELEGATES to the canonical validator in internal/config — a second
+	// hand-rolled copy here drifted from it once already (round-1: both copies
+	// missed userinfo/query/suffix/http-cleartext checks). One validator, one
+	// truth; config is a leaf package so no import cycle.
+	if err := config.ValidateEmbeddingBaseURL(value); err != nil {
+		return err.Error()
 	}
 	return ""
 }

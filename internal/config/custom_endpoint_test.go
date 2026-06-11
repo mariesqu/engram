@@ -275,3 +275,37 @@ func containsStr(s, sub string) bool {
 	}
 	return false
 }
+
+// TestValidateEmbeddingBaseURL_Hardening covers the round-1 review rejections:
+// userinfo credentials, query strings/fragments, an /embeddings suffix (the
+// provider appends it), and plain http to NON-loopback hosts (cleartext key).
+// The controlapi PUT validator DELEGATES to this function, so these cases hold
+// at both gates by construction.
+func TestValidateEmbeddingBaseURL_Hardening(t *testing.T) {
+	bad := []string{
+		"https://user:pass@host/v1",          // userinfo
+		"https://example.com?x=1",            // query
+		"https://example.com/v1#frag",        // fragment
+		"https://example.com/v1/embeddings",  // suffix the provider appends
+		"https://example.com/v1/embeddings/", // suffix, trailing slash
+		"http://203.0.113.7/v1",              // plaintext to a real host
+		"http://api.example.com/v1",          // plaintext to a hostname
+	}
+	for _, u := range bad {
+		if err := config.ValidateEmbeddingBaseURL(u); err == nil {
+			t.Errorf("ValidateEmbeddingBaseURL(%q) = nil, want error", u)
+		}
+	}
+	good := []string{
+		"",                                     // unset → default
+		"https://api.mistral.ai/v1",            // Mistral
+		"https://r.openai.azure.com/openai/v1", // Azure v1 surface
+		"http://localhost:8000/v1",             // local vLLM gateway — http OK on loopback
+		"http://127.0.0.1:4000",                // LiteLLM local
+	}
+	for _, u := range good {
+		if err := config.ValidateEmbeddingBaseURL(u); err != nil {
+			t.Errorf("ValidateEmbeddingBaseURL(%q) = %v, want nil", u, err)
+		}
+	}
+}

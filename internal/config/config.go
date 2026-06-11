@@ -21,9 +21,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -55,11 +57,26 @@ var ValidEmbeddingAuthHeaders = map[string]bool{
 // ValidateEmbeddingBaseURL validates a candidate embedding_base_url value.
 // Returns nil when value is empty (meaning "use default").
 // Returns an error when the value is non-empty but not an absolute http(s) URL.
+// isLoopbackHost reports whether host is a loopback address — the only hosts
+// for which a plain-http embedding_base_url is acceptable (the API key would
+// otherwise cross the network cleartext).
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 func ValidateEmbeddingBaseURL(value string) error {
 	if value == "" {
 		return nil
 	}
-	u, err := url.ParseRequestURI(value)
+	// url.Parse (not ParseRequestURI): ParseRequestURI never splits #fragments,
+	// so a fragment would silently ride inside Path past the checks below.
+	u, err := url.Parse(value)
 	if err != nil {
 		return fmt.Errorf("embedding_base_url %q is not a valid URL: %w", value, err)
 	}
@@ -68,6 +85,23 @@ func ValidateEmbeddingBaseURL(value string) error {
 	}
 	if u.Host == "" {
 		return fmt.Errorf("embedding_base_url %q has no host", value)
+	}
+	if u.User != nil {
+		// Userinfo would ride into every request as Basic auth AND appear in
+		// endpoint/proxy logs — credentials belong in the embedding key, never
+		// the URL.
+		return fmt.Errorf("embedding_base_url must not contain userinfo credentials")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("embedding_base_url must not contain a query string or fragment")
+	}
+	if strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/embeddings") {
+		return fmt.Errorf("embedding_base_url must not include the /embeddings segment — the provider appends it (see the joining rule in the README)")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		// A plaintext endpoint would carry the API key cleartext across the
+		// network. http is allowed only for loopback gateways (vLLM, LiteLLM).
+		return fmt.Errorf("embedding_base_url: plain http is only allowed for localhost endpoints (the API key would travel cleartext); use https")
 	}
 	return nil
 }

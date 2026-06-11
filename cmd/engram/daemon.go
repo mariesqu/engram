@@ -846,6 +846,9 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 		EmbeddingProvider:     patch.EmbeddingProvider,
 		EmbeddingLocalConsent: patch.EmbeddingLocalConsent,
 		EmbeddingDims:         patch.EmbeddingDims,
+		EmbeddingBaseURL:      patch.EmbeddingBaseURL,
+		EmbeddingModel:        patch.EmbeddingModel,
+		EmbeddingAuthHeader:   patch.EmbeddingAuthHeader,
 		OllamaHost:            patch.OllamaHost,
 		OllamaModel:           patch.OllamaModel,
 	}

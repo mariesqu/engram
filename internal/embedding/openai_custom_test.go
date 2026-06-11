@@ -216,8 +216,12 @@ func TestOpenAI_ModelName_DefaultIsTextEmbedding3Small(t *testing.T) {
 // TestOpenAI_DimensionsField_AbsentByDefault asserts that the "dimensions" field
 // is absent from the raw JSON body when no explicit dims are configured.
 // This prevents "unknown field" rejections from strict providers (e.g. Mistral).
-func TestOpenAI_DimensionsField_AbsentByDefault(t *testing.T) {
-	cs := newCaptureServer(1024)
+func TestOpenAI_DimensionsField_Present256ByDefault(t *testing.T) {
+	// THE DEFAULT-CONFIG CONTRACT (round-1 HIGH): text-embedding-3-small has
+	// always been requested at 256 dims (matryoshka). Omitting the field would
+	// flip the API to its 1536-dim default while the store expects 256 —
+	// silently breaking semantic search for every default install.
+	cs := newCaptureServer(256)
 	defer cs.Close()
 
 	p := embedding.NewRemoteOpenAI("sk-key",
@@ -227,8 +231,52 @@ func TestOpenAI_DimensionsField_AbsentByDefault(t *testing.T) {
 	if _, err := p.Embed(context.Background(), "proj", []string{"x"}); err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
+	if raw := rawBodyField(cs.lastBody, "dimensions"); string(raw) != "256" {
+		t.Errorf("dimensions field must be 256 for the default model, got: %s", raw)
+	}
+}
+
+// TestOpenAI_DimensionsField_AbsentForNonOpenAIModel: "dimensions" is an
+// OpenAI matryoshka parameter — for fixed-output models (mistral-embed) the
+// field is OMITTED and embedding_dims configures the STORE expectation only.
+func TestOpenAI_DimensionsField_AbsentForNonOpenAIModel(t *testing.T) {
+	cs := newCaptureServer(1024)
+	defer cs.Close()
+
+	p := embedding.NewRemoteOpenAI("sk-key",
+		embedding.WithBaseURL(cs.URL()),
+		embedding.WithModel("mistral-embed"),
+		embedding.WithDims(1024),
+		embedding.WithTimeout(2*time.Second),
+	)
+	if _, err := p.Embed(context.Background(), "proj", []string{"x"}); err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
 	if raw := rawBodyField(cs.lastBody, "dimensions"); len(raw) != 0 {
-		t.Errorf("dimensions field must be absent when no explicit dims, got: %s", raw)
+		t.Errorf("dimensions field must be ABSENT for non-text-embedding-3 models, got: %s", raw)
+	}
+}
+
+// TestOpenAI_ResponseDimsMismatch_LoudError: a provider returning a different
+// vector length than configured must FAIL the call with an actionable message,
+// never let wrong-length blobs reach the store (where the length guard would
+// silently drop them at query time).
+func TestOpenAI_ResponseDimsMismatch_LoudError(t *testing.T) {
+	cs := newCaptureServer(768) // server returns 768-dim vectors
+	defer cs.Close()
+
+	p := embedding.NewRemoteOpenAI("sk-key",
+		embedding.WithBaseURL(cs.URL()),
+		embedding.WithModel("some-model"),
+		embedding.WithDims(1024), // configured expectation differs
+		embedding.WithTimeout(2*time.Second),
+	)
+	_, err := p.Embed(context.Background(), "proj", []string{"x"})
+	if err == nil {
+		t.Fatal("expected a dims-mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "768") || !strings.Contains(err.Error(), "1024") {
+		t.Errorf("error should name both lengths, got: %v", err)
 	}
 }
 

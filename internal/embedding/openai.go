@@ -124,6 +124,13 @@ func NewRemoteOpenAI(key string, opts ...Option) *RemoteOpenAIProvider {
 	for _, o := range opts {
 		o(p)
 	}
+	// Default-model contract: text-embedding-3-small has ALWAYS been requested
+	// at 256 dims (matryoshka) — leaving dims at 0 here would silently flip the
+	// API to its 1536-dim default while the store still expects 256, breaking
+	// semantic search for every default-config install.
+	if p.dims == 0 && p.model == openAIDefaultModel {
+		p.dims = openAIDefaultDims
+	}
 	p.httpClient = &http.Client{Timeout: p.timeout}
 	return p
 }
@@ -166,11 +173,21 @@ func (p *RemoteOpenAIProvider) ModelName() string { return p.model }
 // /embeddings (or /v1/embeddings for the bare-host default).
 func embeddingsURL(base string) string {
 	u, err := url.Parse(base)
-	if err != nil || u.Path == "" || u.Path == "/" {
-		// Bare host or unparseable: fall back to the original behaviour.
+	if err != nil {
+		// Unreachable after config validation; legacy fallback for direct callers.
 		return strings.TrimRight(base, "/") + "/v1/embeddings"
 	}
-	return strings.TrimRight(base, "/") + "/embeddings"
+	// Operate on the PARSED path — trimming the raw string mis-handles bases
+	// with multiple trailing slashes (".com////" would lose the /v1 segment).
+	cleaned := strings.TrimRight(u.Path, "/")
+	if cleaned == "" {
+		u.Path = "/v1/embeddings" // bare host: the standard OpenAI layout
+	} else {
+		u.Path = cleaned + "/embeddings" // base already carries its version segment
+	}
+	u.RawQuery = "" // defensive — the validator rejects query strings anyway
+	u.Fragment = ""
+	return u.String()
 }
 
 // openAIRequest is the JSON body sent to POST /v1/embeddings (or equivalent).
@@ -208,7 +225,12 @@ func (p *RemoteOpenAIProvider) Embed(ctx context.Context, _ string, texts []stri
 	// Include "dimensions" only when explicitly configured. Omitting it for
 	// fixed-output models (e.g. mistral-embed with native 1024 dims) prevents
 	// "unknown field" errors from strict OpenAI-compatible providers.
-	if p.dims != 0 {
+	// The "dimensions" request field is an OpenAI matryoshka parameter — send
+	// it only for the text-embedding-3 family. Other OpenAI-compatible models
+	// (mistral-embed etc.) have fixed-size output and may reject the field;
+	// for them embedding_dims configures the STORE expectation only, and the
+	// response-length validation below enforces agreement.
+	if p.dims != 0 && strings.HasPrefix(p.model, "text-embedding-3") {
 		d := p.dims
 		req.Dimensions = &d
 	}
@@ -256,7 +278,16 @@ func (p *RemoteOpenAIProvider) Embed(ctx context.Context, _ string, texts []stri
 	}
 
 	out := make([][]float32, len(result.Data))
+	want := p.Dimensions()
 	for i, d := range result.Data {
+		// Vector-store integrity: a provider returning a different length than
+		// the configured dims would write blobs the length guard silently drops
+		// at query time — semantic search degrading to zero results with no
+		// error anywhere. Fail LOUDLY here instead; the message tells the user
+		// the fix (set embedding_dims to the model native size).
+		if want > 0 && len(d.Embedding) != want {
+			return nil, fmt.Errorf("embedding: provider returned %d-dim vector, configured %d — set embedding_dims to the model's native output size", len(d.Embedding), want)
+		}
 		out[i] = d.Embedding
 	}
 	return out, nil
