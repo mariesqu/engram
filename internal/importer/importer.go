@@ -3,7 +3,7 @@
 //
 // # Source schema
 //
-// The source DB is opened READ-ONLY (immutable=1 DSN option) and must contain
+// The source DB is opened READ-ONLY (mode=ro DSN option) and must contain
 // the tables sessions, observations, and user_prompts as defined by
 // old_code/internal/store/store.go.  Soft-deleted rows (deleted_at IS NOT NULL
 // on observations) are skipped.
@@ -63,8 +63,12 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 
+	"crypto/sha256"
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/localstore"
+	"io"
+	"os"
+	"path/filepath"
 )
 
 // Stats summarises the outcome of a Run call.
@@ -104,7 +108,7 @@ func New(dst *localstore.Store, writerID string) *Importer {
 // Run reads from srcDB (already open, read-only) and imports into the destination
 // store.  When dryRun is true no writes are performed and only Stats are returned.
 //
-// srcDB MUST have been opened read-only by the caller (immutable=1 DSN).
+// srcDB MUST have been opened read-only by the caller (mode=ro DSN).
 func (imp *Importer) Run(srcDB *sql.DB, dryRun bool) (Stats, error) {
 	var st Stats
 
@@ -210,13 +214,19 @@ func (imp *Importer) importSessions(srcDB *sql.DB, dryRun bool, st *Stats) error
 			return fmt.Errorf("create session %q: %w", s.ID, err)
 		}
 
-		// Propagate ended_at + summary when present.
+		// Propagate ended_at + summary when present — with the ORIGINAL
+		// timestamp (EndSession stamps datetime('now'), which would record a
+		// years-old session as ending at import time).
 		if s.EndedAt.Valid && s.EndedAt.String != "" {
 			summary := ""
 			if s.Summary.Valid {
 				summary = s.Summary.String
 			}
-			if err := imp.dst.EndSession(s.ID, summary); err != nil {
+			endedAt := parseImportTime(s.EndedAt.String)
+			if endedAt.IsZero() {
+				endedAt = time.Unix(0, 0).UTC() // deterministic, parse-proof
+			}
+			if err := imp.dst.EndSessionAt(s.ID, summary, endedAt); err != nil {
 				return fmt.Errorf("end session %q: %w", s.ID, err)
 			}
 		}
@@ -287,7 +297,8 @@ func (imp *Importer) importObservations(srcDB *sql.DB, dryRun bool, st *Stats) e
 			continue
 		}
 
-		syncID := deriveSyncID(o.SyncID, "import-obs", o.ID)
+		syncID := deriveSyncID(o.SyncID, "import-obs",
+			o.Title, o.Content, o.CreatedAt, o.SessionID)
 		createdAt := parseImportTime(o.CreatedAt)
 		updatedAt := parseImportTime(o.UpdatedAt)
 
@@ -378,7 +389,14 @@ func buildObsMutation(o srcObservation, syncID, project string, createdAt, updat
 	// When the source has a zero updated_at, fall back to createdAt.
 	mutUpdatedAt := updatedAt
 	if mutUpdatedAt.IsZero() {
-		mutUpdatedAt = time.Now().UTC()
+		// DETERMINISTIC fallback chain — time.Now() here would change the
+		// canonical payload (and so the mutation_id) on every re-import,
+		// minting a fresh outbox entry each run and pushing duplicates to
+		// central. createdAt first, then the epoch: same input, same mutation.
+		mutUpdatedAt = createdAt
+	}
+	if mutUpdatedAt.IsZero() {
+		mutUpdatedAt = time.Unix(0, 0).UTC()
 	}
 
 	return domain.Mutation{
@@ -441,7 +459,8 @@ func (imp *Importer) importPrompts(srcDB *sql.DB, dryRun bool, st *Stats) error 
 			continue
 		}
 
-		syncID := deriveSyncID(p.SyncID, "import-prompt", p.ID)
+		syncID := deriveSyncID(p.SyncID, "import-prompt",
+			p.Content, p.CreatedAt, p.SessionID)
 		createdAt := parseImportTime(p.CreatedAt)
 
 		if dryRun {
@@ -460,7 +479,8 @@ func (imp *Importer) importPrompts(srcDB *sql.DB, dryRun bool, st *Stats) error 
 
 		mutUpdatedAt := createdAt
 		if mutUpdatedAt.IsZero() {
-			mutUpdatedAt = time.Now().UTC()
+			// Deterministic (see the observation path note): never time.Now().
+			mutUpdatedAt = time.Unix(0, 0).UTC()
 		}
 
 		m := domain.Mutation{
@@ -510,17 +530,22 @@ func (imp *Importer) cachedPolicy(cache map[string]localstore.Policy, project st
 }
 
 // deriveSyncID returns the source sync_id when non-empty, otherwise builds a
-// deterministic id from the table prefix and the integer row id.
-//
-// Examples:
-//
-//	"obs-abc123" (from source) → "obs-abc123"
-//	NULL         (from source) → "import-obs-42"
-func deriveSyncID(src sql.NullString, prefix string, id int64) string {
+// deterministic CONTENT-ADDRESSED id. The fallback must never be keyed on the
+// source AUTOINCREMENT id alone: two different old machines both start ids at
+// 1, so an integer-keyed fallback would make the second machine's rows collide
+// with the first's and be silently skipped as "already present". Hashing the
+// row's content makes the id unique per distinct record and still reproducible
+// on re-import of the same source.
+func deriveSyncID(src sql.NullString, prefix string, contentKey ...string) string {
 	if src.Valid && strings.TrimSpace(src.String) != "" {
 		return src.String
 	}
-	return fmt.Sprintf("%s-%d", prefix, id)
+	h := sha256.New()
+	for _, part := range contentKey {
+		h.Write([]byte(part))
+		h.Write([]byte{0}) // unambiguous field separator
+	}
+	return fmt.Sprintf("%s-%x", prefix, h.Sum(nil)[:16])
 }
 
 // coalesceStr returns the string value of ns when valid, otherwise def.
@@ -548,23 +573,87 @@ func parseImportTime(s string) time.Time {
 	return time.Time{}
 }
 
-// OpenSourceReadOnly opens srcPath as a read-only SQLite database using the
-// immutable=1 DSN option so the import never mutates the source file.
-// The caller is responsible for closing the returned *sql.DB.
-func OpenSourceReadOnly(srcPath string) (*sql.DB, error) {
-	// The modernc/sqlite DSN accepts URI parameters when the path starts with
-	// "file:".  immutable=1 tells SQLite the file will not change — fastest read
-	// mode and prevents any accidental write.
-	dsn := fmt.Sprintf("file:%s?mode=ro&immutable=1", srcPath)
+// OpenSourceReadOnly gives the importer a guaranteed-zero-risk view of the
+// user's legacy database: the main file AND its WAL sidecars (-wal/-shm, when
+// present) are first SNAPSHOT-COPIED into a private temp directory, and the
+// COPY is opened. Rationale (round-1 review, proven by the sidecar-hash test):
+//
+//   - immutable=1 never touches the source but silently SKIPS WAL frames that
+//     were never checkpointed (a crashed old daemon loses its last writes);
+//   - mode=ro reads those frames but SQLite touches -shm/-wal next to the
+//     user's original even for reads.
+//
+// Copy-then-read gets both: the original is never opened at all, and the
+// copied -wal preserves every frame. Memory databases are megabytes — the
+// copy cost is trivial against an irreplaceable source.
+//
+// The returned cleanup func removes the snapshot directory; callers must
+// defer it after Close.
+func OpenSourceReadOnly(srcPath string) (*sql.DB, func(), error) {
+	if _, err := os.Stat(srcPath); err != nil {
+		return nil, nil, fmt.Errorf("OpenSourceReadOnly: source %q: %w", srcPath, err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "engram-import-src-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("OpenSourceReadOnly: snapshot dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	copyPath := filepath.Join(tmpDir, "source.db")
+	if err := copyFile(srcPath, copyPath); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("OpenSourceReadOnly: snapshot copy: %w", err)
+	}
+	// WAL sidecars: copied when present so non-checkpointed frames survive.
+	// SQLite derives sidecar names by appending to the main path.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		side := srcPath + suffix
+		if _, err := os.Stat(side); err == nil {
+			if err := copyFile(side, copyPath+suffix); err != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("OpenSourceReadOnly: snapshot %s: %w", suffix, err)
+			}
+		}
+	}
+
+	// mode=ro on the COPY: WAL frames merged into the read view; any sidecar
+	// touches land in the snapshot dir, never beside the user's original. The
+	// path is percent-escaped for the characters that break SQLite's URI
+	// parser — '%', '#', '?' and space (a space in a Windows profile path is
+	// the common case).
+	escaped := strings.NewReplacer(
+		"%", "%25", "#", "%23", "?", "%3F", " ", "%20",
+	).Replace(filepath.ToSlash(copyPath))
+	dsn := fmt.Sprintf("file:%s?mode=ro", escaped)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("OpenSourceReadOnly: sql.Open: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("OpenSourceReadOnly: sql.Open: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	// Ping to fail fast if the file does not exist or is not a SQLite DB.
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("OpenSourceReadOnly: ping %q: %w", srcPath, err)
+		cleanup()
+		return nil, nil, fmt.Errorf("OpenSourceReadOnly: ping %q: %w", srcPath, err)
 	}
-	return db, nil
+	return db, cleanup, nil
+}
+
+// copyFile copies src to dst (0600 — the snapshot may hold private memories).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }

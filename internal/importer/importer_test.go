@@ -181,11 +181,11 @@ func openDest(t *testing.T) *localstore.Store {
 // openSrcRO opens the source file in read-only mode via importer.OpenSourceReadOnly.
 func openSrcRO(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	db, err := importer.OpenSourceReadOnly(path)
+	db, cleanup, err := importer.OpenSourceReadOnly(path)
 	if err != nil {
 		t.Fatalf("OpenSourceReadOnly: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = db.Close(); cleanup() })
 	return db
 }
 
@@ -285,6 +285,36 @@ func TestImport_Idempotent(t *testing.T) {
 	}
 	if st2.SessionsSkipped != 1 {
 		t.Errorf("idempotent: SessionsSkipped = %d; want 1", st2.SessionsSkipped)
+	}
+
+	// Depth (round-1 review): counts alone don't prove idempotency — a re-run
+	// must also mint ZERO new outbox entries (no duplicate pushes to central)
+	// and leave version/updated_at untouched on existing rows.
+	pendingAfterFirst, err := dst.PendingCount()
+	if err != nil {
+		t.Fatalf("PendingCount: %v", err)
+	}
+	rec, err := dst.FindBySyncID("obs-live-1")
+	if err != nil || rec == nil {
+		t.Fatalf("FindBySyncID obs-live-1: rec=%v err=%v", rec, err)
+	}
+	versionAfterFirst, updatedAfterFirst := rec.Version, rec.UpdatedAt
+
+	srcDB3 := openSrcRO(t, srcPath)
+	if _, err := imp.Run(srcDB3, false); err != nil {
+		t.Fatalf("third Run: %v", err)
+	}
+
+	pendingAfterThird, _ := dst.PendingCount()
+	if pendingAfterThird != pendingAfterFirst {
+		t.Errorf("re-import minted outbox entries: pending %d -> %d (duplicate pushes to central)", pendingAfterFirst, pendingAfterThird)
+	}
+	rec, _ = dst.FindBySyncID("obs-live-1")
+	if rec.Version != versionAfterFirst {
+		t.Errorf("re-import churned version: %d -> %d", versionAfterFirst, rec.Version)
+	}
+	if rec.UpdatedAt != updatedAfterFirst {
+		t.Errorf("re-import churned updated_at: %v -> %v", updatedAfterFirst, rec.UpdatedAt)
 	}
 }
 
@@ -452,7 +482,15 @@ func TestImport_OmittedProjectSkipped(t *testing.T) {
 // by comparing its SHA-256 hash before and after.
 func TestImport_ReadOnlySource(t *testing.T) {
 	srcPath := seedSourceDB(t)
-	hashBefore := fileHash(t, srcPath)
+
+	// Hash the main DB AND the WAL sidecars: in WAL mode a write lands in
+	// -wal/-shm first and the main file stays byte-identical until checkpoint —
+	// hashing only the .db would miss a read-only violation entirely.
+	sidecars := []string{srcPath, srcPath + "-wal", srcPath + "-shm"}
+	before := make(map[string]string, len(sidecars))
+	for _, f := range sidecars {
+		before[f] = optionalFileHash(t, f)
+	}
 
 	dst := openDest(t)
 	srcDB := openSrcRO(t, srcPath)
@@ -463,16 +501,27 @@ func TestImport_ReadOnlySource(t *testing.T) {
 	}
 	_ = srcDB.Close()
 
-	hashAfter := fileHash(t, srcPath)
-	if fmt.Sprintf("%x", hashBefore) != fmt.Sprintf("%x", hashAfter) {
-		t.Error("source file was modified during import — read-only guarantee violated")
+	for _, f := range sidecars {
+		if after := optionalFileHash(t, f); after != before[f] {
+			t.Errorf("source sidecar %s changed during import — read-only guarantee violated", f)
+		}
 	}
+}
+
+// optionalFileHash hashes f, returning a sentinel for a missing file so the
+// before/after comparison also catches a sidecar CREATED by the import.
+func optionalFileHash(t *testing.T, f string) string {
+	t.Helper()
+	if _, err := os.Stat(f); os.IsNotExist(err) {
+		return "<absent>"
+	}
+	return fmt.Sprintf("%x", fileHash(t, f))
 }
 
 // TestImport_SameFileRefused is covered at the CLI layer (cmd/engram/import.go),
 // but we verify OpenSourceReadOnly fails fast on a non-existent path.
 func TestImport_MissingSource(t *testing.T) {
-	_, err := importer.OpenSourceReadOnly("/nonexistent/path/engram.db")
+	_, _, err := importer.OpenSourceReadOnly("/nonexistent/path/engram.db")
 	if err == nil {
 		t.Error("expected error opening non-existent source path, got nil")
 	}
@@ -493,10 +542,11 @@ func TestImport_InvalidSource(t *testing.T) {
 	}
 	_ = db.Close()
 
-	srcDB, err := importer.OpenSourceReadOnly(path)
+	srcDB, cleanup2, err := importer.OpenSourceReadOnly(path)
 	if err != nil {
 		t.Fatalf("OpenSourceReadOnly: %v", err)
 	}
+	defer cleanup2()
 	defer srcDB.Close()
 
 	dst := openDest(t)
@@ -546,22 +596,42 @@ func TestImport_DeterministicSyncIDForNullSource(t *testing.T) {
 		t.Fatalf("first Run: %v", err)
 	}
 
-	// Obtain the auto-assigned id of the NULL-sync_id observation from source.
-	var nullObsID int64
+	// The fallback is CONTENT-ADDRESSED (round-1 review: an integer-keyed
+	// fallback collides across two old machines whose AUTOINCREMENT ids both
+	// start at 1 — the second machine's rows would be silently skipped).
+	// Recompute the same hash the importer derives and assert the row exists.
+	var title, content, createdAt, sessionID string
 	err := srcDB.QueryRow(
-		`SELECT id FROM observations WHERE sync_id IS NULL LIMIT 1`,
-	).Scan(&nullObsID)
+		`SELECT title, content, created_at, session_id
+		 FROM observations WHERE sync_id IS NULL LIMIT 1`,
+	).Scan(&title, &content, &createdAt, &sessionID)
 	if err != nil {
-		t.Fatalf("get NULL obs id: %v", err)
+		t.Fatalf("get NULL obs row: %v", err)
 	}
 
-	expectedSyncID := fmt.Sprintf("import-obs-%d", nullObsID)
+	h := sha256.New()
+	for _, part := range []string{title, content, createdAt, sessionID} {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	expectedSyncID := fmt.Sprintf("import-obs-%x", h.Sum(nil)[:16])
+
 	rec, err := dst.FindBySyncID(expectedSyncID)
 	if err != nil {
 		t.Fatalf("FindBySyncID %q: %v", expectedSyncID, err)
 	}
 	if rec == nil {
-		t.Errorf("deterministic sync_id %q not found in destination", expectedSyncID)
+		t.Errorf("content-addressed sync_id %q not found in destination", expectedSyncID)
+	}
+
+	// Determinism: a second import derives the SAME id → skipped, not duplicated.
+	srcDB2 := openSrcRO(t, srcPath)
+	st2, err := imp.Run(srcDB2, false)
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if st2.MemoriesImported != 0 {
+		t.Errorf("re-import created %d new memories; content-addressed ids must be stable", st2.MemoriesImported)
 	}
 }
 

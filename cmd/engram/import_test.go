@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "modernc.org/sqlite"
+	"os"
 )
 
 // legacyImportDDL mirrors the old-generation engram schema used in
@@ -129,18 +130,11 @@ func TestRunImportCmd_DryRun(t *testing.T) {
 		t.Fatalf("dry-run import: exit code %d; want 0", code)
 	}
 
-	// The dest DB is created by localstore.Open but should have 0 memories.
-	db, err := sql.Open("sqlite", newPath)
-	if err != nil {
-		t.Fatalf("open dest: %v", err)
-	}
-	defer db.Close()
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&count); err != nil {
-		t.Fatalf("query memories: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("dry-run: memories count = %d; want 0", count)
+	// Round-1 review contract: dry-run must not CREATE the destination —
+	// localstore.Open applies schema+migrations, which is a write. A missing
+	// destination stays missing after a dry-run.
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("dry-run created the destination database at %s — dry-run must write NOTHING", newPath)
 	}
 }
 

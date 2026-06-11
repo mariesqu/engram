@@ -79,6 +79,22 @@ func (s *Store) EndSession(id, summary string) error {
 	return err
 }
 
+// EndSessionAt is EndSession with a caller-supplied end timestamp — used by
+// the legacy importer to PRESERVE the original ended_at instead of stamping
+// import wall-clock time (sessions are local-only, not journaled, so a typed
+// direct update is the correct path). Zero-row updates are a no-op like
+// EndSession.
+func (s *Store) EndSessionAt(id, summary string, endedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`UPDATE sessions SET ended_at = ?, summary = ? WHERE id = ?`,
+		endedAt.UTC().Format("2006-01-02 15:04:05"), nullableStr(summary), id,
+	)
+	return err
+}
+
 // GetSession fetches the full session row for id. Returns ErrSessionNotFound
 // when no row exists.
 func (s *Store) GetSession(id string) (*Session, error) {
