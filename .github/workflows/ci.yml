@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on force-push / rapid PR updates — public-repo CI
+# minutes are a shared community budget.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags acceptance ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Unit tests
+        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: "0"
+
+      # Race detector needs cgo + a C toolchain — run it on ubuntu only (gcc is
+      # preinstalled; the windows runner pays a much slower mingw build for the
+      # same signal). This is the lane that would catch e.g. an unguarded
+      # package-var mutation if a future test gains t.Parallel().
+      - name: Unit tests (race, ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./... -count=1
+
+      # Acceptance tests spin up embedded-postgres, which pulls a ~30 MB binary
+      # on first run.  They are excluded from ALL CI (this workflow AND the
+      # release workflow) to keep minutes cheap — the operator runs them locally
+      # via `make test-acceptance` before tagging.  See RELEASING.md.

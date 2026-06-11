@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege: the workflow defaults to read-only; only the release job
+# elevates to contents:write (needed by `gh release create`). No third-party
+# action ever holds the write token — release creation uses the FIRST-PARTY gh
+# CLI preinstalled on runners, so there is no mutable-tag supply-chain surface.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Shallow is fine: the version comes from GITHUB_REF_NAME (the Actions
+          # environment, not local git), and gh's --notes-from-tag reads the tag
+          # annotation from the GitHub API — the operator pushed the annotated
+          # tag before this workflow fired — NOT from the local clone.
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags acceptance ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # Unit tests only — acceptance tests use embedded-postgres which downloads
+      # a ~30 MB binary per run and adds ~60 s.  The full acceptance suite must
+      # pass locally (make test-acceptance) before pushing the release tag.
+      # See RELEASING.md for the pre-release checklist.
+      - name: Unit tests
+        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-build release matrix
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LDFLAGS="-s -w -X 'main.version=${VERSION}'"
+          mkdir -p dist
+
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-linux-amd64"        ./cmd/engram
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-linux-arm64"        ./cmd/engram
+          GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-darwin-amd64"       ./cmd/engram
+          GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-darwin-arm64"       ./cmd/engram
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "${LDFLAGS}" -o "dist/engram-${VERSION}-windows-amd64.exe"  ./cmd/engram
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum engram-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # First-party gh CLI (preinstalled on runners): no third-party action ever
+      # holds the write token. --notes-from-tag makes the ANNOTATED TAG MESSAGE
+      # the release body (the changelog convention documented in RELEASING.md);
+      # --verify-tag refuses to create a release for a tag absent on the remote.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/engram-* dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes-from-tag \
+            --verify-tag

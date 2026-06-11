@@ -85,6 +85,48 @@ func newSyncedPolicyChecker(projects ...string) *staticPolicyChecker {
 	return &staticPolicyChecker{policies: policies}
 }
 
+// ── Race-proof synchronization helpers ───────────────────────────────────────
+//
+// Fixed time.Sleep windows flake under `go test -race` (2-10x slowdown): the
+// triggered tick may not have finished — or started — inside the window. These
+// helpers poll the OUTCOME instead of guessing a duration.
+
+// waitFor polls cond every 10ms until it holds or the deadline passes.
+// It does NOT fail the test on timeout — the caller's assertions report the
+// actual mismatch with their own messages.
+func waitFor(d time.Duration, cond func() bool) {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitQuiescent polls until the mock's observable state (callCount+totalTexts)
+// has been STABLE for `stable`, capped at `max`. Used where the expected
+// outcome is "nothing (more) happens" — a condition that cannot be polled
+// positively. The stability window comfortably exceeds debounce + scheduling
+// latency even under the race detector.
+func waitQuiescent(mock *recordingMockProvider, stable, max time.Duration) {
+	deadline := time.Now().Add(max)
+	lastCalls, lastTexts := mock.callCount(), mock.totalTexts()
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+		c, x := mock.callCount(), mock.totalTexts()
+		if c != lastCalls || x != lastTexts {
+			lastCalls, lastTexts = c, x
+			stableSince = time.Now()
+			continue
+		}
+		if time.Since(stableSince) >= stable {
+			return
+		}
+	}
+}
+
 // runLoopOnce constructs a loop with fast-forward config (no interval wait,
 // tiny batch), runs one tick synchronously, and returns the mock.
 // It uses the REAL gate (NewGated with the mock as inner).
@@ -102,8 +144,10 @@ func runLoopOnce(t *testing.T, st *localstore.Store, mock *recordingMockProvider
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	// Wait enough for the debounce + tick to complete.
-	time.Sleep(200 * time.Millisecond)
+	// Quiescence, not a fixed sleep: callers include no-op runs (zero expected
+	// calls), so we wait until the mock has been stable for a window that
+	// dwarfs debounce + scheduling latency even under -race.
+	waitQuiescent(mock, 600*time.Millisecond, 8*time.Second)
 	loop.Stop()
 }
 
@@ -217,7 +261,7 @@ func TestLoop_BatchSize_Respected(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(500 * time.Millisecond)
+	waitFor(10*time.Second, func() bool { return mock.totalTexts() >= 250 })
 	loop.Stop()
 
 	// All 250 texts embedded via 3 calls: 100+100+50.
@@ -257,8 +301,8 @@ func TestLoop_BatchFailure_ContinuesRemainingBatches(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(150 * time.Millisecond) // let the triggered tick run
-	loop.Stop()                        // Stop blocks until the goroutine exits — the real barrier
+	waitFor(8*time.Second, func() bool { return errMock.callCount() >= 2 })
+	loop.Stop() // Stop blocks until the goroutine exits — the real barrier
 
 	// Exactly: call 1 (rows A-C) succeeded, call 2 (rows D-F) failed.
 	if errMock.callCount() < 2 {
@@ -306,7 +350,7 @@ func TestLoop_GatedRowsDoNotStarveEligible(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(200 * time.Millisecond)
+	waitFor(8*time.Second, func() bool { return mock.totalTexts() >= 3 })
 	loop.Stop()
 
 	for i := 0; i < 3; i++ {
@@ -377,7 +421,7 @@ func TestLoop_Resume_AfterInterrupt(t *testing.T) {
 	defer cancel2()
 	loop2.Start(ctx2)
 	loop2.Trigger()
-	time.Sleep(300 * time.Millisecond)
+	waitQuiescent(mock2, 600*time.Millisecond, 8*time.Second)
 	loop2.Stop()
 
 	// All 10 rows must be embedded after 2 runs.
@@ -422,7 +466,7 @@ func TestLoop_MixedPolicy_OnlySyncedEmbedded(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(300 * time.Millisecond)
+	waitFor(8*time.Second, func() bool { return mock.totalTexts() >= 2 })
 	loop.Stop()
 
 	// Synced rows should be embedded.
@@ -468,7 +512,9 @@ func TestLoop_Trigger_CoalescesRapidCalls(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		loop.Trigger()
 	}
-	time.Sleep(500 * time.Millisecond)
+	// Quiescence: the assertion is an UPPER bound (coalesced into <= 2 ticks) —
+	// we wait until activity stops, never for a count to be reached.
+	waitQuiescent(mock, 600*time.Millisecond, 8*time.Second)
 	loop.Stop()
 
 	// All triggers coalesced into ≤ 2 ticks (debounce coalesces them into 1).

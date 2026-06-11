@@ -397,7 +397,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 
 	mcpSrv := mcpserver.NewMCPServer(
 		"engram",
-		daemonVersion,
+		version,
 		mcpserver.WithToolCapabilities(true),
 	)
 
@@ -515,8 +515,6 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	return serveErr(mcpserver.NewStdioServer(components.mcpServer).Listen(ctx, stdin, stdout))
 }
 
-// daemonVersion is the single source of truth for the binary version.
-const daemonVersion = "0.1.0"
 
 // ── HTTP resident-mode (PR-①, extended by PR-③) ──────────────────────────────
 
@@ -585,7 +583,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		components.gated,
 	)
 
-	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, daemonVersion, cfgAdapter)
+	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, version, cfgAdapter)
 
 	// ── PR-④a: build the top-level mux (one listener, path-routed) ───────────
 	// The control API and the web UI share a single net.Listener. We mount:
@@ -608,7 +606,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		Store:    storeAdapter,
 		Secret:   token,
 		Port:     actualPort,
-		Version:  daemonVersion,
+		Version:  version,
 	})
 
 	// ── PR-⑥: opt-in MCP HTTP transport ──────────────────────────────────────
@@ -988,7 +986,7 @@ func (a *runtimeSyncAdapter) Status() controlapi.Status {
 	st := controlapi.Status{
 		CentralConnected: a.connected,
 		LastSyncResult:   controlapi.SyncResult{},
-		DaemonVersion:    daemonVersion,
+		DaemonVersion:    version,
 	}
 	if a.centralURL != "" {
 		u := a.centralURL

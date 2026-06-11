@@ -20,7 +20,7 @@ import (
 //   - NOT Secure (loopback)
 func TestCSRF_CookieAttributes(t *testing.T) {
 	const secret = "csrf-attr-tok"
-	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	client := noRedirectClient()
 	resp, err := client.Get(srv.URL + "/ui/?token=" + secret)
@@ -101,7 +101,7 @@ func TestCSRF_MissingCookie_Rejected(t *testing.T) {
 		Store:    &mockStore{},
 		Secret:   secret,
 		Port:     7700,
-		Version:  "0.1.0-test",
+		Version:  "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -139,7 +139,7 @@ func TestCSRF_WrongValue_Rejected(t *testing.T) {
 		Store:    &mockStore{},
 		Secret:   secret,
 		Port:     7700,
-		Version:  "0.1.0-test",
+		Version:  "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -183,7 +183,7 @@ func TestCSRF_Valid_Passes(t *testing.T) {
 		Store:    &mockStore{},
 		Secret:   secret,
 		Port:     7700,
-		Version:  "0.1.0-test",
+		Version:  "test-version",
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -215,7 +215,7 @@ func TestCSRF_Valid_Passes(t *testing.T) {
 // without needing any CSRF token.
 func TestCSRF_GetRoutes_NoCSRFRequired(t *testing.T) {
 	const secret = "csrf-get-tok"
-	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "0.1.0"}, nil)
+	srv := newTestServer(t, secret, controlapi.Status{DaemonVersion: "test-version"}, nil)
 
 	sessionCookie := exchangeGetSessionCookie(t, srv, secret)
 

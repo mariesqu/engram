@@ -2,6 +2,9 @@
 /engram
 *.exe
 
+# Release artifacts
+/dist/
+
 # Database
 *.db
 *.db-wal
