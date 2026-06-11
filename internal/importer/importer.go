@@ -14,8 +14,10 @@
 //
 //  1. Sync-ID reuse: when the source row has a non-empty sync_id that value is
 //     reused directly as the mutation's SyncID.  When it is NULL/empty a stable
-//     deterministic ID is derived: "import-obs-<old-integer-id>" for observations
-//     and "import-prompt-<old-integer-id>" for prompts.
+//     CONTENT-ADDRESSED ID is derived: "import-obs-<hash>" / "import-prompt-<hash>"
+//     (SHA-256 over the row's content fields — never the source AUTOINCREMENT id,
+//     which collides across different old machines; byte-identical duplicate rows
+//     hash to the same ID and dedupe to one).
 //
 //  2. Pre-check via FindBySyncID / user_prompts lookup: before calling LocalWrite
 //     the importer checks whether the target store already has a live row with the

@@ -861,8 +861,8 @@ The command migrates sessions, memories (observations), and captured prompts fro
 | Entity | Notes |
 |--------|-------|
 | **Sessions** | Carried over with their original IDs, project, directory, start time, and summary. |
-| **Memories** | All non-deleted observations — including type, title, content, project, scope, and topic key. Existing `sync_id` values are reused; rows without one get a deterministic derived ID (`import-obs-<id>`). |
-| **Prompts** | User prompts captured via `mem_save_prompt`. Existing `sync_id` values are reused; rows without one get `import-prompt-<id>`. |
+| **Memories** | All non-deleted observations — including type, title, content, project, scope, and topic key. Existing `sync_id` values are reused; rows without one get a deterministic CONTENT-ADDRESSED ID (`import-obs-<hash>`, SHA-256 over title/content/created_at/session — so re-imports and multi-machine imports never collide; byte-identical duplicate rows dedupe to one). |
+| **Prompts** | User prompts captured via `mem_save_prompt`. Existing `sync_id` values are reused; rows without one get `import-prompt-<hash>` (same content-addressed scheme). |
 
 Soft-deleted rows (`deleted_at IS NOT NULL`) in the source are always skipped and counted separately in the summary.
 

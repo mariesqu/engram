@@ -107,6 +107,8 @@ func runImportCmd(args []string) error {
 	if err != nil {
 		return fmt.Errorf("open source database: %w", err)
 	}
+	// LIFO: Close (registered last) runs FIRST, then the snapshot-dir removal —
+	// required on Windows, where removing a still-open file fails.
 	defer srcCleanup()
 	defer srcDB.Close()
 
