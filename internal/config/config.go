@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -40,6 +41,35 @@ var ValidEmbeddingProviders = map[string]bool{
 	"none":   true, // explicit no-op
 	"openai": true,
 	"ollama": true, // local sidecar; requires embedding_local_consent=true for local-only projects
+}
+
+// ValidEmbeddingAuthHeaders is the set of accepted embedding_auth_header values.
+// "" and "authorization" are equivalent (both send Authorization: Bearer <key>).
+// "api-key" sends the Azure-style api-key: <key> header.
+var ValidEmbeddingAuthHeaders = map[string]bool{
+	"":              true, // default → Authorization: Bearer
+	"authorization": true, // explicit Authorization: Bearer
+	"api-key":       true, // Azure classic header
+}
+
+// ValidateEmbeddingBaseURL validates a candidate embedding_base_url value.
+// Returns nil when value is empty (meaning "use default").
+// Returns an error when the value is non-empty but not an absolute http(s) URL.
+func ValidateEmbeddingBaseURL(value string) error {
+	if value == "" {
+		return nil
+	}
+	u, err := url.ParseRequestURI(value)
+	if err != nil {
+		return fmt.Errorf("embedding_base_url %q is not a valid URL: %w", value, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("embedding_base_url %q must use http or https scheme", value)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("embedding_base_url %q has no host", value)
+	}
+	return nil
 }
 
 // SecretBox is the platform-specific encryption interface for the writer key.
@@ -100,6 +130,21 @@ type fileConfig struct {
 	// OllamaHost is the base URL of the local Ollama sidecar. Default "http://localhost:11434".
 	// Only used when EmbeddingProvider = "ollama".
 	OllamaHost string `json:"ollama_host,omitempty"`
+	// EmbeddingBaseURL is the base URL for the "openai" provider. Default "" → https://api.openai.com.
+	// Set this to point at any OpenAI-compatible endpoint (Azure OpenAI, Mistral, vLLM, LiteLLM, etc.).
+	// Must be an absolute http(s) URL when non-empty. Restart-required.
+	EmbeddingBaseURL string `json:"embedding_base_url,omitempty"`
+	// EmbeddingModel is the model name sent in the "model" field of embeddings requests.
+	// Default "" → text-embedding-3-small. Changing this triggers re-embedding of all
+	// existing observations (the backfill loop re-embeds rows whose stored embedding_model
+	// differs from the current ModelName()). Restart-required.
+	// A custom model REQUIRES embedding_dims to be set explicitly (startup-fatal if not).
+	EmbeddingModel string `json:"embedding_model,omitempty"`
+	// EmbeddingAuthHeader selects which HTTP header carries the API key.
+	// "" or "authorization" → Authorization: Bearer <key> (default).
+	// "api-key"            → api-key: <key> (Azure OpenAI classic surface).
+	// Restart-required.
+	EmbeddingAuthHeader string `json:"embedding_auth_header,omitempty"`
 }
 
 // Config is the resolved, decoded in-memory configuration. The writer key is
@@ -135,6 +180,24 @@ type Config struct {
 	// OllamaModel is the ollama embedding model name.
 	// Empty means "use default" (nomic-embed-text).
 	OllamaModel string
+
+	// EmbeddingBaseURL is the base URL for the "openai" provider.
+	// Empty means "use default" (https://api.openai.com).
+	// Must be an absolute http(s) URL when non-empty; validated at Load and at PUT time.
+	EmbeddingBaseURL string
+
+	// EmbeddingModel is the model name sent in embeddings requests.
+	// Empty means "use default" (text-embedding-3-small).
+	// When set, EmbeddingDims must also be set explicitly (startup-fatal if not).
+	// Note: PUT validation enforces URL and enum shapes at write time; the
+	// model×dims pairing rule is only enforceable at startup (the PUT sees one key
+	// at a time and cannot observe the combined state).
+	EmbeddingModel string
+
+	// EmbeddingAuthHeader selects how the API key is sent.
+	// "" or "authorization" → Authorization: Bearer <key> (default).
+	// "api-key"            → api-key: <key> (Azure classic).
+	EmbeddingAuthHeader string
 
 	// embeddingKeyActive records whether an embedding key is available at
 	// runtime — either from ENGRAM_EMBEDDING_KEY env var OR from the stored
@@ -185,16 +248,19 @@ func (c Config) WithEncryptedEmbeddingKey(blob []byte) Config {
 // never present. EmbeddingKeySet is true when an encrypted embedding API key is
 // stored; the key itself is never present.
 type RedactedConfig struct {
-	DB                string `json:"db_path,omitempty"`
-	CentralURL        string `json:"central_url,omitempty"`
-	WriterID          string `json:"writer_id,omitempty"`
-	WriterKey         string `json:"writer_key,omitempty"` // "***REDACTED***" or absent
-	HTTPPort          int    `json:"http_port,omitempty"`
-	SyncInterval      string `json:"sync_interval,omitempty"`
-	LogLevel          string `json:"log_level,omitempty"`
-	Transport         string `json:"transport,omitempty"`
-	EmbeddingProvider string `json:"embedding_provider,omitempty"`
-	EmbeddingKeySet   bool   `json:"embedding_key_set,omitempty"` // true when encrypted key present
+	DB                  string `json:"db_path,omitempty"`
+	CentralURL          string `json:"central_url,omitempty"`
+	WriterID            string `json:"writer_id,omitempty"`
+	WriterKey           string `json:"writer_key,omitempty"` // "***REDACTED***" or absent
+	HTTPPort            int    `json:"http_port,omitempty"`
+	SyncInterval        string `json:"sync_interval,omitempty"`
+	LogLevel            string `json:"log_level,omitempty"`
+	Transport           string `json:"transport,omitempty"`
+	EmbeddingProvider   string `json:"embedding_provider,omitempty"`
+	EmbeddingKeySet     bool   `json:"embedding_key_set,omitempty"` // true when encrypted key present
+	EmbeddingBaseURL    string `json:"embedding_base_url,omitempty"`
+	EmbeddingModel      string `json:"embedding_model,omitempty"`
+	EmbeddingAuthHeader string `json:"embedding_auth_header,omitempty"`
 }
 
 // ConfigPatch is a partial update applied by PUT /api/v1/config.
@@ -213,6 +279,9 @@ type ConfigPatch struct {
 	EmbeddingDims         *int    `json:"embedding_dims,omitempty"`
 	OllamaHost            *string `json:"ollama_host,omitempty"`
 	OllamaModel           *string `json:"ollama_model,omitempty"`
+	EmbeddingBaseURL      *string `json:"embedding_base_url,omitempty"`
+	EmbeddingModel        *string `json:"embedding_model,omitempty"`
+	EmbeddingAuthHeader   *string `json:"embedding_auth_header,omitempty"`
 }
 
 // DefaultConfigDir returns the directory where config.json is stored:
@@ -290,6 +359,31 @@ func Load(dir string) (Config, error) {
 	cfg.OllamaHost = fc.OllamaHost
 	cfg.OllamaModel = fc.OllamaModel
 
+	// Validate embedding_base_url: must be an absolute http(s) URL when set.
+	if err := ValidateEmbeddingBaseURL(fc.EmbeddingBaseURL); err != nil {
+		return Config{}, fmt.Errorf("config.Load: %w", err)
+	}
+	cfg.EmbeddingBaseURL = fc.EmbeddingBaseURL
+
+	cfg.EmbeddingModel = fc.EmbeddingModel
+
+	// Validate embedding_auth_header enum.
+	if !ValidEmbeddingAuthHeaders[fc.EmbeddingAuthHeader] {
+		return Config{}, fmt.Errorf("config.Load: unsupported embedding_auth_header %q (valid: \"\", \"authorization\", \"api-key\")", fc.EmbeddingAuthHeader)
+	}
+	cfg.EmbeddingAuthHeader = fc.EmbeddingAuthHeader
+
+	// Model×dims pairing rule: a custom model without explicit dims is startup-fatal.
+	// The store's length guard and cosine math require knowing the exact vector size.
+	// The default pair (default model + default 256 dims) is keyless-simple and exempt.
+	if cfg.EmbeddingModel != "" && cfg.EmbeddingDims == 0 {
+		return Config{}, fmt.Errorf(
+			"config.Load: custom embedding_model %q requires embedding_dims to be set explicitly; "+
+				"the store must know the vector size (e.g. 1024 for mistral-embed)",
+			cfg.EmbeddingModel,
+		)
+	}
+
 	return cfg, nil
 }
 
@@ -323,6 +417,9 @@ func Save(dir string, cfg Config) error {
 	fc.EmbeddingDims = cfg.EmbeddingDims
 	fc.OllamaHost = cfg.OllamaHost
 	fc.OllamaModel = cfg.OllamaModel
+	fc.EmbeddingBaseURL = cfg.EmbeddingBaseURL
+	fc.EmbeddingModel = cfg.EmbeddingModel
+	fc.EmbeddingAuthHeader = cfg.EmbeddingAuthHeader
 
 	if len(cfg.encryptedEmbeddingKey) > 0 {
 		fc.EncryptedEmbeddingKey = base64.StdEncoding.EncodeToString(cfg.encryptedEmbeddingKey)
@@ -384,6 +481,9 @@ func (c Config) Redact() RedactedConfig {
 	if c.embeddingKeyActive || len(c.encryptedEmbeddingKey) > 0 {
 		rc.EmbeddingKeySet = true
 	}
+	rc.EmbeddingBaseURL = c.EmbeddingBaseURL
+	rc.EmbeddingModel = c.EmbeddingModel
+	rc.EmbeddingAuthHeader = c.EmbeddingAuthHeader
 	return rc
 }
 
@@ -456,6 +556,22 @@ func Patch(base Config, p ConfigPatch) (Config, bool) {
 
 	if p.OllamaModel != nil && *p.OllamaModel != base.OllamaModel {
 		out.OllamaModel = *p.OllamaModel
+		restartRequired = true
+	}
+
+	// New custom-endpoint fields — all restart-required (provider constructed at startup).
+	if p.EmbeddingBaseURL != nil && *p.EmbeddingBaseURL != base.EmbeddingBaseURL {
+		out.EmbeddingBaseURL = *p.EmbeddingBaseURL
+		restartRequired = true
+	}
+
+	if p.EmbeddingModel != nil && *p.EmbeddingModel != base.EmbeddingModel {
+		out.EmbeddingModel = *p.EmbeddingModel
+		restartRequired = true
+	}
+
+	if p.EmbeddingAuthHeader != nil && *p.EmbeddingAuthHeader != base.EmbeddingAuthHeader {
+		out.EmbeddingAuthHeader = *p.EmbeddingAuthHeader
 		restartRequired = true
 	}
 
