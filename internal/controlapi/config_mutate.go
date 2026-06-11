@@ -3,6 +3,7 @@ package controlapi
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -14,6 +15,32 @@ var validEmbeddingProviders = map[string]bool{
 	"none":   true,
 	"openai": true,
 	"ollama": true,
+}
+
+// validEmbeddingAuthHeaders mirrors config.ValidEmbeddingAuthHeaders.
+var validEmbeddingAuthHeaders = map[string]bool{
+	"":              true, // default → Authorization: Bearer
+	"authorization": true,
+	"api-key":       true,
+}
+
+// validateEmbeddingBaseURL mirrors config.ValidateEmbeddingBaseURL.
+// Returns "" (no error message) when valid, or a human-readable error string.
+func validateEmbeddingBaseURL(value string) string {
+	if value == "" {
+		return ""
+	}
+	u, err := url.ParseRequestURI(value)
+	if err != nil {
+		return "embedding_base_url must be a valid absolute URL (e.g. https://api.mistral.ai/v1)"
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "embedding_base_url must use http or https scheme"
+	}
+	if u.Host == "" {
+		return "embedding_base_url has no host"
+	}
+	return ""
 }
 
 // handleConfigPut handles PUT /api/v1/config.
@@ -58,6 +85,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		"sync_interval": true, "log_level": true, "http_port": true,
 		"db_path": true, "transport": true, "embedding_provider": true,
 		"embedding_local_consent": true, "embedding_dims": true, "ollama_host": true, "ollama_model": true,
+		"embedding_base_url": true, "embedding_model": true, "embedding_auth_header": true,
 	}
 	for k := range raw {
 		if !known[k] {
@@ -121,6 +149,28 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	if patch.EmbeddingDims != nil && *patch.EmbeddingDims <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid embedding_dims: must be a positive integer")
 		return
+	}
+
+	// Validate embedding_base_url: must be an absolute http(s) URL when non-empty.
+	// This prevents a bad URL from persisting to the config file and bricking the
+	// next daemon startup (Load validates at startup; PUT validates at write time).
+	if patch.EmbeddingBaseURL != nil {
+		if msg := validateEmbeddingBaseURL(*patch.EmbeddingBaseURL); msg != "" {
+			writeError(w, http.StatusBadRequest, "invalid "+msg)
+			return
+		}
+	}
+
+	// Validate embedding_auth_header enum.
+	// Note: the model×dims pairing rule (custom model requires explicit dims) cannot
+	// be enforced here — the PUT sees one key at a time and cannot observe the
+	// combined state. That rule is enforced at daemon startup in config.Load.
+	if patch.EmbeddingAuthHeader != nil {
+		if !validEmbeddingAuthHeaders[*patch.EmbeddingAuthHeader] {
+			writeError(w, http.StatusBadRequest,
+				"invalid embedding_auth_header: must be one of \"\", \"authorization\", \"api-key\"")
+			return
+		}
 	}
 
 	restartRequired, err := s.cfgStore.Apply(patch)

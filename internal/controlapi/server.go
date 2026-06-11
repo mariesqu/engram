@@ -150,6 +150,9 @@ type ConfigPatch struct {
 	EmbeddingDims         *int    `json:"embedding_dims,omitempty"`
 	OllamaHost            *string `json:"ollama_host,omitempty"`
 	OllamaModel           *string `json:"ollama_model,omitempty"`
+	EmbeddingBaseURL      *string `json:"embedding_base_url,omitempty"`
+	EmbeddingModel        *string `json:"embedding_model,omitempty"`
+	EmbeddingAuthHeader   *string `json:"embedding_auth_header,omitempty"`
 	// WriterKey, CentralURL, and EncryptedEmbeddingKey must NEVER appear here —
 	// rejected at the handler.
 }
