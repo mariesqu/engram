@@ -65,7 +65,7 @@ func insertAcceptanceRow(t *testing.T, st *localstore.Store, syncID, project, ti
 }
 
 // runBackfill creates a Loop, triggers one pass, waits, and stops.
-func runBackfill(t *testing.T, st *localstore.Store, gated embedding.EmbeddingProvider) {
+func runBackfill(t *testing.T, st *localstore.Store, gated embedding.EmbeddingProvider, mock *recordingMockProvider) {
 	t.Helper()
 	loop := embedding.NewLoop(st, gated, embedding.LoopConfig{
 		Interval:   10 * time.Second,
@@ -77,7 +77,7 @@ func runBackfill(t *testing.T, st *localstore.Store, gated embedding.EmbeddingPr
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(400 * time.Millisecond)
+	waitQuiescent(mock, 600*time.Millisecond, 8*time.Second)
 	loop.Stop()
 }
 
@@ -100,7 +100,7 @@ func TestBackfill_SyncedRows_AllEmbedded(t *testing.T) {
 
 	mock := newRecordingMock(4)
 	gated := embedding.NewGated(mock, st, true /* remote */)
-	runBackfill(t, st, gated)
+	runBackfill(t, st, gated, mock)
 
 	// All 5 rows must be embedded.
 	for i := 0; i < 5; i++ {
@@ -136,7 +136,7 @@ func TestBackfill_OmittedRows_ZeroCalls(t *testing.T) {
 
 	mock := newRecordingMock(4)
 	gated := embedding.NewGated(mock, st, true /* remote */)
-	runBackfill(t, st, gated)
+	runBackfill(t, st, gated, mock)
 
 	// All 3 rows must remain NULL.
 	for i := 0; i < 3; i++ {
@@ -182,7 +182,7 @@ func TestBackfill_Status_Pending_ReachesZero(t *testing.T) {
 	// Run backfill.
 	mock := newRecordingMock(4)
 	gated := embedding.NewGated(mock, st, true)
-	runBackfill(t, st, gated)
+	runBackfill(t, st, gated, mock)
 
 	// Verify pending count is 0 after backfill.
 	after, err := st.CountNullEmbeddings()

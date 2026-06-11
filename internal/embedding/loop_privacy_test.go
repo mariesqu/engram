@@ -81,7 +81,7 @@ func TestLoop_Omitted_RecordingMock_ZeroCalls(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(300 * time.Millisecond)
+	waitFor(8*time.Second, func() bool { return mock.totalTexts() >= 2 })
 	loop.Stop()
 
 	// Synced rows MUST be embedded.
@@ -151,7 +151,7 @@ func TestLoop_LocalOnly_Remote_RecordingMock_ZeroCalls(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(300 * time.Millisecond)
+	waitFor(8*time.Second, func() bool { return mock.totalTexts() >= 1 })
 	loop.Stop()
 
 	// Synced row must be embedded.
@@ -214,7 +214,7 @@ func TestLoop_LocalOnly_Local_ConsentTrue_Embeds(t *testing.T) {
 	defer cancel()
 	loop.Start(ctx)
 	loop.Trigger()
-	time.Sleep(300 * time.Millisecond)
+	waitFor(8*time.Second, func() bool { return mock.totalTexts() >= 2 })
 	loop.Stop()
 
 	// Both rows must have embeddings.
@@ -314,17 +314,19 @@ func TestLoop_PolicyFlip_MidBackfill_PostFlipRowsSkipped(t *testing.T) {
 		})
 	}
 
-	runOnce := func(l *embedding.Loop) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	runOnce := func(l *embedding.Loop, mock *recordingMockProvider) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		l.Start(ctx)
 		l.Trigger()
-		time.Sleep(300 * time.Millisecond)
+		// Quiescence covers both phases: the positive pre-flip run AND the
+		// negative post-flip run (where waiting for a count would never end).
+		waitQuiescent(mock, 600*time.Millisecond, 8*time.Second)
 		l.Stop()
 	}
 
 	// First run: policy is synced; pre-flip rows should be embedded.
-	runOnce(makeLoop())
+	runOnce(makeLoop(), mock)
 
 	if !hasEmbedding(t, st, "pre-flip-1") {
 		t.Error("pre-flip-1 should be embedded (policy was synced)")
@@ -343,7 +345,7 @@ func TestLoop_PolicyFlip_MidBackfill_PostFlipRowsSkipped(t *testing.T) {
 	callsBefore := mock.callCount()
 
 	// Second run: policy is now omitted.
-	runOnce(makeLoop())
+	runOnce(makeLoop(), mock)
 
 	// New rows must NOT be embedded.
 	if hasEmbedding(t, st, "post-flip-1") {
