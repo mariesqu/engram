@@ -83,6 +83,16 @@ func applyDefaults(c Config) Config {
 	return c
 }
 
+// SyncOutcome is the result of the most recent sync cycle, surfaced via
+// Loop.LastResult for the daemon status endpoint. The zero value (At.IsZero(),
+// empty Err) means no cycle has completed yet.
+type SyncOutcome struct {
+	At     time.Time // UTC time the cycle completed; zero when none has run yet
+	Pushed int       // mutations pushed to central this cycle
+	Pulled int       // mutations pulled from central this cycle
+	Err    string    // error string when the cycle failed; empty on success
+}
+
 // Loop runs SyncAllProjects in the background on a periodic schedule with
 // debounced on-demand triggering and exponential backoff on retryable errors.
 //
@@ -122,6 +132,13 @@ type Loop struct {
 	// done is closed by the run goroutine just before it exits, allowing Stop()
 	// to block until the goroutine has fully wound down.
 	done chan struct{}
+
+	// resultMu guards lastResult, the outcome of the most recent completed sync
+	// cycle (exposed via LastResult for the daemon status endpoint). It is
+	// SEPARATE from mu (the lifecycle mutex) so run() never touches the lifecycle
+	// lock — run() locks only resultMu, briefly, to record each cycle's outcome.
+	resultMu   sync.Mutex
+	lastResult SyncOutcome
 }
 
 // NewLoop constructs a Loop. cfg zero values are replaced by defaults.
@@ -163,6 +180,25 @@ func (l *Loop) Trigger() {
 	default:
 		// A trigger is already queued; one sync will handle all pending writes.
 	}
+}
+
+// recordResult stores the outcome of a completed sync cycle so LastResult (and
+// thus the daemon status endpoint) reflects real push/pull counts and errors.
+func (l *Loop) recordResult(pushed, pulled int, err error) {
+	l.resultMu.Lock()
+	defer l.resultMu.Unlock()
+	l.lastResult = SyncOutcome{At: time.Now().UTC(), Pushed: pushed, Pulled: pulled}
+	if err != nil {
+		l.lastResult.Err = err.Error()
+	}
+}
+
+// LastResult returns the outcome of the most recent completed sync cycle. The
+// zero value (At.IsZero()) means no cycle has run yet. Safe for concurrent use.
+func (l *Loop) LastResult() SyncOutcome {
+	l.resultMu.Lock()
+	defer l.resultMu.Unlock()
+	return l.lastResult
 }
 
 // Stop signals the goroutine to exit and blocks until it does.
@@ -237,12 +273,16 @@ func (l *Loop) run(ctx context.Context) {
 			triggered = false // consumed
 
 			pushed, pulled, err := SyncAllProjects(ctx, l.node, l.central)
+			if err != nil && ctx.Err() != nil {
+				// Context cancelled (Stop or parent shutdown) mid-sync: exit
+				// cleanly without recording or logging the cancellation as a
+				// sync failure.
+				return
+			}
+			// Record the outcome so the daemon status endpoint (LastResult)
+			// reports real push/pull counts instead of a hardcoded zero value.
+			l.recordResult(pushed, pulled, err)
 			if err != nil {
-				if ctx.Err() != nil {
-					// Context cancelled (Stop or parent shutdown) mid-sync: exit
-					// cleanly without logging the cancellation as a sync failure.
-					return
-				}
 				if isRetryable(err) {
 					// Exponential backoff: first failure → BackoffMin; subsequent → *2 up to max.
 					if backoff == 0 {

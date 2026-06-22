@@ -6,8 +6,9 @@
 //
 // Routes:
 //
-//	POST /v1/push  — apply one mutation to central (see [handlePush])
-//	POST /v1/pull  — fetch mutations since a given seq (see [handlePull])
+//	POST /v1/push     — apply one mutation to central (see [handlePush])
+//	POST /v1/pull     — fetch mutations since a given seq (see [handlePull])
+//	POST /v1/projects — list the projects central knows (see [handleProjects])
 //
 // # Auth
 //
@@ -192,8 +193,9 @@ func New(c transport.Central, verifier Verifier) *Server {
 //
 // Route table:
 //
-//	POST /v1/push  → auth middleware → [Server.handlePush]
-//	POST /v1/pull  → auth middleware → [Server.handlePull]
+//	POST /v1/push     → auth middleware → [Server.handlePush]
+//	POST /v1/pull     → auth middleware → [Server.handlePull]
+//	POST /v1/projects → auth middleware → [Server.handleProjects]
 //
 // Wrong method on a known path → 405. Unknown path → 404 with the JSON
 // {"error":...} shape (via the "/" catch-all, not the text/plain ServeMux default).
@@ -204,6 +206,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/push", s.methodGuard(http.MethodPost, s.withAuth(s.handlePush)))
 	mux.HandleFunc("/v1/pull", s.methodGuard(http.MethodPost, s.withAuth(s.handlePull)))
+	mux.HandleFunc("/v1/projects", s.methodGuard(http.MethodPost, s.withAuth(s.handleProjects)))
 	// Catch-all: any path not matched by the exact /v1/* routes above gets a JSON
 	// 404 instead of net/http's default text/plain "404 page not found".
 	mux.HandleFunc("/", s.handleNotFound)
@@ -401,6 +404,47 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, syncwire.PullResponse{Mutations: wires})
+}
+
+// projectLister is the OPTIONAL capability a [transport.Central] may implement to
+// enumerate the projects central knows. *centralstore.Store satisfies it; a mock
+// that does not causes /v1/projects to return 501 (project discovery is an
+// additive capability, not part of the core Central contract).
+type projectLister interface {
+	ListProjects(ctx context.Context) ([]string, error)
+}
+
+// handleProjects processes a POST /v1/projects request.
+//
+// Pipeline:
+//  1. Auth middleware (runs before this handler via withAuth).
+//  2. Decode JSON body into [syncwire.ProjectsRequest] (currently empty).
+//  3. Capability check: the wrapped Central must implement projectLister → else 501.
+//  4. ListProjects → error → 500. Success → 200 with [syncwire.ProjectsResponse].
+//
+// This is the server side of new-project pull discovery: clients union the
+// returned set with their locally-known projects so they pull projects that
+// originated on other writers.
+func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
+	var req syncwire.ProjectsRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+
+	lister, ok := s.central.(projectLister)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "project discovery not supported")
+		return
+	}
+
+	projects, err := lister.ListProjects(r.Context())
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "cloudserve: ListProjects failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, syncwire.ProjectsResponse{Projects: projects})
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

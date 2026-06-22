@@ -988,8 +988,8 @@ type runtimeSyncAdapter struct {
 	loop       *syncer.Loop    // nil in local-only mode; replaced on Reconnect
 	ctx        context.Context // daemon's root context (for new Loop.Start on reconnect)
 	node       *syncer.Node
-	// lastSyncResult is updated by the loop callbacks (future PR — for now zero value).
-	// PR-③ wires the loop to report results; for the daemon test this is enough.
+	// The last sync result is read LIVE from the Loop via Loop.LastResult() in
+	// Status() (see lastSyncResultLocked) — there is no cached field here.
 	connected  bool // mirrors loop != nil && centralURL != ""
 	centralURL string
 	actualPort int // the actual bound port (for Status.CentralURL etc.)
@@ -1030,13 +1030,34 @@ func newRuntimeSyncAdapter(
 	return a
 }
 
+// lastSyncResultLocked maps the live Loop's most recent outcome into the
+// control-API SyncResult. Caller MUST hold a.mu (it reads a.loop). Returns the
+// zero value (at=null, pushed=0, pulled=0, error=null) when no loop is
+// configured or no cycle has completed yet.
+func (a *runtimeSyncAdapter) lastSyncResultLocked() controlapi.SyncResult {
+	if a.loop == nil {
+		return controlapi.SyncResult{}
+	}
+	out := a.loop.LastResult()
+	if out.At.IsZero() {
+		return controlapi.SyncResult{}
+	}
+	at := out.At
+	res := controlapi.SyncResult{At: &at, Pushed: out.Pushed, Pulled: out.Pulled}
+	if out.Err != "" {
+		e := out.Err
+		res.Error = &e
+	}
+	return res
+}
+
 func (a *runtimeSyncAdapter) Status() controlapi.Status {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	st := controlapi.Status{
 		CentralConnected: a.connected,
-		LastSyncResult:   controlapi.SyncResult{},
+		LastSyncResult:   a.lastSyncResultLocked(),
 		DaemonVersion:    version,
 	}
 	if a.centralURL != "" {

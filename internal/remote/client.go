@@ -75,6 +75,16 @@ func (e *StatusError) Retryable() bool {
 	return e.Code >= 500
 }
 
+// StatusCode returns the HTTP status code the server responded with. It lets
+// callers in OTHER packages classify a specific status — e.g. a 501 meaning a
+// capability is absent — WITHOUT importing this package. syncer.SyncAllProjects
+// uses it via a duck-typed interface to detect an older central that does not
+// implement project discovery, so that a 501 there is treated as "capability
+// absent" rather than a retryable sync failure.
+func (e *StatusError) StatusCode() int {
+	return e.Code
+}
+
 // Client implements [transport.Central] over HTTP.
 // Construct it with [New]; it is safe for concurrent use — the underlying
 // *http.Client handles connection pooling.
@@ -247,4 +257,50 @@ func (c *Client) PullSince(ctx context.Context, project string, sinceSeq int64, 
 		mutations = append(mutations, m)
 	}
 	return mutations, nil
+}
+
+// ListProjects fetches the distinct set of projects central knows (POST
+// /v1/projects, HMAC-signed like push/pull). It is the client side of
+// new-project pull discovery: [syncer.SyncAllProjects] unions these with the
+// node's locally-known projects so the node pulls projects that originated on
+// OTHER writers and were never written locally.
+//
+// Satisfies the optional projectLister capability used by SyncAllProjects. On
+// any non-2xx status a [*StatusError] is returned (a 501 means the server's
+// Central does not support discovery — the caller falls back to local-only
+// projects). ctx cancellation is propagated as in [Apply] and [PullSince].
+func (c *Client) ListProjects(ctx context.Context) ([]string, error) {
+	body, err := json.Marshal(syncwire.ProjectsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("remote.ListProjects: marshal ProjectsRequest: %w", err)
+	}
+
+	req, err := c.buildRequest(ctx, http.MethodPost, "/v1/projects", body)
+	if err != nil {
+		return nil, fmt.Errorf("remote.ListProjects: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("remote.ListProjects: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("remote.ListProjects: read response body: %w", err)
+	}
+	if len(respBody) > maxResponseBytes {
+		return nil, fmt.Errorf("remote.ListProjects: response body exceeds cap of %d bytes", maxResponseBytes)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var pr syncwire.ProjectsResponse
+	if err := json.Unmarshal(respBody, &pr); err != nil {
+		return nil, fmt.Errorf("remote.ListProjects: decode ProjectsResponse: %w", err)
+	}
+	return pr.Projects, nil
 }

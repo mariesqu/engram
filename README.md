@@ -116,6 +116,51 @@ The SQLite file is created automatically on first run. Schema migrations are app
 
 Central sync requires a running Postgres instance and an `engram serve` process. Each writer node needs its own HMAC key.
 
+### Provisioning Postgres
+
+`engram serve` connects to an **existing** Postgres database — it does NOT create the database, a role, or a schema for you, and it runs DDL (`CREATE TABLE`, `ALTER TABLE … ADD/DROP COLUMN`, `CREATE INDEX`) on every `serve`/`keys` startup to apply and migrate its schema idempotently. There are two deployment shapes.
+
+**Dev — a database you own.** Spin up a throwaway Postgres (local install or container), create a database, and point `ENGRAM_DSN` at it as a superuser or the database owner. Nothing else is required:
+
+```bash
+createdb engram
+export ENGRAM_DSN="postgres://you@localhost:5432/engram?sslmode=disable"
+```
+
+**Enterprise — a shared instance, least privilege.** On a shared or managed Postgres (RDS, Aurora, Cloud SQL, …) give engram its own dedicated **schema** and a scoped role, so it never touches `public` and can be locked to just its own objects. engram's DDL is schema-unqualified, so a `search_path` steers every object into the dedicated schema — no code change required:
+
+```sql
+-- Run once as a Postgres admin:
+CREATE ROLE engram_user LOGIN PASSWORD '<strong-password>';
+GRANT CONNECT ON DATABASE <your_db> TO engram_user;
+
+-- engram does NOT create the schema — pre-create it; engram_user owns the tables it creates.
+CREATE SCHEMA IF NOT EXISTS engram;
+GRANT USAGE, CREATE ON SCHEMA engram TO engram_user;
+
+-- Steer every engram connection into that schema (scoped to this database only).
+ALTER ROLE engram_user IN DATABASE <your_db> SET search_path = engram;
+```
+
+```bash
+export ENGRAM_DSN="postgres://engram_user:<password>@<host>:5432/<your_db>?sslmode=require"
+```
+
+Gotchas worth knowing up front:
+
+- **Scoped creds need DDL rights, not just DML.** `ApplySchema` runs `CREATE`/`ALTER`/`DROP` on every `serve` and `keys` startup. `GRANT USAGE, CREATE ON SCHEMA` is sufficient — the role creates and therefore owns its own tables, so `ALTER`/`DROP` succeed. A `SELECT/INSERT/UPDATE`-only grant fails at startup.
+- **`CREATE SCHEMA … AUTHORIZATION other_role` requires role membership** and fails with `42501` on managed Postgres where the admin is not a superuser. Use plain `CREATE SCHEMA` + `GRANT` (as above) instead.
+- **`search_path` alternatives** if you cannot `ALTER ROLE`: append `?options=-c%20search_path%3Dengram` to the DSN, or set the `PGOPTIONS` environment variable to `-c search_path=engram` — pgx honors both.
+- **TLS:** managed instances usually require `sslmode=require` (or stricter).
+
+Verify the schema landed where you expect (7 tables, none in `public`):
+
+```sql
+SELECT tablename FROM pg_tables WHERE schemaname = 'engram' ORDER BY tablename;
+-- central_memories, central_mutations, central_prompt_tombstones,
+-- central_tombstones, central_user_prompts, cloud_sync_audit, cloud_writer_keys
+```
+
 ### 1. Start the central server
 
 ```bash
@@ -346,6 +391,12 @@ Each project has an effective sync policy that controls how its observations mov
 - `local-only` → `synced`: queued outbox entries drain on the next push cycle. No manual intervention required.
 - `synced` → `local-only`: push and pull stop immediately. Observations already on central remain there unchanged.
 - Any → `omitted`: future writes are refused. Pre-existing data is unaffected.
+
+**Cross-node project discovery**
+
+A synced node pulls **every** project central knows — including projects that originated on another node and were never written locally. On each sync cycle the daemon asks central for its full project set and unions it with the projects it already has, so a fresh machine mirrors the whole corpus without you seeding anything. A project is excluded from this only when *that node* has explicitly set its policy to `local-only` or `omitted` before the project first syncs; a project with no local policy defaults to `synced` and is pulled.
+
+> **Shared-central visibility:** because discovery is global, on a central shared by multiple writers every node learns and mirrors every other writer's projects. That is the intended "one corpus, everywhere" model — but if a central is shared across teams or tenants who should NOT see each other's memories, give each tenant its own central (or its own dedicated schema/database), or pre-set the unwanted projects to `omitted` on each node before they sync.
 
 **CLI**
 
