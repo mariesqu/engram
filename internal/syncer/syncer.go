@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/localstore"
@@ -234,6 +235,34 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 	}
 
 	var errs []error
+
+	// New-project pull discovery: ListProjects above reads only the LOCAL store,
+	// so a node would never pull a project it has not written to itself. To honor
+	// the "mirror every project" contract, also discover projects that exist on
+	// central — written by OTHER writers and never seen locally — and union them
+	// in, so this node pulls them too. The capability is OPTIONAL: a Central that
+	// does not implement projectLister (e.g. a lightweight test stub) yields no
+	// central projects and pull stays purely local-driven (older behaviour).
+	if lister, ok := central.(projectLister); ok {
+		centralProjects, derr := lister.ListProjects(ctx)
+		switch {
+		case derr == nil:
+			projects = unionProjects(projects, centralProjects)
+		case isDiscoveryUnsupported(derr):
+			// The central server predates project discovery (HTTP 501). That is NOT
+			// a sync failure: this node simply pulls its locally-known projects this
+			// cycle. Crucially we do NOT append to errs — a 501 is >= 500 and would
+			// otherwise be classified retryable, wedging the Loop into permanent
+			// backoff (and a permanent error status) against any older central in a
+			// mixed-version fleet.
+		default:
+			// A genuine discovery failure (network, 5xx, auth) is recorded so the
+			// Loop can classify retryability and back off, but we still pull the
+			// locally-known projects this cycle rather than aborting the round.
+			errs = append(errs, fmt.Errorf("SyncAllProjects %s: discover central projects: %w", n.Name, derr))
+		}
+	}
+
 	for _, proj := range projects {
 		// Pull filter: skip projects that are not synced.
 		pol, polErr := n.Store.GetPolicy(proj)
@@ -262,6 +291,63 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 		return pushed, pulled, &syncAllError{errs: errs}
 	}
 	return pushed, pulled, nil
+}
+
+// projectLister is the OPTIONAL capability a [Central] may implement to
+// enumerate the projects central knows (across all writers). When the transport
+// supports it, SyncAllProjects unions central's projects with the node's local
+// projects so a node pulls projects that originated elsewhere and were never
+// written locally. *remote.Client and *centralstore.Store both satisfy it;
+// lightweight test doubles need not. Mirrors the structural-typing pattern used
+// by retryabler — an additive capability without widening the core Central port.
+type projectLister interface {
+	ListProjects(ctx context.Context) ([]string, error)
+}
+
+// statusCoder is the OPTIONAL HTTP-status accessor implemented by
+// remote.StatusError. SyncAllProjects uses it to detect a 501 (an older central
+// without project discovery) WITHOUT importing internal/remote — the same
+// structural-typing approach as retryabler and projectLister.
+type statusCoder interface {
+	StatusCode() int
+}
+
+// httpStatusNotImplemented mirrors net/http.StatusNotImplemented (501) without
+// pulling net/http into this transport-agnostic package.
+const httpStatusNotImplemented = 501
+
+// isDiscoveryUnsupported reports whether err is central signalling that it does
+// not implement project discovery (HTTP 501). Such an error must NOT be treated
+// as a retryable sync failure — otherwise an older central would wedge the Loop
+// into permanent backoff. See SyncAllProjects.
+func isDiscoveryUnsupported(err error) bool {
+	var sc statusCoder
+	if errors.As(err, &sc) {
+		return sc.StatusCode() == httpStatusNotImplemented
+	}
+	return false
+}
+
+// unionProjects merges two project-name slices into a sorted, de-duplicated set,
+// dropping the empty string. Sorting keeps pull order stable across cycles and
+// makes tests reproducible.
+func unionProjects(local, central []string) []string {
+	seen := make(map[string]struct{}, len(local)+len(central))
+	out := make([]string, 0, len(local)+len(central))
+	for _, group := range [][]string{local, central} {
+		for _, p := range group {
+			if p == "" {
+				continue
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // syncAllError is a multi-error returned by SyncAllProjects when one or more

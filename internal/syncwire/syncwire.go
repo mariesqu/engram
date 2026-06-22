@@ -223,3 +223,16 @@ type PullRequest struct {
 type PullResponse struct {
 	Mutations []WireMutation `json:"mutations"`
 }
+
+// ProjectsRequest is the body of a POST /v1/projects request (client → server).
+// It carries no parameters today — central's project set is global — but exists
+// so the request is a valid single JSON document that can be HMAC-signed and
+// decoded with the same discipline as push/pull.
+type ProjectsRequest struct{}
+
+// ProjectsResponse is the body returned by POST /v1/projects: the distinct set
+// of project names central knows, sorted ascending. The client unions these with
+// its locally-known projects to drive new-project pull discovery.
+type ProjectsResponse struct {
+	Projects []string `json:"projects"`
+}
