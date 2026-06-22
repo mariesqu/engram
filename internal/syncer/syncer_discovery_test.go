@@ -366,28 +366,36 @@ func TestSyncAllProjects_DiscoveryError_StillPullsLocal(t *testing.T) {
 	}
 }
 
-// TestSyncAllProjects_DiscoveryUnsupported501_NotFatal proves the C1 fix: a 501
-// from central's ListProjects (an OLDER central without project discovery) is
-// treated as "capability absent" — NOT a sync failure. SyncAllProjects must
-// return nil error (so the Loop does not back off / report a perpetual error),
-// while still pulling the locally-known projects.
-func TestSyncAllProjects_DiscoveryUnsupported501_NotFatal(t *testing.T) {
-	ctx := context.Background()
-	node := openNode(t, "disc-501") // seeds "testproject"
+// TestSyncAllProjects_DiscoveryUnsupported_NotFatal proves the capability-absent
+// handling: when central's ListProjects reports that discovery is unsupported,
+// it must NOT be treated as a sync failure. SyncAllProjects must return nil error
+// (so the Loop does not back off / report a perpetual error) while still pulling
+// the locally-known projects. Both statuses must be covered:
+//   - 404: an OLDER central whose catch-all returns 404 for the unregistered
+//     /v1/projects route — the REAL mixed-version case.
+//   - 501: a capability-gated handler ("not supported").
+func TestSyncAllProjects_DiscoveryUnsupported_NotFatal(t *testing.T) {
+	for _, code := range []int{404, 501} {
+		code := code
+		t.Run(itoa(code), func(t *testing.T) {
+			ctx := context.Background()
+			node := openNode(t, "disc-unsupported-"+itoa(code)) // seeds "testproject"
 
-	stub := &discoveryProjectCentral{
-		pullResults: map[string][]domain.Mutation{"testproject": {}},
-		listErr:     &statusErr{code: 501, msg: "not implemented"},
-	}
+			stub := &discoveryProjectCentral{
+				pullResults: map[string][]domain.Mutation{"testproject": {}},
+				listErr:     &statusErr{code: code, msg: "unsupported"},
+			}
 
-	if _, _, err := syncer.SyncAllProjects(ctx, node, stub); err != nil {
-		t.Fatalf("a 501 from discovery must NOT be a sync error (older central); got %v", err)
-	}
+			if _, _, err := syncer.SyncAllProjects(ctx, node, stub); err != nil {
+				t.Fatalf("a %d from discovery must NOT be a sync error (older central); got %v", code, err)
+			}
 
-	// Local projects are still pulled — discovery being unavailable does not stop
-	// the node syncing the projects it already knows.
-	if !contains(stub.getPullCalled(), "testproject") {
-		t.Errorf("local project testproject was not pulled; called=%v", stub.getPullCalled())
+			// Local projects are still pulled — discovery being unavailable does not
+			// stop the node syncing the projects it already knows.
+			if !contains(stub.getPullCalled(), "testproject") {
+				t.Errorf("local project testproject was not pulled; called=%v", stub.getPullCalled())
+			}
+		})
 	}
 }
 

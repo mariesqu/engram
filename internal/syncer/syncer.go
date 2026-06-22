@@ -249,12 +249,13 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 		case derr == nil:
 			projects = unionProjects(projects, centralProjects)
 		case isDiscoveryUnsupported(derr):
-			// The central server predates project discovery (HTTP 501). That is NOT
-			// a sync failure: this node simply pulls its locally-known projects this
-			// cycle. Crucially we do NOT append to errs — a 501 is >= 500 and would
-			// otherwise be classified retryable, wedging the Loop into permanent
-			// backoff (and a permanent error status) against any older central in a
-			// mixed-version fleet.
+			// The central server does not implement project discovery — either an
+			// OLDER central whose catch-all returns 404 for the unregistered
+			// /v1/projects route (the real mixed-version case), or a 501 from a
+			// capability-gated handler. Neither is a sync failure: this node simply
+			// pulls its locally-known projects this cycle. Crucially we do NOT append
+			// to errs — otherwise every cycle would report a spurious failed sync
+			// (and a 501, being >= 500, would wedge the Loop into permanent backoff).
 		default:
 			// A genuine discovery failure (network, 5xx, auth) is recorded so the
 			// Loop can classify retryability and back off, but we still pull the
@@ -312,18 +313,34 @@ type statusCoder interface {
 	StatusCode() int
 }
 
-// httpStatusNotImplemented mirrors net/http.StatusNotImplemented (501) without
-// pulling net/http into this transport-agnostic package.
-const httpStatusNotImplemented = 501
+// HTTP statuses that mean "this central does not implement project discovery,"
+// mirrored here without importing net/http into this transport-agnostic package:
+//   - 404: an OLDER central predating /v1/projects — its catch-all returns a JSON
+//     404 for the unregistered route. This is the REAL mixed-version case (a real
+//     central always has its store implement ListProjects, so it never 501s).
+//   - 501: the route exists but the wrapped Central does not implement the
+//     capability (handleProjects' explicit "not supported").
+const (
+	httpStatusNotFound       = 404
+	httpStatusNotImplemented = 501
+)
 
 // isDiscoveryUnsupported reports whether err is central signalling that it does
-// not implement project discovery (HTTP 501). Such an error must NOT be treated
-// as a retryable sync failure — otherwise an older central would wedge the Loop
-// into permanent backoff. See SyncAllProjects.
+// not implement project discovery — a 404 from an older central's catch-all for
+// the unregistered /v1/projects route, or a 501 from a capability-gated handler.
+// Such an error must NOT be treated as a sync failure: otherwise every cycle
+// against an older central would report a spurious error (and a 501, being >= 500,
+// would wedge the Loop into permanent backoff). See SyncAllProjects.
+//
+// Scoping note: this predicate is applied ONLY to the discovery (ListProjects)
+// error. A wrong base URL or a down server fails push/pull FIRST (push
+// short-circuits the cycle), so reaching discovery means the transport works and
+// a 404 there unambiguously means the route is absent — not a misroute.
 func isDiscoveryUnsupported(err error) bool {
 	var sc statusCoder
 	if errors.As(err, &sc) {
-		return sc.StatusCode() == httpStatusNotImplemented
+		code := sc.StatusCode()
+		return code == httpStatusNotFound || code == httpStatusNotImplemented
 	}
 	return false
 }
