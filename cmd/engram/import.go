@@ -30,6 +30,8 @@ Flags:
   --db        Path to the current-generation destination database.
               Required; or set ENGRAM_DB.
   --dry-run   Count what WOULD be imported without writing anything.
+  --writer-id Writer identity stamped on imported records.
+              Default: ENGRAM_WRITER_ID, else "import".
 
 Output:
   A summary table showing sessions, memories, and prompts imported, skipped
