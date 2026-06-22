@@ -32,7 +32,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Features
 
-- **9 MCP tools** for session tracking, memory write, search, and conflict resolution
+- **10 MCP tools** for session tracking, memory write, search, similarity, and conflict resolution
 - **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
 - **Local-only mode** — no network, no credentials required
 - **Optional central sync** — push/pull over HTTP with HMAC-SHA256 per-writer authentication
@@ -502,6 +502,7 @@ engram projects policy [--db <path>] <project> <policy>
 engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
+engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
 engram version
 ```
 
@@ -515,11 +516,12 @@ link time (see [RELEASING.md](RELEASING.md)).
 |-----------------------|--------------------------------------|----------|------------------------------------------------------------------|
 | `ENGRAM_ADDR`         | `serve`                              | `:8080`  | Listen address for the central HTTP server                       |
 | `ENGRAM_DSN`          | `serve`, `keys`                      | —        | Postgres DSN (required)                                          |
-| `ENGRAM_DB`           | `daemon`, `status`, `ui`, `tray`, `projects`, `config`, `sync` | — | Path to the local SQLite database (required) |
+| `ENGRAM_DB`           | `daemon`, `status`, `ui`, `tray`, `projects`, `config`, `sync`, `import` | — | Path to the local SQLite database (required) |
 | `ENGRAM_CENTRAL_URL`  | `daemon`                             | —        | Central server URL; omit for local-only mode                     |
-| `ENGRAM_WRITER_ID`    | `daemon`                             | —        | Writer identity; required when `ENGRAM_CENTRAL_URL` is set       |
+| `ENGRAM_WRITER_ID`    | `daemon`, `import`                   | —        | Writer identity; required for `daemon` when `ENGRAM_CENTRAL_URL` is set; default writer stamp for `import` (else `import`) |
 | `ENGRAM_WRITER_KEY`   | `daemon`                             | —        | Hex-encoded 32-byte HMAC key; **env only**; required with sync   |
 | `ENGRAM_SYNC_INTERVAL`| `daemon`                             | `30s`    | Autosync cadence (Go duration string, e.g. `1m`, `30s`)          |
+| `ENGRAM_TRANSPORT`    | `daemon`                             | `stdio`  | MCP transport mode: `stdio` or `http` (requires `--http`)        |
 | `ENGRAM_CONFIG_DIR`   | `daemon`                             | platform | Override the config file directory (see Config file section)     |
 
 Flags take precedence over environment variables. `ENGRAM_WRITER_KEY` has no corresponding flag and always takes precedence over the file-stored key.
@@ -602,7 +604,7 @@ If project auto-detection picks the wrong name (e.g. in a monorepo), create `.en
 
 ## MCP tools
 
-The daemon exposes 9 tools to the connected agent.
+The daemon exposes 10 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
@@ -612,6 +614,7 @@ The daemon exposes 9 tools to the connected agent.
 | `mem_save_prompt`     | Save the user's prompt text so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID                |
 | `mem_search`          | Search observations; supports `mode` param: `""` (FTS), `"semantic"`, or `"hybrid"` |
+| `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
 | `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
@@ -905,6 +908,7 @@ Imported rows arrive with `NULL` embeddings. The embedding backfill loop (which 
 | `--from` | `~/.engram/engram.db` | Path to the old-generation source database. |
 | `--db` | _(required)_ | Path to the current-generation destination database (or set `ENGRAM_DB`). |
 | `--dry-run` | `false` | Count what would be imported without writing anything. |
+| `--writer-id` | `$ENGRAM_WRITER_ID`, else `import` | Writer identity stamped on imported records. Set this to the node's central writer-id so pushed rows authenticate under a provisioned HMAC key. |
 
 ## Acknowledgments
 
