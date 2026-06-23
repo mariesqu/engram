@@ -32,7 +32,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Features
 
-- **12 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, and conflict resolution
+- **14 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, lifecycle review, project merge, and conflict resolution
 - **Human memory management** — browse, search, edit, and delete memories, and delete whole projects (local / unshare / purge-all), from both the CLI and the web UI
 - **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
 - **Local-only mode** — no network, no credentials required
