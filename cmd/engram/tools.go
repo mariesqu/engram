@@ -16,6 +16,7 @@ import (
 	"github.com/mariesqu/engram/internal/localstore"
 	projectpkg "github.com/mariesqu/engram/internal/project"
 	"github.com/mariesqu/engram/internal/syncer"
+	"github.com/mariesqu/engram/internal/topickey"
 )
 
 // resolveReadProject resolves the project for a READ tool call. Unlike write
@@ -191,6 +192,61 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			),
 		),
 		handleGetObservation(store),
+	)
+
+	// ── mem_update ───────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_update",
+			mcp.WithDescription(`Edit an existing memory in place by its observation ID. Use this to correct or revise a SPECIFIC memory you already know the ID of (from mem_search or mem_get_observation) — e.g. fixing a wrong detail or refining wording.
+
+Provide the id plus the field(s) to change: title and/or content (and optionally type). Omitted fields keep their current value. The edit is versioned (version+1), propagates to central on the next sync, and the content is re-embedded for semantic search.
+
+For an EVOLVING topic, prefer mem_save with a topic_key (upsert). Use mem_update when you need to edit one specific observation by its ID.`),
+			mcp.WithTitleAnnotation("Update Memory"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithNumber("id",
+				mcp.Required(),
+				mcp.Description("The observation ID to edit (from mem_search or mem_get_observation)"),
+			),
+			mcp.WithString("title",
+				mcp.Description("New title. Omit to keep the current title."),
+			),
+			mcp.WithString("content",
+				mcp.Description("New content. Omit to keep the current content."),
+			),
+			mcp.WithString("type",
+				mcp.Description("New type/category (decision, bugfix, pattern, …). Omit to keep the current type."),
+			),
+		),
+		handleUpdate(store, loop, embedLoop, writerID),
+	)
+
+	// ── mem_suggest_topic_key ────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_suggest_topic_key",
+			mcp.WithDescription(`Suggest a STABLE topic_key for a memory you are about to save, so re-saving the same topic in a later session UPSERTS the existing chain instead of creating a near-duplicate.
+
+The suggestion is deterministic — the same title/type/content always yields the same "family/segment" key (e.g. "architecture/auth-model"). Call this when you intend to use a topic_key but want a consistent one across sessions, then pass the returned value as mem_save's topic_key.`),
+			mcp.WithTitleAnnotation("Suggest Topic Key"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("title",
+				mcp.Required(),
+				mcp.Description("The memory's title — the primary source of the key segment"),
+			),
+			mcp.WithString("type",
+				mcp.Description("The memory's type/category (decision, bugfix, architecture, …) — informs the key family"),
+			),
+			mcp.WithString("content",
+				mcp.Description("Optional content; helps infer the family and is a fallback segment when the title is empty"),
+			),
+		),
+		handleSuggestTopicKey(),
 	)
 
 	// ── mem_search ───────────────────────────────────────────────────────────
@@ -665,6 +721,91 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		)
 
 		return mcp.NewToolResultText(text), nil
+	}
+}
+
+// handleUpdate returns the handler for mem_update. It edits a live observation
+// in place by ID, filling any omitted field from the current record, then writes
+// a versioned OpUpsert via store.UpdateMemory (materialized + enqueued for push).
+// The sync and embedding-backfill triggers are nil-safe (local-only / no-provider).
+func handleUpdate(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, writerID string) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		// id parsing mirrors mem_get_observation: the MCP SDK delivers JSON numbers
+		// as float64, so reject non-integer / out-of-range values explicitly.
+		rawID, ok := args["id"]
+		if !ok {
+			return mcp.NewToolResultError("mem_update: id is required"), nil
+		}
+		idFloat, ok := rawID.(float64)
+		if !ok {
+			return mcp.NewToolResultError("mem_update: id must be a number"), nil
+		}
+		if idFloat != math.Trunc(idFloat) || idFloat <= 0 || idFloat >= float64(math.MaxInt64) {
+			return mcp.NewToolResultError("mem_update: id must be a positive integer"), nil
+		}
+		id := int64(idFloat)
+
+		title, _ := args["title"].(string)
+		content, _ := args["content"].(string)
+		typ, _ := args["type"].(string)
+		if strings.TrimSpace(title) == "" && strings.TrimSpace(content) == "" && strings.TrimSpace(typ) == "" {
+			return mcp.NewToolResultError("mem_update: provide at least one of title, content, or type to change"), nil
+		}
+
+		// Fetch the current record to confirm it is live and to fill omitted fields.
+		rec, err := store.GetObservation(id)
+		if err != nil {
+			if errors.Is(err, localstore.ErrObservationNotFound) {
+				return mcp.NewToolResultError(fmt.Sprintf("mem_update: observation #%d not found", id)), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("mem_update: %s", err)), nil
+		}
+		if strings.TrimSpace(title) == "" {
+			title = rec.Title
+		}
+		if strings.TrimSpace(content) == "" {
+			content = rec.Content
+		}
+		// typ "" → UpdateMemory preserves the existing type.
+
+		updated, err := store.UpdateMemory(id, title, content, typ, writerID)
+		if err != nil {
+			if errors.Is(err, localstore.ErrObservationNotFound) {
+				return mcp.NewToolResultError(fmt.Sprintf("mem_update: observation #%d not found", id)), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("mem_update: failed to update: %s", err)), nil
+		}
+
+		// Propagate to central and re-embed the changed content (both nil-safe).
+		triggerSync(loop)
+		embedLoop.Trigger()
+
+		topic := ""
+		if updated.TopicKey != nil {
+			topic = fmt.Sprintf("\nTopic: %s", *updated.TopicKey)
+		}
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Updated memory #%d [%s] %s\nVersion: %d\nProject: %s%s",
+			id, updated.Type, updated.Title, updated.Version, updated.Project, topic,
+		)), nil
+	}
+}
+
+// handleSuggestTopicKey returns the handler for mem_suggest_topic_key. It is a
+// pure, read-only suggestion (no store access), so independent sessions converge
+// on the same deterministic topic_key for the same input.
+func handleSuggestTopicKey() mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+		title, _ := args["title"].(string)
+		if strings.TrimSpace(title) == "" {
+			return mcp.NewToolResultError("mem_suggest_topic_key: title is required"), nil
+		}
+		typ, _ := args["type"].(string)
+		content, _ := args["content"].(string)
+		return mcp.NewToolResultText(topickey.Suggest(typ, title, content)), nil
 	}
 }
 
