@@ -669,6 +669,54 @@ If project auto-detection picks the wrong name (e.g. in a monorepo), create `.en
 { "project_name": "my-project" }
 ```
 
+## Using engram from your agent
+
+Wiring the daemon as an MCP server makes the tools available — but the agent won't use them proactively unless its instructions say so. This section describes the protocol to add to your agent's instruction file. Copy [docs/agent-instructions.md](docs/agent-instructions.md) into your CLAUDE.md, AGENTS.md, .cursorrules, or whichever file your client reads as system-level instructions.
+
+The protocol works with any MCP-capable agent (Claude Code, Cursor, OpenCode, or any client that exposes MCP tools to its model).
+
+### Save proactively — don't wait to be asked
+
+The agent should call `mem_save` immediately after any of the following events, without the user asking:
+
+- A design or architecture decision was made (including tradeoffs)
+- A bug was fixed — save the root cause and the file(s) changed
+- A new convention or pattern was established
+- A tool, library, or framework choice was made
+- A configuration or environment change was completed
+- A non-obvious codebase discovery, gotcha, or edge case was found
+
+**Format for `mem_save`:** a short searchable `title` (verb + what, e.g. "Fixed N+1 query in UserList"), a `type` (`decision` | `bugfix` | `architecture` | `pattern` | `config` | `discovery`), and structured `content` with **What / Why / Where / Learned** fields.
+
+### Search to recall
+
+When the user references past work ("remember…", "how did we…", "what was the reason for…"), or when starting a task that may have prior context:
+
+1. Call `mem_context` first — assembles recent sessions and observations quickly
+2. If not found, call `mem_search` with relevant keywords
+3. If a hit looks relevant, call `mem_get_observation` with its numeric ID — search results are truncated, the observation endpoint returns the full content
+
+Also search proactively on the user's first message in a session when it references a project, feature, or problem.
+
+### Session lifecycle
+
+- **Start:** call `mem_session_start` to register the session and resolve the active project name
+- **End:** call `mem_session_summary` before saying "done" — with Goal, Discoveries, Accomplished, Next Steps, and Relevant Files. Skipping this leaves the next session with no context
+
+### Prompt capture
+
+If you can observe the user's prompt before saving derived memories, call `mem_save_prompt` first. This records the prompt so subsequent `mem_save` calls can auto-attach it to the observation.
+
+### Conflict resolution
+
+When `mem_save` returns a response with `judgment_required: true`, a post-save similarity scan found candidate conflicts. Call `mem_judge` with the `judgment_id` from the response and one of: `related`, `compatible`, `scoped`, `conflicts_with`, `supersedes`, or `not_conflict`.
+
+### After compaction
+
+If the agent's context is cleared or compacted, the persistent store is unaffected. Call `mem_context` to recover recent session history, then `mem_get_observation` for full detail on any specific entry.
+
+---
+
 ## MCP tools
 
 The daemon exposes 10 tools to the connected agent.
