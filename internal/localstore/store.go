@@ -90,6 +90,13 @@ type Store struct {
 	// embedDims is the dimensionality expected from embedFn. Used by SelectVectors
 	// to filter out dimension-mismatched BLOBs. Set alongside embedFn.
 	embedDims int
+
+	// reviewWindowDays is the memory-lifecycle staleness window in days, used by
+	// the review.go status computation and MarkReviewed. It defaults to 30 and is
+	// overridden from config via SetReviewWindowDays in daemon wiring. Read under
+	// reviewMu so a runtime set is safe. A value <= 0 is normalized to 30.
+	reviewWindowDays int
+	reviewMu         sync.RWMutex
 }
 
 // Open opens (or creates) the SQLite database at path, applies WAL pragmas,
@@ -157,6 +164,27 @@ func (s *Store) SetEmbedFn(fn EmbedQueryFn, dims int) {
 	s.embedFn = fn
 	s.embedDims = dims
 	s.embedFnMu.Unlock()
+}
+
+// SetReviewWindowDays installs the memory-lifecycle staleness window (in days)
+// used by ReviewStatus / ListForReview / MarkReviewed. A value <= 0 is
+// normalized to the default (30) on read. SAFE for concurrent use.
+func (s *Store) SetReviewWindowDays(days int) {
+	s.reviewMu.Lock()
+	s.reviewWindowDays = days
+	s.reviewMu.Unlock()
+}
+
+// reviewWindow returns the effective staleness window in days, defaulting to 30
+// when unset or non-positive.
+func (s *Store) reviewWindow() int {
+	s.reviewMu.RLock()
+	d := s.reviewWindowDays
+	s.reviewMu.RUnlock()
+	if d <= 0 {
+		return 30
+	}
+	return d
 }
 
 // Close releases the underlying database connection.
