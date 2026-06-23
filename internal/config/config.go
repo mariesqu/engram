@@ -182,6 +182,10 @@ type fileConfig struct {
 	// "api-key"            → api-key: <key> (Azure OpenAI classic surface).
 	// Restart-required.
 	EmbeddingAuthHeader string `json:"embedding_auth_header,omitempty"`
+	// ReviewWindowDays is the memory-lifecycle staleness window in days. A memory
+	// is considered "needs_review" once now > COALESCE(review_after, updated_at +
+	// window). 0/unset → default 30; any value <= 0 is treated as the default.
+	ReviewWindowDays int `json:"review_window_days,omitempty"`
 }
 
 // Config is the resolved, decoded in-memory configuration. The writer key is
@@ -235,6 +239,10 @@ type Config struct {
 	// "" or "authorization" → Authorization: Bearer <key> (default).
 	// "api-key"            → api-key: <key> (Azure classic).
 	EmbeddingAuthHeader string
+
+	// ReviewWindowDays is the memory-lifecycle staleness window in days.
+	// 0 means "use default" (30). The store treats any value <= 0 as 30.
+	ReviewWindowDays int
 
 	// embeddingKeyActive records whether an embedding key is available at
 	// runtime — either from ENGRAM_EMBEDDING_KEY env var OR from the stored
@@ -417,6 +425,8 @@ func Load(dir string) (Config, error) {
 	}
 	cfg.EmbeddingAuthHeader = fc.EmbeddingAuthHeader
 
+	cfg.ReviewWindowDays = fc.ReviewWindowDays
+
 	// Model×dims pairing rule: a custom model without explicit dims is startup-fatal.
 	// The store's length guard and cosine math require knowing the exact vector size.
 	// The default pair (default model + default 256 dims) is keyless-simple and exempt.
@@ -464,6 +474,7 @@ func Save(dir string, cfg Config) error {
 	fc.EmbeddingBaseURL = cfg.EmbeddingBaseURL
 	fc.EmbeddingModel = cfg.EmbeddingModel
 	fc.EmbeddingAuthHeader = cfg.EmbeddingAuthHeader
+	fc.ReviewWindowDays = cfg.ReviewWindowDays
 
 	if len(cfg.encryptedEmbeddingKey) > 0 {
 		fc.EncryptedEmbeddingKey = base64.StdEncoding.EncodeToString(cfg.encryptedEmbeddingKey)

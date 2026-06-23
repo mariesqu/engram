@@ -11,6 +11,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/centralstore"
 	"github.com/mariesqu/engram/internal/controlapi"
+	"github.com/mariesqu/engram/internal/localstore"
 )
 
 const projectsUsage = `Usage: engram projects <subcommand> [flags]
@@ -18,9 +19,10 @@ const projectsUsage = `Usage: engram projects <subcommand> [flags]
 Manage per-project sync policies for the running engram resident daemon.
 
 Subcommands:
-  list                        List all known projects with their effective policy
-  policy <project> <policy>   Set the policy for a project
-  delete <project> [flags]    Delete a project (one or more modes required)
+  list                            List all known projects with their effective policy
+  policy <project> <policy>       Set the policy for a project
+  consolidate <from> <to> [flags] Merge a project's memories into another (fixes name drift)
+  delete <project> [flags]        Delete a project (one or more modes required)
 
 Policies:
   synced      Observations are pushed to and pulled from central (default when central is configured)
@@ -35,11 +37,17 @@ Delete flags:
   --dsn DSN            Postgres DSN for central (or set ENGRAM_DSN; used by --remote=unshare)
   --yes                Confirm destructive operation (required)
 
+Consolidate flags:
+  --db                 Path to local SQLite database (or set ENGRAM_DB)
+  --yes                Execute the merge (default is a dry-run preview)
+
 Examples:
   engram projects list
   engram projects policy my-project local-only
   engram projects policy my-project synced
   engram projects policy my-project omitted
+  engram projects consolidate myapp my-app
+  engram projects consolidate myapp my-app --yes
   engram projects delete my-project --local --yes
   engram projects delete my-project --remote=purge-all --yes
   engram projects delete my-project --remote=unshare --dsn "postgres://..." --yes
@@ -58,11 +66,92 @@ func runProjectsCmd(args []string) error {
 		return runProjectsListCmd(args[1:])
 	case "policy":
 		return runProjectsPolicyCmd(args[1:])
+	case "consolidate":
+		return runProjectsConsolidateCmd(args[1:])
 	case "delete":
 		return runProjectsDeleteCmd(args[1:])
 	default:
-		return fmt.Errorf("projects: unknown subcommand %q; expected list, policy, or delete", args[0])
+		return fmt.Errorf("projects: unknown subcommand %q; expected list, policy, consolidate, or delete", args[0])
 	}
+}
+
+// runProjectsConsolidateCmd implements `engram projects consolidate <from> <to>`.
+//
+// It is a LOCAL-ONLY merge: every memory under <from> is renamed to <to> and the
+// per-project policy/cursor rows are deduped (see localstore.MergeProject). The
+// merge does NOT propagate to central.
+//
+// Flag parsing mirrors `projects delete`: Go's flag package stops at the first
+// positional, so the two positionals <from> <to> are taken after the first parse
+// and any trailing flags are re-parsed. Dry-run by default; --yes executes.
+//
+// The store is opened directly (mirroring `engram import`); this is the same
+// local SQLite file the daemon owns, and WAL allows the read+write merge to run
+// alongside a running daemon.
+func runProjectsConsolidateCmd(args []string) error {
+	fs := flag.NewFlagSet("projects consolidate", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Print(projectsUsage) }
+	db := fs.String("db", "", "path to local SQLite database (or set ENGRAM_DB)")
+	yes := fs.Bool("yes", false, "execute the merge (default: dry-run preview)")
+
+	// First parse: leading flags before the positionals.
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("projects consolidate requires two arguments: <from> <to>")
+	}
+	from := rest[0]
+	to := rest[1]
+
+	// Second parse: trailing flags after the positionals.
+	if err := fs.Parse(rest[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("projects consolidate takes exactly <from> <to>; unexpected: %v", fs.Args())
+	}
+
+	if *db == "" {
+		*db = envOr("ENGRAM_DB", "")
+	}
+	if *db == "" {
+		return fmt.Errorf("projects consolidate: --db is required (or set ENGRAM_DB)")
+	}
+
+	store, err := localstore.Open(*db)
+	if err != nil {
+		return fmt.Errorf("projects consolidate: open store: %w", err)
+	}
+	defer store.Close()
+
+	// Dry-run by default: report what WOULD move without writing anything.
+	if !*yes {
+		mem, err := store.CountLiveByProject(from)
+		if err != nil {
+			return fmt.Errorf("projects consolidate (dry-run): %w", err)
+		}
+		fmt.Printf("Dry run — would merge project %q into %q:\n", from, to)
+		fmt.Printf("  [memories]   %d live memory row(s) would be renamed\n", mem)
+		fmt.Println("  [policy]     policy/cursor rows for the source project would be deduped or renamed")
+		fmt.Println("\nRe-run with --yes to execute.")
+		return nil
+	}
+
+	moved, policies, cursors, err := store.MergeProject(from, to)
+	if err != nil {
+		return fmt.Errorf("projects consolidate: %w", err)
+	}
+	fmt.Printf("Merged %q into %q: %d memories, %d policy row(s), %d pull-cursor(s) moved\n",
+		from, to, moved, policies, cursors)
+	return nil
 }
 
 // runProjectsListCmd implements `engram projects list`.

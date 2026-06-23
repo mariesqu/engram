@@ -32,7 +32,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Features
 
-- **12 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, and conflict resolution
+- **14 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, lifecycle review, project merge, and conflict resolution
 - **Human memory management** — browse, search, edit, and delete memories, and delete whole projects (local / unshare / purge-all), from both the CLI and the web UI
 - **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
 - **Local-only mode** — no network, no credentials required
@@ -719,7 +719,7 @@ If the agent's context is cleared or compacted, the persistent store is unaffect
 
 ## MCP tools
 
-The daemon exposes 12 tools to the connected agent.
+The daemon exposes 14 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
@@ -732,9 +732,11 @@ The daemon exposes 12 tools to the connected agent.
 | `mem_update`          | Edit a specific observation in place by ID (omitted fields keep their value; versioned + re-synced) |
 | `mem_search`          | Search observations; supports `mode` param: `""` (FTS), `"semantic"`, or `"hybrid"` |
 | `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
+| `mem_review`          | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the staleness clock (local-only) |
 | `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
+| `mem_merge_projects`  | Merge a source project's memories into a target name to fix project name drift (local-only) |
 
 ### Conflict detection
 

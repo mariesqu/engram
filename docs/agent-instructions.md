@@ -21,9 +21,11 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_update` | Edit a specific observation in place by ID (omitted fields keep their value; versioned and re-synced) |
 | `mem_search` | Full-text, semantic, or hybrid search across observations |
 | `mem_similar` | Find observations semantically nearest a given memory (by sync_id) |
+| `mem_review` | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the clock (local-only) |
 | `mem_context` | Assemble recent sessions and observations into a context summary |
 | `mem_session_summary` | Save a structured end-of-session summary |
 | `mem_judge` | Record a verdict on a conflict candidate surfaced by `mem_save` |
+| `mem_merge_projects` | Merge a source project's memories into a target name to fix name drift (local-only) |
 
 ---
 

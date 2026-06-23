@@ -113,6 +113,10 @@ type daemonCfg struct {
 	embeddingBaseURL      string // "" → https://api.openai.com
 	embeddingModel        string // "" → text-embedding-3-small
 	embeddingAuthHeader   string // "" or "authorization" → Bearer; "api-key" → api-key header
+
+	// reviewWindowDays is the memory-lifecycle staleness window in days (Feature 1).
+	// 0 → store default (30). Resolved from the config file in runDaemonCmd.
+	reviewWindowDays int
 }
 
 // resolveTransport resolves the MCP transport with the standard precedence
@@ -410,6 +414,7 @@ func runDaemonCmd(args []string) error {
 		embeddingBaseURL:      fileCfg.EmbeddingBaseURL,
 		embeddingModel:        fileCfg.EmbeddingModel,
 		embeddingAuthHeader:   fileCfg.EmbeddingAuthHeader,
+		reviewWindowDays:      fileCfg.ReviewWindowDays,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -427,6 +432,11 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store %q: %w", cfg.db, err)
 	}
+
+	// Resolve the memory-lifecycle staleness window (Feature 1). 0/unset → the
+	// store's built-in default (30). Set once at startup; the review tools read
+	// it internally so the window need not thread through registerTools.
+	store.SetReviewWindowDays(cfg.reviewWindowDays)
 
 	mcpSrv := mcpserver.NewMCPServer(
 		"engram",
