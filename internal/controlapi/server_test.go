@@ -46,6 +46,12 @@ func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 func (m *mockStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
 	return nil, m.err
 }
+func (m *mockStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, m.err
+}
+func (m *mockStore) DeleteMemory(id int64) error {
+	return m.err
+}
 
 // mockSyncCtrl implements controlapi.SyncController for tests.
 type mockSyncCtrl struct {

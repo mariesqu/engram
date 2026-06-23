@@ -41,6 +41,12 @@ func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 func (m *mockStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
 	return nil, nil
 }
+func (m *mockStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, nil
+}
+func (m *mockStore) DeleteMemory(id int64) error {
+	return nil
+}
 
 // mockConfigStore is a minimal controlapi.ConfigStore for unit tests.
 type mockConfigStore struct {
@@ -82,6 +88,12 @@ func (m *recordingStore) GetPolicy(project string) (controlapi.Policy, error) {
 }
 func (m *recordingStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
 	return nil, nil
+}
+func (m *recordingStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, nil
+}
+func (m *recordingStore) DeleteMemory(id int64) error {
+	return nil
 }
 
 // newTestServer builds a fresh httptest.Server with a real webui.Mount.

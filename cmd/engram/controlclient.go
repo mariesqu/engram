@@ -92,6 +92,32 @@ func (c *ControlClient) Put(path string, body any, dst any) error {
 	return c.mutate(http.MethodPut, path, body, dst)
 }
 
+// Delete issues an authenticated DELETE request with no body.
+func (c *ControlClient) Delete(path string) error {
+	resp, err := c.do(http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		if refreshErr := c.refresh(); refreshErr != nil {
+			return fmt.Errorf("%w (stale token; %v)", ErrDaemonNotRunning, refreshErr)
+		}
+		resp2, err2 := c.do(http.MethodDelete, path, nil)
+		if err2 != nil {
+			return err2
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%w (token mismatch after re-read)", ErrDaemonNotRunning)
+		}
+		return decodeResponse(resp2, nil)
+	}
+
+	return decodeResponse(resp, nil)
+}
+
 // mutate is the shared implementation for Post and Put.
 func (c *ControlClient) mutate(method, path string, body any, dst any) error {
 	resp, err := c.do(method, path, body)

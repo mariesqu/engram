@@ -19,6 +19,12 @@ type memoriesStoreWebUI struct {
 func (m *memoriesStoreWebUI) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
 	return m.memories, nil
 }
+func (m *memoriesStoreWebUI) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, nil
+}
+func (m *memoriesStoreWebUI) DeleteMemory(id int64) error {
+	return nil
+}
 
 // newTestServerWithMemories builds a test server that returns the given memories
 // from its Store.ListMemories implementation.

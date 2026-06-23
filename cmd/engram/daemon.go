@@ -594,7 +594,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	}()
 
 	// ── PR-③: wire the full runtime adapters ─────────────────────────────────
-	storeAdapter := &localStoreAdapter{store: components.store}
+	storeAdapter := &localStoreAdapter{store: components.store, writerID: cfg.writerID}
 
 	// configStoreAdapter wraps internal/config for the ConfigStore port.
 	// actualPort: report the bound port (not the pre-bind flag, e.g. 0).
@@ -717,7 +717,8 @@ func probeDaemon(dir string, port int) error {
 
 // localStoreAdapter adapts *localstore.Store to controlapi.Store.
 type localStoreAdapter struct {
-	store *localstore.Store
+	store    *localstore.Store
+	writerID string
 }
 
 func (a *localStoreAdapter) ListProjectsWithPolicy() ([]controlapi.ProjectPolicy, error) {
@@ -757,19 +758,36 @@ func (a *localStoreAdapter) ListMemories(query, project string, limit int) ([]co
 	}
 	out := make([]controlapi.MemorySummary, 0, len(records))
 	for _, r := range records {
-		out = append(out, controlapi.MemorySummary{
-			ID:        r.ID,
-			SyncID:    r.SyncID,
-			Project:   r.Project,
-			Type:      r.Type,
-			Title:     r.Title,
-			Content:   r.Content,
-			Scope:     r.Scope,
-			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339),
-			UpdatedAt: r.UpdatedAt.UTC().Format(time.RFC3339),
-		})
+		out = append(out, recordToSummary(r))
 	}
 	return out, nil
+}
+
+// recordToSummary converts a domain.Record to a controlapi.MemorySummary.
+func recordToSummary(r *domain.Record) controlapi.MemorySummary {
+	return controlapi.MemorySummary{
+		ID:        r.ID,
+		SyncID:    r.SyncID,
+		Project:   r.Project,
+		Type:      r.Type,
+		Title:     r.Title,
+		Content:   r.Content,
+		Scope:     r.Scope,
+		CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt: r.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func (a *localStoreAdapter) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	rec, err := a.store.UpdateMemory(id, title, content, typ, a.writerID)
+	if err != nil {
+		return controlapi.MemorySummary{}, err
+	}
+	return recordToSummary(rec), nil
+}
+
+func (a *localStoreAdapter) DeleteMemory(id int64) error {
+	return a.store.DeleteMemory(id, a.writerID)
 }
 
 // ── configStoreAdapter (PR-③) ─────────────────────────────────────────────────

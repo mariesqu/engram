@@ -18,6 +18,12 @@ type memoriesStore struct {
 func (m *memoriesStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
 	return m.memories, m.memErr
 }
+func (m *memoriesStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, m.memErr
+}
+func (m *memoriesStore) DeleteMemory(id int64) error {
+	return m.memErr
+}
 
 // captureMemoriesStore is a mock that lets tests capture calls to ListMemories.
 type captureMemoriesStore struct {
@@ -30,6 +36,12 @@ func (m *captureMemoriesStore) ListMemories(query, project string, limit int) ([
 		return m.onListMemories(query, project, limit)
 	}
 	return nil, nil
+}
+func (m *captureMemoriesStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, nil
+}
+func (m *captureMemoriesStore) DeleteMemory(id int64) error {
+	return nil
 }
 
 func TestHandleMemories_List(t *testing.T) {

@@ -17,6 +17,7 @@
                 <th>Type</th>
                 <th>Project</th>
                 <th>Preview</th>
+                <th>Actions</th>
             </tr>
         </thead>
         <tbody>
@@ -26,6 +27,13 @@
                 <td><span class="badge">{{.Type}}</span></td>
                 <td>{{.Project}}</td>
                 <td class="muted">{{truncateContent .Content 200}}</td>
+                <td>
+                    <a href="/ui/memories/{{.ID}}/edit" class="btn btn-small">Edit</a>
+                    <form method="POST" action="/ui/memories/{{.ID}}/delete" style="display:inline">
+                        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                        <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                    </form>
+                </td>
             </tr>
             {{end}}
         </tbody>

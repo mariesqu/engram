@@ -195,6 +195,12 @@ type Store interface {
 	// ListMemories returns memories matching the query (FTS when non-empty,
 	// recent otherwise), filtered by project, capped at limit.
 	ListMemories(query, project string, limit int) ([]MemorySummary, error)
+	// UpdateMemory edits an existing memory row in-place and returns the updated summary.
+	// Returns an error wrapping ErrObservationNotFound when id is missing or deleted.
+	UpdateMemory(id int64, title, content, typ string) (MemorySummary, error)
+	// DeleteMemory soft-deletes the memory row with the given id.
+	// Returns an error wrapping ErrObservationNotFound when id is missing or deleted.
+	DeleteMemory(id int64) error
 }
 
 // SyncController is the autosync control port. PR-① uses Status for the
@@ -333,6 +339,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyPost))
 	mux.HandleFunc("DELETE /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyDelete))
 	mux.HandleFunc("/api/v1/memories", s.withAuth(s.handleMemories))
+	// PUT /api/v1/memories/{id} and DELETE /api/v1/memories/{id} — memory mutation routes.
+	// Auth + Origin are both required (same chain as config/policy mutation routes).
+	mux.HandleFunc("/api/v1/memories/{id}", s.WithAuthAndOrigin(s.handleMemoryMutate))
 	mux.HandleFunc("/", s.withAuth(s.handleNotFound))
 	return mux
 }
@@ -424,6 +433,98 @@ func (s *Server) handleMemories(w http.ResponseWriter, r *http.Request) {
 		memories = []MemorySummary{}
 	}
 	writeJSON(w, http.StatusOK, memories)
+}
+
+// handleMemoryMutate dispatches PUT and DELETE on /api/v1/memories/{id}.
+// Any other method receives 405 Method Not Allowed.
+func (s *Server) handleMemoryMutate(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPut:
+		s.handleMemoryPut(w, r)
+	case http.MethodDelete:
+		s.handleMemoryDelete(w, r)
+	default:
+		w.Header().Set("Allow", "PUT, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleMemoryPut handles PUT /api/v1/memories/{id}.
+// Body: {"title":"...", "content":"...", "type":"..."}.
+// type is optional; when absent or empty the existing record's type is preserved.
+// Returns 200 with the updated MemorySummary on success, 400 on bad input,
+// 404 when the id is missing or deleted, 500 on internal error.
+func (s *Server) handleMemoryPut(w http.ResponseWriter, r *http.Request) {
+	rawID := r.PathValue("id")
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "id must be a positive integer")
+		return
+	}
+
+	var body struct {
+		Title   string `json:"title"`
+		Content string `json:"content"`
+		Type    string `json:"type"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.Title) == "" {
+		writeError(w, http.StatusBadRequest, "title is required")
+		return
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		writeError(w, http.StatusBadRequest, "content is required")
+		return
+	}
+
+	summary, err := s.store.UpdateMemory(id, body.Title, body.Content, body.Type)
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "memory not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// handleMemoryDelete handles DELETE /api/v1/memories/{id}.
+// Returns 200 {"status":"deleted"} on success, 404 when the id is missing or
+// deleted, 500 on internal error.
+func (s *Server) handleMemoryDelete(w http.ResponseWriter, r *http.Request) {
+	rawID := r.PathValue("id")
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "id must be a positive integer")
+		return
+	}
+
+	if err := s.store.DeleteMemory(id); err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "memory not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// isNotFound reports whether err wraps or equals a "not found" sentinel from the
+// store layer. We check by error message string matching because the localstore
+// ErrObservationNotFound is not exported from this package.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "observation not found") ||
+		strings.Contains(msg, "memory") && strings.Contains(msg, "not found")
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {

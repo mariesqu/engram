@@ -42,10 +42,11 @@ type pageTmpl struct {
 
 // Page template sets — one per page, each parsed independently.
 var (
-	statusTmpl   *pageTmpl
-	projectsTmpl *pageTmpl
-	configTmpl   *pageTmpl
-	memoriesTmpl *pageTmpl
+	statusTmpl     *pageTmpl
+	projectsTmpl   *pageTmpl
+	configTmpl     *pageTmpl
+	memoriesTmpl   *pageTmpl
+	memoryEditTmpl *pageTmpl
 )
 
 // partialTmpl is the template set for HTMX polling partials (no layout wrapper).
@@ -76,6 +77,12 @@ func init() {
 	memoriesTmpl = mustParsePage(
 		"templates/layout.html",
 		"templates/memories.html",
+	)
+
+	// Memory edit form page: layout + edit form.
+	memoryEditTmpl = mustParsePage(
+		"templates/layout.html",
+		"templates/memory_edit.html",
 	)
 
 	// Partial template set: all named {{define}} blocks used for HTMX swaps.
