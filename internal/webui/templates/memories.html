@@ -1,0 +1,39 @@
+{{template "layout" .}}
+
+{{define "content"}}
+<div class="card">
+    <h2>Memories</h2>
+    <form method="GET" action="/ui/memories" class="search-form">
+        <input type="text" name="q" value="{{.Query}}" placeholder="Search memories…" class="search-input">
+        <input type="text" name="project" value="{{.Project}}" placeholder="Project filter (optional)" class="search-input">
+        <button type="submit" class="btn">Search</button>
+        {{if .Query}}<a href="/ui/memories" class="btn btn-small">Clear</a>{{end}}
+    </form>
+    {{if .Memories}}
+    <table>
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Type</th>
+                <th>Project</th>
+                <th>Preview</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Memories}}
+            <tr>
+                <td class="project-name">{{.Title}}</td>
+                <td><span class="badge">{{.Type}}</span></td>
+                <td>{{.Project}}</td>
+                <td class="muted">{{truncateContent .Content 200}}</td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+    {{else if .Searched}}
+    <p class="muted">No memories found{{if .Query}} matching <em>{{.Query}}</em>{{end}}.</p>
+    {{else}}
+    <p class="muted">No memories yet. Use the search box above or save memories via the MCP tools.</p>
+    {{end}}
+</div>
+{{end}}

@@ -33,6 +33,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -67,6 +68,21 @@ func ParsePolicy(s string) (Policy, error) {
 type ProjectPolicy struct {
 	Name   string `json:"name"`
 	Policy Policy `json:"policy"`
+}
+
+// MemorySummary is the JSON shape for a single memory returned by
+// GET /api/v1/memories. Content is included in full so callers can build
+// previews without a second round-trip.
+type MemorySummary struct {
+	ID        int64  `json:"id"`
+	SyncID    string `json:"sync_id"`
+	Project   string `json:"project"`
+	Type      string `json:"type"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	Scope     string `json:"scope"`
+	CreatedAt string `json:"created_at"` // RFC3339 UTC
+	UpdatedAt string `json:"updated_at"` // RFC3339 UTC
 }
 
 // SyncResult is the outcome of the most recent sync cycle.
@@ -176,6 +192,9 @@ type Store interface {
 	ListProjectsWithPolicy() ([]ProjectPolicy, error)
 	SetPolicy(project string, p Policy) error
 	GetPolicy(project string) (Policy, error)
+	// ListMemories returns memories matching the query (FTS when non-empty,
+	// recent otherwise), filtered by project, capped at limit.
+	ListMemories(query, project string, limit int) ([]MemorySummary, error)
 }
 
 // SyncController is the autosync control port. PR-① uses Status for the
@@ -313,6 +332,7 @@ func (s *Server) Handler() http.Handler {
 	// PR-2 (semantic-search): embedding key management.
 	mux.HandleFunc("POST /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyPost))
 	mux.HandleFunc("DELETE /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyDelete))
+	mux.HandleFunc("/api/v1/memories", s.withAuth(s.handleMemories))
 	mux.HandleFunc("/", s.withAuth(s.handleNotFound))
 	return mux
 }
@@ -372,6 +392,38 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		projects = []ProjectPolicy{}
 	}
 	writeJSON(w, http.StatusOK, projects)
+}
+
+func (s *Server) handleMemories(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	q := r.URL.Query()
+	query := q.Get("q")
+	project := q.Get("project")
+	limit := 50
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	memories, err := s.store.ListMemories(query, project, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if memories == nil {
+		memories = []MemorySummary{}
+	}
+	writeJSON(w, http.StatusOK, memories)
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {

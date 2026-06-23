@@ -1,0 +1,157 @@
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"net/url"
+	"os"
+	"text/tabwriter"
+	"unicode/utf8"
+
+	"github.com/mariesqu/engram/internal/controlapi"
+)
+
+const memoriesUsage = `Usage: engram memories <subcommand> [flags]
+
+Browse memories stored in the running engram resident daemon.
+
+Subcommands:
+  list                          List the most recent memories
+  search <query>                Search memories using full-text search
+
+Flags (all subcommands):
+  --db       Path to the local SQLite database (required; or set ENGRAM_DB)
+  --project  Filter by project name (optional)
+  --limit    Maximum number of results (default 50, max 200)
+
+Examples:
+  engram memories list
+  engram memories list --project my-project --limit 20
+  engram memories search "authentication bug"
+  engram memories search "auth" --project my-project
+`
+
+// runMemoriesCmd is the entry point for `engram memories`.
+func runMemoriesCmd(args []string) error {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Print(memoriesUsage)
+		return nil
+	}
+
+	switch args[0] {
+	case "list":
+		return runMemoriesListCmd(args[1:])
+	case "search":
+		return runMemoriesSearchCmd(args[1:])
+	default:
+		return fmt.Errorf("memories: unknown subcommand %q; expected list or search", args[0])
+	}
+}
+
+// runMemoriesListCmd implements `engram memories list`.
+func runMemoriesListCmd(args []string) error {
+	fs := flag.NewFlagSet("memories list", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Print(memoriesUsage) }
+	db := fs.String("db", "", "path to local SQLite database (required; or set ENGRAM_DB)")
+	project := fs.String("project", "", "filter by project name")
+	limit := fs.Int("limit", 50, "maximum number of results (max 200)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("memories list takes no positional arguments; unexpected: %v", fs.Args())
+	}
+	return doMemoriesRequest("", *project, *limit, *db)
+}
+
+// runMemoriesSearchCmd implements `engram memories search <query>`.
+func runMemoriesSearchCmd(args []string) error {
+	fs := flag.NewFlagSet("memories search", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Print(memoriesUsage) }
+	db := fs.String("db", "", "path to local SQLite database (required; or set ENGRAM_DB)")
+	project := fs.String("project", "", "filter by project name")
+	limit := fs.Int("limit", 50, "maximum number of results (max 200)")
+	// Parse leading flags, take the query, then parse any TRAILING flags too, so
+	// both `search --project X "q"` and `search "q" --project X` work — Go's flag
+	// package otherwise stops parsing at the first positional argument.
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return fmt.Errorf("memories search requires a query argument")
+	}
+	query := rest[0]
+	if err := fs.Parse(rest[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("memories search takes exactly one query argument; unexpected: %v", fs.Args())
+	}
+	return doMemoriesRequest(query, *project, *limit, *db)
+}
+
+// doMemoriesRequest issues GET /api/v1/memories and prints the result table.
+func doMemoriesRequest(query, project string, limit int, db string) error {
+	if db == "" {
+		db = envOr("ENGRAM_DB", "")
+	}
+	if db == "" {
+		return fmt.Errorf("--db is required (or set ENGRAM_DB)")
+	}
+
+	client, err := NewControlClient(daemonDir(db))
+	if err != nil {
+		return err
+	}
+
+	params := url.Values{}
+	params.Set("limit", fmt.Sprintf("%d", limit))
+	if query != "" {
+		params.Set("q", query)
+	}
+	if project != "" {
+		params.Set("project", project)
+	}
+	path := "/api/v1/memories?" + params.Encode()
+
+	var memories []controlapi.MemorySummary
+	if err := client.Get(path, &memories); err != nil {
+		if errors.Is(err, ErrDaemonNotRunning) {
+			return fmt.Errorf("engram daemon is not running: %w", err)
+		}
+		return fmt.Errorf("memories: %w", err)
+	}
+
+	if len(memories) == 0 {
+		fmt.Println("(no memories)")
+		return nil
+	}
+
+	// Print as an aligned table.
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tPROJECT\tTYPE\tTITLE")
+	for _, m := range memories {
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", m.ID, m.Project, m.Type, truncateTitle(m.Title, 60))
+	}
+	return tw.Flush()
+}
+
+// truncateTitle truncates s to at most maxRunes runes, appending "…" when truncated.
+func truncateTitle(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes]) + "…"
+}

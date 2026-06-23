@@ -144,6 +144,13 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 		}
 		handleProjectsPage(w, r, deps, sessions)
 
+	case r.URL.Path == "/ui/memories":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		handleMemoriesPage(w, r, deps, sessions)
+
 	case r.URL.Path == "/ui/config":
 		switch r.Method {
 		case http.MethodGet:
@@ -281,6 +288,15 @@ type configViewModel struct {
 	CSRFToken       string
 }
 
+// memoriesViewModel is the template data for the memories browse page.
+type memoriesViewModel struct {
+	DaemonVersion string
+	Memories      []controlapi.MemorySummary
+	Query         string // current search query (echoed for form)
+	Project       string // current project filter (echoed for form)
+	Searched      bool   // true when a query was submitted (vs first load)
+}
+
 // newStatusVM converts a live controlapi.Status into a statusViewModel.
 // csrfToken is injected from the per-session CSRF store.
 func newStatusVM(st controlapi.Status, version, csrfToken string) statusViewModel {
@@ -337,6 +353,29 @@ func handleProjectsPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, 
 func handleConfigPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, sessions *sessionStore) {
 	vm := buildConfigVM(deps, sessions, "", false)
 	renderPage(w, configTmpl, vm)
+}
+
+func handleMemoriesPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, _ *sessionStore) {
+	q := r.URL.Query()
+	query := q.Get("q")
+	project := q.Get("project")
+	// "searched" is true any time the form was submitted (q or project param present).
+	searched := query != "" || project != ""
+
+	memories, err := deps.Store.ListMemories(query, project, 50)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	vm := memoriesViewModel{
+		DaemonVersion: deps.Version,
+		Memories:      memories,
+		Query:         query,
+		Project:       project,
+		Searched:      searched,
+	}
+	renderPage(w, memoriesTmpl, vm)
 }
 
 // buildConfigVM loads the current config from ConfigStore and builds the view model.

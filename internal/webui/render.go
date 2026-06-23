@@ -23,6 +23,14 @@ var sharedFuncs = template.FuncMap{
 			return template.HTML(`<span class="badge">` + template.HTMLEscapeString(p) + `</span>`)
 		}
 	},
+	// truncateContent truncates s to at most n runes, appending "…" when truncated.
+	"truncateContent": func(s string, n int) string {
+		runes := []rune(s)
+		if len(runes) <= n {
+			return s
+		}
+		return string(runes[:n]) + "…"
+	},
 }
 
 // pageTmpl is a parsed (layout + page) template pair for a full HTML page.
@@ -37,6 +45,7 @@ var (
 	statusTmpl   *pageTmpl
 	projectsTmpl *pageTmpl
 	configTmpl   *pageTmpl
+	memoriesTmpl *pageTmpl
 )
 
 // partialTmpl is the template set for HTMX polling partials (no layout wrapper).
@@ -61,6 +70,12 @@ func init() {
 	configTmpl = mustParsePage(
 		"templates/layout.html",
 		"templates/config.html",
+	)
+
+	// Memories page: layout + memories page.
+	memoriesTmpl = mustParsePage(
+		"templates/layout.html",
+		"templates/memories.html",
 	)
 
 	// Partial template set: all named {{define}} blocks used for HTMX swaps.

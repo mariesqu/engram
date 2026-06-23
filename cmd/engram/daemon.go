@@ -25,6 +25,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/config"
 	"github.com/mariesqu/engram/internal/controlapi"
+	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 	"github.com/mariesqu/engram/internal/remote"
@@ -741,6 +742,34 @@ func (a *localStoreAdapter) SetPolicy(project string, p controlapi.Policy) error
 func (a *localStoreAdapter) GetPolicy(project string) (controlapi.Policy, error) {
 	p, err := a.store.GetPolicy(project)
 	return controlapi.Policy(p), err
+}
+
+func (a *localStoreAdapter) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+	var records []*domain.Record
+	var err error
+	if query != "" {
+		records, _, err = a.store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{})
+	} else {
+		records, err = a.store.RecentObservations(project, "", limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]controlapi.MemorySummary, 0, len(records))
+	for _, r := range records {
+		out = append(out, controlapi.MemorySummary{
+			ID:        r.ID,
+			SyncID:    r.SyncID,
+			Project:   r.Project,
+			Type:      r.Type,
+			Title:     r.Title,
+			Content:   r.Content,
+			Scope:     r.Scope,
+			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt: r.UpdatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return out, nil
 }
 
 // ── configStoreAdapter (PR-③) ─────────────────────────────────────────────────

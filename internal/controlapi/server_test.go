@@ -43,6 +43,10 @@ func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 	return controlapi.PolicySynced, m.err
 }
 
+func (m *mockStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+	return nil, m.err
+}
+
 // mockSyncCtrl implements controlapi.SyncController for tests.
 type mockSyncCtrl struct {
 	status controlapi.Status
