@@ -25,7 +25,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/localstore"
@@ -69,63 +75,141 @@ func (n *Node) Write(m domain.Mutation) (domain.Mutation, error) {
 // mutation counts always come back in one round.
 const pullLimit = 1000
 
-// Push drains the node's pending outbox and applies each mutation to central in
-// local order. Central assigns the authoritative seq and reconciles. On a
-// successful central Apply the outbox entry is acked so it is never pushed again
-// (INV5 at the transport layer; central_mutations.mutation_id UNIQUE is the
-// deeper guard).
+// Push drains the node's pending outbox and applies each synced mutation to
+// central. Central assigns the authoritative seq and reconciles BY VERSION
+// (domain.Decide is last-write-wins), so applies are safe to run out of order —
+// a higher-version mutation never loses to a lower-version one. On a successful
+// central Apply the outbox entry is acked so it is never pushed again (INV5 at
+// the transport layer; central_mutations.mutation_id UNIQUE is the deeper guard).
+//
+// Concurrency: the network Apply is the bottleneck — one round-trip per mutation
+// to a possibly-remote central. Push applies up to pushConcurrency() DISTINCT
+// memories (sync_ids) in parallel (default 8; override with ENGRAM_PUSH_CONCURRENCY),
+// turning a large first-sync backlog from O(N·RTT) wall time into roughly
+// O(N·RTT / C). Multiple versions of the SAME memory are applied sequentially so
+// central's read-then-write reconcile can't lose a higher version to a stale one.
+// The local store is single-connection (SetMaxOpenConns(1)), so the concurrent
+// AckMutation calls serialize safely without SQLITE_BUSY; only network applies overlap.
 //
 // Policy filter (PR-②): each outbox entry is checked against the project's
-// effective policy before being applied to central.  Entries whose project has
-// policy local-only or omitted are SKIPPED — they are left UNACKED in the outbox
-// so they remain eligible for drain on the next push cycle.  This is the
-// mechanism behind the "flip local-only→synced drains the queue" guarantee:
-// eligibility is re-evaluated every drain, no outbox surgery needed.
+// effective policy (via a small per-project cache) before being applied. Entries
+// whose project has policy local-only or omitted are SKIPPED — left UNACKED in
+// the outbox so they remain eligible for drain on the next push cycle. This is
+// the mechanism behind the "flip local-only→synced drains the queue" guarantee.
 //
-// Returns the number of mutations pushed (acked) this round.
+// Returns the number of mutations pushed (acked) this round and the first error
+// encountered (if any). On error, already-acked mutations stay acked; the rest
+// are retried next cycle (idempotent via mutation_id).
 func Push(ctx context.Context, n *Node, central Central) (int, error) {
 	entries, err := n.Store.DrainOutbox(0)
 	if err != nil {
 		return 0, fmt.Errorf("push %s: drain outbox: %w", n.Name, err)
 	}
 
-	pushed := 0
-	// skipped accumulates per-project skip counts for one summary debug line per
-	// drain cycle. Logging per-entry would be too noisy for large outboxes.
+	// Phase 1 — policy filter (sequential, cheap local reads). Build the list of
+	// synced entries to apply and accumulate per-project skip counts. The cache
+	// avoids a GetPolicy round-trip per entry when many share a project.
+	type pushJob struct {
+		localSeq int64
+		mutation domain.Mutation
+	}
+	// Group synced entries by sync_id, preserving outbox (local_seq) order within
+	// each group. Skipped (non-synced) entries are left unacked.
+	groups := make(map[string][]pushJob)
+	var order []string // first-seen sync_id order, for deterministic scheduling
 	skipped := map[string]int{}
+	polCache := map[string]localstore.Policy{}
 	for _, e := range entries {
-		// Policy filter: skip (do not ack) entries for non-synced projects.
-		// Skipped entries remain unacked; they are re-evaluated on the next drain.
-		pol, polErr := n.Store.GetPolicy(e.Mutation.Project)
-		if polErr != nil {
-			return pushed, fmt.Errorf("push %s: get policy for project %q (local_seq=%d): %w",
-				n.Name, e.Mutation.Project, e.LocalSeq, polErr)
+		pol, cached := polCache[e.Mutation.Project]
+		if !cached {
+			p, polErr := n.Store.GetPolicy(e.Mutation.Project)
+			if polErr != nil {
+				return 0, fmt.Errorf("push %s: get policy for project %q (local_seq=%d): %w",
+					n.Name, e.Mutation.Project, e.LocalSeq, polErr)
+			}
+			pol = p
+			polCache[e.Mutation.Project] = p
 		}
 		if pol != localstore.PolicySynced {
-			skipped[e.Mutation.Project]++
-			continue // leave unacked — eligible again when policy flips to synced
+			skipped[e.Mutation.Project]++ // leave unacked — eligible again when policy flips to synced
+			continue
 		}
-
-		if err := central.Apply(ctx, e.Mutation); err != nil {
-			return pushed, fmt.Errorf("push %s: central.Apply(local_seq=%d, mutation_id=%s): %w",
-				n.Name, e.LocalSeq, e.Mutation.MutationID, err)
+		sid := e.Mutation.SyncID
+		if _, seen := groups[sid]; !seen {
+			order = append(order, sid)
 		}
-		if err := n.Store.AckMutation(e.LocalSeq); err != nil {
-			return pushed, fmt.Errorf("push %s: ack(local_seq=%d): %w", n.Name, e.LocalSeq, err)
-		}
-		pushed++
+		groups[sid] = append(groups[sid], pushJob{localSeq: e.LocalSeq, mutation: e.Mutation})
 	}
+
+	// Phase 2 — apply with bounded concurrency, ONE goroutine per sync_id.
+	//
+	// Central reconciles each mutation by reading current state (domain.Decide)
+	// then writing, in SEPARATE transactions — so two concurrent applies of the
+	// SAME identity can interleave and a stale lower version can clobber a higher
+	// one (a lost update the old serial path could never produce). Serializing per
+	// sync_id (entries applied in local_seq = version order within one goroutine)
+	// preserves each identity's apply order, while DISTINCT identities — the
+	// overwhelming majority of a backlog — still run in parallel. SetLimit throttles
+	// to pushConcurrency() groups; the first error cancels gctx so the rest stop.
+	var pushed atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(pushConcurrency())
+	for _, sid := range order {
+		if gctx.Err() != nil {
+			break // a prior apply failed (or ctx cancelled) — stop scheduling more
+		}
+		jobs := groups[sid]
+		g.Go(func() error {
+			for _, j := range jobs {
+				if gctx.Err() != nil {
+					return gctx.Err() // a sibling failed or ctx cancelled — stop this identity
+				}
+				if err := central.Apply(gctx, j.mutation); err != nil {
+					return fmt.Errorf("push %s: central.Apply(local_seq=%d, mutation_id=%s): %w",
+						n.Name, j.localSeq, j.mutation.MutationID, err)
+				}
+				if err := n.Store.AckMutation(j.localSeq); err != nil {
+					return fmt.Errorf("push %s: ack(local_seq=%d): %w", n.Name, j.localSeq, err)
+				}
+				pushed.Add(1)
+			}
+			return nil
+		})
+	}
+	applyErr := g.Wait()
+
 	// One debug line per drain cycle summarises all skipped projects — not per entry.
 	for proj, count := range skipped {
-		pol, _ := n.Store.GetPolicy(proj)
 		slog.Debug("syncer.Push: skipped project (non-synced policy)",
 			"node", n.Name,
 			"project", proj,
-			"policy", string(pol),
+			"policy", string(polCache[proj]),
 			"skipped_entries", count,
 		)
 	}
-	return pushed, nil
+	return int(pushed.Load()), applyErr
+}
+
+// pushConcurrency returns how many DISTINCT memories (sync_ids) Push applies in
+// parallel. Default 8; override with ENGRAM_PUSH_CONCURRENCY (clamped to [1, 64]).
+// The network Apply dominates, so parallelism cuts first-sync backlog wall time
+// roughly linearly until central's connection pool saturates — that pool is sized
+// to at least 16 (centralstore.Open), so values above 16 only help when the DSN
+// raises pool_max_conns to match.
+func pushConcurrency() int {
+	const def = 8
+	raw := strings.TrimSpace(os.Getenv("ENGRAM_PUSH_CONCURRENCY"))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return def
+	}
+	if n > 64 {
+		return 64
+	}
+	return n
 }
 
 // Pull fetches central mutations for project with seq > the node's per-project

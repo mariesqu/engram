@@ -9,7 +9,9 @@ package syncer_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,13 +37,17 @@ func openSyncNode(t *testing.T, name string, centralConfigured bool) *syncer.Nod
 }
 
 // simpleCentral records Apply calls and returns configurable mutations from PullSince.
+// Apply is mutex-guarded because Push applies mutations concurrently.
 type simpleCentral struct {
+	mu      sync.Mutex
 	applied []domain.Mutation
 	pulls   map[string][]domain.Mutation // project → mutations
 }
 
 func (c *simpleCentral) Apply(_ context.Context, m domain.Mutation) error {
+	c.mu.Lock()
 	c.applied = append(c.applied, m)
+	c.mu.Unlock()
 	return nil
 }
 
@@ -88,6 +94,85 @@ func pendingCount(t *testing.T, n *syncer.Node) int {
 
 // TestPush_SkipsLocalOnly verifies that Push does not push or ack outbox
 // entries for a local-only project, leaving them unacked.
+// TestPush_ConcurrentDrainsAllEntries exercises the parallel apply path: many
+// synced entries must all be applied to central and acked, even though the
+// applies run out of order across pushConcurrency() workers.
+func TestPush_ConcurrentDrainsAllEntries(t *testing.T) {
+	ctx := context.Background()
+	n := openSyncNode(t, "push-concurrent", true)
+	central := &simpleCentral{}
+
+	const total = 50
+	for i := 0; i < total; i++ {
+		writeToNode(t, n, "proj", fmt.Sprintf("m-%d", i))
+	}
+
+	pushed, err := syncer.Push(ctx, n, central)
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if pushed != total {
+		t.Errorf("pushed = %d; want %d", pushed, total)
+	}
+	// Push has returned (g.Wait completed) — no goroutines remain, so reading
+	// applied without the lock is safe here.
+	if got := len(central.applied); got != total {
+		t.Errorf("central.applied = %d; want %d", got, total)
+	}
+	if cnt := pendingCount(t, n); cnt != 0 {
+		t.Errorf("pending after Push = %d; want 0 (all acked)", cnt)
+	}
+}
+
+// TestPush_SameSyncIDAppliedInOrder verifies the per-identity serialization:
+// three versions of the SAME memory (same sync_id, versions 1→2→3) must reach
+// central in ascending version order, even though Push runs identities
+// concurrently. Without per-sync_id grouping, a stale lower version could be
+// applied after a higher one (central reconciles read-then-write, non-atomic).
+func TestPush_SameSyncIDAppliedInOrder(t *testing.T) {
+	ctx := context.Background()
+	n := openSyncNode(t, "push-ordered", true)
+	central := &simpleCentral{}
+
+	res, err := n.Store.AddObservation(localstore.AddObservationParams{
+		SessionID: "s", Type: "manual", Title: "v1", Content: "c1",
+		Project: "proj", Scope: "project", WriterID: "w1",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := n.Store.UpdateMemory(res.ID, "v2", "c2", "", "w1"); err != nil {
+		t.Fatalf("UpdateMemory v2: %v", err)
+	}
+	if _, err := n.Store.UpdateMemory(res.ID, "v3", "c3", "", "w1"); err != nil {
+		t.Fatalf("UpdateMemory v3: %v", err)
+	}
+
+	pushed, err := syncer.Push(ctx, n, central)
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if pushed != 3 {
+		t.Fatalf("pushed = %d; want 3 (v1, v2, v3)", pushed)
+	}
+
+	central.mu.Lock()
+	defer central.mu.Unlock()
+	if len(central.applied) != 3 {
+		t.Fatalf("central.applied = %d; want 3", len(central.applied))
+	}
+	versions := make([]int, len(central.applied))
+	for i, m := range central.applied {
+		versions[i] = m.Version
+	}
+	for i := 1; i < len(versions); i++ {
+		if versions[i] < versions[i-1] {
+			t.Errorf("same-sync_id applies out of version order: %v", versions)
+			break
+		}
+	}
+}
+
 func TestPush_SkipsLocalOnly(t *testing.T) {
 	ctx := context.Background()
 	n := openSyncNode(t, "push-local-only", true)
