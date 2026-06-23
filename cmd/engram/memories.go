@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mariesqu/engram/internal/controlapi"
+	"github.com/mariesqu/engram/internal/localstore"
 )
 
 const memoriesUsage = `Usage: engram memories <subcommand> [flags]
@@ -20,6 +21,7 @@ Browse and manage memories stored in the running engram resident daemon.
 Subcommands:
   list                          List the most recent memories
   search <query>                Search memories using full-text search
+  review                        List memories by lifecycle/staleness status
   edit <id>                     Edit an existing memory (requires --title and --content)
   delete <id>                   Delete a memory by ID
 
@@ -28,11 +30,19 @@ Flags (list/search subcommands):
   --project  Filter by project name (optional)
   --limit    Maximum number of results (default 50, max 200)
 
+Flags (review subcommand):
+  --db       Path to the local SQLite database (required; or set ENGRAM_DB)
+  --status   needs_review (default) | active | expired | all
+  --project  Filter by project name (optional)
+  --limit    Maximum number of results (default 50, max 200)
+
 Examples:
   engram memories list
   engram memories list --project my-project --limit 20
   engram memories search "authentication bug"
   engram memories search "auth" --project my-project
+  engram memories review --status needs_review
+  engram memories review --project my-project --status all
   engram memories edit 42 --title "New title" --content "Updated content"
   engram memories delete 42
 `
@@ -49,13 +59,72 @@ func runMemoriesCmd(args []string) error {
 		return runMemoriesListCmd(args[1:])
 	case "search":
 		return runMemoriesSearchCmd(args[1:])
+	case "review":
+		return runMemoriesReviewCmd(args[1:])
 	case "edit":
 		return runMemoriesEditCmd(args[1:])
 	case "delete":
 		return runMemoriesDeleteCmd(args[1:])
 	default:
-		return fmt.Errorf("memories: unknown subcommand %q; expected list, search, edit, or delete", args[0])
+		return fmt.Errorf("memories: unknown subcommand %q; expected list, search, review, edit, or delete", args[0])
 	}
+}
+
+// runMemoriesReviewCmd implements `engram memories review`. It opens the local
+// store directly (mirroring `engram import`) and lists memories by lifecycle
+// status. This is a read-only operation, so opening alongside a running daemon
+// is safe under WAL.
+func runMemoriesReviewCmd(args []string) error {
+	fs := flag.NewFlagSet("memories review", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Print(memoriesUsage) }
+	db := fs.String("db", "", "path to local SQLite database (required; or set ENGRAM_DB)")
+	status := fs.String("status", "needs_review", "needs_review (default) | active | expired | all")
+	project := fs.String("project", "", "filter by project name")
+	limit := fs.Int("limit", 50, "maximum number of results (max 200)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("memories review takes no positional arguments; unexpected: %v", fs.Args())
+	}
+
+	dbPath := *db
+	if dbPath == "" {
+		dbPath = envOr("ENGRAM_DB", "")
+	}
+	if dbPath == "" {
+		return fmt.Errorf("--db is required (or set ENGRAM_DB)")
+	}
+
+	store, err := localstore.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("memories review: open store: %w", err)
+	}
+	defer store.Close()
+
+	rows, err := store.ListForReview(*status, *project, *limit)
+	if err != nil {
+		return fmt.Errorf("memories review: %w", err)
+	}
+	if len(rows) == 0 {
+		fmt.Println("(no memories)")
+		return nil
+	}
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tPROJECT\tTYPE\tSTATUS\tREVIEW_AFTER\tTITLE")
+	for _, r := range rows {
+		reviewAfter := "-"
+		if r.ReviewAfter != nil {
+			reviewAfter = r.ReviewAfter.UTC().Format("2006-01-02")
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
+			r.ID, r.Project, r.Type, r.Status, reviewAfter, truncateTitle(r.Title, 60))
+	}
+	return tw.Flush()
 }
 
 // runMemoriesListCmd implements `engram memories list`.

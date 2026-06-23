@@ -372,6 +372,72 @@ Re-judging an already-judged ID overwrites the verdict (deliberate revision).`),
 		handleMemSimilar(store, gated),
 	)
 
+	// ── mem_review ────────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_review",
+			mcp.WithDescription(`Review the lifecycle/staleness of saved memories so stale architecture/decision notes are VERIFIED before being trusted, not trusted blindly.
+
+action="list": list memories by review status — status filter is one of:
+  needs_review (default) | active | expired | all. Optional project and limit.
+  Returns id, title, type, project, status, review_after.
+
+action="mark_reviewed": reset the staleness clock on memories you have verified.
+  Provide ids (a number array) OR a topic_key (resolves to its current observation).
+  Sets review_after = now + window; returns the count updated.
+
+Status is computed at read time: a memory is "needs_review" once it ages past the staleness window, "expired" once past its expires_at, else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
+			mcp.WithTitleAnnotation("Review Memory Lifecycle"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("action",
+				mcp.Required(),
+				mcp.Description("Action: \"list\" or \"mark_reviewed\""),
+			),
+			mcp.WithString("status",
+				mcp.Description("list filter: needs_review (default) | active | expired | all"),
+			),
+			mcp.WithArray("ids",
+				mcp.Description("mark_reviewed: observation IDs (numbers) to mark as reviewed"),
+				mcp.Items(map[string]any{"type": "number"}),
+			),
+			mcp.WithString("topic_key",
+				mcp.Description("mark_reviewed: alternative to ids — resolve a topic_key (in scope \"project\") to its current observation and mark it reviewed; for personal-scope memories use ids"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Filter (list) / resolution scope (mark_reviewed via topic_key). Omit to auto-detect."),
+			),
+			mcp.WithNumber("limit",
+				mcp.Description("list: max results (default 50, max 200)"),
+			),
+		),
+		handleReview(store),
+	)
+
+	// ── mem_merge_projects ────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_merge_projects",
+			mcp.WithDescription(`Merge a source project's local memories into a target (canonical) project name — cleans up project name drift (e.g. "myapp" → "my-app").
+
+Renames every local memory under "from" to live under "to", and dedups the per-project policy and pull-cursor rows. This is a LOCAL-ONLY rename: it does not propagate to central (each node merges independently). from and to are both required and must differ.`),
+			mcp.WithTitleAnnotation("Merge Projects"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("from",
+				mcp.Required(),
+				mcp.Description("Source project name to merge FROM (its rows are renamed)"),
+			),
+			mcp.WithString("to",
+				mcp.Required(),
+				mcp.Description("Target (canonical) project name to merge INTO"),
+			),
+		),
+		handleMergeProjects(store),
+	)
+
 	// ── mem_session_summary ──────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_summary",
@@ -644,6 +710,19 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 
 		msg := fmt.Sprintf("Memory saved: %q (id=%d, project=%q)", title, result.ID, project)
 
+		// Save-time name-drift warning (Feature 2): if the resolved project is not
+		// an exact match to an existing one but IS a near-variant, append a
+		// non-blocking note. NEVER blocks the save; any error degrades to no note.
+		driftNote := ""
+		if existing, derr := store.DistinctProjects(); derr == nil {
+			if near, ok := nearVariantProject(project, existing); ok {
+				driftNote = fmt.Sprintf(
+					"\nnote: project %q looks close to existing %q — pass an explicit project, or run 'engram projects consolidate'",
+					project, near,
+				)
+			}
+		}
+
 		if len(candidates) > 0 {
 			// Build judgment envelope — faithful to old_code handleSave envelope format.
 			var b strings.Builder
@@ -667,10 +746,11 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 					b.WriteString(fmt.Sprintf("\n    topic_key: %s", *c.TopicKey))
 				}
 			}
+			b.WriteString(driftNote)
 			return mcp.NewToolResultText(b.String()), nil
 		}
 
-		return mcp.NewToolResultText(msg), nil
+		return mcp.NewToolResultText(msg + driftNote), nil
 	}
 }
 
@@ -710,13 +790,22 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			topic = fmt.Sprintf("\nTopic: %s", *rec.TopicKey)
 		}
 
-		text := fmt.Sprintf("#%d [%s] %s\n%s\nSession: %s\nProject: %s\nScope: %s%s\nCreated: %s",
+		// Surface the review/staleness status inline so an agent sees whether a
+		// memory should be re-verified before trusting it (Feature 1). Best-effort:
+		// a status lookup error never blocks returning the observation.
+		statusLine := ""
+		if st, serr := store.ReviewStatusForID(id); serr == nil && st != "" {
+			statusLine = fmt.Sprintf("\nStatus: %s", st)
+		}
+
+		text := fmt.Sprintf("#%d [%s] %s\n%s\nSession: %s\nProject: %s\nScope: %s%s%s\nCreated: %s",
 			id, rec.Type, rec.Title,
 			rec.Content,
 			rec.SessionID,
 			rec.Project,
 			rec.Scope,
 			topic,
+			statusLine,
 			rec.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		)
 
@@ -1212,3 +1301,175 @@ func handleMemSimilar(store *localstore.Store, gated embedding.EmbeddingProvider
 		return mcp.NewToolResultText(b.String()), nil
 	}
 }
+
+// parseObservationID converts a single MCP JSON number into a positive int64
+// observation ID, mirroring the rigor in mem_get_observation / mem_update: the
+// MCP SDK delivers all JSON numbers as float64, which cannot exactly represent
+// every int64 above 2^53, so non-integer, non-positive, and out-of-range values
+// are rejected. Returns a descriptive error suitable for the tool error text.
+func parseObservationID(raw any) (int64, error) {
+	f, ok := raw.(float64)
+	if !ok {
+		return 0, fmt.Errorf("must be a number")
+	}
+	if f != math.Trunc(f) || f <= 0 || f >= float64(math.MaxInt64) {
+		return 0, fmt.Errorf("must be a positive integer")
+	}
+	return int64(f), nil
+}
+
+// handleReview returns the handler for mem_review. action="list" lists memories
+// by review status; action="mark_reviewed" resets the staleness clock on the
+// given ids (or the row resolved from topic_key). mark_reviewed is a LOCAL-ONLY
+// write — it never enqueues an outbox entry, so no sync trigger is needed.
+func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		action, _ := args["action"].(string)
+		action = strings.TrimSpace(strings.ToLower(action))
+		switch action {
+		case "list":
+			explicitProject, _ := args["project"].(string)
+			project := resolveReadProject(explicitProject)
+
+			status, _ := args["status"].(string)
+
+			limit := 50
+			if raw, ok := args["limit"].(float64); ok && raw > 0 {
+				limit = int(raw)
+			}
+
+			rows, err := store.ListForReview(status, project, limit)
+			if err != nil {
+				return mcp.NewToolResultError("mem_review: " + err.Error()), nil
+			}
+			if len(rows) == 0 {
+				return mcp.NewToolResultText("No memories match the requested review status."), nil
+			}
+
+			var b strings.Builder
+			fmt.Fprintf(&b, "Found %d memories:\n\n", len(rows))
+			for _, r := range rows {
+				reviewAfter := "—"
+				if r.ReviewAfter != nil {
+					reviewAfter = r.ReviewAfter.UTC().Format("2006-01-02T15:04:05Z")
+				}
+				fmt.Fprintf(&b, "#%d [%s] %s\n    project: %s | status: %s | review_after: %s\n",
+					r.ID, r.Type, r.Title, r.Project, r.Status, reviewAfter)
+			}
+			return mcp.NewToolResultText(b.String()), nil
+
+		case "mark_reviewed":
+			// Resolve the target ids: explicit ids[] OR a topic_key (resolved to its
+			// current observation's id). Exactly one source must be supplied.
+			var ids []int64
+
+			if rawIDs, ok := args["ids"].([]any); ok && len(rawIDs) > 0 {
+				for i, raw := range rawIDs {
+					id, err := parseObservationID(raw)
+					if err != nil {
+						return mcp.NewToolResultError(fmt.Sprintf("mem_review: ids[%d] %s", i, err)), nil
+					}
+					ids = append(ids, id)
+				}
+			}
+
+			topicKey, _ := args["topic_key"].(string)
+			topicKey = strings.TrimSpace(topicKey)
+			if topicKey != "" {
+				explicitProject, _ := args["project"].(string)
+				project := resolveReadProject(explicitProject)
+				id, err := store.IDByTopicKey(topicKey, project, "project")
+				if err != nil {
+					if errors.Is(err, localstore.ErrObservationNotFound) {
+						return mcp.NewToolResultError(fmt.Sprintf("mem_review: no live memory for topic_key %q in project %q", topicKey, project)), nil
+					}
+					return mcp.NewToolResultError("mem_review: " + err.Error()), nil
+				}
+				ids = append(ids, id)
+			}
+
+			if len(ids) == 0 {
+				return mcp.NewToolResultError("mem_review: mark_reviewed requires ids (number array) or topic_key"), nil
+			}
+
+			n, err := store.MarkReviewed(ids)
+			if err != nil {
+				return mcp.NewToolResultError("mem_review: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Marked %d memory(ies) as reviewed.", n)), nil
+
+		default:
+			return mcp.NewToolResultError("mem_review: action is required — must be \"list\" or \"mark_reviewed\""), nil
+		}
+	}
+}
+
+// handleMergeProjects returns the handler for mem_merge_projects. It renames a
+// source project's local rows to the target project name (LOCAL-ONLY — no sync
+// propagation). from and to are both required.
+func handleMergeProjects(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		from, _ := args["from"].(string)
+		from = strings.TrimSpace(from)
+		if from == "" {
+			return mcp.NewToolResultError("mem_merge_projects: from is required"), nil
+		}
+		to, _ := args["to"].(string)
+		to = strings.TrimSpace(to)
+		if to == "" {
+			return mcp.NewToolResultError("mem_merge_projects: to is required"), nil
+		}
+
+		mem, pol, cur, err := store.MergeProject(from, to)
+		if err != nil {
+			return mcp.NewToolResultError("mem_merge_projects: " + err.Error()), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Merged project %q into %q: %d memories, %d policy row(s), %d pull-cursor(s) moved.",
+			from, to, mem, pol, cur,
+		)), nil
+	}
+}
+
+// nearVariantProject reports whether candidate is a near-variant — but NOT an
+// exact match — of any project in existing. It returns the first matching
+// existing project name. Two names are near-variants when, after stripping case
+// and separators (-, _, spaces), they are equal, OR their normalized
+// Levenshtein distance is <= 2. An exact match (case-sensitive equality) is
+// never a drift warning (it is the same project), so it returns ok=false.
+func nearVariantProject(candidate string, existing []string) (string, bool) {
+	candNorm := normalizeForDrift(candidate)
+	if candNorm == "" {
+		return "", false
+	}
+	for _, e := range existing {
+		if e == candidate {
+			return "", false // exact match — same project, no drift
+		}
+		// High-precision: warn ONLY on case/separator-only differences (my-app vs
+		// myapp vs My_App), which collapse to the same normalized key. A fuzzy
+		// edit-distance match was deliberately dropped — for short or intentionally
+		// similar names (api/app, cli/ci, service-a/service-b) it false-positived
+		// and would train users to ignore the note.
+		if normalizeForDrift(e) == candNorm {
+			return e, true
+		}
+	}
+	return "", false
+}
+
+// normalizeForDrift lowercases s and removes separators (-, _, spaces) so that
+// case/separator-only differences ("my-app" vs "myapp" vs "My_App") collapse to
+// the same key for the near-variant comparison.
+func normalizeForDrift(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	r := strings.NewReplacer("-", "", "_", "", " ", "")
+	return r.Replace(s)
+}
+
+// (levenshtein/min3 removed: the name-drift warning is now case/separator-only,
+// see nearVariantProject.)
