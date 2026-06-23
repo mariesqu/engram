@@ -44,6 +44,7 @@ Usage:
   engram projects policy <project> <synced|local-only|omitted>
   engram config   get | set <key> <value>
   engram sync     now
+  engram memories list | search <query>
   engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
   engram version
 
@@ -67,6 +68,7 @@ Subcommands:
   projects  List and manage per-project sync policies (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).
   sync      Trigger an immediate sync cycle (requires daemon --http).
+  memories  Browse stored memories: list recent or search by keyword (requires daemon --http).
   import    Import memories, prompts, and sessions from an old-generation engram database.
   version   Print binary version, GOOS/GOARCH, and Go runtime version.
 
@@ -140,6 +142,12 @@ func run(args []string) int {
 	case "sync":
 		if err := runSyncCmd(args[1:]); err != nil {
 			log.Printf("engram sync: %v", err)
+			return 1
+		}
+		return 0
+	case "memories":
+		if err := runMemoriesCmd(args[1:]); err != nil {
+			log.Printf("engram memories: %v", err)
 			return 1
 		}
 		return 0

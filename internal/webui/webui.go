@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -144,6 +145,36 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 		}
 		handleProjectsPage(w, r, deps, sessions)
 
+	case r.URL.Path == "/ui/memories":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		handleMemoriesPage(w, r, deps, sessions)
+
+	case isMemoryDeletePath(r.URL.Path):
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id, _ := extractMemoryID(r.URL.Path, "/delete")
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handleMemoryDeletePost(w, r, deps, id)
+		})).ServeHTTP(w, r)
+
+	case isMemoryEditPath(r.URL.Path):
+		id, _ := extractMemoryID(r.URL.Path, "/edit")
+		switch r.Method {
+		case http.MethodGet:
+			handleMemoryEditGet(w, r, deps, sessions, id)
+		case http.MethodPost:
+			withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handleMemoryEditPost(w, r, deps, sessions, id)
+			})).ServeHTTP(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+
 	case r.URL.Path == "/ui/config":
 		switch r.Method {
 		case http.MethodGet:
@@ -192,9 +223,202 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			handlePolicyPost(w, r, deps, sessions)
 		})).ServeHTTP(w, r)
 
+	case isProjectDeletePath(r.URL.Path):
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handleProjectDeletePost(w, r, deps, sessions)
+		})).ServeHTTP(w, r)
+
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// isMemoryDeletePath reports whether path matches /ui/memories/{id}/delete.
+func isMemoryDeletePath(path string) bool {
+	const prefix = "/ui/memories/"
+	const suffix = "/delete"
+	return isMemoryActionPath(path, prefix, suffix)
+}
+
+// isMemoryEditPath reports whether path matches /ui/memories/{id}/edit.
+func isMemoryEditPath(path string) bool {
+	const prefix = "/ui/memories/"
+	const suffix = "/edit"
+	return isMemoryActionPath(path, prefix, suffix)
+}
+
+// isMemoryActionPath is the shared structural check for memory sub-paths.
+// Path must be /ui/memories/<id>/<action> where <id> is a non-empty numeric segment.
+func isMemoryActionPath(path, prefix, suffix string) bool {
+	if len(path) <= len(prefix)+len(suffix) {
+		return false
+	}
+	if path[:len(prefix)] != prefix {
+		return false
+	}
+	if path[len(path)-len(suffix):] != suffix {
+		return false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	if middle == "" || strings.Contains(middle, "/") {
+		return false
+	}
+	_, err := strconv.ParseInt(middle, 10, 64)
+	return err == nil
+}
+
+// extractMemoryID parses the integer id from a /ui/memories/{id}/{action} path.
+// suffix is "/delete" or "/edit". Returns (0, false) on any parse error.
+func extractMemoryID(path, suffix string) (int64, bool) {
+	const prefix = "/ui/memories/"
+	if len(path) <= len(prefix)+len(suffix) {
+		return 0, false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	id, err := strconv.ParseInt(middle, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+// handleMemoryDeletePost handles POST /ui/memories/{id}/delete.
+// On success it redirects to /ui/memories. On 404 it returns 404.
+func handleMemoryDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, id int64) {
+	if err := deps.Store.DeleteMemory(id); err != nil {
+		if isStoreNotFound(err) {
+			http.Error(w, "memory not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/ui/memories", http.StatusSeeOther)
+}
+
+// handleMemoryEditGet handles GET /ui/memories/{id}/edit.
+// Fetches the existing memory and renders the edit form.
+func handleMemoryEditGet(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, sessions *sessionStore, id int64) {
+	memories, err := deps.Store.ListMemories("", "", 200)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// Find the specific memory by id.
+	var found *controlapi.MemorySummary
+	for i := range memories {
+		if memories[i].ID == id {
+			found = &memories[i]
+			break
+		}
+	}
+	if found == nil {
+		http.Error(w, "memory not found", http.StatusNotFound)
+		return
+	}
+	vm := memoryEditViewModel{
+		DaemonVersion: deps.Version,
+		Memory:        *found,
+		CSRFToken:     sessions.csrfToken(),
+	}
+	renderPage(w, memoryEditTmpl, vm)
+}
+
+// handleMemoryEditPost handles POST /ui/memories/{id}/edit.
+// Applies the edit and redirects to /ui/memories on success.
+func handleMemoryEditPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore, id int64) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+
+	title := strings.TrimSpace(r.FormValue("title"))
+	content := strings.TrimSpace(r.FormValue("content"))
+	typ := strings.TrimSpace(r.FormValue("type"))
+
+	if title == "" || content == "" {
+		// Re-render the form with an error.
+		memories, _ := deps.Store.ListMemories("", "", 200)
+		var mem controlapi.MemorySummary
+		for _, m := range memories {
+			if m.ID == id {
+				mem = m
+				break
+			}
+		}
+		vm := memoryEditViewModel{
+			DaemonVersion: deps.Version,
+			Memory: controlapi.MemorySummary{
+				ID:      id,
+				Title:   title,
+				Content: content,
+				Type:    typ,
+				Project: mem.Project,
+				Scope:   mem.Scope,
+			},
+			CSRFToken: sessions.csrfToken(),
+			Error:     "title and content are required",
+		}
+		renderPageStatus(w, memoryEditTmpl, vm, http.StatusUnprocessableEntity)
+		return
+	}
+
+	_, err := deps.Store.UpdateMemory(id, title, content, typ)
+	if err != nil {
+		if isStoreNotFound(err) {
+			http.Error(w, "memory not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/ui/memories", http.StatusSeeOther)
+}
+
+// isStoreNotFound reports whether an error from the store layer indicates a
+// missing or deleted record. The localstore.ErrObservationNotFound is wrapped
+// with context text; we detect it by message content.
+func isStoreNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "observation not found") ||
+		(strings.Contains(msg, "memory") && strings.Contains(msg, "not found"))
+}
+
+// isProjectDeletePath reports whether path matches /ui/projects/{project}/delete.
+func isProjectDeletePath(path string) bool {
+	const prefix = "/ui/projects/"
+	const suffix = "/delete"
+	if len(path) <= len(prefix)+len(suffix) {
+		return false
+	}
+	if path[:len(prefix)] != prefix {
+		return false
+	}
+	if path[len(path)-len(suffix):] != suffix {
+		return false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	return middle != "" && !strings.Contains(middle, "/")
+}
+
+// extractProjectFromDeletePath returns the project name from a
+// /ui/projects/{project}/delete path. Returns "" on any parse error.
+func extractProjectFromDeletePath(path string) string {
+	const prefix = "/ui/projects/"
+	const suffix = "/delete"
+	raw := path[len(prefix) : len(path)-len(suffix)]
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || strings.Contains(decoded, "/") {
+		return ""
+	}
+	return decoded
 }
 
 // isPolicyPath reports whether path matches /ui/projects/{project}/policy.
@@ -281,6 +505,24 @@ type configViewModel struct {
 	CSRFToken       string
 }
 
+// memoriesViewModel is the template data for the memories browse page.
+type memoriesViewModel struct {
+	DaemonVersion string
+	Memories      []controlapi.MemorySummary
+	Query         string // current search query (echoed for form)
+	Project       string // current project filter (echoed for form)
+	Searched      bool   // true when a query was submitted (vs first load)
+	CSRFToken     string // needed for delete/edit forms
+}
+
+// memoryEditViewModel is the template data for the memory edit form page.
+type memoryEditViewModel struct {
+	DaemonVersion string
+	Memory        controlapi.MemorySummary
+	CSRFToken     string
+	Error         string
+}
+
 // newStatusVM converts a live controlapi.Status into a statusViewModel.
 // csrfToken is injected from the per-session CSRF store.
 func newStatusVM(st controlapi.Status, version, csrfToken string) statusViewModel {
@@ -339,6 +581,30 @@ func handleConfigPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, se
 	renderPage(w, configTmpl, vm)
 }
 
+func handleMemoriesPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
+	q := r.URL.Query()
+	query := q.Get("q")
+	project := q.Get("project")
+	// "searched" is true any time the form was submitted (q or project param present).
+	searched := query != "" || project != ""
+
+	memories, err := deps.Store.ListMemories(query, project, 50)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	vm := memoriesViewModel{
+		DaemonVersion: deps.Version,
+		Memories:      memories,
+		Query:         query,
+		Project:       project,
+		Searched:      searched,
+		CSRFToken:     sessions.csrfToken(),
+	}
+	renderPage(w, memoriesTmpl, vm)
+}
+
 // buildConfigVM loads the current config from ConfigStore and builds the view model.
 // errMsg is set when the form POST failed. restartRequired is set on a successful
 // POST that required a restart.
@@ -393,6 +659,59 @@ func handlePolicyPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, se
 	}
 
 	// Return the refreshed projects tbody rows for the HTMX innerHTML swap.
+	projects, err := deps.Store.ListProjectsWithPolicy()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if projects == nil {
+		projects = []controlapi.ProjectPolicy{}
+	}
+	vm := projectsViewModel{
+		Projects:      projects,
+		DaemonVersion: deps.Version,
+		CSRFToken:     sessions.csrfToken(),
+	}
+	renderPartial(w, "projects-rows", vm)
+}
+
+// handleProjectDeletePost handles POST /ui/projects/{project}/delete.
+//
+// The form must include a "scope" field with value "local" or "purge-all".
+// Unshare (remote=unshare in the CLI) is intentionally NOT offered here because
+// it requires a DSN — a server-side operation that is not appropriate for the
+// loopback web UI. After a successful delete the projects list partial is
+// re-rendered so the HTMX swap shows the updated state.
+func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
+	project := extractProjectFromDeletePath(r.URL.Path)
+	if project == "" {
+		http.Error(w, "project name required", http.StatusBadRequest)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+
+	scope := r.FormValue("scope")
+	switch scope {
+	case "local":
+		if _, err := deps.Store.PurgeProjectLocal(project); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	case "purge-all":
+		if _, err := deps.Store.TombstoneProject(project); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "scope must be local or purge-all", http.StatusBadRequest)
+		return
+	}
+
+	// Re-render the projects tbody rows for the HTMX innerHTML swap.
 	projects, err := deps.Store.ListProjectsWithPolicy()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)

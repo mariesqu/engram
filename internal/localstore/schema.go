@@ -119,7 +119,20 @@ import (
 //	  - prompts_fts / FTS triggers are intentionally omitted; prompt search is
 //	    deferred to a later PR.
 //	  - Both tables are idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema).
-const currentSchemaVersion = 10
+//
+// v10 → v11: fix mem_fts_delete trigger to add WHERE OLD.deleted_at IS NULL guard.
+//
+//	The INSERT-form trigger (VALUES ...) fired unconditionally on any hard-DELETE
+//	of a memories row, including rows that had already been soft-deleted.
+//	Soft-deleted rows are removed from the FTS index by mem_fts_update at soft-
+//	delete time; attempting to 'delete' a non-indexed rowid causes FTS5 to return
+//	SQLITE_CORRUPT_VTAB (267).  PurgeProjectLocal hard-DELETEs all rows for a
+//	project (including previously soft-deleted ones), which triggered the bug.
+//	The fix converts the trigger body to the SELECT ... WHERE form (matching the
+//	guard already present in mem_fts_update) and recreates all three FTS triggers
+//	from the shared package-level constants (same pattern as v1→v2).  No table
+//	data is touched.
+const currentSchemaVersion = 11
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -162,11 +175,18 @@ BEGIN
 END`
 
 // ftsTriggerDelete is the AFTER DELETE trigger that removes rows from the FTS index.
+//
+// The FTS 'delete' command is only issued when OLD.deleted_at IS NULL.
+// Rows that were previously soft-deleted (deleted_at set) were already removed
+// from the FTS index by the UPDATE trigger (mem_fts_update). Attempting to
+// 'delete' a rowid that is not in the FTS5 external-content table causes
+// SQLITE_CORRUPT_VTAB (267). The conditional SELECT ... WHERE OLD.deleted_at IS NULL
+// guards against that — mirroring the same guard in mem_fts_update.
 const ftsTriggerDelete = `CREATE TRIGGER IF NOT EXISTS mem_fts_delete
 	AFTER DELETE ON memories
 BEGIN
 	INSERT INTO memories_fts(memories_fts, rowid, title, content, type, entity_type, status, project, topic_key)
-	VALUES (
+	SELECT
 		'delete',
 		OLD.id,
 		OLD.title,
@@ -176,7 +196,7 @@ BEGIN
 		COALESCE(OLD.status, ''),
 		OLD.project,
 		COALESCE(OLD.topic_key, '')
-	);
+	WHERE OLD.deleted_at IS NULL;
 END`
 
 // ftsTriggerUpdate is the AFTER UPDATE trigger that keeps the FTS index in sync.
@@ -464,9 +484,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 10
 	}
 
+	if ver < 11 {
+		if err := migrateV10ToV11(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 11
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 10` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 11` migration block.
+	// the final `ver = 11` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 12` migration block.
 	_ = ver
 	return nil
 }
@@ -1124,6 +1152,46 @@ func migrateV9ToV10(db *sql.DB) error {
 	}
 
 	if _, err := tx.Exec(`PRAGMA user_version = 10`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV10ToV11 fixes the mem_fts_delete trigger to add a WHERE OLD.deleted_at IS NULL
+// guard — matching the guard already present in mem_fts_update.
+//
+// Without the guard, calling PurgeProjectLocal (which hard-DELETEs all memories
+// for a project, including those already soft-deleted) caused the trigger to
+// attempt an FTS5 'delete' on a rowid that was already removed from the index
+// by mem_fts_update, resulting in SQLITE_CORRUPT_VTAB (267).
+//
+// The fix drops all three FTS maintenance triggers and recreates them from the
+// shared package-level constants (same pattern as migrateV1ToV2). No table data
+// is touched; the operation is idempotent and safe to re-run.
+func migrateV10ToV11(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	for _, drop := range []string{
+		`DROP TRIGGER IF EXISTS mem_fts_insert`,
+		`DROP TRIGGER IF EXISTS mem_fts_delete`,
+		`DROP TRIGGER IF EXISTS mem_fts_update`,
+	} {
+		if _, err = tx.Exec(drop); err != nil {
+			return err
+		}
+	}
+
+	for _, stmt := range []string{ftsTriggerInsert, ftsTriggerDelete, ftsTriggerUpdate} {
+		if _, err = tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+
+	if _, err = tx.Exec(`PRAGMA user_version = 11`); err != nil {
 		return err
 	}
 	return tx.Commit()

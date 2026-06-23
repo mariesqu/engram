@@ -2312,15 +2312,16 @@ func TestMigration_V9ToV10_TableCreated(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if ver != 10 {
-		t.Errorf("user_version = %d; want 10", ver)
+	// runMigrations applies all pending migrations (v9→v10→...→currentSchemaVersion).
+	if ver != currentSchemaVersion {
+		t.Errorf("user_version = %d; want %d (currentSchemaVersion)", ver, currentSchemaVersion)
 	}
 
 	var tblName string
 	if err := db.QueryRow(
 		`SELECT name FROM sqlite_master WHERE type='table' AND name='project_policy'`,
 	).Scan(&tblName); err != nil {
-		t.Errorf("project_policy table not found after migrateV9ToV10: %v", err)
+		t.Errorf("project_policy table not found after migration: %v", err)
 	}
 }
 
