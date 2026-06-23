@@ -359,18 +359,22 @@ func runDaemonCmd(args []string) error {
 	// ── Resolve embedding key: ENGRAM_EMBEDDING_KEY env always wins ──────────
 	//
 	// ENGRAM_EMBEDDING_KEY env ALWAYS wins over any stored ciphertext — same
-	// precedence contract as ENGRAM_WRITER_KEY. The key is hex-encoded.
-	// When neither source provides a key, the daemon starts with the Noop provider
-	// regardless of embedding_provider — no error, just no embedding capability.
+	// precedence contract as ENGRAM_WRITER_KEY. The value may be hex-encoded OR
+	// the raw API key. When neither source provides a key, the daemon starts with
+	// the Noop provider regardless of embedding_provider — no error, just no
+	// embedding capability.
 	embeddingProvider := fileCfg.EmbeddingProvider
 	var embeddingKey []byte
-	if embeddingKeyHex := strings.TrimSpace(os.Getenv("ENGRAM_EMBEDDING_KEY")); embeddingKeyHex != "" {
-		// Env var wins — decode and use directly. Invalid hex is a startup error.
-		decoded, err := hex.DecodeString(embeddingKeyHex)
-		if err != nil {
-			return fmt.Errorf("ENGRAM_EMBEDDING_KEY is not valid hex: %w", err)
+	if embeddingKeyEnv := strings.TrimSpace(os.Getenv("ENGRAM_EMBEDDING_KEY")); embeddingKeyEnv != "" {
+		// Env var wins. Accept EITHER a hex-encoded key (legacy/explicit) or the
+		// raw API key verbatim: try hex first, and if it does not decode, use the
+		// value as-is. This avoids the footgun where a normal provider key (e.g.
+		// "sk-…" / a Mistral key — not valid hex) would error at startup.
+		if decoded, err := hex.DecodeString(embeddingKeyEnv); err == nil {
+			embeddingKey = decoded
+		} else {
+			embeddingKey = []byte(embeddingKeyEnv)
 		}
-		embeddingKey = decoded
 	} else if blob := fileCfg.EncryptedEmbeddingKey(); len(blob) > 0 {
 		// No env var — attempt to decrypt the stored ciphertext.
 		secretBox := config.NewSecretBox()

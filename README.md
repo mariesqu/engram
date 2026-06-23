@@ -871,10 +871,10 @@ Valid values: `""` (noop, default), `"none"` (explicit noop), `"openai"`, `"olla
 
 #### OpenAI
 
-Supply the API key via the `ENGRAM_EMBEDDING_KEY` environment variable (hex-encoded). On Windows the key can also be stored as a DPAPI-encrypted blob via the key-management API (see below). The environment variable always wins over the stored blob.
+Supply the API key via the `ENGRAM_EMBEDDING_KEY` environment variable — the **raw key** works directly (a hex-encoded key is also accepted for backward compatibility). On Windows the key can also be stored as a DPAPI-encrypted blob via the key-management API (see below). The environment variable always wins over the stored blob.
 
 ```bash
-export ENGRAM_EMBEDDING_KEY=<hex-encoded-openai-key>
+export ENGRAM_EMBEDDING_KEY=<your-api-key>
 ```
 
 The key is kept in process memory only and is **never written to disk in plaintext, never logged, and never included in error messages**.

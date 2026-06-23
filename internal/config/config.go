@@ -325,6 +325,13 @@ type ConfigPatch struct {
 // %APPDATA%\engram on Windows, os.UserConfigDir()/engram elsewhere.
 // Returns an error when the OS cannot determine the user config directory.
 func DefaultConfigDir() (string, error) {
+	// ENGRAM_CONFIG_DIR overrides the default platform location (as documented in
+	// the README's Config file / Environment variables sections). It lets a user
+	// relocate or isolate their config — e.g. for testing, or running multiple
+	// daemons with distinct settings without colliding on a single config.json.
+	if override := strings.TrimSpace(os.Getenv("ENGRAM_CONFIG_DIR")); override != "" {
+		return override, nil
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("config: cannot determine user config dir: %w", err)
