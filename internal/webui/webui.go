@@ -223,6 +223,15 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			handlePolicyPost(w, r, deps, sessions)
 		})).ServeHTTP(w, r)
 
+	case isProjectDeletePath(r.URL.Path):
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		withCSRF(sessions, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handleProjectDeletePost(w, r, deps, sessions)
+		})).ServeHTTP(w, r)
+
 	default:
 		http.NotFound(w, r)
 	}
@@ -380,6 +389,36 @@ func isStoreNotFound(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "observation not found") ||
 		(strings.Contains(msg, "memory") && strings.Contains(msg, "not found"))
+}
+
+// isProjectDeletePath reports whether path matches /ui/projects/{project}/delete.
+func isProjectDeletePath(path string) bool {
+	const prefix = "/ui/projects/"
+	const suffix = "/delete"
+	if len(path) <= len(prefix)+len(suffix) {
+		return false
+	}
+	if path[:len(prefix)] != prefix {
+		return false
+	}
+	if path[len(path)-len(suffix):] != suffix {
+		return false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	return middle != "" && !strings.Contains(middle, "/")
+}
+
+// extractProjectFromDeletePath returns the project name from a
+// /ui/projects/{project}/delete path. Returns "" on any parse error.
+func extractProjectFromDeletePath(path string) string {
+	const prefix = "/ui/projects/"
+	const suffix = "/delete"
+	raw := path[len(prefix) : len(path)-len(suffix)]
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || strings.Contains(decoded, "/") {
+		return ""
+	}
+	return decoded
 }
 
 // isPolicyPath reports whether path matches /ui/projects/{project}/policy.
@@ -620,6 +659,59 @@ func handlePolicyPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, se
 	}
 
 	// Return the refreshed projects tbody rows for the HTMX innerHTML swap.
+	projects, err := deps.Store.ListProjectsWithPolicy()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if projects == nil {
+		projects = []controlapi.ProjectPolicy{}
+	}
+	vm := projectsViewModel{
+		Projects:      projects,
+		DaemonVersion: deps.Version,
+		CSRFToken:     sessions.csrfToken(),
+	}
+	renderPartial(w, "projects-rows", vm)
+}
+
+// handleProjectDeletePost handles POST /ui/projects/{project}/delete.
+//
+// The form must include a "scope" field with value "local" or "purge-all".
+// Unshare (remote=unshare in the CLI) is intentionally NOT offered here because
+// it requires a DSN — a server-side operation that is not appropriate for the
+// loopback web UI. After a successful delete the projects list partial is
+// re-rendered so the HTMX swap shows the updated state.
+func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
+	project := extractProjectFromDeletePath(r.URL.Path)
+	if project == "" {
+		http.Error(w, "project name required", http.StatusBadRequest)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+
+	scope := r.FormValue("scope")
+	switch scope {
+	case "local":
+		if _, err := deps.Store.PurgeProjectLocal(project); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	case "purge-all":
+		if _, err := deps.Store.TombstoneProject(project); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "scope must be local or purge-all", http.StatusBadRequest)
+		return
+	}
+
+	// Re-render the projects tbody rows for the HTMX innerHTML swap.
 	projects, err := deps.Store.ListProjectsWithPolicy()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)

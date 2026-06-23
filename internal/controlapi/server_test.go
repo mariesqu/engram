@@ -52,6 +52,12 @@ func (m *mockStore) UpdateMemory(id int64, title, content, typ string) (controla
 func (m *mockStore) DeleteMemory(id int64) error {
 	return m.err
 }
+func (m *mockStore) PurgeProjectLocal(project string) (int, error) {
+	return 0, m.err
+}
+func (m *mockStore) TombstoneProject(project string) (int, error) {
+	return 0, m.err
+}
 
 // mockSyncCtrl implements controlapi.SyncController for tests.
 type mockSyncCtrl struct {

@@ -790,6 +790,14 @@ func (a *localStoreAdapter) DeleteMemory(id int64) error {
 	return a.store.DeleteMemory(id, a.writerID)
 }
 
+func (a *localStoreAdapter) PurgeProjectLocal(project string) (int, error) {
+	return a.store.PurgeProjectLocal(project)
+}
+
+func (a *localStoreAdapter) TombstoneProject(project string) (int, error) {
+	return a.store.TombstoneProject(project, a.writerID)
+}
+
 // ── configStoreAdapter (PR-③) ─────────────────────────────────────────────────
 
 // configStoreAdapter adapts internal/config.Config to controlapi.ConfigStore.

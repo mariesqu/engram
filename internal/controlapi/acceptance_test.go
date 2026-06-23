@@ -48,6 +48,19 @@ func (a *realStoreAdapter) GetPolicy(project string) (controlapi.Policy, error) 
 	return controlapi.Policy(p), err
 }
 
+// The memory and project-purge methods are not exercised by the acceptance tests
+// that use this adapter (they predate those endpoints); stubbed to satisfy the
+// grown controlapi.Store interface.
+func (a *realStoreAdapter) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+	return nil, nil
+}
+func (a *realStoreAdapter) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
+	return controlapi.MemorySummary{}, nil
+}
+func (a *realStoreAdapter) DeleteMemory(id int64) error             { return nil }
+func (a *realStoreAdapter) PurgeProjectLocal(p string) (int, error) { return 0, nil }
+func (a *realStoreAdapter) TombstoneProject(p string) (int, error)  { return 0, nil }
+
 // realSyncCtrl is a no-op sync controller for the acceptance suite.
 type realSyncCtrl struct {
 	centralURL string

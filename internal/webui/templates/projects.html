@@ -15,6 +15,7 @@
             <th>Project</th>
             <th>Policy</th>
             <th>Change</th>
+            <th>Delete</th>
         </tr>
     </thead>
     <tbody id="projects-table-body">
@@ -36,6 +37,22 @@
                         <option value="omitted"{{if eq (printf "%s" .Policy) "omitted"}} selected{{end}}>omitted</option>
                     </select>
                     <button type="submit" class="btn btn-small">Apply</button>
+                </form>
+            </td>
+            <td>
+                <form method="POST"
+                      action="/ui/projects/{{.Name}}/delete"
+                      hx-post="/ui/projects/{{.Name}}/delete"
+                      hx-target="#projects-table-body"
+                      hx-swap="innerHTML"
+                      hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'
+                      onsubmit="return confirm('Delete project {{.Name}} with scope ' + this.scope.value + '?')">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <select name="scope" class="policy-select">
+                        <option value="local">local</option>
+                        <option value="purge-all">purge-all</option>
+                    </select>
+                    <button type="submit" class="btn btn-small btn-danger">Delete</button>
                 </form>
             </td>
         </tr>

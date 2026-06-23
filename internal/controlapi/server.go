@@ -201,6 +201,12 @@ type Store interface {
 	// DeleteMemory soft-deletes the memory row with the given id.
 	// Returns an error wrapping ErrObservationNotFound when id is missing or deleted.
 	DeleteMemory(id int64) error
+	// PurgeProjectLocal hard-deletes the project's local data and sets its policy
+	// to omitted. Returns the total rows deleted.
+	PurgeProjectLocal(project string) (int, error)
+	// TombstoneProject soft-deletes every live memory in the project, enqueueing
+	// OpDelete mutations that propagate to all synced nodes. Returns the count.
+	TombstoneProject(project string) (int, error)
 }
 
 // SyncController is the autosync control port. PR-① uses Status for the
@@ -314,6 +320,7 @@ func (s *Server) WithAuthAndOrigin(next http.HandlerFunc) http.HandlerFunc {
 //	PUT    /api/v1/config                       → withAuth+Origin → handleConfigPut
 //	GET    /api/v1/projects                     → withAuth → handleProjects (real policies)
 //	PUT    /api/v1/projects/{project}/policy    → withAuth+Origin → handleProjectPolicy
+//	DELETE /api/v1/projects/{project}           → withAuth+Origin → handleProjectDelete (scope=local|purge-all)
 //	POST   /api/v1/central/connect              → withAuth+Origin → handleConnect
 //	POST   /api/v1/central/disconnect           → withAuth+Origin → handleDisconnect
 //	POST   /api/v1/sync/trigger                 → withAuth+Origin → handleSyncTrigger
@@ -331,6 +338,8 @@ func (s *Server) Handler() http.Handler {
 	// PR-②: PUT /api/v1/projects/{project}/policy
 	// Go 1.22+ ServeMux supports {variable} patterns and method prefixes.
 	mux.HandleFunc("PUT /api/v1/projects/{project}/policy", s.WithAuthAndOrigin(s.handleProjectPolicy))
+	// Project delete: scope=local (PurgeProjectLocal) or scope=purge-all (TombstoneProject).
+	mux.HandleFunc("DELETE /api/v1/projects/{project}", s.WithAuthAndOrigin(s.handleProjectDelete))
 	// PR-③: central connect/disconnect + sync trigger.
 	mux.HandleFunc("POST /api/v1/central/connect", s.WithAuthAndOrigin(s.handleConnect))
 	mux.HandleFunc("POST /api/v1/central/disconnect", s.WithAuthAndOrigin(s.handleDisconnect))
@@ -567,6 +576,44 @@ func (s *Server) handleProjectPolicy(w http.ResponseWriter, r *http.Request) {
 		"project": project,
 		"policy":  string(p),
 	})
+}
+
+// handleProjectDelete handles DELETE /api/v1/projects/{project}?scope=local|purge-all.
+//
+// scope=local     → PurgeProjectLocal: hard-delete local data + set policy omitted.
+// scope=purge-all → TombstoneProject:  soft-delete all live memories (propagates via sync).
+//
+// Any other or missing scope returns 400. The route is registered with
+// WithAuthAndOrigin so both bearer-token auth and Origin validation are
+// enforced before this handler runs.
+func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
+	project := r.PathValue("project")
+	if project == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	scope := r.URL.Query().Get("scope")
+	switch scope {
+	case "local":
+		n, err := s.store.PurgeProjectLocal(project)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]int{"deleted": n})
+
+	case "purge-all":
+		n, err := s.store.TombstoneProject(project)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]int{"deleted": n})
+
+	default:
+		writeError(w, http.StatusBadRequest, "scope must be one of: local, purge-all")
+	}
 }
 
 // ── HTTP helpers (mirrored from cloudserve — same patterns, separate package) ─
