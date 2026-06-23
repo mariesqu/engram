@@ -126,12 +126,24 @@ func runProjectsPolicyCmd(args []string) error {
 		return err
 	}
 
-	if fs.NArg() != 2 {
-		return fmt.Errorf("projects policy requires exactly two arguments: <project> <policy> (got %d)", fs.NArg())
+	// <project> <policy> are positionals; Go's flag package stops at the first
+	// one, so parse any flags that FOLLOW them with a second pass — both
+	// `projects policy --db X p synced` and `projects policy p synced --db X` work.
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("projects policy requires exactly two arguments: <project> <policy>")
 	}
-
-	project := fs.Arg(0)
-	policyStr := fs.Arg(1)
+	project := rest[0]
+	policyStr := rest[1]
+	if err := fs.Parse(rest[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("projects policy takes exactly <project> <policy>; unexpected: %v", fs.Args())
+	}
 
 	// Validate policy value before making a network call.
 	if _, err := controlapi.ParsePolicy(policyStr); err != nil {
