@@ -33,6 +33,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 ## Features
 
 - **10 MCP tools** for session tracking, memory write, search, similarity, and conflict resolution
+- **Human memory management** — browse, search, edit, and delete memories, and delete whole projects (local / unshare / purge-all), from both the CLI and the web UI
 - **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
 - **Local-only mode** — no network, no credentials required
 - **Optional central sync** — push/pull over HTTP with HMAC-SHA256 per-writer authentication
@@ -41,6 +42,8 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 - **Prompt capture** — `mem_save_prompt` persists the user's prompt; `mem_save` auto-attaches it
 - **Project auto-detection** — resolves project name from git remote, repo root, or `.engram/config.json`
 - **Pure Go, CGO_ENABLED=0** — no C toolchain required
+
+> **New to engram?** [Quickstart: local-only mode](#quickstart-local-only-mode) gets you running in two commands. Once memories start accumulating, [Managing your memories](#managing-your-memories) shows how to browse, search, edit, and clean them up from the CLI or web UI — no agent required.
 
 ## Install from release
 
@@ -273,18 +276,22 @@ The file is written atomically (temp file + rename) so a crash during a write ne
 
 All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-Control: no-store`.
 
-| Method  | Path                                       | Description                                            |
-|---------|--------------------------------------------|--------------------------------------------------------|
-| `GET`   | `/api/v1/status`                           | Connection state, last sync result, version            |
-| `GET`   | `/api/v1/config`                           | Redacted daemon configuration (writer key masked)      |
-| `PUT`   | `/api/v1/config`                           | Patch runtime-mutable or restart-required config       |
-| `GET`   | `/api/v1/projects`                         | List of projects with their effective policy           |
-| `PUT`   | `/api/v1/projects/{project}/policy`        | Set the sync policy for a project                      |
-| `POST`  | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
-| `POST`  | `/api/v1/central/disconnect`               | Disconnect from central (clears credentials)           |
-| `POST`  | `/api/v1/sync/trigger`                     | Trigger an immediate sync cycle (202; 409 if offline)  |
+| Method   | Path                                       | Description                                            |
+|----------|--------------------------------------------|--------------------------------------------------------|
+| `GET`    | `/api/v1/status`                           | Connection state, last sync result, version            |
+| `GET`    | `/api/v1/config`                           | Redacted daemon configuration (writer key masked)      |
+| `PUT`    | `/api/v1/config`                           | Patch runtime-mutable or restart-required config       |
+| `GET`    | `/api/v1/projects`                         | List of projects with their effective policy           |
+| `PUT`    | `/api/v1/projects/{project}/policy`        | Set the sync policy for a project                      |
+| `DELETE` | `/api/v1/projects/{project}?scope=local\|purge-all` | Delete a project locally or propagate deletions via tombstones |
+| `GET`    | `/api/v1/memories`                         | List/search memories (`q`, `project`, `limit` params) |
+| `PUT`    | `/api/v1/memories/{id}`                    | Edit a memory in place (`title`, `content`, `type`)   |
+| `DELETE` | `/api/v1/memories/{id}`                    | Soft-delete a memory by numeric ID                     |
+| `POST`   | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
+| `POST`   | `/api/v1/central/disconnect`               | Disconnect from central (clears credentials)           |
+| `POST`   | `/api/v1/sync/trigger`                     | Trigger an immediate sync cycle (202; 409 if offline)  |
 
-Mutating endpoints (`PUT`, `POST`) additionally require an `Origin: http://127.0.0.1:<port>` header.
+Mutating endpoints (`PUT`, `POST`, `DELETE`) additionally require an `Origin: http://127.0.0.1:<port>` header.
 
 ### CLI subcommands
 
@@ -448,7 +455,8 @@ engram ui --db ~/.engram/memories.db
 |------|---------|------|
 | `/ui/` | **Status page** — central connected state, last sync result (pushed/pulled counts, error), daemon version. Auto-refreshes every 3 s via HTMX polling. | session cookie |
 | `/ui/status` | **Status partial** — HTMX polling fragment (no full page wrapper). | session cookie |
-| `/ui/projects` | **Projects** — table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`) and a per-row policy selector. | session cookie |
+| `/ui/projects` | **Projects** — table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`) and a per-row policy selector; includes per-row delete (local or purge-all). | session cookie |
+| `/ui/memories` | **Memories** — browse or search the full memory corpus; per-row edit and delete buttons. Accepts `q` (search query) and `project` (filter) query params. | session cookie |
 | `/ui/config` | **Configuration** — editable `sync_interval`; `central_url` and `writer_key` shown read-only (managed via the connect/disconnect actions on the Status page). | session cookie |
 
 ### Mutating actions (PR-④b)
@@ -458,6 +466,9 @@ All mutating actions (POST) require both a valid session cookie **and** a CSRF d
 | Action | Route | Notes |
 |--------|-------|-------|
 | Change project policy | `POST /ui/projects/{name}/policy` | Calls `Store.SetPolicy`; returns refreshed projects rows via HTMX swap. |
+| Delete project | `POST /ui/projects/{name}/delete` | Form field `scope`: `local` (hard-delete local data, set policy to omitted) or `purge-all` (tombstone all memories so deletions propagate via sync). `unshare` is CLI-only (requires a DSN). Returns refreshed projects rows. |
+| Edit memory | `GET /ui/memories/{id}/edit` / `POST /ui/memories/{id}/edit` | GET renders the edit form pre-populated with the existing title, content, and type. POST applies the change and redirects to `/ui/memories`. |
+| Delete memory | `POST /ui/memories/{id}/delete` | Soft-deletes the memory and redirects to `/ui/memories`. |
 | Update sync interval | `POST /ui/config` | Validates Go duration server-side; returns updated config form. Shows restart-required notice when applicable. |
 | Trigger sync now | `POST /ui/sync` | Calls `SyncController.TriggerNow`; button hidden/disabled when central is not connected. Returns status partial. |
 | Disconnect from central | `POST /ui/disconnect` | Calls `SyncController.Disconnect`; includes HTMX confirm dialog. Returns status partial. |
@@ -550,6 +561,11 @@ engram ui       [--db <path>]
 engram tray     [--db <path>]  (Windows only)
 engram projects list   [--db <path>]
 engram projects policy [--db <path>] <project> <policy>
+engram projects delete <project> [--local] [--remote unshare|purge-all] [--db <path>] [--dsn <dsn>] [--yes]
+engram memories list   [--db <path>] [--project <name>] [--limit <n>]
+engram memories search <query> [--db <path>] [--project <name>] [--limit <n>]
+engram memories edit   <id> --title <title> --content <content> [--type <type>] [--db <path>]
+engram memories delete <id> [--db <path>]
 engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
@@ -684,6 +700,103 @@ judgment_id: rel-<hex>
 ```
 
 The agent calls `mem_judge` with the `judgment_id` and one of: `related`, `compatible`, `scoped`, `conflicts_with`, `supersedes`, `not_conflict`.
+
+## Managing your memories
+
+The MCP tools are how the AI agent reads and writes memories automatically. This section is for **you** — the human — when you want to browse, correct, or clean up what's been saved.
+
+All CLI commands below need `--db` pointing at your local database, or set `ENGRAM_DB` once in your shell:
+
+```bash
+export ENGRAM_DB=~/.engram/memories.db
+```
+
+### Browsing and searching
+
+List the most recent memories (default: up to 50):
+
+```bash
+engram memories list
+engram memories list --project my-project --limit 20
+```
+
+Search by keyword across all projects, or narrow to one:
+
+```bash
+engram memories search "authentication bug"
+engram memories search "auth" --project my-project
+```
+
+Flags can appear before or after the query — both forms work:
+
+```bash
+engram memories search --project my-project "auth"   # equivalent
+```
+
+You can also browse and search visually in the web UI. Start it with:
+
+```bash
+engram ui
+```
+
+Then click the **Memories** tab (`/ui/memories`). The page has a search form and lists every memory with edit and delete buttons next to each row.
+
+### Editing a memory
+
+To fix a title or update the content of a saved memory, you need its numeric ID. Get it from `engram memories list` (the first column) or from the web UI.
+
+```bash
+engram memories edit 42 --title "Fixed: N+1 in UserList" --content "Root cause was missing .Include(). Fixed in UserRepository.cs line 87."
+```
+
+Both `--title` and `--content` are required. `--type` is optional — omit it to keep the existing type.
+
+In the web UI: click **Edit** on any row, update the fields in the form, and click **Save**.
+
+### Deleting a memory
+
+Soft-deletes the memory by ID. The deletion is propagated to other synced nodes on the next sync cycle.
+
+```bash
+engram memories delete 42
+```
+
+In the web UI: click **Delete** on any row in the Memories tab. The list refreshes immediately.
+
+### Deleting a whole project
+
+Sometimes you want to remove everything engram knows about a project — not just a single memory. There are three modes, and they can be combined:
+
+| Mode | Flag | What it does |
+|------|------|--------------|
+| **Local delete** | `--local` | Hard-deletes all local data for the project and sets its policy to `omitted` so nothing is written again. Needs `--db`. |
+| **Purge-all** | `--remote=purge-all` | Writes tombstones for every live memory in the project. Deletions propagate to all synced nodes on the next sync cycle. Needs `--db`. |
+| **Unshare** | `--remote=unshare` | Hard-deletes the project from central without tombstones — other nodes keep their local copy. Needs `--dsn` (Postgres DSN; this is an admin operation). Optionally pair with `--db` to also flip the local policy to `local-only` so this node stops re-pushing. |
+
+**All destructive modes require `--yes`.** Without it, the command prints a dry-run summary of what would happen and exits cleanly — safe to run before committing.
+
+**Examples:**
+
+```bash
+# Preview what would happen (dry run — no data is deleted):
+engram projects delete myproj --local
+
+# Hard-delete local data only:
+engram projects delete myproj --local --yes
+
+# Propagate deletions to all synced nodes (tombstones):
+engram projects delete myproj --remote=purge-all --yes
+
+# "I synced a project by accident and want to keep it only on this machine":
+# Remove it from central (no tombstones), and flip the local policy to local-only
+# so this node stops pushing it again.
+engram projects delete myproj --remote=unshare --dsn "$ENGRAM_DSN" --db ~/.engram/memories.db --yes
+
+# Do everything at once — delete local data AND purge from central:
+engram projects delete myproj --local --remote=purge-all --yes
+```
+
+The web UI also exposes local and purge-all delete from the **Projects** page. `unshare` is CLI-only because it requires a Postgres DSN (a server-side / admin operation).
 
 ## Semantic search
 
