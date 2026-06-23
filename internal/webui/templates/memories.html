@@ -10,7 +10,14 @@
         {{if .Query}}<a href="/ui/memories" class="btn btn-small">Clear</a>{{end}}
     </form>
     {{if .Memories}}
-    <table>
+    <table class="data">
+        <colgroup>
+            <col style="width:24%">
+            <col style="width:11%">
+            <col style="width:17%">
+            <col style="width:32%">
+            <col style="width:16%">
+        </colgroup>
         <thead>
             <tr>
                 <th>Title</th>
@@ -27,7 +34,7 @@
                 <td><span class="badge">{{.Type}}</span></td>
                 <td>{{.Project}}</td>
                 <td class="muted">{{truncateContent .Content 200}}</td>
-                <td>
+                <td class="actions">
                     <a href="/ui/memories/{{.ID}}/edit" class="btn btn-small">Edit</a>
                     <form method="POST" action="/ui/memories/{{.ID}}/delete" style="display:inline">
                         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
