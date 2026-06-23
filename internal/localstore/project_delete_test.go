@@ -15,6 +15,21 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 )
 
+// TestProjectDelete_EmptyProjectRejected verifies the W1 guard: a blank or
+// whitespace-only project name (which normalizes to "") is refused by both
+// destructive store methods, so the empty-project bucket can't be purged by accident.
+func TestProjectDelete_EmptyProjectRejected(t *testing.T) {
+	st := openTempStore(t)
+	for _, p := range []string{"", "   ", "\t"} {
+		if _, err := st.PurgeProjectLocal(p); err == nil {
+			t.Errorf("PurgeProjectLocal(%q): expected error, got nil", p)
+		}
+		if _, err := st.TombstoneProject(p, "w1"); err == nil {
+			t.Errorf("TombstoneProject(%q): expected error, got nil", p)
+		}
+	}
+}
+
 // TestPurgeProjectLocal_DeletesRowsAndSetsOmitted verifies that PurgeProjectLocal:
 //   - hard-deletes memories for the target project
 //   - sets its policy to omitted
@@ -268,4 +283,3 @@ func TestPurgeProjectLocal_LiveAndSoftDeleted(t *testing.T) {
 		t.Errorf("PurgeProjectLocal: %d rows remain; want 0", count)
 	}
 }
-

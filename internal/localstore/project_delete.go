@@ -1,5 +1,7 @@
 package localstore
 
+import "fmt"
+
 // PurgeProjectLocal hard-deletes all local data for the named project in one
 // transaction and then sets the project's policy to omitted so sync will not
 // re-pull the project in the future.
@@ -26,6 +28,12 @@ package localstore
 // Returns the total number of rows deleted across all tables.
 func (s *Store) PurgeProjectLocal(project string) (int, error) {
 	project = normalizeProject(project)
+	// Guard: a whitespace-only argument normalizes to "" and would otherwise
+	// silently purge the empty-project bucket. Refuse it (the caller must name a
+	// real project) — destructive ops must not act on an accidental blank.
+	if project == "" {
+		return 0, fmt.Errorf("PurgeProjectLocal: project must not be empty")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,9 +134,19 @@ func (s *Store) PurgeProjectLocal(project string) (int, error) {
 // s.mu is NOT held around DeleteMemory — DeleteMemory acquires it internally.
 // Holding it here would deadlock.
 //
+// PARTIAL PROGRESS: each memory is tombstoned in its own transaction (DeleteMemory
+// is atomic per row), so this operation is NOT all-or-nothing. On an error part-way
+// through it returns the count of memories successfully tombstoned SO FAR together
+// with the error. It is safe to re-run: already-tombstoned rows are no longer live
+// and won't be re-selected, so a re-run completes the remainder.
+//
 // Returns the number of memories that were tombstoned.
 func (s *Store) TombstoneProject(project, writerID string) (int, error) {
 	project = normalizeProject(project)
+	// Guard: refuse a blank/whitespace-only project (see PurgeProjectLocal).
+	if project == "" {
+		return 0, fmt.Errorf("TombstoneProject: project must not be empty")
+	}
 
 	// Select all live memory IDs for this project in a single read.
 	rows, err := s.db.Query(
