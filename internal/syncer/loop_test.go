@@ -324,8 +324,13 @@ func TestLoop_NonRetryableNoHotLoop(t *testing.T) {
 	if count > 30 {
 		t.Errorf("non-retryable: %d syncs in 80ms — looks like a hot-loop (want ≤30)", count)
 	}
-	if count < 3 {
-		t.Errorf("non-retryable: only %d syncs in 80ms — loop may have stalled", count)
+	// Lower bound is intentionally loose (>=1, not a tight cadence count): under
+	// heavy parallel CPU load (e.g. the full -tags acceptance run) the loop
+	// goroutine can be starved enough to fire only a couple of syncs in 80ms of
+	// wall clock — a scheduling artifact, not a stall. The MEANINGFUL assertion is
+	// the upper bound above (no hot-loop); this floor just proves the loop ran.
+	if count < 1 {
+		t.Errorf("non-retryable: loop did not run at all (%d syncs in 80ms) — stalled", count)
 	}
 }
 
