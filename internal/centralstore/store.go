@@ -23,9 +23,19 @@ type Store struct {
 // Open connects to Postgres at dsn, creates the pgxpool, and applies the
 // central schema idempotently. The returned Store is ready to use.
 func Open(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("centralstore.Open: pgxpool.New: %w", err)
+		return nil, fmt.Errorf("centralstore.Open: parse dsn: %w", err)
+	}
+	// Headroom for concurrent push applies from the daemon (see syncer.Push,
+	// which applies up to ENGRAM_PUSH_CONCURRENCY mutations in parallel). Only
+	// raise the ceiling — never lower a pool_max_conns set explicitly in the DSN.
+	if cfg.MaxConns < 16 {
+		cfg.MaxConns = 16
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("centralstore.Open: pgxpool.NewWithConfig: %w", err)
 	}
 
 	// Ping to verify connectivity before returning.

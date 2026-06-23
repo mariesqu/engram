@@ -32,7 +32,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Features
 
-- **10 MCP tools** for session tracking, memory write, search, similarity, and conflict resolution
+- **12 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, and conflict resolution
 - **Human memory management** — browse, search, edit, and delete memories, and delete whole projects (local / unshare / purge-all), from both the CLI and the web UI
 - **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
 - **Local-only mode** — no network, no credentials required
@@ -719,15 +719,17 @@ If the agent's context is cleared or compacted, the persistent store is unaffect
 
 ## MCP tools
 
-The daemon exposes 10 tools to the connected agent.
+The daemon exposes 12 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
 | `mem_session_start`   | Register the start of a coding session; resolves and stores the project name         |
 | `mem_session_end`     | Mark a session as completed with an optional summary                                 |
 | `mem_save`            | Save an observation (decision, bug fix, discovery, …) to persistent memory           |
+| `mem_suggest_topic_key` | Suggest a stable, deterministic `topic_key` so re-saves UPSERT the same chain instead of duplicating |
 | `mem_save_prompt`     | Save the user's prompt text so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID                |
+| `mem_update`          | Edit a specific observation in place by ID (omitted fields keep their value; versioned + re-synced) |
 | `mem_search`          | Search observations; supports `mode` param: `""` (FTS), `"semantic"`, or `"hybrid"` |
 | `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
 | `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |

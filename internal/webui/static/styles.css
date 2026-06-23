@@ -165,6 +165,19 @@ tr:last-child td { border-bottom: none; }
     font-size: 0.85rem;
 }
 
+/* Data tables (memories): fixed layout so long titles or unbroken content
+   (URLs, hashes) wrap inside their column instead of stretching the table and
+   misaligning the others. Column widths come from the <colgroup>. */
+table.data { table-layout: fixed; }
+table.data td {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    vertical-align: top;
+}
+/* Edit + Delete sit inline but may wrap to a second line in a narrow Actions
+   column; the margin keeps the two rows from touching when they do. */
+table.data td.actions .btn { margin-bottom: 0.2rem; }
+
 /* ── 401 error page ─────────────────────────────────────── */
 
 .error-page {

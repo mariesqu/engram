@@ -15,8 +15,10 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_session_start` | Register the start of a coding session |
 | `mem_session_end` | Mark a session as completed with an optional summary |
 | `mem_save` | Save an observation (decision, bug fix, discovery, …) to persistent memory |
+| `mem_suggest_topic_key` | Suggest a stable, deterministic `topic_key` so re-saves UPSERT the same chain instead of duplicating |
 | `mem_save_prompt` | Save the user's prompt so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID |
+| `mem_update` | Edit a specific observation in place by ID (omitted fields keep their value; versioned and re-synced) |
 | `mem_search` | Full-text, semantic, or hybrid search across observations |
 | `mem_similar` | Find observations semantically nearest a given memory (by sync_id) |
 | `mem_context` | Assemble recent sessions and observations into a context summary |
