@@ -20,6 +20,7 @@ type fakeWin32 struct {
 	registerCalled bool
 	removeCalled   bool
 	updateCalls    []string
+	balloons       []string
 
 	// nextMenuSelect is the MenuItemID that ShowContextMenu returns.
 	nextMenuSelect MenuItemID
@@ -48,6 +49,13 @@ func (f *fakeWin32) UpdateTrayIcon(_ uintptr, tooltip string) error {
 func (f *fakeWin32) RemoveTrayIcon(_ uintptr) error {
 	f.mu.Lock()
 	f.removeCalled = true
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeWin32) ShowBalloon(_ uintptr, title, message string) error {
+	f.mu.Lock()
+	f.balloons = append(f.balloons, title+": "+message)
 	f.mu.Unlock()
 	return nil
 }
@@ -213,6 +221,7 @@ type sequencedFakeWin32 struct {
 func (f *sequencedFakeWin32) RegisterTrayIcon(_ uint32) (uintptr, error) { return 0x1234, nil }
 func (f *sequencedFakeWin32) UpdateTrayIcon(_ uintptr, _ string) error   { return nil }
 func (f *sequencedFakeWin32) RemoveTrayIcon(_ uintptr) error             { return nil }
+func (f *sequencedFakeWin32) ShowBalloon(_ uintptr, _, _ string) error   { return nil }
 
 func (f *sequencedFakeWin32) ShowContextMenu(_ uintptr, _ []MenuItem) (MenuItemID, error) {
 	f.mu.Lock()

@@ -50,6 +50,19 @@ func TestBuildMenu_Disconnected_HasConnect(t *testing.T) {
 	}
 }
 
+func TestBuildMenu_HasCheckForUpdates(t *testing.T) {
+	for _, s := range []StatusSnapshot{
+		{Connected: true, DaemonRunning: true},
+		{Connected: false, DaemonRunning: true},
+		{},
+	} {
+		items := BuildMenu(s)
+		if findItem(items, MenuIDCheckUpdate) == nil {
+			t.Errorf("Check for Updates item missing for snapshot %+v", s)
+		}
+	}
+}
+
 func TestBuildMenu_AlwaysHasQuit(t *testing.T) {
 	for _, s := range []StatusSnapshot{
 		{Connected: true, DaemonRunning: true},
