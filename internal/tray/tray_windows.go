@@ -38,9 +38,12 @@
 package tray
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -48,6 +51,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/mariesqu/engram/internal/updater"
 )
 
 // ── Win32 constants ───────────────────────────────────────────────────────────
@@ -60,6 +65,9 @@ const (
 	nifMessage = 0x00000001
 	nifIcon    = 0x00000002
 	nifTip     = 0x00000004
+	nifInfo    = 0x00000010 // balloon notification fields are valid
+
+	niifInfo = 0x00000001 // info (i) balloon icon
 
 	wm_Null         = 0x0000
 	wm_User         = 0x0400
@@ -189,15 +197,20 @@ type realWin32 struct {
 }
 
 func newRealWin32() (*realWin32, error) {
-	// Load the icon from the embedded .ico bytes using CreateIconFromResourceEx.
-	// Win32 expects a pointer to the raw DIB data inside the .ico file, which
-	// for a monochrome icon starts after the ICONDIRENTRY (6 + 16*n bytes).
-	// We use the first image (16×16) at offset 6 + 2*16 = 38.
-	const icoHeaderSize = 6
-	const icoDirEntrySize = 16
-	iconOffset := icoHeaderSize + 2*icoDirEntrySize // 38 bytes (2 images in our ICO)
-	if len(iconData) <= iconOffset {
+	// Load the icon from the embedded .ico bytes using CreateIconFromResourceEx,
+	// which wants a pointer to the first image's DIB data. That data begins at the
+	// dwImageOffset stored in the first ICONDIRENTRY — the 4 little-endian bytes at
+	// offset 12 of the entry, and entries start at byte 6 (after the 6-byte
+	// ICONDIR header). Reading it from the directory (rather than hardcoding an
+	// offset) keeps this correct regardless of how many images the .ico packs —
+	// ours now carries 16/32/48.
+	const dwImageOffsetField = 6 + 12
+	if len(iconData) < dwImageOffsetField+4 {
 		return nil, fmt.Errorf("tray: embedded icon data too small (%d bytes)", len(iconData))
+	}
+	iconOffset := int(binary.LittleEndian.Uint32(iconData[dwImageOffsetField:]))
+	if iconOffset <= 0 || iconOffset >= len(iconData) {
+		return nil, fmt.Errorf("tray: invalid icon image offset %d (data %d bytes)", iconOffset, len(iconData))
 	}
 
 	imgData := iconData[iconOffset:]
@@ -295,6 +308,25 @@ func (w *realWin32) UpdateTrayIcon(hwnd uintptr, tooltip string) error {
 	r, _, err := procShellNotifyIcon.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
 	if r == 0 {
 		return fmt.Errorf("tray: Shell_NotifyIconW(NIM_MODIFY): %w", err)
+	}
+	return nil
+}
+
+func (w *realWin32) ShowBalloon(hwnd uintptr, title, message string) error {
+	var nid notifyIconDataW
+	nid.cbSize = uint32(unsafe.Sizeof(nid))
+	nid.hWnd = hwnd
+	nid.uID = 1
+	nid.uFlags = nifInfo
+	nid.dwInfoFlags = niifInfo
+	t, _ := windows.UTF16FromString(title)
+	m, _ := windows.UTF16FromString(message)
+	copy(nid.szInfoTitle[:], t) // [64] — truncates a long title
+	copy(nid.szInfo[:], m)      // [256] — truncates a long body
+
+	r, _, err := procShellNotifyIcon.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
+	if r == 0 {
+		return fmt.Errorf("tray: Shell_NotifyIconW(NIM_MODIFY balloon): %w", err)
 	}
 	return nil
 }
@@ -413,9 +445,82 @@ func (w *realWin32) PumpMessages(hwnd uintptr, quit <-chan struct{}, onCallback 
 
 // TrayConfig is the configuration passed to Run by cmd/engram/tray.go.
 type TrayConfig struct {
-	Port  int
-	Token string
-	DBDir string
+	Port    int
+	Token   string
+	DBDir   string
+	Version string // current binary version, for the updater (main.version)
+}
+
+// Update source: the engram GitHub repo and the platform asset suffix.
+const (
+	updateRepo        = "mariesqu/engram"
+	updateAssetSuffix = "windows-amd64.exe"
+)
+
+// runUpdate checks GitHub Releases for a newer engram build. When install is
+// false (the quiet startup check) it only notifies if a newer version exists;
+// when true (the "Check for Updates" menu item) it downloads, verifies the
+// SHA256, swaps the binary in place, and notifies the user to restart. Safe to
+// call from any goroutine: it touches only the network, the filesystem, and
+// ShowBalloon (consistent with the poller's NIM_MODIFY usage).
+func runUpdate(w win32, hwnd uintptr, currentVersion string, install bool) {
+	notify := func(title, message string) {
+		if hwnd != 0 {
+			_ = w.ShowBalloon(hwnd, title, message)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	u, err := updater.Check(ctx, client, updateRepo, currentVersion, updateAssetSuffix)
+	if err != nil {
+		log.Printf("tray: update check: %v", err)
+		if install {
+			notify("engram", "Update check failed — see logs.")
+		}
+		return
+	}
+	if u == nil {
+		if install {
+			notify("engram", "You're on the latest version ("+currentVersion+").")
+		}
+		return
+	}
+	if !install {
+		notify("engram update available",
+			u.LatestVersion+" is available. Use \"Check for Updates\" to install.")
+		return
+	}
+
+	notify("engram", "Downloading "+u.LatestVersion+"…")
+	bin, err := updater.DownloadAndVerify(ctx, client, u)
+	if err != nil {
+		log.Printf("tray: update download/verify: %v", err)
+		notify("engram", "Update download or checksum failed — see logs.")
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		log.Printf("tray: locate executable: %v", err)
+		notify("engram", "Could not locate the engram binary to update.")
+		return
+	}
+	if _, err := updater.SwapBinary(exe, bin); err != nil {
+		log.Printf("tray: swap binary: %v", err)
+		notify("engram", "Update failed to install — see logs.")
+		return
+	}
+	log.Printf("tray: updated %s -> %s at %s; restart required", currentVersion, u.LatestVersion, exe)
+	notify("engram updated", "Installed "+u.LatestVersion+". Restart engram to apply.")
+}
+
+// cleanupOldBinary removes the engram.exe.old left by a previous in-place update
+// (best-effort; ignored if the file is absent or still locked).
+func cleanupOldBinary() {
+	if exe, err := os.Executable(); err == nil {
+		_ = os.Remove(exe + ".old")
+	}
 }
 
 // ── Run — public entrypoint ───────────────────────────────────────────────────
@@ -445,6 +550,11 @@ func runTray(cfg TrayConfig, w win32) error {
 	// Mutable status snapshot, updated by the poller goroutine.
 	var snapshotMu sync.Mutex
 	snapshot := StatusSnapshot{DaemonRunning: true} // optimistic on start
+
+	// hwndAtomic holds the tray window handle once the pump registers it. Declared
+	// here (before the handlers) so the Check-for-Updates handler can read it to
+	// anchor its notifications.
+	var hwndAtomic atomic.Uintptr
 
 	// Build action handlers that post HTTP calls to workCh.
 	// CRITICAL: none of these handlers call win32 directly — they only enqueue
@@ -476,6 +586,13 @@ func runTray(cfg TrayConfig, w win32) error {
 				log.Printf("tray: sync trigger: %v", err)
 			}
 		},
+		MenuIDCheckUpdate: func() {
+			// Network + filesystem work — run off the worker goroutine so a slow
+			// download never blocks other menu actions. ShowBalloon from this
+			// goroutine matches the poller's NIM_MODIFY usage.
+			h := hwndAtomic.Load()
+			go runUpdate(w, h, cfg.Version, true)
+		},
 		MenuIDQuit: func() {
 			// sync.Once: a double Quit click (or sync+channel race) must not
 			// panic on closing an already-closed channel.
@@ -496,7 +613,6 @@ func runTray(cfg TrayConfig, w win32) error {
 
 	// Status poller goroutine: polls GET /api/v1/status every 5 seconds.
 	wg.Add(1)
-	var hwndAtomic atomic.Uintptr
 	go func() {
 		defer wg.Done()
 		ticker := time.NewTicker(5 * time.Second)
@@ -527,6 +643,31 @@ func runTray(cfg TrayConfig, w win32) error {
 				}
 			}
 		}
+	}()
+
+	// Startup update check: clean up any leftover .old binary from a previous
+	// in-place update, then do ONE quiet check (notify only if a newer version
+	// exists). One-shot and best-effort, bounded by runUpdate's own timeout. It
+	// waits briefly for the pump to register the tray window so a notification has
+	// somewhere to anchor.
+	go func() {
+		cleanupOldBinary()
+		// No version configured (e.g. tests) → skip the network check so unit tests
+		// never hit GitHub. Production always sets a version ("dev" or vX.Y.Z).
+		if cfg.Version == "" {
+			return
+		}
+		for i := 0; i < 40; i++ { // up to ~10s for the window to appear
+			if hwndAtomic.Load() != 0 {
+				break
+			}
+			select {
+			case <-quit:
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		runUpdate(w, hwndAtomic.Load(), cfg.Version, false)
 	}()
 
 	// The message pump MUST run on a dedicated OS-thread-locked goroutine.

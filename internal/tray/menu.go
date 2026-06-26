@@ -7,12 +7,13 @@ package tray
 type MenuItemID uint32
 
 const (
-	MenuIDStatus     MenuItemID = 1001 // disabled status label — never sent as WM_COMMAND
-	MenuIDOpenUI     MenuItemID = 1002
-	MenuIDConnect    MenuItemID = 1003 // "Connect to central" (disconnected state)
-	MenuIDDisconnect MenuItemID = 1004 // "Disconnect from central" (connected state)
-	MenuIDSyncNow    MenuItemID = 1005
-	MenuIDQuit       MenuItemID = 1006
+	MenuIDStatus      MenuItemID = 1001 // disabled status label — never sent as WM_COMMAND
+	MenuIDOpenUI      MenuItemID = 1002
+	MenuIDConnect     MenuItemID = 1003 // "Connect to central" (disconnected state)
+	MenuIDDisconnect  MenuItemID = 1004 // "Disconnect from central" (connected state)
+	MenuIDSyncNow     MenuItemID = 1005
+	MenuIDQuit        MenuItemID = 1006
+	MenuIDCheckUpdate MenuItemID = 1007 // "Check for Updates"
 )
 
 // MenuItem describes one entry in the tray context menu.
@@ -42,8 +43,9 @@ type StatusSnapshot struct {
 //  2. Open UI
 //  3. Connect / Disconnect (context-sensitive)
 //  4. Sync Now (disabled when not connected)
-//  5. Separator
-//  6. Quit
+//  5. Check for Updates
+//  6. Separator
+//  7. Quit
 func BuildMenu(s StatusSnapshot) []MenuItem {
 	statusLabel := "Disconnected"
 	if s.Connected {
@@ -63,6 +65,7 @@ func BuildMenu(s StatusSnapshot) []MenuItem {
 
 	items = append(items,
 		MenuItem{ID: MenuIDSyncNow, Label: "Sync Now", Disabled: !s.Connected},
+		MenuItem{ID: MenuIDCheckUpdate, Label: "Check for Updates"},
 		MenuItem{Separator: true},
 		MenuItem{ID: MenuIDQuit, Label: "Quit"},
 	)

@@ -21,7 +21,7 @@
     <tbody id="projects-table-body">
         {{range .Projects}}
         <tr id="project-row-{{.Name}}">
-            <td class="project-name">{{.Name}}</td>
+            <td class="project-name">{{.Name}}{{if and .RemoteKnown .InRemote}} <span class="badge badge-remote" title="This project also exists in central">central</span>{{end}}</td>
             <td>{{policyBadge (printf "%s" .Policy)}}</td>
             <td>
                 <form method="POST"
@@ -46,11 +46,12 @@
                       hx-target="#projects-table-body"
                       hx-swap="innerHTML"
                       hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'
-                      onsubmit="return confirm('Delete project {{.Name}} with scope ' + this.scope.value + '?')">
+                      hx-confirm="Delete project {{.Name}}? The selected scope will be applied — this cannot be undone.">
                     <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                     <select name="scope" class="policy-select">
                         <option value="local">local</option>
                         <option value="purge-all">purge-all</option>
+                        {{if $.CentralConnected}}<option value="unshare">unshare (central, keep local)</option>{{end}}
                     </select>
                     <button type="submit" class="btn btn-small btn-danger">Delete</button>
                 </form>

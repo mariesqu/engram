@@ -16,6 +16,10 @@ type win32 interface {
 	// UpdateTrayIcon refreshes the icon tooltip. Used after a status change.
 	UpdateTrayIcon(hwnd uintptr, tooltip string) error
 
+	// ShowBalloon shows a balloon/toast notification anchored to the tray icon.
+	// Used by the updater to surface "update available" / "restart to apply".
+	ShowBalloon(hwnd uintptr, title, message string) error
+
 	// RemoveTrayIcon removes the icon from the tray on cleanup.
 	RemoveTrayIcon(hwnd uintptr) error
 

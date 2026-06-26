@@ -27,10 +27,21 @@ type mockCentral struct {
 	gotProject  string
 	gotSinceSeq int64
 	gotLimit    int
+
+	// unshare (DeleteProject) — makes mockCentral satisfy the projectDeleter
+	// capability so /v1/unshare can be exercised.
+	deleteResult     int64
+	deleteErr        error
+	gotDeleteProject string
 }
 
 func (m *mockCentral) Apply(_ context.Context, _ domain.Mutation) error {
 	return m.applyErr
+}
+
+func (m *mockCentral) DeleteProject(_ context.Context, project string) (int64, error) {
+	m.gotDeleteProject = project
+	return m.deleteResult, m.deleteErr
 }
 
 func (m *mockCentral) PullSince(_ context.Context, project string, sinceSeq int64, limit int) ([]domain.Mutation, error) {

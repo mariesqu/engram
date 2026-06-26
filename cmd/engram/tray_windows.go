@@ -82,7 +82,7 @@ func ensureDaemon(dbDir, dbPath string) (tray.TrayConfig, error) {
 	// Try to connect to an existing daemon.
 	if d, err := controlapi.ReadDaemonJSON(dbDir); err == nil {
 		if probeErr := probeDaemon(dbDir, d.Port); probeErr == nil {
-			return tray.TrayConfig{Port: d.Port, Token: d.Token, DBDir: dbDir}, nil
+			return tray.TrayConfig{Port: d.Port, Token: d.Token, DBDir: dbDir, Version: version}, nil
 		}
 	}
 
@@ -121,7 +121,7 @@ func ensureDaemon(dbDir, dbPath string) (tray.TrayConfig, error) {
 		}
 
 		if probeErr := probeDaemonHTTP(d.Port, d.Token); probeErr == nil {
-			return tray.TrayConfig{Port: d.Port, Token: d.Token, DBDir: dbDir}, nil
+			return tray.TrayConfig{Port: d.Port, Token: d.Token, DBDir: dbDir, Version: version}, nil
 		}
 		_ = i
 	}
