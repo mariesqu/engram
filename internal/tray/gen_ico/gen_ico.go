@@ -1,152 +1,184 @@
-// gen_ico generates a minimal monochrome engram.ico with 16x16 and 32x32 images.
-// The icon depicts a simple memory/brain glyph (solid squares pattern) in white
-// on a transparent black background.
+// gen_ico generates engram.ico: a gold "neuron" mark (a soma with radiating
+// dendrites ending in synaptic boutons) — the engram brand. It renders 16, 32,
+// and 48px images as 32-bit BGRA with anti-aliasing via a signed-distance field,
+// so the same vector geometry stays crisp at every tray DPI.
+//
+// Geometry matches internal/webui/static/logo.svg (coordinates ÷32).
 //
 // Usage (run once; the generated file is checked in):
 //
 //	cd internal/tray && go run gen_ico/gen_ico.go
 //
-// The generated .ico is a standard Windows Icon format:
-//   - ICO header (6 bytes)
-//   - 2 ICONDIRENTRY records (16 bytes each)
-//   - 2 BITMAPINFOHEADER + AND/XOR bitmaps (one per size)
-//
-// This tool has no external dependencies. It is NOT part of the engram binary.
+// No external dependencies — pure standard library.
 package main
 
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 )
 
-func main() {
-	ico, err := buildICO()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "gen_ico:", err)
-		os.Exit(1)
+type vec struct{ x, y float64 }
+
+// Neuron geometry in normalized [0,1] coordinates (logo.svg coords / 32).
+var (
+	soma      = vec{0.5, 0.5}
+	rSoma     = 5.0 / 32
+	rSpark    = 2.2 / 32
+	halfWidth = (1.7 / 32) / 2 // dendrite stroke half-width
+	terminals = []struct {
+		p vec
+		r float64
+	}{
+		{vec{5.4 / 32, 5.4 / 32}, 1.9 / 32},
+		{vec{26.6 / 32, 5.8 / 32}, 1.9 / 32},
+		{vec{3.8 / 32, 19.2 / 32}, 1.75 / 32},
+		{vec{28.2 / 32, 20.5 / 32}, 1.75 / 32},
+		{vec{16.6 / 32, 28.2 / 32}, 1.9 / 32},
 	}
-	if err := os.WriteFile("engram.ico", ico, 0o644); err != nil {
+)
+
+// Brand colors (straight, not premultiplied).
+var (
+	gold  = [3]float64{232, 168, 69}  // #e8a845
+	spark = [3]float64{245, 201, 122} // #f5c97a — bright memory core
+)
+
+func main() {
+	if err := os.WriteFile("engram.ico", buildICO(16, 32, 48), 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, "gen_ico: write:", err)
 		os.Exit(1)
 	}
-	fmt.Println("gen_ico: wrote engram.ico")
+	fmt.Println("gen_ico: wrote engram.ico (neuron, 16/32/48 @ 32bpp)")
 }
 
-// buildICO builds a 2-image (16x16, 32x32) monochrome ICO file.
-// Format: ICONDIR header + 2 ICONDIRENTRY + 2 BITMAPINFOHEADER blocks.
-func buildICO() ([]byte, error) {
-	img16 := buildBMPBlock(16)
-	img32 := buildBMPBlock(32)
+func buildICO(sizes ...int) []byte {
+	blocks := make([][]byte, len(sizes))
+	for i, n := range sizes {
+		blocks[i] = buildBGRABlock(n)
+	}
 
 	const headerSize = 6
 	const entrySize = 16
-	offset0 := headerSize + 2*entrySize
-	offset1 := offset0 + len(img16)
+	offset := headerSize + entrySize*len(sizes)
 
-	out := make([]byte, 0, headerSize+2*entrySize+len(img16)+len(img32))
+	var out []byte
+	out = leU16(out, 0)                  // reserved
+	out = leU16(out, 1)                  // type: icon
+	out = leU16(out, uint16(len(sizes))) // image count
 
-	// ICONDIR header
-	out = leU16(out, 0) // reserved (0)
-	out = leU16(out, 1) // type: 1 = ICO
-	out = leU16(out, 2) // image count: 2
-
-	// ICONDIRENTRY for 16x16
-	out = append(out, 16, 16) // width, height
-	out = append(out, 2, 0)   // colorCount, reserved
-	out = leU16(out, 0)       // planes
-	out = leU16(out, 1)       // bit count
-	out = leU32(out, uint32(len(img16)))
-	out = leU32(out, uint32(offset0))
-
-	// ICONDIRENTRY for 32x32
-	out = append(out, 32, 32) // width, height (0 means 256 for 256x256, here it's 32)
-	out = append(out, 2, 0)   // colorCount, reserved
-	out = leU16(out, 0)       // planes
-	out = leU16(out, 1)       // bit count
-	out = leU32(out, uint32(len(img32)))
-	out = leU32(out, uint32(offset1))
-
-	out = append(out, img16...)
-	out = append(out, img32...)
-	return out, nil
+	for i, n := range sizes {
+		b := byte(n)
+		if n >= 256 {
+			b = 0
+		}
+		out = append(out, b, b) // width, height
+		out = append(out, 0, 0) // colorCount, reserved
+		out = leU16(out, 1)     // planes
+		out = leU16(out, 32)    // bit count
+		out = leU32(out, uint32(len(blocks[i])))
+		out = leU32(out, uint32(offset))
+		offset += len(blocks[i])
+	}
+	for _, blk := range blocks {
+		out = append(out, blk...)
+	}
+	return out
 }
 
-// buildBMPBlock builds the BITMAPINFOHEADER + color table + XOR bitmap + AND
-// bitmap for a monochrome square image of size n×n.
-//
-// The design is a centered "brain/node" glyph:
-//   - Inner square of (n/2 x n/2) solid white pixels in the center
-//   - Border ring of 2 pixels at n/4 offset from center
-//
-// This is visible at 16x16 and 32x32 without anti-aliasing.
-func buildBMPBlock(n int) []byte {
-	// Color table: 2 entries × 4 bytes (RGBQUAD)
-	// Index 0 = black (transparent when combined with AND mask)
-	// Index 1 = white
-	colorTable := []byte{
-		0, 0, 0, 0, // black (BGRA)
-		255, 255, 255, 0, // white
-	}
+// buildBGRABlock renders the neuron into a BITMAPINFOHEADER + 32bpp BGRA XOR
+// bitmap + a 1bpp all-opaque AND mask (transparency comes from the alpha channel).
+func buildBGRABlock(n int) []byte {
+	aa := 1.0 / float64(n) // ~1px anti-aliasing band
 
-	// XOR bitmap: each row is padded to a multiple of 4 bytes.
-	// Monochrome: 1 bit per pixel, 8 pixels per byte.
-	rowBytes := (n + 31) / 32 * 4 // DWORD-aligned
-	xorBitmap := make([]byte, rowBytes*n)
+	// XOR bitmap: n rows of n BGRA pixels, bottom-up.
+	xor := make([]byte, n*n*4)
+	for py := 0; py < n; py++ {
+		for px := 0; px < n; px++ {
+			u := (float64(px) + 0.5) / float64(n)
+			v := (float64(py) + 0.5) / float64(n)
+			p := vec{u, v}
 
-	// Draw a simple solid square glyph in the center.
-	// Center area: from n/4 to 3*n/4 in both dimensions.
-	lo := n / 4
-	hi := (3 * n) / 4
-	for y := lo; y < hi; y++ {
-		for x := lo; x < hi; x++ {
-			// ICO bitmaps are bottom-up: flip the y.
-			row := n - 1 - y
-			byteIdx := row*rowBytes + x/8
-			bitIdx := 7 - (x % 8)
-			xorBitmap[byteIdx] |= 1 << bitIdx
+			d := dist(p, soma) - rSoma
+			for _, t := range terminals {
+				if e := dist(p, t.p) - t.r; e < d {
+					d = e
+				}
+				if e := distSeg(p, soma, t.p) - halfWidth; e < d {
+					d = e
+				}
+			}
+
+			alpha := clamp01(0.5 - d/aa)
+			if alpha <= 0 {
+				continue
+			}
+			// Bright core blends in near the soma centre.
+			sc := clamp01(0.5 - (dist(p, soma)-rSpark)/aa)
+			col := [3]float64{
+				lerp(gold[0], spark[0], sc),
+				lerp(gold[1], spark[1], sc),
+				lerp(gold[2], spark[2], sc),
+			}
+
+			row := n - 1 - py // ICO bitmaps are bottom-up
+			i := (row*n + px) * 4
+			xor[i+0] = byte(col[2] + 0.5) // B
+			xor[i+1] = byte(col[1] + 0.5) // G
+			xor[i+2] = byte(col[0] + 0.5) // R
+			xor[i+3] = byte(alpha*255 + 0.5)
 		}
 	}
 
-	// AND bitmap: 0 = opaque, 1 = transparent (same layout as XOR).
-	// We want the inner square opaque (0) and outside transparent (1).
-	andBitmap := make([]byte, rowBytes*n)
-	for row := range n {
-		// Set all bits to 1 (transparent) then clear the visible square.
-		for b := range rowBytes {
-			andBitmap[row*rowBytes+b] = 0xFF
-		}
-	}
-	for y := lo; y < hi; y++ {
-		row := n - 1 - y
-		for x := lo; x < hi; x++ {
-			byteIdx := row*rowBytes + x/8
-			bitIdx := 7 - (x % 8)
-			andBitmap[byteIdx] &^= 1 << bitIdx // clear → opaque
-		}
-	}
+	andRow := (n + 31) / 32 * 4
+	and := make([]byte, andRow*n) // all zero → opaque; alpha drives transparency
 
-	// BITMAPINFOHEADER (40 bytes). Height is n*2 (XOR+AND combined).
 	hdr := make([]byte, 40)
 	binary.LittleEndian.PutUint32(hdr[0:], 40)          // biSize
 	binary.LittleEndian.PutUint32(hdr[4:], uint32(n))   // biWidth
 	binary.LittleEndian.PutUint32(hdr[8:], uint32(2*n)) // biHeight (XOR+AND)
 	binary.LittleEndian.PutUint16(hdr[12:], 1)          // biPlanes
-	binary.LittleEndian.PutUint16(hdr[14:], 1)          // biBitCount (monochrome)
-	// biCompression, biSizeImage, etc.: all 0 (BI_RGB, auto-size)
+	binary.LittleEndian.PutUint16(hdr[14:], 32)         // biBitCount
 
-	out := make([]byte, 0, 40+len(colorTable)+len(xorBitmap)+len(andBitmap))
+	out := make([]byte, 0, len(hdr)+len(xor)+len(and))
 	out = append(out, hdr...)
-	out = append(out, colorTable...)
-	out = append(out, xorBitmap...)
-	out = append(out, andBitmap...)
+	out = append(out, xor...)
+	out = append(out, and...)
 	return out
 }
 
-func leU16(dst []byte, v uint16) []byte {
-	return append(dst, byte(v), byte(v>>8))
+func dist(a, b vec) float64 { return math.Hypot(a.x-b.x, a.y-b.y) }
+
+func distSeg(p, a, b vec) float64 {
+	abx, aby := b.x-a.x, b.y-a.y
+	apx, apy := p.x-a.x, p.y-a.y
+	denom := abx*abx + aby*aby
+	t := 0.0
+	if denom > 0 {
+		t = (apx*abx + apy*aby) / denom
+	}
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	return math.Hypot(p.x-(a.x+t*abx), p.y-(a.y+t*aby))
 }
 
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func lerp(a, b, t float64) float64 { return a + (b-a)*t }
+
+func leU16(dst []byte, v uint16) []byte { return append(dst, byte(v), byte(v>>8)) }
 func leU32(dst []byte, v uint32) []byte {
 	return append(dst, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
 }

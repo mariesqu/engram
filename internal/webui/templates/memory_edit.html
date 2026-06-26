@@ -4,25 +4,46 @@
 <div class="card">
     <h2>Edit Memory</h2>
     {{if .Error}}
-    <p class="error">{{.Error}}</p>
+    <div class="alert alert-error">{{.Error}}</div>
     {{end}}
-    <form method="POST" action="/ui/memories/{{.Memory.ID}}/edit">
+    <form method="POST" action="/ui/memories/{{.Memory.ID}}/edit" class="edit-form">
         <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-        <div class="form-group">
-            <label for="title">Title</label>
-            <input type="text" id="title" name="title" value="{{.Memory.Title}}" required class="search-input">
+
+        <div class="meta-strip">
+            <span><span class="meta-k">project</span><span class="project-name">{{.Memory.Project}}</span></span>
+            <span><span class="meta-k">scope</span>{{.Memory.Scope}}</span>
+            <span><span class="meta-k">id</span>{{.Memory.ID}}</span>
         </div>
-        <div class="form-group">
-            <label for="type">Type</label>
-            <input type="text" id="type" name="type" value="{{.Memory.Type}}" class="search-input">
+
+        <div class="form-row">
+            <div class="form-group grow">
+                <label for="title">Title</label>
+                <input type="text" id="title" name="title" value="{{.Memory.Title}}" required autofocus>
+            </div>
+            <div class="form-group type-field">
+                <label for="type">Type</label>
+                <input type="text" id="type" name="type" value="{{.Memory.Type}}" list="type-options" placeholder="e.g. decision">
+                <datalist id="type-options">
+                    <option value="decision"></option>
+                    <option value="bugfix"></option>
+                    <option value="architecture"></option>
+                    <option value="discovery"></option>
+                    <option value="pattern"></option>
+                    <option value="config"></option>
+                    <option value="preference"></option>
+                    <option value="manual"></option>
+                </datalist>
+            </div>
         </div>
+
         <div class="form-group">
             <label for="content">Content</label>
-            <textarea id="content" name="content" rows="10" required class="search-input">{{.Memory.Content}}</textarea>
+            <textarea id="content" name="content" rows="18" required class="content-area">{{.Memory.Content}}</textarea>
         </div>
-        <div class="form-group">
-            <button type="submit" class="btn">Save</button>
-            <a href="/ui/memories" class="btn btn-small">Cancel</a>
+
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Save changes</button>
+            <a href="/ui/memories" class="btn">Cancel</a>
         </div>
     </form>
 </div>

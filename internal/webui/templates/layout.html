@@ -4,13 +4,20 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>engram daemon</title>
+    <!-- Stop htmx injecting its indicator <style> inline (blocked by style-src 'self');
+         the .htmx-indicator rules live in styles.css instead. -->
+    <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+    <link rel="icon" href="/ui/static/favicon.svg">
     <link rel="stylesheet" href="/ui/static/styles.css">
     <!-- htmx 2.0.4 — vendored, no CDN. Source: https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js -->
     <script src="/ui/static/htmx.min.js"></script>
+    <!-- Active-tab highlighter (progressive enhancement; CSP script-src 'self'). -->
+    <script src="/ui/static/nav-active.js" defer></script>
 </head>
 <body>
 <div class="page">
     <header>
+        <img class="brand-mark" src="/ui/static/logo.svg" alt="" width="26" height="26">
         <span class="brand">engram</span>
         <nav>
             <a href="/ui/">Status</a>
