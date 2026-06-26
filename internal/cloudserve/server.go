@@ -38,6 +38,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mariesqu/engram/internal/syncwire"
@@ -207,6 +208,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/push", s.methodGuard(http.MethodPost, s.withAuth(s.handlePush)))
 	mux.HandleFunc("/v1/pull", s.methodGuard(http.MethodPost, s.withAuth(s.handlePull)))
 	mux.HandleFunc("/v1/projects", s.methodGuard(http.MethodPost, s.withAuth(s.handleProjects)))
+	mux.HandleFunc("/v1/unshare", s.methodGuard(http.MethodPost, s.withAuth(s.handleUnshare)))
 	// Catch-all: any path not matched by the exact /v1/* routes above gets a JSON
 	// 404 instead of net/http's default text/plain "404 page not found".
 	mux.HandleFunc("/", s.handleNotFound)
@@ -445,6 +447,58 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, syncwire.ProjectsResponse{Projects: projects})
+}
+
+// projectDeleter is the OPTIONAL capability for unshare: hard-delete a project's
+// central rows WITHOUT tombstones (no propagation). *centralstore.Store satisfies
+// it; a Central that does not causes /v1/unshare to return 501.
+type projectDeleter interface {
+	DeleteProject(ctx context.Context, project string) (int64, error)
+}
+
+// handleUnshare processes a POST /v1/unshare request — the authenticated-wire
+// equivalent of the `--remote=unshare` admin op. It hard-deletes all central data
+// for the named project WITHOUT writing tombstones, so the deletion does NOT
+// propagate to other nodes (they keep their local copies). The daemon uses this so
+// it never needs the central Postgres DSN.
+//
+// AUTHORIZATION: any authenticated writer may unshare a project. Central is a
+// SHARED, multi-writer store — projects are not per-writer owned — so this is a
+// privileged cross-writer operation, logged with the calling writer id for audit.
+// A future multi-tenant deployment should scope it (writer-owns, or an admin
+// flag); for the single-writer product it is intentionally open. The DSN admin
+// path (`engram projects delete --remote=unshare --dsn`) remains as an operator
+// escape hatch.
+func (s *Server) handleUnshare(w http.ResponseWriter, r *http.Request) {
+	var req syncwire.UnshareRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	project := strings.TrimSpace(req.Project)
+	if project == "" {
+		writeError(w, http.StatusBadRequest, "project is required")
+		return
+	}
+
+	deleter, ok := s.central.(projectDeleter)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "unshare not supported")
+		return
+	}
+
+	n, err := deleter.DeleteProject(r.Context(), project)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "cloudserve: unshare failed",
+			"project", project, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	s.logger.InfoContext(r.Context(), "cloudserve: unshare",
+		"project", project,
+		"writer_id", writerIDFromContext(r.Context()),
+		"deleted", n)
+
+	writeJSON(w, http.StatusOK, syncwire.UnshareResponse{Deleted: n})
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

@@ -236,3 +236,19 @@ type ProjectsRequest struct{}
 type ProjectsResponse struct {
 	Projects []string `json:"projects"`
 }
+
+// UnshareRequest is the body of a POST /v1/unshare request (client → server). It
+// asks central to hard-delete all data for Project WITHOUT writing tombstones, so
+// the deletion does NOT propagate to other nodes (they keep their copies). This
+// is the authenticated-wire equivalent of the `--remote=unshare` admin op; the
+// daemon uses it so it never needs the central Postgres DSN. Project must be
+// non-empty.
+type UnshareRequest struct {
+	Project string `json:"project"`
+}
+
+// UnshareResponse is the body returned by POST /v1/unshare: the number of central
+// rows deleted across all project-scoped tables.
+type UnshareResponse struct {
+	Deleted int64 `json:"deleted"`
+}

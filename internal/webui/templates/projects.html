@@ -51,6 +51,7 @@
                     <select name="scope" class="policy-select">
                         <option value="local">local</option>
                         <option value="purge-all">purge-all</option>
+                        {{if $.CentralConnected}}<option value="unshare">unshare (central, keep local)</option>{{end}}
                     </select>
                     <button type="submit" class="btn btn-small btn-danger">Delete</button>
                 </form>

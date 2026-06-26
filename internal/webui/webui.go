@@ -34,6 +34,11 @@ type WebUIDeps struct {
 	// are shown — the state is simply "unknown".
 	RemoteProjects func(ctx context.Context) ([]string, error)
 
+	// Unshare removes a project from central over the authenticated wire (no DSN).
+	// Optional: when nil the "unshare" delete scope is unavailable. Returns an error
+	// when the daemon is not connected to central.
+	Unshare func(ctx context.Context, project string) (int, error)
+
 	// Secret is the daemon bearer token used to validate the ?token= exchange.
 	Secret string
 
@@ -505,9 +510,10 @@ type projectRow struct {
 
 // projectsViewModel is the template data for the projects page.
 type projectsViewModel struct {
-	Projects      []projectRow
-	DaemonVersion string
-	CSRFToken     string // ④b: needed for the policy toggle forms
+	Projects         []projectRow
+	CentralConnected bool // true → offer the "unshare" delete scope (needs central)
+	DaemonVersion    string
+	CSRFToken        string // ④b: needed for the policy toggle forms
 }
 
 // configViewModel is the template data for the config form page.
@@ -576,15 +582,16 @@ func handleStatusPartial(w http.ResponseWriter, _ *http.Request, deps WebUIDeps,
 }
 
 func handleProjectsPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
-	rows, err := buildProjectRows(deps, r)
+	rows, connected, err := buildProjectRows(deps, r)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	vm := projectsViewModel{
-		Projects:      rows,
-		DaemonVersion: deps.Version,
-		CSRFToken:     sessions.csrfToken(),
+		Projects:         rows,
+		CentralConnected: connected,
+		DaemonVersion:    deps.Version,
+		CSRFToken:        sessions.csrfToken(),
 	}
 	renderPage(w, projectsTmpl, vm)
 }
@@ -594,10 +601,12 @@ func handleProjectsPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, 
 // RemoteProjects (daemon disconnected from central) leaves RemoteKnown=false, so
 // the template shows no remote marker rather than a misleading one. The project
 // name is matched case-insensitively (central-pulled names keep their case).
-func buildProjectRows(deps WebUIDeps, r *http.Request) ([]projectRow, error) {
+// Returns the rows plus whether central was reachable (remoteKnown) — the latter
+// gates the "unshare" delete scope, which needs a live central connection.
+func buildProjectRows(deps WebUIDeps, r *http.Request) ([]projectRow, bool, error) {
 	projects, err := deps.Store.ListProjectsWithPolicy()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var remoteSet map[string]bool
@@ -620,7 +629,7 @@ func buildProjectRows(deps WebUIDeps, r *http.Request) ([]projectRow, error) {
 			InRemote:      remoteKnown && remoteSet[strings.ToLower(strings.TrimSpace(p.Name))],
 		})
 	}
-	return rows, nil
+	return rows, remoteKnown, nil
 }
 
 func handleConfigPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, sessions *sessionStore) {
@@ -706,26 +715,29 @@ func handlePolicyPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, se
 	}
 
 	// Return the refreshed projects tbody rows for the HTMX innerHTML swap.
-	rows, err := buildProjectRows(deps, r)
+	rows, connected, err := buildProjectRows(deps, r)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	vm := projectsViewModel{
-		Projects:      rows,
-		DaemonVersion: deps.Version,
-		CSRFToken:     sessions.csrfToken(),
+		Projects:         rows,
+		CentralConnected: connected,
+		DaemonVersion:    deps.Version,
+		CSRFToken:        sessions.csrfToken(),
 	}
 	renderPartial(w, "projects-rows", vm)
 }
 
 // handleProjectDeletePost handles POST /ui/projects/{project}/delete.
 //
-// The form must include a "scope" field with value "local" or "purge-all".
-// Unshare (remote=unshare in the CLI) is intentionally NOT offered here because
-// it requires a DSN — a server-side operation that is not appropriate for the
-// loopback web UI. After a successful delete the projects list partial is
-// re-rendered so the HTMX swap shows the updated state.
+// The form must include a "scope" field with value "local", "purge-all", or
+// "unshare". Unshare removes the project from central over the AUTHENTICATED WIRE
+// (deps.Unshare → POST /v1/unshare, signed with the writer key — no Postgres DSN
+// in the daemon) and then sets the local policy to local-only so the node keeps
+// its copy but stops re-pushing. It is offered only when the daemon is connected
+// to central (CentralConnected gates the option). After a successful delete the
+// projects list partial is re-rendered so the HTMX swap shows the updated state.
 func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
 	project := extractProjectFromDeletePath(r.URL.Path)
 	if project == "" {
@@ -750,21 +762,37 @@ func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUID
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
+	case "unshare":
+		// Remove from central over the authenticated wire (no DSN), then keep the
+		// local copy but stop re-pushing by setting the policy to local-only.
+		if deps.Unshare == nil {
+			http.Error(w, "unshare unavailable: not connected to central", http.StatusConflict)
+			return
+		}
+		if _, err := deps.Unshare(r.Context(), project); err != nil {
+			http.Error(w, "unshare failed (central unreachable?)", http.StatusBadGateway)
+			return
+		}
+		if err := deps.Store.SetPolicy(project, controlapi.PolicyLocalOnly); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	default:
-		http.Error(w, "scope must be local or purge-all", http.StatusBadRequest)
+		http.Error(w, "scope must be local, purge-all, or unshare", http.StatusBadRequest)
 		return
 	}
 
 	// Re-render the projects tbody rows for the HTMX innerHTML swap.
-	rows, err := buildProjectRows(deps, r)
+	rows, connected, err := buildProjectRows(deps, r)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	vm := projectsViewModel{
-		Projects:      rows,
-		DaemonVersion: deps.Version,
-		CSRFToken:     sessions.csrfToken(),
+		Projects:         rows,
+		CentralConnected: connected,
+		DaemonVersion:    deps.Version,
+		CSRFToken:        sessions.csrfToken(),
 	}
 	renderPartial(w, "projects-rows", vm)
 }

@@ -304,3 +304,45 @@ func (c *Client) ListProjects(ctx context.Context) ([]string, error) {
 	}
 	return pr.Projects, nil
 }
+
+// Unshare hard-deletes a project's data from central WITHOUT tombstones (POST
+// /v1/unshare, HMAC-signed like push/pull). The deletion does NOT propagate to
+// other nodes — they keep their copies. Returns the number of central rows
+// deleted. It is the authenticated-wire equivalent of `--remote=unshare`, so the
+// daemon never needs the central Postgres DSN. A 501 means the server's Central
+// does not support unshare; any non-2xx status returns a *StatusError.
+func (c *Client) Unshare(ctx context.Context, project string) (int, error) {
+	body, err := json.Marshal(syncwire.UnshareRequest{Project: project})
+	if err != nil {
+		return 0, fmt.Errorf("remote.Unshare: marshal UnshareRequest: %w", err)
+	}
+
+	req, err := c.buildRequest(ctx, http.MethodPost, "/v1/unshare", body)
+	if err != nil {
+		return 0, fmt.Errorf("remote.Unshare: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("remote.Unshare: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return 0, fmt.Errorf("remote.Unshare: read response body: %w", err)
+	}
+	if len(respBody) > maxResponseBytes {
+		return 0, fmt.Errorf("remote.Unshare: response body exceeds cap of %d bytes", maxResponseBytes)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return 0, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var ur syncwire.UnshareResponse
+	if err := json.Unmarshal(respBody, &ur); err != nil {
+		return 0, fmt.Errorf("remote.Unshare: decode UnshareResponse: %w", err)
+	}
+	return int(ur.Deleted), nil
+}

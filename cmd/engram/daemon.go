@@ -166,11 +166,13 @@ func buildOpenAIOpts(cfg daemonCfg) []embedding.Option {
 	return opts
 }
 
-// remoteProjectLister is the subset of *remote.Client the web UI needs to show
-// which local projects also exist in central. Satisfied by *remote.Client; nil
-// in local-only mode (no central configured).
-type remoteProjectLister interface {
+// remoteCentral is the subset of *remote.Client the web UI needs: list central's
+// projects (for the "exists in central" marker) and unshare a project (delete it
+// from central over the authenticated wire — no DSN). Satisfied by *remote.Client;
+// nil in local-only mode (no central configured).
+type remoteCentral interface {
 	ListProjects(ctx context.Context) ([]string, error)
+	Unshare(ctx context.Context, project string) (int, error)
 }
 
 // daemonComponents holds the wired-but-not-yet-serving components built by
@@ -179,7 +181,7 @@ type daemonComponents struct {
 	store     *localstore.Store
 	mcpServer *mcpserver.MCPServer
 	loop      *syncer.Loop                // nil when running in local-only mode
-	central   remoteProjectLister         // nil in local-only mode; the wire client for the loop
+	central   remoteCentral               // nil in local-only mode; the wire client for the loop
 	embedLoop *embedding.Loop             // nil when provider is Noop or key absent
 	gated     embedding.EmbeddingProvider // always non-nil (at least NoopProvider via gate)
 }
@@ -453,7 +455,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	)
 
 	var loop *syncer.Loop
-	var central remoteProjectLister
+	var central remoteCentral
 
 	if cfg.centralURL != "" {
 		c := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
@@ -664,6 +666,7 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		SyncCtrl:       syncAdapter,
 		Store:          storeAdapter,
 		RemoteProjects: syncAdapter.RemoteProjects,
+		Unshare:        syncAdapter.UnshareProject,
 		Secret:         token,
 		Port:           actualPort,
 		Version:        version,
@@ -1069,9 +1072,9 @@ type runtimeSyncAdapter struct {
 	mu         sync.Mutex
 	store      *localstore.Store
 	cfgAdapter *configStoreAdapter
-	loop       *syncer.Loop        // nil in local-only mode; replaced on Reconnect
-	central    remoteProjectLister // wire client for remote project discovery; nil when disconnected
-	ctx        context.Context     // daemon's root context (for new Loop.Start on reconnect)
+	loop       *syncer.Loop    // nil in local-only mode; replaced on Reconnect
+	central    remoteCentral   // wire client for remote project discovery; nil when disconnected
+	ctx        context.Context // daemon's root context (for new Loop.Start on reconnect)
 	node       *syncer.Node
 	// The last sync result is read LIVE from the Loop via Loop.LastResult() in
 	// Status() (see lastSyncResultLocked) — there is no cached field here.
@@ -1187,6 +1190,20 @@ func (a *runtimeSyncAdapter) RemoteProjects(ctx context.Context) ([]string, erro
 		return nil, nil
 	}
 	return c.ListProjects(ctx)
+}
+
+// UnshareProject deletes the project from central over the authenticated wire
+// (POST /v1/unshare with the writer key — no DSN). Returns an error when the
+// daemon is not connected to central. The network call runs OUTSIDE a.mu.
+func (a *runtimeSyncAdapter) UnshareProject(ctx context.Context, project string) (int, error) {
+	a.mu.Lock()
+	c := a.central
+	connected := a.connected
+	a.mu.Unlock()
+	if c == nil || !connected {
+		return 0, fmt.Errorf("unshare: not connected to central")
+	}
+	return c.Unshare(ctx, project)
 }
 
 // Disconnect stops the sync loop, clears central credentials from the config
