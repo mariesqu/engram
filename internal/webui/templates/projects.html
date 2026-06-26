@@ -21,7 +21,7 @@
     <tbody id="projects-table-body">
         {{range .Projects}}
         <tr id="project-row-{{.Name}}">
-            <td class="project-name">{{.Name}}</td>
+            <td class="project-name">{{.Name}}{{if and .RemoteKnown .InRemote}} <span class="badge badge-remote" title="This project also exists in central">central</span>{{end}}</td>
             <td>{{policyBadge (printf "%s" .Policy)}}</td>
             <td>
                 <form method="POST"

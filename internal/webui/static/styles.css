@@ -281,6 +281,7 @@ footer {
 .badge-omitted    { background: var(--alert-bg); color: var(--alert); border-color: transparent; }
 .badge-connected  { background: var(--green-bg); color: var(--green); border-color: transparent; }
 .badge-disconnected { background: var(--alert-bg); color: var(--alert); border-color: transparent; }
+.badge-remote     { background: var(--gold-soft); color: var(--gold); border-color: transparent; }
 
 /* Signature: live heartbeat node on the connected badge. */
 .badge-connected::before {

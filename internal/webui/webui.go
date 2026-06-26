@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"net/http"
@@ -26,6 +27,12 @@ type WebUIDeps struct {
 
 	// ConfigStore handles config reads and updates for the config form.
 	ConfigStore controlapi.ConfigStore
+
+	// RemoteProjects returns the project names central knows, so the projects page
+	// can mark which local projects also exist in the remote DB. Optional: when nil
+	// (or when it returns nil because the daemon is disconnected) no remote markers
+	// are shown — the state is simply "unknown".
+	RemoteProjects func(ctx context.Context) ([]string, error)
 
 	// Secret is the daemon bearer token used to validate the ?token= exchange.
 	Secret string
@@ -487,9 +494,18 @@ type statusViewModel struct {
 	ConnectWriterID   string
 }
 
+// projectRow is one project plus whether it also exists in central. RemoteKnown
+// is false when the daemon is disconnected (we can't tell), so the template shows
+// nothing rather than a misleading "local only".
+type projectRow struct {
+	controlapi.ProjectPolicy
+	InRemote    bool
+	RemoteKnown bool
+}
+
 // projectsViewModel is the template data for the projects page.
 type projectsViewModel struct {
-	Projects      []controlapi.ProjectPolicy
+	Projects      []projectRow
 	DaemonVersion string
 	CSRFToken     string // ④b: needed for the policy toggle forms
 }
@@ -559,21 +575,52 @@ func handleStatusPartial(w http.ResponseWriter, _ *http.Request, deps WebUIDeps,
 	renderPartial(w, "status-partial", vm)
 }
 
-func handleProjectsPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, sessions *sessionStore) {
-	projects, err := deps.Store.ListProjectsWithPolicy()
+func handleProjectsPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
+	rows, err := buildProjectRows(deps, r)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if projects == nil {
-		projects = []controlapi.ProjectPolicy{}
-	}
 	vm := projectsViewModel{
-		Projects:      projects,
+		Projects:      rows,
 		DaemonVersion: deps.Version,
 		CSRFToken:     sessions.csrfToken(),
 	}
 	renderPage(w, projectsTmpl, vm)
+}
+
+// buildProjectRows lists local projects with their effective policy and annotates
+// each with whether central also has it. Best-effort: a nil or erroring
+// RemoteProjects (daemon disconnected from central) leaves RemoteKnown=false, so
+// the template shows no remote marker rather than a misleading one. The project
+// name is matched case-insensitively (central-pulled names keep their case).
+func buildProjectRows(deps WebUIDeps, r *http.Request) ([]projectRow, error) {
+	projects, err := deps.Store.ListProjectsWithPolicy()
+	if err != nil {
+		return nil, err
+	}
+
+	var remoteSet map[string]bool
+	remoteKnown := false
+	if deps.RemoteProjects != nil {
+		if names, rerr := deps.RemoteProjects(r.Context()); rerr == nil && names != nil {
+			remoteKnown = true
+			remoteSet = make(map[string]bool, len(names))
+			for _, n := range names {
+				remoteSet[strings.ToLower(strings.TrimSpace(n))] = true
+			}
+		}
+	}
+
+	rows := make([]projectRow, 0, len(projects))
+	for _, p := range projects {
+		rows = append(rows, projectRow{
+			ProjectPolicy: p,
+			RemoteKnown:   remoteKnown,
+			InRemote:      remoteKnown && remoteSet[strings.ToLower(strings.TrimSpace(p.Name))],
+		})
+	}
+	return rows, nil
 }
 
 func handleConfigPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, sessions *sessionStore) {
@@ -659,16 +706,13 @@ func handlePolicyPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, se
 	}
 
 	// Return the refreshed projects tbody rows for the HTMX innerHTML swap.
-	projects, err := deps.Store.ListProjectsWithPolicy()
+	rows, err := buildProjectRows(deps, r)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if projects == nil {
-		projects = []controlapi.ProjectPolicy{}
-	}
 	vm := projectsViewModel{
-		Projects:      projects,
+		Projects:      rows,
 		DaemonVersion: deps.Version,
 		CSRFToken:     sessions.csrfToken(),
 	}
@@ -712,16 +756,13 @@ func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUID
 	}
 
 	// Re-render the projects tbody rows for the HTMX innerHTML swap.
-	projects, err := deps.Store.ListProjectsWithPolicy()
+	rows, err := buildProjectRows(deps, r)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if projects == nil {
-		projects = []controlapi.ProjectPolicy{}
-	}
 	vm := projectsViewModel{
-		Projects:      projects,
+		Projects:      rows,
 		DaemonVersion: deps.Version,
 		CSRFToken:     sessions.csrfToken(),
 	}

@@ -166,12 +166,20 @@ func buildOpenAIOpts(cfg daemonCfg) []embedding.Option {
 	return opts
 }
 
+// remoteProjectLister is the subset of *remote.Client the web UI needs to show
+// which local projects also exist in central. Satisfied by *remote.Client; nil
+// in local-only mode (no central configured).
+type remoteProjectLister interface {
+	ListProjects(ctx context.Context) ([]string, error)
+}
+
 // daemonComponents holds the wired-but-not-yet-serving components built by
 // buildDaemon. Callers must call Close to release resources.
 type daemonComponents struct {
 	store     *localstore.Store
 	mcpServer *mcpserver.MCPServer
 	loop      *syncer.Loop                // nil when running in local-only mode
+	central   remoteProjectLister         // nil in local-only mode; the wire client for the loop
 	embedLoop *embedding.Loop             // nil when provider is Noop or key absent
 	gated     embedding.EmbeddingProvider // always non-nil (at least NoopProvider via gate)
 }
@@ -445,11 +453,13 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	)
 
 	var loop *syncer.Loop
+	var central remoteProjectLister
 
 	if cfg.centralURL != "" {
-		central := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
+		c := remote.New(cfg.centralURL, nil, cfg.writerID, cfg.writerKey)
+		central = c
 		node := syncer.NewNode("daemon", store)
-		loop = syncer.NewLoop(node, central, syncer.Config{
+		loop = syncer.NewLoop(node, c, syncer.Config{
 			Interval: cfg.syncInterval,
 		})
 	}
@@ -523,6 +533,7 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 		store:     store,
 		mcpServer: mcpSrv,
 		loop:      loop,
+		central:   central,
 		embedLoop: embedLoop,
 		gated:     gated,
 	}, nil
@@ -627,6 +638,9 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		actualPort,
 		components.gated,
 	)
+	// The wire client for remote project discovery (RemoteProjects). Reconnect /
+	// Disconnect replace it under the adapter lock.
+	syncAdapter.central = components.central
 
 	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, version, cfgAdapter)
 
@@ -647,11 +661,12 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 
 	// Mount the web UI on the same mux and listener.
 	webui.Mount(topMux, webui.WebUIDeps{
-		SyncCtrl: syncAdapter,
-		Store:    storeAdapter,
-		Secret:   token,
-		Port:     actualPort,
-		Version:  version,
+		SyncCtrl:       syncAdapter,
+		Store:          storeAdapter,
+		RemoteProjects: syncAdapter.RemoteProjects,
+		Secret:         token,
+		Port:           actualPort,
+		Version:        version,
 	})
 
 	// ── PR-⑥: opt-in MCP HTTP transport ──────────────────────────────────────
@@ -1054,8 +1069,9 @@ type runtimeSyncAdapter struct {
 	mu         sync.Mutex
 	store      *localstore.Store
 	cfgAdapter *configStoreAdapter
-	loop       *syncer.Loop    // nil in local-only mode; replaced on Reconnect
-	ctx        context.Context // daemon's root context (for new Loop.Start on reconnect)
+	loop       *syncer.Loop        // nil in local-only mode; replaced on Reconnect
+	central    remoteProjectLister // wire client for remote project discovery; nil when disconnected
+	ctx        context.Context     // daemon's root context (for new Loop.Start on reconnect)
 	node       *syncer.Node
 	// The last sync result is read LIVE from the Loop via Loop.LastResult() in
 	// Status() (see lastSyncResultLocked) — there is no cached field here.
@@ -1157,6 +1173,22 @@ func (a *runtimeSyncAdapter) TriggerNow(_ context.Context) error {
 	return nil
 }
 
+// RemoteProjects returns the set of project names central knows, for the web
+// UI's "exists in central" marker. Returns (nil, nil) when the daemon is not
+// connected to central — the UI then shows no remote markers (state unknown).
+// The network call runs OUTSIDE a.mu so a slow/blocked central cannot stall
+// concurrent Status/connect/disconnect calls.
+func (a *runtimeSyncAdapter) RemoteProjects(ctx context.Context) ([]string, error) {
+	a.mu.Lock()
+	c := a.central
+	connected := a.connected
+	a.mu.Unlock()
+	if c == nil || !connected {
+		return nil, nil
+	}
+	return c.ListProjects(ctx)
+}
+
 // Disconnect stops the sync loop, clears central credentials from the config
 // file, and re-installs the SetCentralConfiguredFn closure → false.
 // Local data is NOT deleted.
@@ -1169,6 +1201,7 @@ func (a *runtimeSyncAdapter) Disconnect() error {
 		a.loop.Stop()
 		a.loop = nil
 	}
+	a.central = nil
 
 	a.connected = false
 	a.centralURL = ""
@@ -1265,6 +1298,7 @@ func (a *runtimeSyncAdapter) Reconnect(cfg controlapi.CentralConfig) error {
 	newLoop.Start(a.ctx)
 
 	a.loop = newLoop
+	a.central = centralClient
 	a.connected = true
 	a.centralURL = cfg.URL
 
