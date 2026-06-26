@@ -130,35 +130,40 @@ func (s *Store) SetPolicy(project string, p Policy) error {
 // ListProjectsWithPolicy returns all projects known to the local store, each
 // paired with its effective policy.
 //
-// Projects are discovered via a LEFT JOIN of the distinct project values in
-// the memories table against the project_policy table.  Projects that have no
-// explicit policy row receive the read-time default from defaultPolicy.
+// Projects come from the distinct memories project values UNION the project_policy
+// rows; each is paired with its explicit policy (or the read-time default).
 //
-// The query also includes projects that exist only in project_policy (no
-// memories row) via a UNION with project_policy rows, so explicitly-set
-// policies are always visible even for projects not yet written to memories.
+// CASE-INSENSITIVE: central-pulled projects keep their ORIGINAL case in memories
+// (e.g. "Gentleman.Dots") while SetPolicy stores the policy under the normalized
+// lowercase name. A plain exact JOIN therefore (a) missed the policy for a
+// mixed-case project — showing the default badge after a successful toggle — and
+// (b) listed a phantom duplicate lowercase row. We now collapse case-variant
+// names (one row per project, lowercased key) preferring the original memories
+// name for display, and resolve the policy with a lower()=lower() join.
 func (s *Store) ListProjectsWithPolicy() ([]ProjectPolicy, error) {
 	s.policyMu.RLock()
 	def := s.defaultPolicyLocked()
 	s.policyMu.RUnlock()
 
-	// UNION of:
-	//   (a) all projects in memories with their policy (or default when absent)
-	//   (b) all projects in project_policy that have no memories row
-	// This covers:
-	//   - Projects that have memories but no policy row → default
-	//   - Projects that have memories and a policy row → explicit policy
-	//   - Projects that have a policy row but no memories → explicit policy
-	// The outer COALESCE maps NULL (no policy row) to the default string.
+	// names: every project name from memories (src=0) and project_policy (src=1).
+	// ranked: one row per lower(name); ORDER BY src prefers the memories name (the
+	// original case) over the lowercase policy name for the display label.
+	// The final join matches the explicit policy case-insensitively.
 	const q = `
-		SELECT project, COALESCE(pp.policy, ?) AS effective_policy
-		FROM (
-			SELECT DISTINCT project FROM memories WHERE deleted_at IS NULL
-			UNION
-			SELECT project FROM project_policy
-		) AS all_projects
-		LEFT JOIN project_policy pp USING (project)
-		ORDER BY project`
+		WITH names AS (
+			SELECT DISTINCT project AS name, 0 AS src FROM memories WHERE deleted_at IS NULL
+			UNION ALL
+			SELECT project AS name, 1 AS src FROM project_policy
+		),
+		ranked AS (
+			SELECT name, ROW_NUMBER() OVER (PARTITION BY lower(name) ORDER BY src, name) AS rn
+			FROM names
+		)
+		SELECT r.name, COALESCE(pp.policy, ?) AS effective_policy
+		FROM ranked r
+		LEFT JOIN project_policy pp ON lower(pp.project) = lower(r.name)
+		WHERE r.rn = 1
+		ORDER BY r.name`
 
 	rows, err := s.db.Query(q, string(def))
 	if err != nil {

@@ -5,6 +5,7 @@ package localstore
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,6 +198,49 @@ func TestListProjectsWithPolicy_PolicyOnlyProject(t *testing.T) {
 	}
 	if !found {
 		t.Error("policy-only-proj not found in ListProjectsWithPolicy")
+	}
+}
+
+// TestListProjectsWithPolicy_MixedCasePolicy is the regression test for the
+// policy-toggle bug: central-pulled projects keep their ORIGINAL case in memories,
+// but SetPolicy stores the policy under the normalized lowercase name. The list
+// used to (a) show the DEFAULT badge for the mixed-case project (the toggle looked
+// like a no-op) and (b) emit a phantom duplicate lowercase row. The list now
+// resolves the policy case-insensitively and collapses the duplicate.
+func TestListProjectsWithPolicy_MixedCasePolicy(t *testing.T) {
+	st := openTempStore(t)
+	st.SetCentralConfiguredFn(func() bool { return true }) // default = synced
+
+	// Mimic a central-pulled project: stored with original case (not normalized).
+	seedMemory(t, st, "Gentleman.Dots", "mem-mixed")
+
+	// The UI sets the policy on the displayed (mixed-case) name; SetPolicy
+	// normalizes it to "gentleman.dots" internally.
+	if err := st.SetPolicy("Gentleman.Dots", PolicyLocalOnly); err != nil {
+		t.Fatalf("SetPolicy: %v", err)
+	}
+
+	projects, err := st.ListProjectsWithPolicy()
+	if err != nil {
+		t.Fatalf("ListProjectsWithPolicy: %v", err)
+	}
+
+	// Exactly ONE row for the logical project (no phantom lowercase duplicate).
+	var rows []ProjectPolicy
+	for _, p := range projects {
+		if strings.EqualFold(p.Name, "gentleman.dots") {
+			rows = append(rows, p)
+		}
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows for the project; want exactly 1 (no case-variant duplicate): %+v", len(rows), rows)
+	}
+	// Display name keeps the original case, and the explicit policy is shown.
+	if rows[0].Name != "Gentleman.Dots" {
+		t.Errorf("display name = %q; want original-case Gentleman.Dots", rows[0].Name)
+	}
+	if rows[0].Policy != PolicyLocalOnly {
+		t.Errorf("policy = %q; want %q (explicit toggle, not the default)", rows[0].Policy, PolicyLocalOnly)
 	}
 }
 
