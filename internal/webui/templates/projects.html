@@ -46,7 +46,7 @@
                       hx-target="#projects-table-body"
                       hx-swap="innerHTML"
                       hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'
-                      onsubmit="return confirm('Delete project {{.Name}} with scope ' + this.scope.value + '?')">
+                      hx-confirm="Delete project {{.Name}}? The selected scope will be applied — this cannot be undone.">
                     <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                     <select name="scope" class="policy-select">
                         <option value="local">local</option>

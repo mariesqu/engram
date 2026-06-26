@@ -207,6 +207,120 @@ func TestTombstoneProject_SoftDeletesLiveMemories(t *testing.T) {
 	}
 }
 
+// TestTombstoneProject_DelistsProjectWithPolicyRow is the regression test for the
+// "purge-all looks like a no-op" bug: a project with an explicit project_policy row
+// used to remain in ListProjectsWithPolicy after every memory was tombstoned, so the
+// web UI showed no change. TombstoneProject now drops the policy row once the project
+// is fully purged, so the project disappears from the listing.
+func TestTombstoneProject_DelistsProjectWithPolicyRow(t *testing.T) {
+	st := openTempStore(t)
+
+	seedMemory(t, st, "gentleman.dots", "sync-del-1")
+	seedMemory(t, st, "gentleman.dots", "sync-del-2")
+	// Give it an explicit policy row — this is what made it linger before the fix.
+	if err := st.SetPolicy("gentleman.dots", PolicySynced); err != nil {
+		t.Fatalf("SetPolicy: %v", err)
+	}
+
+	listed := func() bool {
+		ps, err := st.ListProjectsWithPolicy()
+		if err != nil {
+			t.Fatalf("ListProjectsWithPolicy: %v", err)
+		}
+		for _, p := range ps {
+			if p.Name == "gentleman.dots" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !listed() {
+		t.Fatal("precondition: project should be listed before purge-all")
+	}
+
+	n, err := st.TombstoneProject("gentleman.dots", "writer-test")
+	if err != nil {
+		t.Fatalf("TombstoneProject: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("TombstoneProject: tombstoned %d; want 2", n)
+	}
+
+	if listed() {
+		t.Error("project still listed after purge-all; policy row was not cleared (regression)")
+	}
+
+	// The policy row must actually be gone (not just hidden).
+	var rows int
+	if err := st.DB().QueryRow(
+		`SELECT COUNT(*) FROM project_policy WHERE project = ?`, "gentleman.dots",
+	).Scan(&rows); err != nil {
+		t.Fatalf("count policy rows: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("project_policy rows = %d; want 0 after purge-all", rows)
+	}
+}
+
+// TestProjectDelete_MixedCaseProject is the regression test for the main reported
+// bug: central-pulled projects keep their ORIGINAL case in the memories table
+// (e.g. "Gentleman.Dots"), but the delete path used to normalize the lookup to
+// lowercase, so it matched zero rows and the delete silently did nothing. Both
+// delete scopes must now match case-insensitively.
+func TestProjectDelete_MixedCaseProject(t *testing.T) {
+	insertMixedCase := func(t *testing.T, st *Store, syncID string) {
+		t.Helper()
+		// Raw insert preserving case, mimicking the central-pull apply path
+		// (which does NOT normalize) rather than seedMemory's lowercase callers.
+		_, err := st.DB().Exec(`
+			INSERT INTO memories (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id)
+			VALUES (?, 'sess', 'memory', 'manual', 'seed', 'seed', 'Gentleman.Dots', 'project', 'w')`, syncID)
+		if err != nil {
+			t.Fatalf("insert mixed-case memory: %v", err)
+		}
+	}
+
+	t.Run("purge-all/TombstoneProject", func(t *testing.T) {
+		st := openTempStore(t)
+		insertMixedCase(t, st, "mc-tomb-1")
+		insertMixedCase(t, st, "mc-tomb-2")
+
+		// Caller may use any casing — the displayed name is "Gentleman.Dots".
+		n, err := st.TombstoneProject("Gentleman.Dots", "w")
+		if err != nil {
+			t.Fatalf("TombstoneProject: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("tombstoned %d; want 2 (case-insensitive match failed)", n)
+		}
+		var live int
+		_ = st.DB().QueryRow(`SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL`).Scan(&live)
+		if live != 0 {
+			t.Errorf("%d live memories remain; want 0", live)
+		}
+	})
+
+	t.Run("local/PurgeProjectLocal", func(t *testing.T) {
+		st := openTempStore(t)
+		insertMixedCase(t, st, "mc-purge-1")
+
+		// Deliberately pass a different casing than stored to prove NOCASE matching.
+		total, err := st.PurgeProjectLocal("gentleman.DOTS")
+		if err != nil {
+			t.Fatalf("PurgeProjectLocal: %v", err)
+		}
+		if total < 1 {
+			t.Errorf("purged %d rows; want >= 1 (case-insensitive match failed)", total)
+		}
+		var rows int
+		_ = st.DB().QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&rows)
+		if rows != 0 {
+			t.Errorf("%d memory rows remain after purge; want 0", rows)
+		}
+	})
+}
+
 // TestTombstoneProject_EmptyProject verifies that TombstoneProject on a project
 // with no live memories returns 0 without error.
 func TestTombstoneProject_EmptyProject(t *testing.T) {
