@@ -159,6 +159,10 @@ func TestRunImportCmd_MissingFrom(t *testing.T) {
 
 // TestRunImportCmd_MissingDB verifies exit 1 when --db is omitted.
 func TestRunImportCmd_MissingDB(t *testing.T) {
+	// Isolate from the developer's environment: a set ENGRAM_DB would satisfy
+	// the flag > env resolution and let the import proceed.
+	t.Setenv("ENGRAM_DB", "")
+
 	oldPath := makeOldDB(t)
 	code := run([]string{"import", "--from", oldPath})
 	if code == 0 {
