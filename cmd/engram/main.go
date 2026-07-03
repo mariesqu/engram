@@ -36,15 +36,23 @@ Usage:
   engram serve    [--addr <addr>] [--dsn <dsn>]
   engram keys     provision [--dsn <dsn>] <writer-id>
   engram keys     revoke    [--dsn <dsn>] <writer-id>
-  engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
+  engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>] [--transport <stdio|http>]
   engram status   [--db <path>]
   engram ui       [--db <path>]
   engram tray     [--db <path>]  (Windows only)
+  engram connect  [--db <path>]
+  engram central  connect --url <url> --writer-id <id> [--db <path>]
+  engram central  disconnect [--db <path>]
   engram projects list
   engram projects policy <project> <synced|local-only|omitted>
+  engram projects consolidate <from> <to> [--yes] [--db <path>]
+  engram projects delete <project> [--local] [--remote=purge-all|unshare] [--db <path>] [--dsn <dsn>] [--yes]
   engram config   get | set <key> <value>
   engram sync     now
   engram memories list | search <query>
+  engram memories review [--status <status>] [--project <project>] [--limit <n>] [--db <path>]
+  engram memories edit <id> --title <t> --content <c> [--type <type>] [--db <path>]
+  engram memories delete <id> [--yes] [--db <path>]
   engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
   engram version
 
@@ -54,9 +62,11 @@ Environment:
   ENGRAM_DB              path to local SQLite database (required for 'daemon', 'status', 'ui', 'projects')
   ENGRAM_CENTRAL_URL     central server URL for autosync (optional for 'daemon')
   ENGRAM_WRITER_ID       writer identity for autosync (required when ENGRAM_CENTRAL_URL is set)
-  ENGRAM_WRITER_KEY      hex-encoded 32-byte HMAC key (env only; required when ENGRAM_CENTRAL_URL is set)
+  ENGRAM_WRITER_KEY      hex-encoded 32-byte HMAC key (env only; required when ENGRAM_CENTRAL_URL is set, or for 'engram central connect')
   ENGRAM_SYNC_INTERVAL   autosync cadence for 'daemon' (default "30s")
   ENGRAM_TRANSPORT       MCP transport override for 'daemon' ("stdio" or "http")
+  ENGRAM_EMBEDDING_KEY   API key for the embedding provider (env only; overrides any stored ciphertext)
+  ENGRAM_CONFIG_DIR      overrides the config file directory (default: %APPDATA%\engram or $XDG_CONFIG_HOME/engram)
 
 Subcommands:
   serve     Run the central HTTP server (plain HTTP — terminate TLS upstream).
@@ -65,10 +75,12 @@ Subcommands:
   status    Print status of the running resident daemon (requires daemon --http).
   ui        Open the web UI in the default browser (requires daemon --http).
   tray      Start the Windows system tray icon (Windows only; auto-launches daemon --http).
-  projects  List and manage per-project sync policies (requires daemon --http).
+  connect   Bridge stdio MCP to a resident daemon's HTTP MCP endpoint (requires daemon --http --transport http).
+  central   Connect or disconnect the resident daemon from a central sync server (requires daemon --http).
+  projects  List, manage policy, consolidate, or delete per-project data (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).
   sync      Trigger an immediate sync cycle (requires daemon --http).
-  memories  Browse stored memories: list recent or search by keyword (requires daemon --http).
+  memories  Browse, review, edit, or delete stored memories (requires daemon --http).
   import    Import memories, prompts, and sessions from an old-generation engram database.
   version   Print binary version, GOOS/GOARCH, and Go runtime version.
 
@@ -124,6 +136,18 @@ func run(args []string) int {
 	case "tray":
 		if err := runTrayCmd(args[1:]); err != nil {
 			log.Printf("engram tray: %v", err)
+			return 1
+		}
+		return 0
+	case "connect":
+		if err := runConnectCmd(args[1:]); err != nil {
+			log.Printf("engram connect: %v", err)
+			return 1
+		}
+		return 0
+	case "central":
+		if err := runCentralCmd(args[1:]); err != nil {
+			log.Printf("engram central: %v", err)
 			return 1
 		}
 		return 0

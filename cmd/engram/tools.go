@@ -645,6 +645,13 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 			return toolErr, nil
 		}
 
+		// Default session_id to "manual-save-{project}" when omitted, using the
+		// FINAL resolved project (auto-detected or explicit) — matches the tool
+		// description's documented default.
+		if sessionID == "" {
+			sessionID = fmt.Sprintf("manual-save-%s", project)
+		}
+
 		// Policy check: refuse writes for omitted projects BEFORE any store write.
 		// Returns a clear MCP error; writes nothing (no row, no outbox entry).
 		pol, polErr := store.GetPolicy(project)
@@ -931,6 +938,14 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 			}
 		}
 
+		// Default session_id to "manual-save-{project}" when omitted, using the
+		// FINAL resolved project — matches the tool description's documented
+		// default. Applied AFTER the session-lookup above so an explicit empty
+		// session_id still resolves the project from cwd rather than a session row.
+		if sessionID == "" {
+			sessionID = fmt.Sprintf("manual-save-%s", project)
+		}
+
 		// Policy check: refuse writes for omitted projects BEFORE any store write —
 		// session summaries land in the memories table like any observation.
 		pol, polErr := store.GetPolicy(project)
@@ -1181,6 +1196,13 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		project, toolErr := resolveSaveProject(store, explicitProject)
 		if toolErr != nil {
 			return toolErr, nil
+		}
+
+		// Default session_id to "manual-save-{project}" when omitted, using the
+		// FINAL resolved project (auto-detected or explicit) — matches the tool
+		// description's documented default.
+		if sessionID == "" {
+			sessionID = fmt.Sprintf("manual-save-%s", project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write.

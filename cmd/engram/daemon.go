@@ -44,8 +44,12 @@ conflict judgment (mem_judge).
 
 When --central-url is set the daemon wires an autosync Loop that pushes local
 writes to the central server and pulls remote mutations back on a periodic
-schedule.  Pulls cover only projects already present in the local store, so a
-fresh/empty database pulls nothing until a local write first creates a project.
+schedule.  Each cycle also asks central for its project list (POST /v1/projects)
+and unions it into the pull set, so projects created on other machines are
+discovered and pulled automatically.  When central does not support discovery
+(older server: 404/501) the daemon falls back to pulling only projects already
+present in the local store.  Projects whose local policy is not "synced" are
+skipped in both cases.
 Without --central-url the daemon runs in LOCAL-ONLY mode: no network traffic,
 no HMAC credentials required.
 
@@ -64,6 +68,8 @@ On SIGINT or SIGTERM the daemon stops the autosync loop (if running), closes the
 store, and exits cleanly.  In HTTP mode daemon.json is removed on clean shutdown.
 
 Config file: %APPDATA%\engram\config.json (Windows) or $XDG_CONFIG_HOME/engram/config.json.
+ENGRAM_CONFIG_DIR overrides the config file directory (relocate or isolate config.json,
+e.g. for testing or running multiple daemons without colliding on one file).
 Precedence: flags > env vars > config file > defaults.
 Writer key is DPAPI-encrypted at rest on Windows. Use ENGRAM_WRITER_KEY env var on other platforms.
 

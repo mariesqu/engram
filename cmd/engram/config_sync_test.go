@@ -159,6 +159,10 @@ func TestCLI_SyncNow_Connected(t *testing.T) {
 	// correct endpoint is called. Since we can't inject the server URL easily
 	// without refactoring ControlClient, we verify dispatch routing:
 
+	// Isolate from the developer's environment: a set ENGRAM_DB would satisfy
+	// the flag > env resolution and make the missing---db assertion pass vacuously.
+	t.Setenv("ENGRAM_DB", "")
+
 	err := runSyncCmd([]string{"now", "--db", ""})
 	// Missing --db triggers a config error, not a crash.
 	if err == nil {

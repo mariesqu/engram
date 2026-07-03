@@ -290,6 +290,8 @@ All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-
 | `POST`   | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
 | `POST`   | `/api/v1/central/disconnect`               | Disconnect from central (clears credentials)           |
 | `POST`   | `/api/v1/sync/trigger`                     | Trigger an immediate sync cycle (202; 409 if offline)  |
+| `POST`   | `/api/v1/embedding/key`                    | Store an embedding provider API key (sealed at rest; takes effect on next restart) |
+| `DELETE` | `/api/v1/embedding/key`                    | Clear the stored embedding provider API key             |
 
 Mutating endpoints (`PUT`, `POST`, `DELETE`) additionally require an `Origin: http://127.0.0.1:<port>` header.
 
@@ -372,6 +374,28 @@ Add an entry to your `claude_desktop_config.json` (or equivalent MCP host config
 Replace `7700` with the actual port and `<token>` with the value from `daemon.json`. Re-read `daemon.json` after every daemon restart — the token is rotated on start.
 
 The `"type": "http"` value matches the Claude Code `.mcp.json` schema; other MCP clients may name the Streamable HTTP transport differently (e.g. `"streamable-http"`) — check your client’s documentation.
+
+**Bridging with `engram connect` (stdio clients, no token rotation pain)**
+
+The `"type": "http"` config above works well for MCP hosts that support the Streamable HTTP transport natively. But not every client does, and even for the ones that do, hardcoding the bearer token means the config breaks every time the daemon restarts (the token rotates on every start — see "Authentication" above). `engram connect` solves both problems: it is a stdio MCP subcommand that bridges to the resident daemon’s `/mcp` endpoint over HTTP internally, so from the client’s point of view it looks like a normal stdio server.
+
+```bash
+# Prerequisite: a resident daemon already running with --transport http
+./engram daemon --db ~/.engram/memories.db --http --transport http
+```
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "/path/to/engram",
+      "args": ["connect", "--db", "/home/you/.engram/memories.db"]
+    }
+  }
+}
+```
+
+Every client gets this same trivial config — no token in sight, no per-client daemon process, no per-client SQLite owner. `engram connect` reads the current token from `daemon.json` at startup, and re-reads it automatically if a request comes back `401` (the daemon restarted and rotated its token mid-session) — the client never sees the rotation. If `engram connect` cannot find a resident daemon, or finds one running without `--transport http`, it exits immediately with a message telling you how to fix it.
 
 **Mode matrix**
 
@@ -555,21 +579,26 @@ The generator writes a standard ICO file with two BITMAPINFOHEADER + XOR/AND bit
 engram serve    [--addr <addr>] [--dsn <dsn>]
 engram keys     provision [--dsn <dsn>] <writer-id>
 engram keys     revoke    [--dsn <dsn>] <writer-id>
-engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>]
+engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>] [--transport <stdio|http>]
 engram status   [--db <path>]
 engram ui       [--db <path>]
 engram tray     [--db <path>]  (Windows only)
+engram connect  [--db <path>]
+engram central  connect --url <url> --writer-id <id> [--db <path>]
+engram central  disconnect [--db <path>]
 engram projects list   [--db <path>]
 engram projects policy [--db <path>] <project> <policy>
+engram projects consolidate <from> <to> [--yes] [--db <path>]
 engram projects delete <project> [--local] [--remote unshare|purge-all] [--db <path>] [--dsn <dsn>] [--yes]
 engram memories list   [--db <path>] [--project <name>] [--limit <n>]
 engram memories search <query> [--db <path>] [--project <name>] [--limit <n>]
+engram memories review [--status <status>] [--project <name>] [--limit <n>] [--db <path>]
 engram memories edit   <id> --title <title> --content <content> [--type <type>] [--db <path>]
-engram memories delete <id> [--db <path>]
+engram memories delete <id> [--yes] [--db <path>]
 engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
-engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
+engram import   [--from <old-db>] [--db <dest-db>] [--dry-run] [--writer-id <id>]
 engram version
 ```
 
@@ -590,6 +619,8 @@ link time (see [RELEASING.md](RELEASING.md)).
 | `ENGRAM_SYNC_INTERVAL`| `daemon`                             | `30s`    | Autosync cadence (Go duration string, e.g. `1m`, `30s`)          |
 | `ENGRAM_TRANSPORT`    | `daemon`                             | `stdio`  | MCP transport mode: `stdio` or `http` (requires `--http`)        |
 | `ENGRAM_CONFIG_DIR`   | `daemon`                             | platform | Override the config file directory (see Config file section)     |
+| `ENGRAM_PUSH_CONCURRENCY` | `daemon` (autosync)               | `8`      | Parallel push workers per sync cycle (clamped to `[1, 64]`)       |
+| `ENGRAM_EMBEDDING_KEY`| `daemon`                             | —        | API key for the embedding provider; **env only**; overrides any stored ciphertext |
 
 Flags take precedence over environment variables. `ENGRAM_WRITER_KEY` has no corresponding flag and always takes precedence over the file-stored key.
 
@@ -660,6 +691,21 @@ With central sync and a writer key supplied via environment:
 ```
 
 > **Note on `ENGRAM_WRITER_KEY` in `.mcp.json`:** storing the secret directly in a committed file is convenient for local dev but inappropriate for shared repos. Prefer injecting it via your shell profile or a secrets manager and omitting the `env` block from the committed config.
+
+If you already run a resident daemon (`engram daemon --http --transport http`) and want multiple MCP clients to share it instead of each spawning their own `engram daemon` process, point `.mcp.json` at `connect` instead of `daemon`:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "/path/to/engram",
+      "args": ["connect", "--db", "/home/you/.engram/memories.db"]
+    }
+  }
+}
+```
+
+See "Bridging with `engram connect`" under [HTTP MCP transport](#http-mcp-transport) for details — this is still a stdio config (`command`/`args`, no `env`/token needed), it just talks to the shared daemon over HTTP internally.
 
 ### Project name override
 
@@ -813,6 +859,8 @@ Soft-deletes the memory by ID. The deletion is propagated to other synced nodes 
 engram memories delete 42
 ```
 
+Note: `--yes` is accepted for forward compatibility, but deletion is currently immediate and non-interactive — no confirmation prompt exists yet, with or without the flag.
+
 In the web UI: click **Delete** on any row in the Memories tab. The list refreshes immediately.
 
 ### Deleting a whole project
@@ -950,7 +998,7 @@ Because Ollama is local, embedding local-only projects requires explicit consent
 
 #### Embedding key management API
 
-The embedding API key can be stored as a platform-encrypted blob (DPAPI on Windows) via the control-plane API, without restarting the daemon:
+The embedding API key can be stored as a platform-encrypted blob (DPAPI on Windows) via the control-plane API. The key is persisted without restarting the daemon, but takes effect only after the next daemon restart — the live provider is constructed once at startup:
 
 ```bash
 # Store key (hex-encoded plaintext — never echoed in response)
