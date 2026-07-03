@@ -44,8 +44,12 @@ conflict judgment (mem_judge).
 
 When --central-url is set the daemon wires an autosync Loop that pushes local
 writes to the central server and pulls remote mutations back on a periodic
-schedule.  Pulls cover only projects already present in the local store, so a
-fresh/empty database pulls nothing until a local write first creates a project.
+schedule.  Each cycle also asks central for its project list (POST /v1/projects)
+and unions it into the pull set, so projects created on other machines are
+discovered and pulled automatically.  When central does not support discovery
+(older server: 404/501) the daemon falls back to pulling only projects already
+present in the local store.  Projects whose local policy is not "synced" are
+skipped in both cases.
 Without --central-url the daemon runs in LOCAL-ONLY mode: no network traffic,
 no HMAC credentials required.
 
