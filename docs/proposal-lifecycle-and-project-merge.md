@@ -1,22 +1,35 @@
 # Proposal: memory lifecycle (`mem_review`) + project-merge tools
 
-Status: draft / spec
+Status: shipped (see "Shipped status" note below) — retained as design rationale
 Audience: engram maintainers
 
 ## Why
 
 The team's SDD orchestrator + `engram-convention.md` reference engram capabilities that the
-v1.1.0 rewrite does not yet expose:
+v1.1.0 rewrite did not yet expose at the time this proposal was written:
 
 - **`mem_review`** (lifecycle: `active` / `needs_review`, `mark_reviewed`) — the convention's
   "Memory lifecycle rule" leans on this so stale architecture memories are verified, not trusted
-  blindly. Today it's a documented no-op.
+  blindly. At proposal time it was a documented no-op; **it has since shipped** (`tools.go`
+  `mem_review` tool + `handleReview`, and `engram memories review` / `engram memories edit` CLI
+  subcommands).
 - **`mem_merge_projects`** (MCP) + **`engram projects consolidate`** (CLI) — clean up project
-  name drift (`my-app` vs `myapp`). Today: not implemented (`projects` CLI is `list`/`policy`/`delete`).
+  name drift (`my-app` vs `myapp`). At proposal time this was not implemented (`projects` CLI was
+  `list`/`policy`/`delete`); **it has since shipped** (`mem_merge_projects` tool +
+  `engram projects consolidate`).
 - **Save-time name-drift warning** — warn when `mem_save` resolves a project that's close-but-not-equal
   to an existing one.
 
-This spec closes those gaps, prioritized smallest-and-highest-value first.
+This spec closes those gaps, prioritized smallest-and-highest-value first. The design rationale
+and phased plan below are kept as-written for historical context; see the shipped-status note
+for what actually landed.
+
+> **Shipped status:** `mem_review` (list / mark_reviewed) is implemented in `cmd/engram/tools.go`
+> (lines ~375-439) with local store support in `memories.go` (CLI: `engram memories review`,
+> `engram memories edit`). Project consolidation is implemented as `mem_merge_projects` (MCP) and
+> `engram projects consolidate` (CLI, `cmd/engram/projects.go` lines ~69-155). The passages below
+> describing these as "not implemented" or "a documented no-op" reflect the state at proposal time,
+> not the current codebase.
 
 ---
 

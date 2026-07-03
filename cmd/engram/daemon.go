@@ -68,6 +68,8 @@ On SIGINT or SIGTERM the daemon stops the autosync loop (if running), closes the
 store, and exits cleanly.  In HTTP mode daemon.json is removed on clean shutdown.
 
 Config file: %APPDATA%\engram\config.json (Windows) or $XDG_CONFIG_HOME/engram/config.json.
+ENGRAM_CONFIG_DIR overrides the config file directory (relocate or isolate config.json,
+e.g. for testing or running multiple daemons without colliding on one file).
 Precedence: flags > env vars > config file > defaults.
 Writer key is DPAPI-encrypted at rest on Windows. Use ENGRAM_WRITER_KEY env var on other platforms.
 

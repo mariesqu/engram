@@ -46,7 +46,7 @@ Call `mem_save` immediately after any of the following — without the user aski
 
 **Format for `mem_save`:**
 - `title`: short, searchable — verb + what (e.g. "Fixed N+1 query in UserList")
-- `type`: `decision` | `bugfix` | `architecture` | `pattern` | `config` | `discovery`
+- `type`: `decision` | `bugfix` | `architecture` | `pattern` | `config` | `discovery` | `learning`
 - `content`: structured — **What** / **Why** / **Where** / **Learned** (omit Learned if none)
 
 ---
