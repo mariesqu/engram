@@ -460,6 +460,43 @@ PUT  /api/v1/projects/{project}/policy       → {"policy": "synced|local-only|o
 
 `PUT` requires a valid `Authorization: Bearer <token>` header. The token is read from the `daemon.json` file written by the running daemon.
 
+### Remote purge
+
+Sometimes you need to force a node to throw away its local synced data and re-pull a clean copy from central — e.g. a corrupted local database, or a machine that drifted after being offline for a long time. `engram keys purge` triggers this remotely, without SSH access to the affected machine.
+
+**How it works:** central tracks a per-writer generation counter (`purge_epoch`) on `cloud_writer_keys`. Every daemon checks that counter once at startup (`POST /v1/state`, HMAC-authenticated). If central's epoch for that writer is ahead of the epoch the daemon last honored, the daemon:
+
+1. Hard-deletes all local data (`memories`, `user_prompts`, tombstones, the outbox, and its idempotency-guard records) for every project whose **policy is `synced`**.
+2. Resets those projects' pull cursors to zero.
+3. Records the new epoch as honored.
+4. Continues starting up — the normal autosync loop rediscovers and re-pulls the purged projects from central on its next cycle, exactly like a fresh machine.
+
+**What is never touched:** projects with policy `local-only` or `omitted`. Their data was either never in central (`local-only`) or deliberately excluded (`omitted`), so central has no copy to re-pull from — purging them would be permanent, unrecoverable data loss. The feature is deliberately scoped to *synced* data only.
+
+**Per-writer, not per-machine:** the epoch belongs to the `writer_id`, not to an individual daemon process. If you run the daemon on multiple machines under the same `writer_id` (e.g. a laptop and a desktop sharing one identity), **all of them purge together** the next time each one starts up or checks in — there is no way to target a single machine independently of its writer_id.
+
+**Design note — why a counter, not a boolean flag:** an earlier design considered a simple "purge requested" boolean on the writer row. It was rejected: if two purges are requested in quick succession, a node that clears the flag after honoring the first purge can race a second `SET` and silently lose it. A monotonic counter has no such race — a node just remembers the highest epoch it has already honored, and any read of a higher epoch (no matter how many times it's re-read, or how many bumps happened between checks) triggers exactly one purge to catch up.
+
+**Fail-open behavior:** the startup check has a 5-second timeout. A network error, timeout, or an older central without the `/v1/state` endpoint (404/501) is treated as "nothing to check" — the daemon boots normally rather than blocking startup on central's availability. This means an offline laptop can always start; the purge check simply runs again (and catches up) the next time it can reach central.
+
+**No backwards epochs:** a daemon only purges when central's `remote_epoch` is *strictly greater than* the epoch it last honored — the comparison never fires on a lower or equal value. This means a central restored from an older backup (whose `purge_epoch` is lower than what nodes have already honored) will silently disable purging for those nodes: they compare the restored (lower) epoch against their own higher honored value, see nothing to do, and never purge again until an admin runs `engram keys purge` enough times to bump the counter *past* the highest value any node had previously honored. There is no automatic detection of this state — after restoring central from backup, check (or conservatively re-bump) `purge_epoch` before relying on remote purge again.
+
+**CLI**
+
+```bash
+# Bump the epoch for one writer — every daemon sharing this writer_id purges
+# its synced data and re-pulls on its next startup:
+engram keys purge my-writer-id --dsn "$ENGRAM_DSN"
+
+# Bump the epoch for every active writer (central-wide purge broadcast):
+engram keys purge --all --dsn "$ENGRAM_DSN"
+
+# Same, but spare specific writers (e.g. the writer that requested it):
+engram keys purge --all --except my-writer-id,another-writer --dsn "$ENGRAM_DSN"
+```
+
+`--all` cannot be combined with a positional `<writer-id>`.
+
 ## Web UI
 
 The resident daemon (`engram daemon --http`) serves a browser-based dashboard at `http://127.0.0.1:<port>/ui/`.
@@ -579,6 +616,8 @@ The generator writes a standard ICO file with two BITMAPINFOHEADER + XOR/AND bit
 engram serve    [--addr <addr>] [--dsn <dsn>]
 engram keys     provision [--dsn <dsn>] <writer-id>
 engram keys     revoke    [--dsn <dsn>] <writer-id>
+engram keys     purge     [--dsn <dsn>] <writer-id>
+engram keys     purge     --all [--except <id>[,<id>...]] [--dsn <dsn>]
 engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>] [--transport <stdio|http>]
 engram status   [--db <path>]
 engram ui       [--db <path>]

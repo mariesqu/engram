@@ -172,13 +172,16 @@ func buildOpenAIOpts(cfg daemonCfg) []embedding.Option {
 	return opts
 }
 
-// remoteCentral is the subset of *remote.Client the web UI needs: list central's
-// projects (for the "exists in central" marker) and unshare a project (delete it
-// from central over the authenticated wire — no DSN). Satisfied by *remote.Client;
-// nil in local-only mode (no central configured).
+// remoteCentral is the subset of *remote.Client the web UI and the startup
+// remote-purge check need: list central's projects (for the "exists in
+// central" marker), unshare a project (delete it from central over the
+// authenticated wire — no DSN), and fetch this writer's purge_epoch (the
+// remote-purge startup check — see checkRemotePurgeOnStartup). Satisfied by
+// *remote.Client; nil in local-only mode (no central configured).
 type remoteCentral interface {
 	ListProjects(ctx context.Context) ([]string, error)
 	Unshare(ctx context.Context, project string) (int, error)
+	State(ctx context.Context) (remote.WriterState, error)
 }
 
 // daemonComponents holds the wired-but-not-yet-serving components built by
@@ -563,6 +566,8 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	}
 	defer components.Close()
 
+	checkRemotePurgeOnStartup(ctx, components.store, components.central)
+
 	autosync := "off"
 	if components.loop != nil {
 		components.loop.Start(ctx)
@@ -589,6 +594,8 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		return err
 	}
 	defer components.Close()
+
+	checkRemotePurgeOnStartup(ctx, components.store, components.central)
 
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -718,6 +725,135 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 		defer cancel()
 		return httpSrv.Shutdown(shutCtx)
 	}
+}
+
+// ── Remote purge (per-writer purge_epoch) ────────────────────────────────────
+
+// remoteStateTimeout bounds the /v1/state check so a black-holed or slow
+// central cannot delay daemon startup. An offline laptop must still boot.
+const remoteStateTimeout = 5 * time.Second
+
+// stateFetcher is the narrow interface checkRemotePurgeOnStartup needs from
+// the wire client: fetch the authenticated writer's current purge_epoch.
+// *remote.Client satisfies it. Defined as a local interface (rather than
+// depending on the concrete type) so the startup check is testable with a
+// fake State() implementation, per the "testable with a fake State()" spec
+// requirement.
+type stateFetcher interface {
+	State(ctx context.Context) (remote.WriterState, error)
+}
+
+// purgeStore is the narrow interface checkRemotePurgeOnStartup needs from the
+// local store: read the last-honored epoch and run the destructive resync
+// purge. *localstore.Store satisfies it.
+type purgeStore interface {
+	HonoredPurgeEpoch() (int64, error)
+	PurgeForResync(newEpoch int64) (localstore.PurgeResult, error)
+}
+
+// statusCoder is the OPTIONAL HTTP-status accessor implemented by
+// *remote.StatusError. checkRemotePurgeOnStartup uses it to detect a 404/501
+// (an older central without the /v1/state endpoint, or a Central that does not
+// implement the writerPurgeEpoch capability) WITHOUT a type assertion to the
+// concrete *remote.StatusError — mirrors the same duck-typed classification
+// syncer.isDiscoveryUnsupported uses for /v1/projects (see
+// internal/syncer/syncer.go), reimplemented locally here because that
+// predicate is unexported.
+type statusCoder interface {
+	StatusCode() int
+}
+
+// isRemoteStateUnsupported reports whether err is central signalling that it
+// does not implement the /v1/state endpoint or the writerPurgeEpoch capability
+// — a 404 from an older central's catch-all for the unregistered route, or a
+// 501 from the capability-gated handler. Mirrors syncer.isDiscoveryUnsupported.
+func isRemoteStateUnsupported(err error) bool {
+	var sc statusCoder
+	if errors.As(err, &sc) {
+		code := sc.StatusCode()
+		return code == http.StatusNotFound || code == http.StatusNotImplemented
+	}
+	return false
+}
+
+// checkRemotePurgeOnStartup implements the remote-purge decision table from
+// the feature spec. It is called once at daemon startup, AFTER buildDaemon and
+// BEFORE the autosync loop starts, so a purge (if triggered) completes before
+// any pull cycle can race it.
+//
+// central is nil in local-only mode (no --central-url configured) — the check
+// is a no-op in that case, matching daemonComponents.central's nil-in-local-only
+// contract.
+//
+// Decision table:
+//   - central == nil (local-only mode): no-op, return immediately.
+//   - Network error / timeout calling State(): FAIL OPEN — log a warning, skip
+//     the check, continue startup. An offline laptop must still be able to boot.
+//   - 404/501 (older central without /v1/state, or a Central lacking the
+//     capability): treat as a no-op, same as isDiscoveryUnsupported for
+//     project discovery — not a startup failure.
+//   - remote_epoch > honored_epoch: log prominently, run PurgeForResync, log
+//     the per-table counts, then continue startup (the next autosync cycle's
+//     project discovery + pull re-populates the store; no special pull mode
+//     needed).
+//   - remote_epoch <= honored_epoch: continue normally (no-op — this also
+//     covers the "never checked before, central never bumped" steady state
+//     where both sides are 0).
+//
+// Errors reading/writing the LOCAL store (HonoredPurgeEpoch, PurgeForResync)
+// are logged and treated as fail-open too: a local storage hiccup must not
+// block startup any more than a network hiccup should.
+func checkRemotePurgeOnStartup(ctx context.Context, store purgeStore, central stateFetcher) {
+	if central == nil {
+		return // local-only mode: nothing to check
+	}
+
+	stateCtx, cancel := context.WithTimeout(ctx, remoteStateTimeout)
+	defer cancel()
+
+	remoteState, err := central.State(stateCtx)
+	if err != nil {
+		if isRemoteStateUnsupported(err) {
+			// Older central (no /v1/state) or a Central lacking the capability —
+			// not an error condition, just nothing to check this startup.
+			return
+		}
+		// Network error, timeout, 5xx, or auth failure: FAIL OPEN. An offline or
+		// flaky-network machine must still be able to start the daemon.
+		log.Printf("engram daemon: remote purge check skipped (central unreachable): %v", err)
+		return
+	}
+
+	honoredEpoch, err := store.HonoredPurgeEpoch()
+	if err != nil {
+		log.Printf("engram daemon: remote purge check skipped (read local honored epoch failed): %v", err)
+		return
+	}
+
+	if remoteState.PurgeEpoch <= honoredEpoch {
+		return // nothing to do — already honored (covers the 0 == 0 steady state)
+	}
+
+	log.Printf("engram daemon: remote purge requested (central epoch=%d > honored epoch=%d) — purging local SYNCED data and re-pulling from central",
+		remoteState.PurgeEpoch, honoredEpoch)
+
+	result, err := store.PurgeForResync(remoteState.PurgeEpoch)
+	if err != nil {
+		log.Printf("engram daemon: remote purge FAILED: %v — local data left unchanged; will retry on next daemon start", err)
+		return
+	}
+
+	log.Printf("engram daemon: remote purge complete: projects=%v memories=%d user_prompts=%d memory_tombstones=%d prompt_tombstones=%d sync_mutations=%d applied_mutations=%d pull_cursors=%d new_honored_epoch=%d",
+		result.Projects,
+		result.MemoriesDeleted,
+		result.UserPromptsDeleted,
+		result.MemoryTombstones,
+		result.PromptTombstones,
+		result.SyncMutations,
+		result.AppliedMutations,
+		result.PullCursorsDeleted,
+		result.NewHonoredEpoch,
+	)
 }
 
 // probeDaemon probes an existing daemon on the given port.

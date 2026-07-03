@@ -346,3 +346,61 @@ func (c *Client) Unshare(ctx context.Context, project string) (int, error) {
 	}
 	return int(ur.Deleted), nil
 }
+
+// WriterState is the decoded result of [Client.State]: the authenticated
+// writer's current remote-purge generation counter.
+type WriterState struct {
+	// PurgeEpoch is central's current purge_epoch for this writer. The daemon
+	// compares it to the epoch it last honored (persisted locally) to decide
+	// whether a remote purge is due.
+	PurgeEpoch int64
+}
+
+// State fetches the authenticated writer's current purge_epoch (POST
+// /v1/state, HMAC-signed like push/pull/projects/unshare). This is the client
+// side of the remote-purge feature: the daemon calls it once at startup and
+// compares the returned epoch to the locally-honored epoch (see
+// internal/localstore's HonoredPurgeEpoch) to decide whether to purge its
+// SYNCED local data and re-pull from central.
+//
+// A 501 means the server's Central does not implement the writerPurgeEpoch
+// capability (an older central, or a lightweight test double) — the caller is
+// expected to treat that the same way project discovery's 501/404 is treated
+// (see syncer.isDiscoveryUnsupported): as "capability absent," not a hard sync
+// failure. Any other non-2xx status returns a *StatusError. ctx cancellation is
+// propagated as in Apply, PullSince, ListProjects, and Unshare.
+func (c *Client) State(ctx context.Context) (WriterState, error) {
+	body, err := json.Marshal(syncwire.StateRequest{})
+	if err != nil {
+		return WriterState{}, fmt.Errorf("remote.State: marshal StateRequest: %w", err)
+	}
+
+	req, err := c.buildRequest(ctx, http.MethodPost, "/v1/state", body)
+	if err != nil {
+		return WriterState{}, fmt.Errorf("remote.State: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return WriterState{}, fmt.Errorf("remote.State: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return WriterState{}, fmt.Errorf("remote.State: read response body: %w", err)
+	}
+	if len(respBody) > maxResponseBytes {
+		return WriterState{}, fmt.Errorf("remote.State: response body exceeds cap of %d bytes", maxResponseBytes)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return WriterState{}, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var sr syncwire.StateResponse
+	if err := json.Unmarshal(respBody, &sr); err != nil {
+		return WriterState{}, fmt.Errorf("remote.State: decode StateResponse: %w", err)
+	}
+	return WriterState{PurgeEpoch: sr.PurgeEpoch}, nil
+}

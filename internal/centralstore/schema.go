@@ -174,12 +174,16 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		// active = false revokes a key without deleting the audit trail.  WriterKey
 		// returns ErrWriterKeyNotFound when active = false, preventing the revoked
 		// key from being used for new requests.
+		//
+		// purge_epoch is the remote-purge generation counter (see the ADD COLUMN
+		// statement below, kept separate so it is idempotent on existing DBs too).
 		`CREATE TABLE IF NOT EXISTS cloud_writer_keys (
-			writer_id  TEXT        PRIMARY KEY,
-			secret     BYTEA       NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			active     BOOLEAN     NOT NULL DEFAULT true
+			writer_id   TEXT        PRIMARY KEY,
+			secret      BYTEA       NOT NULL,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			active      BOOLEAN     NOT NULL DEFAULT true,
+			purge_epoch INTEGER     NOT NULL DEFAULT 0
 		)`,
 
 		// ── central_user_prompts — EntityPrompt central materialization ───────────
@@ -216,6 +220,22 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 			deleted_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
 			deleted_by TEXT         NOT NULL DEFAULT ''
 		)`,
+
+		// ── cloud_writer_keys.purge_epoch — remote purge generation counter ──────
+		// Per-writer monotonic counter used by the remote-purge feature: on daemon
+		// startup, if central's purge_epoch for this writer is AHEAD of the epoch the
+		// node last honored, the node purges its local SYNCED data and re-pulls from
+		// central. The epoch design was chosen over a boolean "purge requested" flag
+		// because a boolean has a clear-back race (two operators triggering a purge in
+		// quick succession can have the second's "set" clobbered by the first's
+		// "clear", losing a purge request); an ever-incrementing counter is
+		// idempotent to read any number of times and needs no write-back/ack from the
+		// node — the node simply remembers the highest epoch it has already honored.
+		// ADD COLUMN IF NOT EXISTS makes this idempotent on both a fresh DB (the
+		// CREATE TABLE above already includes it going forward) and an existing
+		// central DB created before this column existed.
+		`ALTER TABLE cloud_writer_keys
+			ADD COLUMN IF NOT EXISTS purge_epoch INTEGER NOT NULL DEFAULT 0`,
 	}
 
 	for i, stmt := range stmts {
