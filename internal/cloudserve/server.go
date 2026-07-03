@@ -9,6 +9,7 @@
 //	POST /v1/push     — apply one mutation to central (see [handlePush])
 //	POST /v1/pull     — fetch mutations since a given seq (see [handlePull])
 //	POST /v1/projects — list the projects central knows (see [handleProjects])
+//	POST /v1/state    — report the authenticated writer's purge_epoch (see [handleState])
 //
 // # Auth
 //
@@ -197,6 +198,7 @@ func New(c transport.Central, verifier Verifier) *Server {
 //	POST /v1/push     → auth middleware → [Server.handlePush]
 //	POST /v1/pull     → auth middleware → [Server.handlePull]
 //	POST /v1/projects → auth middleware → [Server.handleProjects]
+//	POST /v1/state    → auth middleware → [Server.handleState]
 //
 // Wrong method on a known path → 405. Unknown path → 404 with the JSON
 // {"error":...} shape (via the "/" catch-all, not the text/plain ServeMux default).
@@ -209,6 +211,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/pull", s.methodGuard(http.MethodPost, s.withAuth(s.handlePull)))
 	mux.HandleFunc("/v1/projects", s.methodGuard(http.MethodPost, s.withAuth(s.handleProjects)))
 	mux.HandleFunc("/v1/unshare", s.methodGuard(http.MethodPost, s.withAuth(s.handleUnshare)))
+	mux.HandleFunc("/v1/state", s.methodGuard(http.MethodPost, s.withAuth(s.handleState)))
 	// Catch-all: any path not matched by the exact /v1/* routes above gets a JSON
 	// 404 instead of net/http's default text/plain "404 page not found".
 	mux.HandleFunc("/", s.handleNotFound)
@@ -499,6 +502,61 @@ func (s *Server) handleUnshare(w http.ResponseWriter, r *http.Request) {
 		"deleted", n)
 
 	writeJSON(w, http.StatusOK, syncwire.UnshareResponse{Deleted: n})
+}
+
+// writerPurgeEpoch is the OPTIONAL capability a [transport.Central] may
+// implement to report a writer's remote-purge generation counter.
+// *centralstore.Store satisfies it; a Central that does not causes
+// /v1/state to return 501, mirroring the projectLister/projectDeleter
+// capability-gating pattern used by /v1/projects and /v1/unshare.
+type writerPurgeEpoch interface {
+	WriterPurgeEpoch(ctx context.Context, writerID string) (int64, error)
+}
+
+// handleState processes a POST /v1/state request — the daemon's remote-purge
+// check. It returns the CURRENT purge_epoch for the AUTHENTICATED writer (never
+// a client-supplied writer_id: there is nothing to forge here because the
+// request carries no identity field at all).
+//
+// Pipeline:
+//  1. Auth middleware (runs before this handler via withAuth): the writer_id is
+//     stashed in the request context after HMAC verification.
+//  2. Decode JSON body into [syncwire.StateRequest] (currently empty).
+//  3. Capability check: the wrapped Central must implement writerPurgeEpoch → else 501.
+//  4. Reject an empty authenticated writer_id (AllowAllVerifier / no-auth mode)
+//     with 400 — there is no writer identity to report an epoch for.
+//  5. WriterPurgeEpoch → centralstore.ErrWriterKeyNotFound-shaped errors and any
+//     other lookup error → 500 (the auth middleware already rejected unknown/
+//     revoked writers before reaching here, so this should not occur in practice
+//     — treating it as an internal error rather than leaking store details).
+//     Success → 200 with [syncwire.StateResponse].
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	var req syncwire.StateRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+
+	epochStore, ok := s.central.(writerPurgeEpoch)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "remote purge state not supported")
+		return
+	}
+
+	writerID := writerIDFromContext(r.Context())
+	if writerID == "" {
+		writeError(w, http.StatusBadRequest, "no authenticated writer identity")
+		return
+	}
+
+	epoch, err := epochStore.WriterPurgeEpoch(r.Context(), writerID)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "cloudserve: WriterPurgeEpoch failed",
+			"writer_id", writerID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, syncwire.StateResponse{PurgeEpoch: epoch})
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

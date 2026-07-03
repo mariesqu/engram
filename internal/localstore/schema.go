@@ -132,7 +132,19 @@ import (
 //	guard already present in mem_fts_update) and recreates all three FTS triggers
 //	from the shared package-level constants (same pattern as v1→v2).  No table
 //	data is touched.
-const currentSchemaVersion = 11
+//
+// v11 → v12: add daemon_meta, a generic single-row-per-key metadata table.
+//
+//	Its first (and currently only) consumer is the remote-purge feature's
+//	honored_purge_epoch key: the highest central purge_epoch this node has
+//	already honored (purged for). A dedicated one-column-pair table is chosen
+//	over widening an existing table because the value is daemon-scoped, not
+//	project-scoped or memory-scoped — it doesn't belong on project_policy or
+//	sync_state, and a generic key/value table lets future daemon-level settings
+//	reuse it without another migration. The table is idempotent (CREATE TABLE IF
+//	NOT EXISTS in ApplySchema), so a fresh DB where ApplySchema already created it
+//	is a no-op in the migration.
+const currentSchemaVersion = 12
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -378,6 +390,20 @@ const projectPolicyTableDDL = `CREATE TABLE IF NOT EXISTS project_policy (
 	updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 )`
 
+// daemonMetaTableDDL is the authoritative CREATE TABLE statement for the
+// daemon_meta table — a generic single-row-per-key metadata store for
+// daemon-scoped settings that don't belong on a project- or memory-scoped
+// table. It is shared between ApplySchema (fresh DB) and migrateV11ToV12
+// (existing DB upgrade) so both always produce the same schema.
+//
+// The first consumer is the "honored_purge_epoch" key (remote-purge feature):
+// the highest central purge_epoch this node has already purged for. See
+// HonoredPurgeEpoch / SetHonoredPurgeEpoch in purge.go.
+const daemonMetaTableDDL = `CREATE TABLE IF NOT EXISTS daemon_meta (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+)`
+
 // promptTombstonesTableDDL is the authoritative CREATE TABLE statement for the
 // prompt_tombstones table. It mirrors memory_tombstones structure but is
 // intentionally leaner: prompts have no scope/topic_key/version LWW fields
@@ -492,9 +518,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 11
 	}
 
+	if ver < 12 {
+		if err := migrateV11ToV12(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 12
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 11` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 12` migration block.
+	// the final `ver = 12` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 13` migration block.
 	_ = ver
 	return nil
 }
@@ -1197,6 +1231,33 @@ func migrateV10ToV11(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV11ToV12 creates the daemon_meta table for daemon-scoped key/value
+// settings (currently: the remote-purge feature's honored_purge_epoch).
+//
+// A fresh DB created by ApplySchema already has daemon_meta (via
+// CREATE TABLE IF NOT EXISTS), so this migration is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 11.
+func migrateV11ToV12(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(daemonMetaTableDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 12`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1304,6 +1365,10 @@ func ApplySchema(db *sql.DB) error {
 
 		// ── prompt_tombstones — soft-delete for EntityPrompt ─────────────────
 		promptTombstonesTableDDL,
+
+		// ── daemon_meta — generic daemon-scoped key/value settings (v12) ─────
+		// First consumer: honored_purge_epoch (remote-purge feature).
+		daemonMetaTableDDL,
 
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic

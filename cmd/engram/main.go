@@ -36,6 +36,8 @@ Usage:
   engram serve    [--addr <addr>] [--dsn <dsn>]
   engram keys     provision [--dsn <dsn>] <writer-id>
   engram keys     revoke    [--dsn <dsn>] <writer-id>
+  engram keys     purge     [--dsn <dsn>] <writer-id>
+  engram keys     purge     --all [--except <id>[,<id>...]] [--dsn <dsn>]
   engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-interval <dur>] [--http] [--http-port <port>] [--transport <stdio|http>]
   engram status   [--db <path>]
   engram ui       [--db <path>]
@@ -70,7 +72,7 @@ Environment:
 
 Subcommands:
   serve     Run the central HTTP server (plain HTTP — terminate TLS upstream).
-  keys      Provision or revoke per-writer HMAC keys.
+  keys      Provision, revoke, or purge per-writer HMAC keys (purge triggers a remote data purge).
   daemon    Run the local MCP daemon (stdio MCP by default; use --http for resident control plane).
   status    Print status of the running resident daemon (requires daemon --http).
   ui        Open the web UI in the default browser (requires daemon --http).

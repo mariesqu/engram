@@ -252,3 +252,17 @@ type UnshareRequest struct {
 type UnshareResponse struct {
 	Deleted int64 `json:"deleted"`
 }
+
+// StateRequest is the body of a POST /v1/state request (client → server). It
+// carries no parameters — the server identifies the writer from the
+// AUTHENTICATED identity established by the HMAC auth middleware, never from a
+// client-supplied field, so there is nothing for the caller to fill in beyond a
+// valid (empty) JSON document.
+type StateRequest struct{}
+
+// StateResponse is the body returned by POST /v1/state: the AUTHENTICATED
+// writer's current purge_epoch. The daemon compares this to the epoch it last
+// honored (persisted locally) to decide whether a remote purge is due.
+type StateResponse struct {
+	PurgeEpoch int64 `json:"purge_epoch"`
+}
