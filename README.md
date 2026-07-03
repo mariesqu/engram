@@ -373,6 +373,28 @@ Replace `7700` with the actual port and `<token>` with the value from `daemon.js
 
 The `"type": "http"` value matches the Claude Code `.mcp.json` schema; other MCP clients may name the Streamable HTTP transport differently (e.g. `"streamable-http"`) — check your client’s documentation.
 
+**Bridging with `engram connect` (stdio clients, no token rotation pain)**
+
+The `"type": "http"` config above works well for MCP hosts that support the Streamable HTTP transport natively. But not every client does, and even for the ones that do, hardcoding the bearer token means the config breaks every time the daemon restarts (the token rotates on every start — see "Authentication" above). `engram connect` solves both problems: it is a stdio MCP subcommand that bridges to the resident daemon’s `/mcp` endpoint over HTTP internally, so from the client’s point of view it looks like a normal stdio server.
+
+```bash
+# Prerequisite: a resident daemon already running with --transport http
+./engram daemon --db ~/.engram/memories.db --http --transport http
+```
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "/path/to/engram",
+      "args": ["connect", "--db", "/home/you/.engram/memories.db"]
+    }
+  }
+}
+```
+
+Every client gets this same trivial config — no token in sight, no per-client daemon process, no per-client SQLite owner. `engram connect` reads the current token from `daemon.json` at startup, and re-reads it automatically if a request comes back `401` (the daemon restarted and rotated its token mid-session) — the client never sees the rotation. If `engram connect` cannot find a resident daemon, or finds one running without `--transport http`, it exits immediately with a message telling you how to fix it.
+
 **Mode matrix**
 
 | Flags | MCP transport | `/mcp` endpoint |
@@ -660,6 +682,21 @@ With central sync and a writer key supplied via environment:
 ```
 
 > **Note on `ENGRAM_WRITER_KEY` in `.mcp.json`:** storing the secret directly in a committed file is convenient for local dev but inappropriate for shared repos. Prefer injecting it via your shell profile or a secrets manager and omitting the `env` block from the committed config.
+
+If you already run a resident daemon (`engram daemon --http --transport http`) and want multiple MCP clients to share it instead of each spawning their own `engram daemon` process, point `.mcp.json` at `connect` instead of `daemon`:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "/path/to/engram",
+      "args": ["connect", "--db", "/home/you/.engram/memories.db"]
+    }
+  }
+}
+```
+
+See "Bridging with `engram connect`" under [HTTP MCP transport](#http-mcp-transport) for details — this is still a stdio config (`command`/`args`, no `env`/token needed), it just talks to the shared daemon over HTTP internally.
 
 ### Project name override
 

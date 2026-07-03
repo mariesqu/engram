@@ -40,6 +40,7 @@ Usage:
   engram status   [--db <path>]
   engram ui       [--db <path>]
   engram tray     [--db <path>]  (Windows only)
+  engram connect  [--db <path>]
   engram projects list
   engram projects policy <project> <synced|local-only|omitted>
   engram config   get | set <key> <value>
@@ -65,6 +66,7 @@ Subcommands:
   status    Print status of the running resident daemon (requires daemon --http).
   ui        Open the web UI in the default browser (requires daemon --http).
   tray      Start the Windows system tray icon (Windows only; auto-launches daemon --http).
+  connect   Bridge stdio MCP to a resident daemon's HTTP MCP endpoint (requires daemon --http --transport http).
   projects  List and manage per-project sync policies (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).
   sync      Trigger an immediate sync cycle (requires daemon --http).
@@ -124,6 +126,12 @@ func run(args []string) int {
 	case "tray":
 		if err := runTrayCmd(args[1:]); err != nil {
 			log.Printf("engram tray: %v", err)
+			return 1
+		}
+		return 0
+	case "connect":
+		if err := runConnectCmd(args[1:]); err != nil {
+			log.Printf("engram connect: %v", err)
 			return 1
 		}
 		return 0
