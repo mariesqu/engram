@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -52,6 +53,99 @@ var ValidEmbeddingAuthHeaders = map[string]bool{
 	"":              true, // default → Authorization: Bearer
 	"authorization": true, // explicit Authorization: Bearer
 	"api-key":       true, // Azure classic header
+}
+
+// ValidObsidianGraphConfigs is the set of accepted obsidian_graph_config
+// values (REQ-GRAPH-01 / REQ-WATCH-09). "" means "unset" — the daemon defaults
+// its own knob to "preserve" before the value reaches the exporter.
+//
+// Deliberately NOT startup-fatal on an unknown value, diverging from
+// embedding_provider and embedding_auth_header: an unrecognised graph mode
+// falls back to ObsidianGraphConfigDefault with a warning (see Load). Refusing
+// to boot the process that owns MCP, autosync and the store because a cosmetic
+// export setting is misspelled is a strictly worse failure than not applying a
+// graph theme. The brick-guard doctrine is still satisfied from the other
+// direction: PUT /api/v1/config rejects an unknown value with 400, so the API
+// can never persist one.
+var ValidObsidianGraphConfigs = map[string]bool{
+	"":         true, // unset → the daemon applies ObsidianGraphConfigDefault
+	"preserve": true,
+	"force":    true,
+	"skip":     true,
+}
+
+// ObsidianGraphConfigDefault is the fallback used when obsidian_graph_config
+// holds an unrecognised value. It matches the CLI's --graph-config default:
+// "preserve" is non-destructive by construction (it writes
+// {vault}/.obsidian/graph.json only when that file is absent).
+const ObsidianGraphConfigDefault = "preserve"
+
+// ValidateObsidianInterval validates a candidate obsidian_interval value
+// (REQ-WATCH-04). Returns nil when raw is empty (meaning "unset — use the
+// daemon default of 10m").
+//
+// Two rejections, both startup-fatal via Load and 400 via PUT:
+//
+//   - a value that is not a Go duration at all (a plain typo);
+//   - a value that parses but is NOT POSITIVE.
+//
+// The second is the one that matters and the reason this function exists.
+// time.ParseDuration("-1s") SUCCEEDS and performs no sign check — the identical
+// gap that still exists for sync_interval (config.Load parses it with no sign
+// validation; see the note at that call site). A negative duration handed to
+// time.NewTimer fires instantly, forever: Phase 8's adversarial review measured
+// 1,024,805 cycles/sec from time.Duration(math.MinInt64), which saturates the
+// single SQLite connection (localstore sets SetMaxOpenConns(1)) and starves
+// every MCP tool call behind it. obsidian.Loop now clamps a sub-floor Interval
+// of any sign defensively, but that must not be the only defence: a negative
+// value must never be stored, loaded or propagated in the first place.
+//
+// A POSITIVE value below the 1-minute floor is deliberately NOT rejected here.
+// REQ-WATCH-04 says it is clamped to 1m with a logged warning, not a startup
+// abort, and obsidian.Loop owns that clamp (it is the single place that knows
+// the floor, and it is pinned by its own tests).
+func ValidateObsidianInterval(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("obsidian_interval %q: %w", raw, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("obsidian_interval %q must be positive (a non-positive cadence would make the export loop spin)", raw)
+	}
+	return nil
+}
+
+// ValidateObsidianVaultPath validates a candidate obsidian_vault value
+// (REQ-WATCH-09 hardening, Phase 9 review MINOR-2). Returns nil when raw is
+// empty — empty is the feature's master OFF switch, not a path to validate.
+//
+// Rejects a RELATIVE path. A relative obsidian_vault resolves against the
+// daemon process's current working directory, which for a process launched by
+// a service manager (or scheduled task, or a differently-invoked shell) is
+// arbitrary and surprising: a typo'd relative value creates an "engram/"
+// namespace and a whole vault tree wherever the daemon happens to have been
+// started from, not where the user thinks. Same posture as
+// ValidateObsidianInterval: startup-fatal via Load, 400 via PUT, so a bad
+// value can neither be loaded nor persisted.
+//
+// Deliberately NOT validated here, matching the interval validator's own
+// restraint: existence (MkdirAll silently creates the tree — accepted,
+// documented behaviour, the same posture Load already takes for db_path) or
+// file-vs-directory (a path that names a regular file fails every export
+// cycle forever with a clear per-cycle error surfaced through the daemon's
+// own logging — an operational inconvenience, not a brick, and not the kind
+// of defect a one-shot startup check can usefully catch).
+func ValidateObsidianVaultPath(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if !filepath.IsAbs(raw) {
+		return fmt.Errorf("obsidian_vault %q must be an absolute path (a relative path resolves against the daemon's current working directory, which is arbitrary under a service manager)", raw)
+	}
+	return nil
 }
 
 // ValidateEmbeddingBaseURL validates a candidate embedding_base_url value.
@@ -186,6 +280,27 @@ type fileConfig struct {
 	// is considered "needs_review" once now > COALESCE(review_after, updated_at +
 	// window). 0/unset → default 30; any value <= 0 is treated as the default.
 	ReviewWindowDays int `json:"review_window_days,omitempty"`
+
+	// ── Obsidian scheduled export (REQ-WATCH-09) ─────────────────────────────
+	// All four are RESTART-REQUIRED: the Exporter and the Loop are constructed
+	// once in buildDaemon, exactly like the embedding provider.
+
+	// ObsidianVault is the absolute path to the Obsidian vault root.
+	// EMPTY IS THE MASTER OFF SWITCH for the whole feature — there is
+	// deliberately no separate obsidian_enabled bool, because two knobs would
+	// create an enabled=true/vault="" state that must then either error or
+	// silently do nothing. "Presence of the coordinate is the switch" is the
+	// idiom the daemon already uses for central_url.
+	ObsidianVault string `json:"obsidian_vault,omitempty"`
+	// ObsidianInterval is the export cycle cadence as a Go duration string
+	// (e.g. "10m"). Unset → the daemon's 10m default. Validated by
+	// ValidateObsidianInterval: unparseable or non-positive is startup-fatal.
+	ObsidianInterval string `json:"obsidian_interval,omitempty"`
+	// ObsidianProject filters the export to one project. Empty = every project.
+	ObsidianProject string `json:"obsidian_project,omitempty"`
+	// ObsidianGraphConfig is "preserve" | "force" | "skip". An unrecognised
+	// value falls back to ObsidianGraphConfigDefault with a warning.
+	ObsidianGraphConfig string `json:"obsidian_graph_config,omitempty"`
 }
 
 // Config is the resolved, decoded in-memory configuration. The writer key is
@@ -243,6 +358,33 @@ type Config struct {
 	// ReviewWindowDays is the memory-lifecycle staleness window in days.
 	// 0 means "use default" (30). The store treats any value <= 0 as 30.
 	ReviewWindowDays int
+
+	// ── Obsidian scheduled export (REQ-WATCH-09) ─────────────────────────────
+
+	// ObsidianVault is the absolute path to the Obsidian vault root.
+	// EMPTY = the whole feature is OFF: buildDaemon constructs no Exporter and
+	// no Loop, creates no directory, probes no file, writes nothing anywhere
+	// and emits no log line about it.
+	ObsidianVault string
+
+	// ObsidianInterval is the export cycle cadence. 0 means "unset" — the
+	// daemon applies its 10m default. Load GUARANTEES this is never negative
+	// and never an explicit zero (both are startup-fatal); a positive value
+	// below the 1-minute floor is passed through and clamped, with a warning,
+	// by obsidian.Loop.
+	ObsidianInterval time.Duration
+
+	// ObsidianProject filters the export to a single project. Empty = every
+	// project. Setting it truncates cross-project session/topic hub membership
+	// and disables the stale-hub sweep, so the daemon logs a startup warning
+	// naming that consequence (REQ-WATCH-11).
+	ObsidianProject string
+
+	// ObsidianGraphConfig is "preserve" | "force" | "skip", or "" when unset
+	// (the daemon then applies ObsidianGraphConfigDefault). Load normalises an
+	// unrecognised value to ObsidianGraphConfigDefault with a warning rather
+	// than failing startup.
+	ObsidianGraphConfig string
 
 	// embeddingKeyActive records whether an embedding key is available at
 	// runtime — either from ENGRAM_EMBEDDING_KEY env var OR from the stored
@@ -306,6 +448,13 @@ type RedactedConfig struct {
 	EmbeddingBaseURL    string `json:"embedding_base_url,omitempty"`
 	EmbeddingModel      string `json:"embedding_model,omitempty"`
 	EmbeddingAuthHeader string `json:"embedding_auth_header,omitempty"`
+	// ObsidianVault is exposed VERBATIM, not redacted: it is a filesystem path
+	// like db_path, not a secret (REQ-WATCH-09 requires it to be visible in the
+	// redacted config read so a user can confirm what the daemon resolved).
+	ObsidianVault       string `json:"obsidian_vault,omitempty"`
+	ObsidianInterval    string `json:"obsidian_interval,omitempty"`
+	ObsidianProject     string `json:"obsidian_project,omitempty"`
+	ObsidianGraphConfig string `json:"obsidian_graph_config,omitempty"`
 }
 
 // ConfigPatch is a partial update applied by PUT /api/v1/config.
@@ -327,6 +476,10 @@ type ConfigPatch struct {
 	EmbeddingBaseURL      *string `json:"embedding_base_url,omitempty"`
 	EmbeddingModel        *string `json:"embedding_model,omitempty"`
 	EmbeddingAuthHeader   *string `json:"embedding_auth_header,omitempty"`
+	ObsidianVault         *string `json:"obsidian_vault,omitempty"`
+	ObsidianInterval      *string `json:"obsidian_interval,omitempty"`
+	ObsidianProject       *string `json:"obsidian_project,omitempty"`
+	ObsidianGraphConfig   *string `json:"obsidian_graph_config,omitempty"`
 }
 
 // DefaultConfigDir returns the directory where config.json is stored:
@@ -374,6 +527,14 @@ func Load(dir string) (Config, error) {
 		Transport:  fc.Transport,
 	}
 
+	// NOTE (pre-existing, deliberately UNCHANGED by the Obsidian export work):
+	// this parse performs NO SIGN CHECK, so sync_interval "-1s" loads cleanly as
+	// a negative duration. That is a real defect — see ValidateObsidianInterval
+	// for what a negative cadence does to a timer-driven loop — but it belongs
+	// to the autosync subsystem and fixing it here risks a regression in code
+	// this change does not otherwise touch. It is reported separately as a
+	// pre-existing defect worth its own change. obsidian_interval below does
+	// NOT repeat the omission.
 	if fc.SyncInterval != "" {
 		d, err := time.ParseDuration(fc.SyncInterval)
 		if err != nil {
@@ -427,6 +588,40 @@ func Load(dir string) (Config, error) {
 
 	cfg.ReviewWindowDays = fc.ReviewWindowDays
 
+	// ── Obsidian scheduled export (REQ-WATCH-09) ─────────────────────────────
+	// obsidian_vault: a relative path is startup-fatal (Phase 9 review
+	// MINOR-2) — it would resolve against the daemon's arbitrary CWD under a
+	// service manager. Empty (feature off) is exempt.
+	if err := ValidateObsidianVaultPath(fc.ObsidianVault); err != nil {
+		return Config{}, fmt.Errorf("config.Load: %w", err)
+	}
+	cfg.ObsidianVault = fc.ObsidianVault
+	cfg.ObsidianProject = fc.ObsidianProject
+
+	// obsidian_interval: unparseable OR non-positive is startup-fatal
+	// (REQ-WATCH-04). The non-positive half is the one this phase exists to
+	// add — time.ParseDuration has no sign check, so "-1s" would otherwise load
+	// silently and be handed straight to a time.Timer.
+	if err := ValidateObsidianInterval(fc.ObsidianInterval); err != nil {
+		return Config{}, fmt.Errorf("config.Load: %w", err)
+	}
+	if fc.ObsidianInterval != "" {
+		// Already validated above: this cannot fail and cannot be <= 0.
+		d, _ := time.ParseDuration(fc.ObsidianInterval)
+		cfg.ObsidianInterval = d
+	}
+
+	// obsidian_graph_config: LENIENT by design — an unknown value falls back to
+	// "preserve" with a warning on stderr rather than aborting startup. The
+	// warning goes through the standard logger (stderr); it must never reach
+	// stdout, which is the MCP JSON-RPC channel in the daemon's default mode.
+	cfg.ObsidianGraphConfig = fc.ObsidianGraphConfig
+	if !ValidObsidianGraphConfigs[fc.ObsidianGraphConfig] {
+		log.Printf("warning: unsupported obsidian_graph_config %q (valid: %q, %q, %q); falling back to %q",
+			fc.ObsidianGraphConfig, "preserve", "force", "skip", ObsidianGraphConfigDefault)
+		cfg.ObsidianGraphConfig = ObsidianGraphConfigDefault
+	}
+
 	// Model×dims pairing rule: a custom model without explicit dims is startup-fatal.
 	// The store's length guard and cosine math require knowing the exact vector size.
 	// The default pair (default model + default 256 dims) is keyless-simple and exempt.
@@ -475,6 +670,17 @@ func Save(dir string, cfg Config) error {
 	fc.EmbeddingModel = cfg.EmbeddingModel
 	fc.EmbeddingAuthHeader = cfg.EmbeddingAuthHeader
 	fc.ReviewWindowDays = cfg.ReviewWindowDays
+
+	fc.ObsidianVault = cfg.ObsidianVault
+	fc.ObsidianProject = cfg.ObsidianProject
+	fc.ObsidianGraphConfig = cfg.ObsidianGraphConfig
+	// Only a POSITIVE cadence is ever written. A zero means "unset" (omitted so
+	// the next Load applies the daemon default) and a negative must never reach
+	// disk at all — the on-disk value is what the next boot reads back, and
+	// Load would reject it, bricking that boot.
+	if cfg.ObsidianInterval > 0 {
+		fc.ObsidianInterval = cfg.ObsidianInterval.String()
+	}
 
 	if len(cfg.encryptedEmbeddingKey) > 0 {
 		fc.EncryptedEmbeddingKey = base64.StdEncoding.EncodeToString(cfg.encryptedEmbeddingKey)
@@ -539,6 +745,14 @@ func (c Config) Redact() RedactedConfig {
 	rc.EmbeddingBaseURL = c.EmbeddingBaseURL
 	rc.EmbeddingModel = c.EmbeddingModel
 	rc.EmbeddingAuthHeader = c.EmbeddingAuthHeader
+
+	// Obsidian export: a vault path is not a secret (REQ-WATCH-09).
+	rc.ObsidianVault = c.ObsidianVault
+	rc.ObsidianProject = c.ObsidianProject
+	rc.ObsidianGraphConfig = c.ObsidianGraphConfig
+	if c.ObsidianInterval > 0 {
+		rc.ObsidianInterval = c.ObsidianInterval.String()
+	}
 	return rc
 }
 
@@ -628,6 +842,61 @@ func Patch(base Config, p ConfigPatch) (Config, bool) {
 	if p.EmbeddingAuthHeader != nil && *p.EmbeddingAuthHeader != base.EmbeddingAuthHeader {
 		out.EmbeddingAuthHeader = *p.EmbeddingAuthHeader
 		restartRequired = true
+	}
+
+	// ── Obsidian scheduled export — ALL FOUR RESTART-REQUIRED ────────────────
+	// The Exporter and the Loop are constructed once in buildDaemon, exactly
+	// like the embedding provider. Reporting restart_required=false here would
+	// be a lie: a user who changes the vault path and sees "no restart needed"
+	// would watch the OLD vault keep updating.
+	if p.ObsidianVault != nil {
+		// Unlike ObsidianProject/ObsidianGraphConfig below, a relative,
+		// non-empty value is DISCARDED rather than applied — mirrors
+		// ObsidianInterval's non-positive discard a few lines down. The
+		// handler validates first (config_mutate.go), but Patch is exported
+		// and must not depend on that: persisting a relative path here would
+		// reach Save, and the next Load would reject it, bricking that boot
+		// (see ValidateObsidianVaultPath).
+		if err := ValidateObsidianVaultPath(*p.ObsidianVault); err == nil {
+			if *p.ObsidianVault != base.ObsidianVault {
+				out.ObsidianVault = *p.ObsidianVault
+				restartRequired = true
+			}
+		}
+	}
+
+	if p.ObsidianProject != nil && *p.ObsidianProject != base.ObsidianProject {
+		out.ObsidianProject = *p.ObsidianProject
+		restartRequired = true
+	}
+
+	if p.ObsidianGraphConfig != nil && *p.ObsidianGraphConfig != base.ObsidianGraphConfig {
+		out.ObsidianGraphConfig = *p.ObsidianGraphConfig
+		restartRequired = true
+	}
+
+	if p.ObsidianInterval != nil {
+		switch {
+		case *p.ObsidianInterval == "":
+			// Explicit reset to "unset" — the daemon then applies its default.
+			if base.ObsidianInterval != 0 {
+				out.ObsidianInterval = 0
+				restartRequired = true
+			}
+		default:
+			// Unlike sync_interval above, a value that fails validation is
+			// DISCARDED rather than partially applied: the handler validates
+			// first, but Patch is exported and must not depend on that. Storing
+			// a negative here would put it on disk via Save, and the next
+			// Load would reject it — bricking the boot.
+			if err := ValidateObsidianInterval(*p.ObsidianInterval); err == nil {
+				d, _ := time.ParseDuration(*p.ObsidianInterval)
+				if d != base.ObsidianInterval {
+					out.ObsidianInterval = d
+					restartRequired = true
+				}
+			}
+		}
 	}
 
 	return out, restartRequired

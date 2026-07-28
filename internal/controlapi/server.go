@@ -102,6 +102,40 @@ type EmbeddingBackfill struct {
 	Provider string `json:"provider,omitempty"` // "", "none", "openai"
 }
 
+// ObsidianExport holds the scheduled Obsidian export status included in
+// GET /api/v1/status (REQ-WATCH-11).
+//
+// It exists because the Obsidian viewer plugin cannot distinguish "the daemon
+// is dead" from "the export is failing every single cycle" — both look like a
+// freshness timestamp that stopped moving. The last error string is the only
+// place that answer can live.
+//
+// Deliberately absent: the configured graph-config mode. obsidian.Loop calls
+// SetGraphConfig(skip) after the first successful cycle of the process, so
+// *Exporter.GraphConfig() reports "skip" from cycle 2 onwards regardless of
+// what the user configured (Phase 8 adversarial review, MAJOR-3). A field
+// sourced from there would misreport; a field sourced from config would
+// duplicate GET /api/v1/config. Neither is worth it.
+type ObsidianExport struct {
+	// LastExportAt is the timestamp of the last completed cycle, or nil when
+	// no cycle has finished yet.
+	LastExportAt *time.Time `json:"last_export_at"`
+	Created      int        `json:"created"`
+	Updated      int        `json:"updated"`
+	Deleted      int        `json:"deleted"`
+	Skipped      int        `json:"skipped"`
+	Hubs         int        `json:"hubs"`
+	// Error is the last cycle's failure message, or nil when the last cycle
+	// succeeded.
+	Error               *string `json:"error"`
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+	// Vault and Interval echo the resolved configuration so an operator can
+	// confirm what the daemon actually started with (both are restart-required,
+	// so they cannot drift from the running loop).
+	Vault    string `json:"vault,omitempty"`
+	Interval string `json:"interval,omitempty"`
+}
+
 // Status holds the runtime state snapshot returned by GET /api/v1/status.
 type Status struct {
 	CentralConnected bool       `json:"central_connected"`
@@ -112,6 +146,12 @@ type Status struct {
 	// omitempty so the field is ABSENT from responses until then — a permanent
 	// {"pending":0} would misreport thousands of unembedded rows as done.
 	EmbeddingBackfill *EmbeddingBackfill `json:"embedding_backfill,omitempty"`
+	// ObsidianExport is populated only when the scheduled Obsidian export is
+	// enabled (obsidian_vault is set). Pointer + omitempty so the field is
+	// ABSENT when the feature is off — same reasoning as EmbeddingBackfill
+	// above: a permanent all-zero object would misreport a disabled feature as
+	// a healthy one (REQ-WATCH-11).
+	ObsidianExport *ObsidianExport `json:"obsidian_export,omitempty"`
 }
 
 // RedactedConfig is the config view returned by GET /api/v1/config.
@@ -132,6 +172,12 @@ type RedactedConfig struct {
 	EmbeddingBaseURL    string            `json:"embedding_base_url,omitempty"`
 	EmbeddingModel      string            `json:"embedding_model,omitempty"`
 	EmbeddingAuthHeader string            `json:"embedding_auth_header,omitempty"`
+	// Obsidian scheduled export (REQ-WATCH-09). The vault path is a filesystem
+	// path, not a secret — exposed like db_path, never redacted.
+	ObsidianVault       string `json:"obsidian_vault,omitempty"`
+	ObsidianInterval    string `json:"obsidian_interval,omitempty"`
+	ObsidianProject     string `json:"obsidian_project,omitempty"`
+	ObsidianGraphConfig string `json:"obsidian_graph_config,omitempty"`
 }
 
 // ErrConfigInvalid is wrapped by ConfigStore.Apply implementations when a
@@ -179,6 +225,10 @@ type ConfigPatch struct {
 	EmbeddingBaseURL      *string `json:"embedding_base_url,omitempty"`
 	EmbeddingModel        *string `json:"embedding_model,omitempty"`
 	EmbeddingAuthHeader   *string `json:"embedding_auth_header,omitempty"`
+	ObsidianVault         *string `json:"obsidian_vault,omitempty"`
+	ObsidianInterval      *string `json:"obsidian_interval,omitempty"`
+	ObsidianProject       *string `json:"obsidian_project,omitempty"`
+	ObsidianGraphConfig   *string `json:"obsidian_graph_config,omitempty"`
 	// WriterKey, CentralURL, and EncryptedEmbeddingKey must NEVER appear here —
 	// rejected at the handler.
 }

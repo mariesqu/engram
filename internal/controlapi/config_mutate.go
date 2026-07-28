@@ -79,6 +79,8 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		"db_path": true, "transport": true, "embedding_provider": true,
 		"embedding_local_consent": true, "embedding_dims": true, "ollama_host": true, "ollama_model": true,
 		"embedding_base_url": true, "embedding_model": true, "embedding_auth_header": true,
+		"obsidian_vault": true, "obsidian_interval": true,
+		"obsidian_project": true, "obsidian_graph_config": true,
 	}
 	for k := range raw {
 		if !known[k] {
@@ -162,6 +164,45 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		if !validEmbeddingAuthHeaders[*patch.EmbeddingAuthHeader] {
 			writeError(w, http.StatusBadRequest,
 				"invalid embedding_auth_header: must be one of \"\", \"authorization\", \"api-key\"")
+			return
+		}
+	}
+
+	// Validate obsidian_vault (Phase 9 review MINOR-2): a relative path MUST be
+	// rejected with 400 at write time, same posture as obsidian_interval —
+	// config.Load rejects the identical relative-path case at startup, so this
+	// PUT can never persist a value that bricks the next boot. Empty (turning
+	// the feature off) is exempt.
+	if patch.ObsidianVault != nil && *patch.ObsidianVault != "" {
+		if err := config.ValidateObsidianVaultPath(*patch.ObsidianVault); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid "+err.Error())
+			return
+		}
+	}
+
+	// Validate obsidian_interval (REQ-WATCH-04): an out-of-range value MUST be
+	// rejected with 400 at write time so a bad value never reaches disk through
+	// the API. The accepted set here is EXACTLY what config.Load accepts at
+	// startup — unparseable and non-positive are rejected in both places, so
+	// this PUT can never persist a value that bricks the next boot.
+	//
+	// A POSITIVE sub-minute value is deliberately ACCEPTED: REQ-WATCH-04 clamps
+	// it to 1m with a warning at runtime, and 400-ing it here would make that
+	// clamp unreachable through the API.
+	if patch.ObsidianInterval != nil && *patch.ObsidianInterval != "" {
+		if err := config.ValidateObsidianInterval(*patch.ObsidianInterval); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid "+err.Error())
+			return
+		}
+	}
+
+	// Validate obsidian_graph_config enum. Strict at write time, LENIENT at
+	// read time (config.Load falls back to "preserve" with a warning rather
+	// than refusing to boot) — the brick guard satisfied from both directions.
+	if patch.ObsidianGraphConfig != nil {
+		if !config.ValidObsidianGraphConfigs[*patch.ObsidianGraphConfig] {
+			writeError(w, http.StatusBadRequest,
+				"invalid obsidian_graph_config: must be one of \"preserve\", \"force\", \"skip\"")
 			return
 		}
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
+	"github.com/mariesqu/engram/internal/obsidian"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/syncer"
 	"github.com/mariesqu/engram/internal/webui"
@@ -123,6 +124,135 @@ type daemonCfg struct {
 	// reviewWindowDays is the memory-lifecycle staleness window in days (Feature 1).
 	// 0 → store default (30). Resolved from the config file in runDaemonCmd.
 	reviewWindowDays int
+
+	// ── Obsidian scheduled export (REQ-WATCH-09) ─────────────────────────────
+	// Config-file only: no flag and no env var, mirroring the embedding
+	// subsystem — the closest in-repo precedent for an optional, off-by-default
+	// background worker.
+	//
+	// obsidianVault EMPTY IS THE MASTER OFF SWITCH: buildDaemon then constructs
+	// no Exporter and no Loop, creates no directory, probes no file, writes
+	// nothing anywhere and logs nothing about it. "Presence of the coordinate is
+	// the switch" — the same idiom as centralURL above.
+	obsidianVault       string
+	obsidianInterval    time.Duration // 0 → 10m (resolveObsidianInterval)
+	obsidianProject     string        // "" → every project
+	obsidianGraphConfig string        // "" → "preserve" (resolveObsidianGraphConfig)
+
+	// ── config.Load caching (Phase 9 review MINOR-5) ─────────────────────────
+	// loadedFileConfig/loadedFileConfigCached cache the config.Config that
+	// runDaemonCmd ALREADY parsed via config.Load, so newConfigStoreAdapter —
+	// which needs a handful of fields Load alone resolves (encrypted blobs,
+	// log-level/transport fallback, the four obsidian_* keys) — does not have
+	// to re-parse config.json from disk a SECOND time for one daemon boot.
+	// Without this, an unrecognised obsidian_graph_config value produced the
+	// SAME stderr warning twice per HTTP boot: once from runDaemonCmd's Load
+	// (daemon.go, in this file) and once more from newConfigStoreAdapter's own
+	// Load (also this file) — two log lines for one misconfiguration.
+	//
+	// loadedFileConfigCached=false (the zero value) means "not cached" —
+	// newConfigStoreAdapter then falls back to its own config.Load call
+	// exactly as before. This is what keeps every test in this package that
+	// constructs a daemonCfg{} literal directly (bypassing runDaemonCmd)
+	// working unchanged: only the real runDaemonCmd → runDaemonHTTP
+	// production path ever sets these fields, so only that path is affected.
+	loadedFileConfig       config.Config
+	loadedFileConfigCached bool
+}
+
+// Obsidian export cadence bounds (REQ-WATCH-04). The floor duplicates
+// obsidian.Loop's own unexported floor DELIBERATELY: this is the daemon's
+// independent layer of the defence, so a change to one does not silently
+// disarm the other.
+const (
+	obsidianIntervalDefault = 10 * time.Minute
+	obsidianIntervalFloor   = time.Minute
+)
+
+// resolveObsidianInterval turns the configured obsidian_interval into the value
+// handed to obsidian.LoopConfig.Interval, returning an optional warning string
+// for the caller to log ("" = nothing to say).
+//
+// This is the SECOND of three independent defences against a cadence that would
+// make the export loop spin:
+//
+//  1. config.Load REJECTS a non-positive obsidian_interval outright
+//     (startup-fatal), and PUT /api/v1/config rejects it with 400, so a bad
+//     value can neither be loaded nor persisted. time.ParseDuration("-1s")
+//     succeeds and does NO sign check — that gap is exactly what produced Phase
+//     8's CRITICAL-1 (measured 1,024,805 cycles/sec from math.MinInt64, which
+//     saturates the single SQLite connection and starves MCP).
+//  2. THIS function: anything non-positive falls back to the 10m default, and a
+//     positive sub-floor value is clamped to 1m with a warning. Non-positive →
+//     default is how both sibling loops already read their Interval
+//     (syncer.Loop, embedding.Loop), so it is the repo's existing idiom.
+//  3. obsidian.Loop.applyLoopDefaults clamps anything below its own floor.
+//
+// Three layers is not paranoia here: daemonCfg is a plain struct any caller can
+// build, and the spec's instruction to mirror sync_interval "exactly" is what
+// would have reproduced the missing sign check in the first place.
+//
+// A positive sub-minute value is CLAMPED, never fatal (REQ-WATCH-04): refusing
+// to boot the process that owns MCP, autosync and the store because a cosmetic
+// export cadence is too small is a strictly worse failure than exporting less
+// often than asked.
+//
+// DELIBERATE, DOCUMENTED DIVERGENCE from obsidian.Loop's own floor (Phase 9
+// adversarial review MINOR-1): this function answers a negative interval with
+// its DEFAULT (10m); obsidian.applyLoopDefaults answers the identical input
+// with its FLOOR (1m) — see the matching comment there. Both are positive and
+// therefore both safe; the two are intentionally NOT reconciled to one value,
+// because reconciling would mean changing the behaviour of whichever layer
+// moved, and the Phase 8 review already verified the Loop's floor behaviour
+// safe on its own terms. What DOES matter, and is now pinned by
+// TestBuildDaemonResolvedIntervalReachesLoop (daemon_obsidian_test.go), is
+// that the value THIS function returns — not the raw cfg.obsidianInterval —
+// is what reaches obsidian.NewLoop below: if a future change accidentally
+// hands the Loop the unresolved config value instead, the disagreement above
+// stops being unreachable and starts being observable (this function's 10m
+// default vs the Loop's own 1m floor for the same negative input).
+func resolveObsidianInterval(configured time.Duration) (time.Duration, string) {
+	switch {
+	case configured == 0:
+		return obsidianIntervalDefault, ""
+	case configured < 0:
+		// Comparison only — never negate. time.Duration(math.MinInt64) negates
+		// back to itself (two's-complement overflow) and stays negative.
+		return obsidianIntervalDefault, fmt.Sprintf(
+			"obsidian_interval %s is not a valid cadence; using the %s default",
+			configured, obsidianIntervalDefault)
+	case configured < obsidianIntervalFloor:
+		return obsidianIntervalFloor, fmt.Sprintf(
+			"obsidian_interval %s is below the %s floor; clamping to %s",
+			configured, obsidianIntervalFloor, obsidianIntervalFloor)
+	default:
+		return configured, ""
+	}
+}
+
+// resolveObsidianGraphConfig turns the configured obsidian_graph_config into an
+// obsidian.GraphConfigMode, returning an optional warning string.
+//
+// Unset defaults to "preserve", matching the CLI's --graph-config default.
+// Defaulting the daemon to "skip" was considered and rejected: a user who only
+// ever runs the daemon would then never get the curated graph, which is the
+// entire visual point of the feature — and "preserve" is non-destructive by
+// construction (it writes {vault}/.obsidian/graph.json only when absent).
+//
+// An unrecognised value falls back to "preserve" with a warning rather than
+// failing startup. config.Load already normalises it the same way; this is the
+// daemon's own layer, because daemonCfg is a plain struct.
+func resolveObsidianGraphConfig(configured string) (obsidian.GraphConfigMode, string) {
+	if configured == "" {
+		return obsidian.GraphConfigPreserve, ""
+	}
+	mode, err := obsidian.ParseGraphConfigMode(configured)
+	if err != nil {
+		return obsidian.GraphConfigPreserve, fmt.Sprintf(
+			"obsidian_graph_config %q is not recognised; falling back to %q",
+			configured, obsidian.GraphConfigPreserve)
+	}
+	return mode, ""
 }
 
 // resolveTransport resolves the MCP transport with the standard precedence
@@ -193,11 +323,73 @@ type daemonComponents struct {
 	central   remoteCentral               // nil in local-only mode; the wire client for the loop
 	embedLoop *embedding.Loop             // nil when provider is Noop or key absent
 	gated     embedding.EmbeddingProvider // always non-nil (at least NoopProvider via gate)
+	// obsidianLoop is nil when obsidian_vault is unset — the feature's master
+	// OFF switch (REQ-WATCH-09).
+	obsidianLoop *obsidian.Loop
+	// obsidianStarted is set true ONLY at the point obsidianLoop.Start(ctx) is
+	// actually called (both runDaemonWithIO and runDaemonHTTP set it
+	// immediately after that call). It is deliberately a SEPARATE signal from
+	// "obsidianLoop != nil": the loop can be constructed (vault configured)
+	// long before either run mode reaches its Start() call, and several early
+	// returns in runDaemonHTTP — port already in use, token generation
+	// failure, WriteDaemonJSON failure — run the deferred Close() BEFORE
+	// Start() was ever reached (Phase 9 review MINOR-3). Gating the "waiting
+	// for any in-flight export cycle" log on this flag, rather than on
+	// obsidianLoop's nil-ness alone, stops that log firing when no cycle
+	// could possibly be in flight. obsidian.Loop.Stop() was ALREADY a safe,
+	// fast no-op on a never-started loop — only the log line was wrong.
+	obsidianStarted bool
 }
 
-// Close stops the embedding backfill loop, the autosync loop, and the store —
-// in that order so no in-flight UpdateEmbedding can race the store close.
+// Close stops the Obsidian export loop, the embedding backfill loop, the
+// autosync loop, and the store — IN THAT ORDER, so no in-flight work can race
+// the store close.
+//
+// The Obsidian loop goes FIRST and the ordering is not cosmetic. Its Stop()
+// BLOCKS until the in-flight export cycle finishes (REQ-WATCH-05: no abrupt
+// cancellation mid-write, because Exporter.Export() takes no context.Context by
+// design). A cycle caught mid-RecentObservations against a closed DB — or mid
+// os.WriteFile on the state file the Obsidian viewer reads — is exactly the
+// corruption that drain exists to prevent, and it can only be prevented if the
+// store is still alive while the drain runs.
+//
+// A bounded drain that abandons the goroutine after N seconds was explicitly
+// rejected in design: leaking a goroutine mid-write while store.Close() runs is
+// the very failure being avoided.
 func (d *daemonComponents) Close() {
+	// REQ-WATCH-05's "SHOULD log that it is waiting" clause. This MUST be
+	// emitted BEFORE the blocking Stop(), not after: a cold first cycle over
+	// ~4,650 observations was MEASURED at ~18 seconds, and that figure scales
+	// with vault size. An unexplained multi-second hang at shutdown reads as a
+	// deadlock and invites a SIGKILL mid-write — which is the corruption the
+	// drain is there to prevent. Deliberately no timeout is derived from the
+	// ~18s figure; it is an observation, not a bound.
+	//
+	// HTTP-mode total worst case is HIGHER than the figure this log line
+	// quotes on its own (Phase 9 review MINOR-4, documentation-only — the
+	// ordering below is correct and unchanged): runDaemonHTTP's ctx.Done()
+	// branch calls httpSrv.Shutdown with its own 10s budget and RETURNS from
+	// that branch — the "waiting…" log below and the blocking obsidianLoop
+	// drain only happen AFTER, inside the LIFO deferred components.Close().
+	// So the HTTP listener's own drain (up to 10s) runs SERIALLY before this
+	// one even starts: worst case in HTTP mode is therefore ~28-33s (≤10s
+	// HTTP drain + up to ~18-23s cold obsidian drain), not the ~18s this line
+	// names alone. The store is still the LAST thing closed either way.
+	//
+	// Nothing is logged when the feature is off, OR when it was constructed
+	// but never actually Started (REQ-WATCH-09: OFF must be inert, including
+	// in the log; Phase 9 review MINOR-3: an early return in runDaemonHTTP
+	// before Start() — port already in use, token generation failure,
+	// WriteDaemonJSON failure — must not print a drain warning for a cycle
+	// that could never have been in flight). log.Printf writes to stderr —
+	// never stdout, which is the MCP JSON-RPC channel in the daemon's default
+	// mode.
+	if d.obsidianLoop != nil && d.obsidianStarted {
+		log.Printf("engram daemon: stopping the Obsidian export loop — waiting for any in-flight export cycle to finish " +
+			"(a cold first cycle over ~4,650 observations was measured at ~18s and scales with vault size)")
+	}
+	// obsidian.Loop.Stop() is nil-safe and blocks until the goroutine exits.
+	d.obsidianLoop.Stop()
 	// embedding.Loop.Stop() is nil-safe and blocks until the goroutine exits.
 	d.embedLoop.Stop()
 	if d.loop != nil {
@@ -434,6 +626,21 @@ func runDaemonCmd(args []string) error {
 		embeddingModel:        fileCfg.EmbeddingModel,
 		embeddingAuthHeader:   fileCfg.EmbeddingAuthHeader,
 		reviewWindowDays:      fileCfg.ReviewWindowDays,
+		// Obsidian scheduled export: config file ONLY — no flag, no env var
+		// (REQ-WATCH-09). config.Load has already rejected a non-positive
+		// obsidian_interval as startup-fatal and normalised an unrecognised
+		// obsidian_graph_config to "preserve".
+		obsidianVault:       fileCfg.ObsidianVault,
+		obsidianInterval:    fileCfg.ObsidianInterval,
+		obsidianProject:     fileCfg.ObsidianProject,
+		obsidianGraphConfig: fileCfg.ObsidianGraphConfig,
+		// Cache the config.Config this function already loaded above (MINOR-5)
+		// so newConfigStoreAdapter (HTTP mode only) reuses it instead of
+		// parsing config.json a second time. Set unconditionally: when
+		// configDir == "" fileCfg is the legitimate zero value, matching what
+		// newConfigStoreAdapter's own configDir != "" guard would already skip.
+		loadedFileConfig:       fileCfg,
+		loadedFileConfigCached: true,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -537,16 +744,72 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 		})
 	}
 
+	// ── Construct the Obsidian export loop (REQ-WATCH-09/-10) ────────────────
+	// Constructed HERE, from the store buildDaemon has ALREADY opened, and
+	// never from a second localstore.Open. That is the whole point of hosting
+	// the scheduled export in the daemon: localstore.Open is not a read-only
+	// open — it runs ApplySchema then runMigrations on EVERY invocation — so a
+	// repeating unattended open from a second, possibly version-mismatched
+	// binary would migrate the schema out from under a running daemon
+	// (verify-report #4710, MAJOR-10). internal/obsidian never imports
+	// internal/localstore; that is pinned mechanically by
+	// internal/obsidian/imports_test.go, not left to review discipline.
+	//
+	// An empty obsidianVault is the master OFF switch: nothing below runs, so
+	// no Exporter exists, no goroutine is started, no directory is created, no
+	// file is probed and no log line is emitted (REQ-WATCH-09).
+	var obsidianLoop *obsidian.Loop
+	if cfg.obsidianVault != "" {
+		graphMode, graphWarn := resolveObsidianGraphConfig(cfg.obsidianGraphConfig)
+		if graphWarn != "" {
+			log.Printf("warning: %s", graphWarn)
+		}
+		interval, intervalWarn := resolveObsidianInterval(cfg.obsidianInterval)
+		if intervalWarn != "" {
+			log.Printf("warning: %s", intervalWarn)
+		}
+
+		// REQ-WATCH-11 (REQUIRED): warn at startup when a project filter is
+		// set. This is the agreed mitigation for verify-report #4710's deferred
+		// MAJOR-3, which is otherwise unfixed — and under a daemon the damage
+		// repeats every cycle forever instead of once when a human typed a
+		// filter, so it has to be loud.
+		if cfg.obsidianProject != "" {
+			log.Printf("warning: obsidian_project=%q limits the scheduled export to one project; "+
+				"session and topic hubs are inherently cross-project, so their membership is rendered "+
+				"from this scope ONLY (truncated) and the stale-hub sweep is disabled for every cycle",
+				cfg.obsidianProject)
+		}
+
+		exp, expErr := obsidian.NewExporter(&obsidianStoreAdapter{store: store}, obsidian.ExportConfig{
+			VaultPath:   cfg.obsidianVault,
+			Project:     cfg.obsidianProject,
+			GraphConfig: graphMode,
+		})
+		if expErr != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("obsidian export: %w", expErr)
+		}
+		obsidianLoop = obsidian.NewLoop(exp, obsidian.LoopConfig{
+			Interval: interval,
+			// slog writes to stderr by default. The loop MUST NOT write to
+			// stdout at all — design constraint 16: in the daemon's default
+			// mode stdout is the MCP JSON-RPC channel.
+			Logger: slog.Default(),
+		})
+	}
+
 	activity := NewSessionActivity()
 	registerTools(mcpSrv, store, loop, embedLoop, gated, cfg.writerID, activity)
 
 	return &daemonComponents{
-		store:     store,
-		mcpServer: mcpSrv,
-		loop:      loop,
-		central:   central,
-		embedLoop: embedLoop,
-		gated:     gated,
+		store:        store,
+		mcpServer:    mcpSrv,
+		loop:         loop,
+		central:      central,
+		embedLoop:    embedLoop,
+		gated:        gated,
+		obsidianLoop: obsidianLoop,
 	}, nil
 }
 
@@ -578,6 +841,16 @@ func runDaemonWithIO(ctx context.Context, cfg daemonCfg, stdin io.Reader, stdout
 	// embedLoop is nil when provider is Noop — Start on nil panics, so guard.
 	if components.embedLoop != nil {
 		components.embedLoop.Start(ctx)
+	}
+
+	// Start the Obsidian export loop. Started in BOTH run modes on purpose
+	// (REQ-WATCH-09): a user on the default stdio transport is entitled to a
+	// fresh vault too, and starting it in only one is the asymmetry that ships
+	// as "works on my machine". nil when obsidian_vault is unset — Start on nil
+	// panics, so guard.
+	if components.obsidianLoop != nil {
+		components.obsidianLoop.Start(ctx)
+		components.obsidianStarted = true
 	}
 
 	log.Printf("engram daemon: MCP over stdio (db=%s, autosync=%s)", cfg.db, autosync)
@@ -629,6 +902,12 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	if components.embedLoop != nil {
 		components.embedLoop.Start(ctx)
 	}
+	// Start the Obsidian export loop — see the note in runDaemonWithIO: BOTH
+	// run modes start it (REQ-WATCH-09).
+	if components.obsidianLoop != nil {
+		components.obsidianLoop.Start(ctx)
+		components.obsidianStarted = true
+	}
 	defer func() {
 		_ = controlapi.RemoveDaemonJSON(dir)
 	}()
@@ -656,6 +935,14 @@ func runDaemonHTTP(ctx context.Context, cfg daemonCfg) error {
 	// The wire client for remote project discovery (RemoteProjects). Reconnect /
 	// Disconnect replace it under the adapter lock.
 	syncAdapter.central = components.central
+	// Obsidian export status (REQ-WATCH-11). nil loop → the field is omitted.
+	// The interval echoed here is the RESOLVED one, so an operator sees the
+	// cadence the loop actually runs at rather than the raw config value.
+	syncAdapter.obsidianLoop = components.obsidianLoop
+	if components.obsidianLoop != nil {
+		syncAdapter.obsidianVault = cfg.obsidianVault
+		syncAdapter.obsidianInterval, _ = resolveObsidianInterval(cfg.obsidianInterval)
+	}
 
 	ctrlSrv := controlapi.New(token, actualPort, storeAdapter, syncAdapter, cfgAdapter, version, cfgAdapter)
 
@@ -1003,9 +1290,21 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 		HTTPPort:     httpPort,
 		SyncInterval: daemonCfg.syncInterval,
 	}
-	// Re-load the file to recover encrypted blobs and fields not in daemonCfg.
+	// Recover encrypted blobs and fields not in daemonCfg. Reuses the
+	// config.Config runDaemonCmd already parsed (MINOR-5) when available,
+	// rather than parsing config.json a second time — a second parse would
+	// re-run config.Load's obsidian_graph_config fallback warning, printing
+	// the identical stderr line twice for one HTTP daemon boot. Falls back to
+	// a fresh config.Load when the cache was not populated (daemonCfg built
+	// directly, e.g. by tests in this package, rather than via runDaemonCmd).
 	if daemonCfg.configDir != "" {
-		if fileCfg, err := config.Load(daemonCfg.configDir); err == nil {
+		fileCfg, ok := daemonCfg.loadedFileConfig, daemonCfg.loadedFileConfigCached
+		if !ok {
+			var err error
+			fileCfg, err = config.Load(daemonCfg.configDir)
+			ok = err == nil
+		}
+		if ok {
 			cfg.EncryptedWriterKey = fileCfg.EncryptedWriterKey
 			cfg = cfg.WithEncryptedEmbeddingKey(fileCfg.EncryptedEmbeddingKey())
 			cfg.EmbeddingProvider = fileCfg.EmbeddingProvider
@@ -1016,6 +1315,10 @@ func newConfigStoreAdapter(daemonCfg daemonCfg, actualPort int) *configStoreAdap
 			cfg.EmbeddingAuthHeader = fileCfg.EmbeddingAuthHeader
 			cfg.OllamaHost = fileCfg.OllamaHost
 			cfg.OllamaModel = fileCfg.OllamaModel
+			cfg.ObsidianVault = fileCfg.ObsidianVault
+			cfg.ObsidianInterval = fileCfg.ObsidianInterval
+			cfg.ObsidianProject = fileCfg.ObsidianProject
+			cfg.ObsidianGraphConfig = fileCfg.ObsidianGraphConfig
 			if cfg.LogLevel == "" {
 				cfg.LogLevel = fileCfg.LogLevel
 			}
@@ -1064,6 +1367,12 @@ func (a *configStoreAdapter) Load() (controlapi.RedactedConfig, error) {
 	result.EmbeddingBaseURL = rc.EmbeddingBaseURL
 	result.EmbeddingModel = rc.EmbeddingModel
 	result.EmbeddingAuthHeader = rc.EmbeddingAuthHeader
+	// Obsidian export (REQ-WATCH-09): visible in the redacted read. The vault
+	// path is a filesystem path like db_path, not a secret.
+	result.ObsidianVault = rc.ObsidianVault
+	result.ObsidianInterval = rc.ObsidianInterval
+	result.ObsidianProject = rc.ObsidianProject
+	result.ObsidianGraphConfig = rc.ObsidianGraphConfig
 	return result, nil
 }
 
@@ -1087,6 +1396,10 @@ func (a *configStoreAdapter) Apply(patch controlapi.ConfigPatch) (bool, error) {
 		EmbeddingAuthHeader:   patch.EmbeddingAuthHeader,
 		OllamaHost:            patch.OllamaHost,
 		OllamaModel:           patch.OllamaModel,
+		ObsidianVault:         patch.ObsidianVault,
+		ObsidianInterval:      patch.ObsidianInterval,
+		ObsidianProject:       patch.ObsidianProject,
+		ObsidianGraphConfig:   patch.ObsidianGraphConfig,
 	}
 
 	updated, restartRequired := config.Patch(a.cfg, cfgPatch)
@@ -1227,6 +1540,58 @@ type runtimeSyncAdapter struct {
 	// embeddingProvider is the provider name for Status.EmbeddingBackfill.Provider.
 	// Populated by newRuntimeSyncAdapter when an embedLoop is active.
 	embeddingProvider string
+
+	// Obsidian scheduled export (REQ-WATCH-11). Assigned AFTER construction
+	// (like `central` above) rather than threaded through
+	// newRuntimeSyncAdapter's parameter list, which is already seven wide.
+	// obsidianLoop is nil when the feature is off, and that nil IS the signal
+	// that Status must omit the field entirely.
+	//
+	// obsidianVault/obsidianInterval are echoed from CONFIG, never from the
+	// Exporter: obsidian.Loop calls SetGraphConfig(skip) after the first
+	// successful cycle, so anything read back off *Exporter after that point
+	// reports the loop's internal state rather than the user's setting (Phase 8
+	// review, MAJOR-3). Both keys are restart-required, so a config echo cannot
+	// drift from the running loop.
+	obsidianLoop     *obsidian.Loop
+	obsidianVault    string
+	obsidianInterval time.Duration
+}
+
+// obsidianStatus maps the export loop's most recent outcome into the control-API
+// shape, or returns nil when the feature is off.
+//
+// nil (→ omitempty → the field is ABSENT from the JSON) is deliberate and
+// mirrors EmbeddingBackfill's documented reasoning: a permanent all-zero object
+// would misreport a disabled feature as a healthy one, and the whole purpose of
+// this field is to let a user distinguish "daemon dead" from "export failing
+// every cycle" — two states the Obsidian viewer cannot tell apart.
+func (a *runtimeSyncAdapter) obsidianStatus() *controlapi.ObsidianExport {
+	if a.obsidianLoop == nil {
+		return nil
+	}
+	out := a.obsidianLoop.LastResult()
+	st := &controlapi.ObsidianExport{
+		Created:             out.Created,
+		Updated:             out.Updated,
+		Deleted:             out.Deleted,
+		Skipped:             out.Skipped,
+		Hubs:                out.Hubs,
+		ConsecutiveFailures: out.ConsecutiveFailures,
+		Vault:               a.obsidianVault,
+	}
+	if !out.At.IsZero() {
+		at := out.At
+		st.LastExportAt = &at
+	}
+	if out.Err != "" {
+		e := out.Err
+		st.Error = &e
+	}
+	if a.obsidianInterval > 0 {
+		st.Interval = a.obsidianInterval.String()
+	}
+	return st
 }
 
 func newRuntimeSyncAdapter(
@@ -1304,6 +1669,10 @@ func (a *runtimeSyncAdapter) Status() controlapi.Status {
 		Pending:  pending,
 		Provider: a.embeddingProvider,
 	}
+
+	// obsidian_export sub-object (REQ-WATCH-11). nil — and therefore ABSENT
+	// from the JSON — when the feature is off.
+	st.ObsidianExport = a.obsidianStatus()
 
 	return st
 }
