@@ -75,6 +75,31 @@ type ExportConfig struct {
 	// for defaulting THEIR OWN unset value to GraphConfigPreserve before
 	// it ever reaches here.
 	GraphConfig GraphConfigMode
+
+	// LocalWriterID is this machine's writer identity (REQ-PROV-01,
+	// REQ-NARR-08). It feeds two independent, purely additive checks:
+	//
+	//   - Each observation's local_writer frontmatter field
+	//     (rec.WriterID == LocalWriterID, computed in ObservationToMarkdown).
+	//   - The single-writer mismatch check against SyncState.LastWriterID,
+	//     immediately after ReadState in Export().
+	//
+	// Empty (the default for a bare manual CLI run, e.g. `engram
+	// obsidian-export` with no daemon config behind it) disables BOTH: no
+	// observation is ever local_writer=true by vacuous equality with an
+	// empty rec.WriterID, and the single-writer check is skipped entirely
+	// rather than false-alarming a real recorded writer id against "".
+	LocalWriterID string
+
+	// ReviewWindowDays feeds each observation's lifecycle_due frontmatter
+	// field (REQ-PROV-03): UpdatedAt + ReviewWindowDays days, computed
+	// purely from data already on the record. Never wall-clock time at
+	// render time, and never Record.ReviewAfter — that field is not
+	// populated on the exporter's read path (see markdown.go's doc
+	// comment), so this is deliberately an updated_at-based approximation
+	// that can only OVER-flag, never under-flag, relative to
+	// Store.ReviewStatus.
+	ReviewWindowDays int
 }
 
 // Exporter renders engram observations into an Obsidian vault.
@@ -189,7 +214,27 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			return nil, fmt.Errorf("%w (re-run with --force to discard it and rebuild the state from scratch)", err)
 		}
 		e.logf("obsidian: %v; --force: discarding it and rebuilding from an empty state", err)
-		state = &SyncState{Files: map[int64]string{}, Hubs: map[string]string{}}
+		state = &SyncState{Files: map[int64]string{}, Hubs: map[string]string{}, Narratives: map[string]string{}}
+	}
+
+	// Single-writer detection (REQ-NARR-08, decision #4751): narratives are
+	// a PER-MACHINE local cache that never syncs, so two machines
+	// alternately exporting into one git-synced vault would otherwise flap
+	// narrative notes in git history forever with no visible signal. This
+	// check WARNS LOUDLY and NEVER BLOCKS — a legitimate machine migration
+	// (the primary machine changing) must still complete the export
+	// successfully. Both non-empty checks matter: an empty LocalWriterID
+	// (feature unconfigured, e.g. a bare manual CLI run) must never compare
+	// "" against a real recorded writer id, and a state file with no prior
+	// writer recorded (first run, or a pre-Phase-B file) has nothing to
+	// differ from.
+	if e.cfg.LocalWriterID != "" && state.LastWriterID != "" && state.LastWriterID != e.cfg.LocalWriterID {
+		e.logf("obsidian: WARNING — this vault was last exported by writer %q, "+
+			"but this machine is %q. Narratives are a PER-MACHINE local cache and "+
+			"never sync; two machines exporting into one git-synced vault will flap "+
+			"narrative notes in git history every cycle. If this is a machine "+
+			"migration, this warning is expected once and can be ignored.",
+			state.LastWriterID, e.cfg.LocalWriterID)
 	}
 
 	cutoff := state.LastExportAt
@@ -268,7 +313,7 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			if err != nil {
 				return nil, fmt.Errorf("obsidian: observation %d: %w", rec.ID, err)
 			}
-			content := ObservationToMarkdown(rec)
+			content := ObservationToMarkdown(rec, e.cfg.LocalWriterID, e.cfg.ReviewWindowDays)
 			wrote, err := writeIfChanged(absPath, content)
 			if err != nil {
 				return nil, fmt.Errorf("obsidian: write observation %d: %w", rec.ID, err)
@@ -466,6 +511,13 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			state.Hubs[identity] = relPath
 		}
 	}
+
+	// Recorded unconditionally, even when e.cfg.LocalWriterID is empty: this
+	// is what gives the mismatch check above its exact firing shape. A
+	// one-off migration (writer A -> writer B) warns on cycle 1 and then
+	// falls silent on cycle 2, because THIS assignment already moved the
+	// recorded writer forward before that next cycle's ReadState runs.
+	state.LastWriterID = e.cfg.LocalWriterID
 
 	state.LastExportAt = cycleStart
 	if err := WriteState(statePath, state); err != nil {

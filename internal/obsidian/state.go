@@ -32,21 +32,50 @@ import (
 // compatible with NO migration, and the first post-upgrade cycle sweeps
 // nothing, because nothing is tracked yet to compare against.
 //
-// Every value in Files and Hubs MUST use forward slashes
+// Narratives carries the narrative identity ("lower(project)\x00lower(topic
+// prefix)") -> vault-relative-path map for every narrative note written by a
+// prior export run (REQ-NARR-07's SyncState amendment). Phase 7 introduces
+// the field itself, its round-trip support and its nil-normalisation only —
+// nothing in this package renders a narrative note yet (that lands with the
+// render pass in a later phase); the map exists now purely so a state file
+// written by THIS build round-trips cleanly and so that later phase's sweep
+// has somewhere to read from and write to.
+//
+// LastWriterID records the writer_id of the process that most recently wrote
+// this state file (REQ-NARR-08). Export() compares it against the current
+// process's configured writer id and, on a mismatch, logs a loud warning
+// naming both — but NEVER blocks the cycle: a legitimate machine migration
+// must still complete successfully. This exists because narratives are a
+// PER-MACHINE local cache that never syncs (decision #4751) — two machines
+// alternately exporting into one git-synced vault would otherwise flap
+// narrative notes in git history forever with no visible signal that
+// anything was wrong.
+//
+// Both Narratives and LastWriterID follow the EXACT backward-compatible
+// precedent Hubs already set, immediately above: a state file written before
+// they existed has neither key at all; json.Unmarshal leaves Narratives nil
+// and LastWriterID "", and ReadState normalises the nil map to an empty one
+// exactly as it already does for Files and Hubs — no migration, no mass
+// rewrite, and an empty LastWriterID correctly means "no prior writer is
+// recorded", which is exactly what a first run (or a pre-Phase-B file) is.
+//
+// Every value in Files, Hubs and Narratives MUST use forward slashes
 // (bugfix/obsidian-wikilink-path-separator): this file travels with the
 // git-synced vault and is read by the Phase 4 viewer plugin on every
-// platform, and Files/Hubs values are the same strings vaultRelPath and the
-// hub-path construction in Export() render into wikilinks -- a persisted
-// backslash is exactly as unresolvable as a rendered one. ReadState
-// normalises every value to forward slashes the instant the file is
-// loaded, so a state file written by a pre-fix build (or by a different
-// OS) is upgraded in place with no migration step and no mass
+// platform, and Files/Hubs/Narratives values are the same strings
+// vaultRelPath and the hub-path construction in Export() render into
+// wikilinks -- a persisted backslash is exactly as unresolvable as a
+// rendered one. ReadState normalises every value to forward slashes the
+// instant the file is loaded, so a state file written by a pre-fix build (or
+// by a different OS) is upgraded in place with no migration step and no mass
 // deletion/re-export; WriteState never needs to convert anything, because
 // only already-normalised values are ever assigned into these maps.
 type SyncState struct {
 	LastExportAt time.Time         `json:"last_export_at"`
 	Files        map[int64]string  `json:"files"`
 	Hubs         map[string]string `json:"hubs"`
+	Narratives   map[string]string `json:"narratives"`
+	LastWriterID string            `json:"last_writer_id"`
 }
 
 // ExportResult is the summary of one export cycle — the fields backing the
@@ -75,7 +104,7 @@ func ReadState(path string) (*SyncState, error) {
 	data, err := readFileWithRetry(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &SyncState{Files: map[int64]string{}, Hubs: map[string]string{}}, nil
+			return &SyncState{Files: map[int64]string{}, Hubs: map[string]string{}, Narratives: map[string]string{}}, nil
 		}
 		return nil, fmt.Errorf("obsidian: read state %s: %w", path, err)
 	}
@@ -89,6 +118,9 @@ func ReadState(path string) (*SyncState, error) {
 	}
 	if st.Hubs == nil {
 		st.Hubs = map[string]string{}
+	}
+	if st.Narratives == nil {
+		st.Narratives = map[string]string{}
 	}
 
 	// Normalise every persisted value to forward slashes NOW, at the one
@@ -110,6 +142,9 @@ func ReadState(path string) (*SyncState, error) {
 	}
 	for k, p := range st.Hubs {
 		st.Hubs[k] = toVaultSlash(p)
+	}
+	for k, p := range st.Narratives {
+		st.Narratives[k] = toVaultSlash(p)
 	}
 
 	return &st, nil

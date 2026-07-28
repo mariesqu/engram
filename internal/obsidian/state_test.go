@@ -352,3 +352,111 @@ func TestReadStateNormalisesBackslashPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncStateRoundTripsNarrativesAndLastWriterID covers REQ-NARR-07's
+// SyncState amendment and REQ-NARR-08: SyncState must carry a Narratives map
+// (narrative identity -> vault-relative path) and a LastWriterID string, and
+// both must round-trip through WriteState/ReadState exactly like Files and
+// Hubs already do.
+func TestSyncStateRoundTripsNarrativesAndLastWriterID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".engram-sync-state.json")
+
+	want := &SyncState{
+		LastExportAt: time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+		Files:        map[int64]string{1: "engram/proj/architecture/foo-1.md"},
+		Hubs:         map[string]string{"_sessions/sess-1": "engram/_sessions/sess-1.md"},
+		Narratives: map[string]string{
+			"proj#topic/prefix": "engram/_narratives/proj/topic-prefix.md",
+		},
+		LastWriterID: "writer-a",
+	}
+	if err := WriteState(path, want); err != nil {
+		t.Fatalf("WriteState() error = %v", err)
+	}
+
+	got, err := ReadState(path)
+	if err != nil {
+		t.Fatalf("ReadState() error = %v", err)
+	}
+	if got.LastWriterID != want.LastWriterID {
+		t.Errorf("LastWriterID = %q, want %q", got.LastWriterID, want.LastWriterID)
+	}
+	if len(got.Narratives) != len(want.Narratives) {
+		t.Fatalf("Narratives = %v, want %v", got.Narratives, want.Narratives)
+	}
+	for k, v := range want.Narratives {
+		if got.Narratives[k] != v {
+			t.Errorf("Narratives[%q] = %q, want %q", k, got.Narratives[k], v)
+		}
+	}
+}
+
+// TestReadStateNormalisesMissingNarrativesMap covers the backward-compatible
+// upgrade path this field must follow, EXACTLY like Hubs before it: a
+// pre-Phase-B state file has "files" and "hubs" but no "narratives" key at
+// all. json.Unmarshal leaves the field nil; ReadState must normalise that to
+// a non-nil, empty map — no migration, no mass rewrite — and LastWriterID
+// must come back as "" (there is no prior writer to compare against, so the
+// single-writer check in Export() has nothing to warn about).
+func TestReadStateNormalisesMissingNarrativesMap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".engram-sync-state.json")
+	legacy := `{"last_export_at":"2026-07-27T12:00:00Z",` +
+		`"files":{"1":"engram/proj/architecture/foo-1.md"},` +
+		`"hubs":{"_sessions/sess-1":"engram/_sessions/sess-1.md"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
+		t.Fatalf("setup: WriteFile() error = %v", err)
+	}
+
+	got, err := ReadState(path)
+	if err != nil {
+		t.Fatalf("ReadState() error = %v", err)
+	}
+	if got.Narratives == nil {
+		t.Fatal("Narratives map is nil, want an initialized empty map")
+	}
+	if len(got.Narratives) != 0 {
+		t.Errorf("Narratives = %v, want empty", got.Narratives)
+	}
+	if got.LastWriterID != "" {
+		t.Errorf("LastWriterID = %q, want empty (no prior writer recorded)", got.LastWriterID)
+	}
+
+	// A subsequent write must not panic assigning into a nil map.
+	got.Narratives["proj#topic"] = "engram/_narratives/proj/topic.md"
+	if err := WriteState(path, got); err != nil {
+		t.Fatalf("WriteState() after normalising Narratives error = %v", err)
+	}
+}
+
+// TestNarrativeStatePathsAreSlashNormalised covers the SAME normalisation
+// loop Files and Hubs already go through
+// (bugfix/obsidian-wikilink-path-separator): a persisted Narratives value
+// carrying OS-native backslashes must come back forward-slash-only after
+// ReadState, or a narrative wikilink would be exactly as unresolvable as the
+// bug this precedent already fixed for observation and hub notes.
+func TestNarrativeStatePathsAreSlashNormalised(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".engram-sync-state.json")
+	legacy := `{"last_export_at":"2026-07-27T12:00:00Z",` +
+		`"files":{},"hubs":{},` +
+		`"narratives":{"proj#prefix":"engram\\_narratives\\proj\\prefix.md"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
+		t.Fatalf("setup: WriteFile() error = %v", err)
+	}
+
+	got, err := ReadState(path)
+	if err != nil {
+		t.Fatalf("ReadState() error = %v", err)
+	}
+	want := "engram/_narratives/proj/prefix.md"
+	if got.Narratives["proj#prefix"] != want {
+		t.Errorf("Narratives[...] = %q, want %q", got.Narratives["proj#prefix"], want)
+	}
+	for k, p := range got.Narratives {
+		if strings.Contains(p, `\`) {
+			t.Errorf("Narratives[%q] = %q still contains a backslash after ReadState", k, p)
+		}
+	}
+}

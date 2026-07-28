@@ -30,11 +30,14 @@ func TestObservationToMarkdown(t *testing.T) {
 			Scope:     "project",
 			TopicKey:  strPtr("sdd/obsidian-export-rebuild/spec"),
 			Status:    strPtr("active"),
+			WriterID:  "writer-a",
 			CreatedAt: created,
+			UpdatedAt: created,
 		}
 
-		got := ObservationToMarkdown(rec)
+		got := ObservationToMarkdown(rec, "writer-a", 90)
 
+		wantDue := created.UTC().AddDate(0, 0, 90).Format(time.RFC3339)
 		wantContains := []string{
 			"---\n",
 			"type: \"architecture\"\n",
@@ -44,6 +47,9 @@ func TestObservationToMarkdown(t *testing.T) {
 			"session_id: \"sess-1\"\n",
 			"created_at: 2026-07-27T14:50:23Z\n",
 			"status: \"active\"\n",
+			"writer_id: \"writer-a\"\n",
+			"local_writer: true\n",
+			fmt.Sprintf("lifecycle_due: %s\n", wantDue),
 			"tags: [\"architecture\"]\n",
 			"# Some Decision\n",
 			"Decision body text.",
@@ -69,7 +75,7 @@ func TestObservationToMarkdown(t *testing.T) {
 			TopicKey:  nil,
 			CreatedAt: created,
 		}
-		got := ObservationToMarkdown(rec)
+		got := ObservationToMarkdown(rec, "", 0)
 		if strings.Contains(got, "<nil>") {
 			t.Errorf("ObservationToMarkdown() rendered <nil> for a nil TopicKey:\n%s", got)
 		}
@@ -90,7 +96,7 @@ func TestObservationToMarkdown(t *testing.T) {
 			Status:    nil,
 			CreatedAt: created,
 		}
-		got := ObservationToMarkdown(rec)
+		got := ObservationToMarkdown(rec, "", 0)
 		if strings.Contains(got, "<nil>") {
 			t.Errorf("ObservationToMarkdown() rendered <nil> for a nil Status:\n%s", got)
 		}
@@ -110,7 +116,7 @@ func TestObservationToMarkdown(t *testing.T) {
 			Scope:     "project",
 			CreatedAt: created,
 		}
-		got := ObservationToMarkdown(rec)
+		got := ObservationToMarkdown(rec, "", 0)
 		if !strings.Contains(got, `project: "my\"project"`) {
 			t.Errorf("ObservationToMarkdown() did not escape embedded quote in project:\n%s", got)
 		}
@@ -198,7 +204,7 @@ func TestObservationTagsFromType(t *testing.T) {
 				Scope:     "project",
 				CreatedAt: created,
 			}
-			got := ObservationToMarkdown(rec)
+			got := ObservationToMarkdown(rec, "", 0)
 
 			gotLine := lineWithPrefix(t, got, "tags:")
 			wantLine := fmt.Sprintf("tags: [%q]", tc.wantTag)
@@ -256,7 +262,7 @@ func TestFrontmatterSurvivesHostileFieldValues(t *testing.T) {
 				Scope:     "project",
 				CreatedAt: created,
 			}
-			got := ObservationToMarkdown(rec)
+			got := ObservationToMarkdown(rec, "", 0)
 
 			fm := frontmatterBlock(t, got)
 			for _, line := range strings.Split(fm, "\n") {
@@ -268,5 +274,129 @@ func TestFrontmatterSurvivesHostileFieldValues(t *testing.T) {
 				t.Errorf("frontmatter is missing %q; got:\n%s", tc.wantTag, fm)
 			}
 		})
+	}
+}
+
+// TestObservationFrontmatterCarriesWriterIDAndLocalWriter covers REQ-PROV-01:
+// every rendered observation MUST carry writer_id (rec.WriterID verbatim)
+// and local_writer (rec.WriterID == localWriterID). The load-bearing case is
+// the empty-localWriterID one: an unconfigured feature (a bare manual CLI
+// run) must NEVER report local_writer=true by vacuous equality with an
+// equally empty rec.WriterID.
+func TestObservationFrontmatterCarriesWriterIDAndLocalWriter(t *testing.T) {
+	created := time.Date(2026, 7, 27, 14, 50, 23, 0, time.UTC)
+
+	cases := []struct {
+		name            string
+		recWriterID     string
+		localWriterID   string
+		wantLocalWriter bool
+	}{
+		{"matching writer id is local", "writer-a", "writer-a", true},
+		{"differing writer id is not local", "writer-a", "writer-b", false},
+		{"empty local writer id is never local, even with an empty rec writer id", "", "", false},
+		{"empty local writer id is never local, with a real rec writer id", "writer-a", "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &domain.Record{
+				ID:        1,
+				SessionID: "sess-1",
+				Type:      "architecture",
+				Title:     "T",
+				Content:   "C",
+				Project:   "engram",
+				Scope:     "project",
+				WriterID:  tc.recWriterID,
+				CreatedAt: created,
+			}
+			got := ObservationToMarkdown(rec, tc.localWriterID, 0)
+
+			wantWriterLine := fmt.Sprintf("writer_id: %s", yamlQuote(tc.recWriterID))
+			if !strings.Contains(got, wantWriterLine) {
+				t.Errorf("ObservationToMarkdown() missing %q in output:\n%s", wantWriterLine, got)
+			}
+			wantLocalLine := fmt.Sprintf("local_writer: %t", tc.wantLocalWriter)
+			if !strings.Contains(got, wantLocalLine) {
+				t.Errorf("ObservationToMarkdown() missing %q in output:\n%s", wantLocalLine, got)
+			}
+		})
+	}
+}
+
+// TestObservationFrontmatterCarriesLifecycleDueOnly covers REQ-PROV-03 as
+// AMENDED by maintainer decision #4755: the frontmatter MUST carry
+// lifecycle_due (rec.UpdatedAt + reviewWindowDays, RFC3339) and MUST carry
+// NEITHER a derived `lifecycle:` state key NOR a `lifecycle_basis:` key. The
+// negative assertions are the load-bearing half — a lifecycle_due-only
+// contract is only really pinned once the two dropped keys are proven
+// absent, not merely once the one kept key is proven present.
+func TestObservationFrontmatterCarriesLifecycleDueOnly(t *testing.T) {
+	updated := time.Date(2026, 7, 27, 14, 50, 23, 0, time.UTC)
+	rec := &domain.Record{
+		ID:        1,
+		SessionID: "sess-1",
+		Type:      "architecture",
+		Title:     "T",
+		Content:   "C",
+		Project:   "engram",
+		Scope:     "project",
+		CreatedAt: updated,
+		UpdatedAt: updated,
+	}
+	const reviewWindowDays = 90
+
+	got := ObservationToMarkdown(rec, "", reviewWindowDays)
+
+	wantDue := updated.UTC().AddDate(0, 0, reviewWindowDays).Format(time.RFC3339)
+	wantLine := fmt.Sprintf("lifecycle_due: %s", wantDue)
+	if !strings.Contains(got, wantLine) {
+		t.Errorf("ObservationToMarkdown() missing %q in output:\n%s", wantLine, got)
+	}
+
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "lifecycle:") {
+			t.Errorf("ObservationToMarkdown() emitted a derived %q line; decision #4755 drops it — overdue-ness is computed at READ time by the vault consumer, never baked into exported bytes:\n%s", line, got)
+		}
+		if strings.HasPrefix(line, "lifecycle_basis:") {
+			t.Errorf("ObservationToMarkdown() emitted %q; with no derived lifecycle field left to explain, lifecycle_basis has nothing to name and must be absent:\n%s", line, got)
+		}
+	}
+}
+
+// TestLifecycleDueIsWallClockIndependent covers the other half of decision
+// #4755: lifecycle_due must be a pure function of (rec, reviewWindowDays),
+// never of wall-clock time at render time — the whole point of dropping the
+// derived `lifecycle` state was to remove every wall-clock-dependent byte
+// from the frontmatter, and this pins that ObservationToMarkdown itself
+// never reintroduces one.
+//
+// TIMING: this sleeps across a real second boundary so that a
+// time.Now()-based regression (RFC3339 renders to second precision) would
+// actually be caught, not just "usually" caught by a nanosecond-scale gap.
+func TestLifecycleDueIsWallClockIndependent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping a real-time sleep under -short")
+	}
+	updated := time.Date(2026, 1, 15, 9, 0, 0, 0, time.UTC)
+	rec := &domain.Record{
+		ID:        1,
+		SessionID: "sess-1",
+		Type:      "architecture",
+		Title:     "T",
+		Content:   "C",
+		Project:   "engram",
+		Scope:     "project",
+		CreatedAt: updated,
+		UpdatedAt: updated,
+	}
+
+	first := ObservationToMarkdown(rec, "writer-a", 90)
+	time.Sleep(1100 * time.Millisecond)
+	second := ObservationToMarkdown(rec, "writer-a", 90)
+
+	if first != second {
+		t.Errorf("ObservationToMarkdown() rendered different bytes for the identical record across a real wall-clock gap — a wall-clock dependency leaked into the frontmatter.\nfirst:\n%s\nsecond:\n%s", first, second)
 	}
 }
