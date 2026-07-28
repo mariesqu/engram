@@ -327,8 +327,14 @@ All subcommands read `daemon.json` from the same directory as `--db`. If no daem
 | `ollama_model`  | No (restart)       | Ollama embedding model (default `nomic-embed-text`) |
 | `http_port`     | No (restart)       | Control API TCP port                           |
 | `transport`     | No (restart)       | MCP transport mode: `stdio` or `http`          |
+| `obsidian_vault`| No (restart)       | Absolute path to an Obsidian vault root; empty (the default) disables the scheduled export entirely |
+| `obsidian_interval` | No (restart)   | Scheduled export cadence (Go duration, default `10m`, floor `1m`) |
+| `obsidian_project`  | No (restart)   | Limit the scheduled export to one project; empty (default) exports every project |
+| `obsidian_graph_config` | No (restart) | Graph view bootstrap mode: `preserve` (default) \| `force` \| `skip` |
 
 `writer_key` and `central_url` are managed exclusively via `engram central connect / disconnect` — they are rejected by `PUT /api/v1/config`.
+
+See [Obsidian Export](#obsidian-export) for what these four keys do and how to enable the feature.
 
 ### HTTP MCP transport
 
@@ -638,6 +644,7 @@ engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
 engram import   [--from <old-db>] [--db <dest-db>] [--dry-run] [--writer-id <id>]
+engram obsidian-export --vault <path> --db <path> [--project <name>] [--limit <n>] [--since <time>] [--force] [--graph-config <preserve|force|skip>]
 engram version
 ```
 
@@ -651,7 +658,7 @@ link time (see [RELEASING.md](RELEASING.md)).
 |-----------------------|--------------------------------------|----------|------------------------------------------------------------------|
 | `ENGRAM_ADDR`         | `serve`                              | `:8080`  | Listen address for the central HTTP server                       |
 | `ENGRAM_DSN`          | `serve`, `keys`                      | —        | Postgres DSN (required)                                          |
-| `ENGRAM_DB`           | `daemon`, `status`, `ui`, `tray`, `projects`, `config`, `sync`, `import` | — | Path to the local SQLite database (required) |
+| `ENGRAM_DB`           | `daemon`, `status`, `ui`, `tray`, `projects`, `config`, `sync`, `import`, `obsidian-export` | — | Path to the local SQLite database (required) |
 | `ENGRAM_CENTRAL_URL`  | `daemon`                             | —        | Central server URL; omit for local-only mode                     |
 | `ENGRAM_WRITER_ID`    | `daemon`, `import`                   | —        | Writer identity; required for `daemon` when `ENGRAM_CENTRAL_URL` is set; default writer stamp for `import` (else `import`) |
 | `ENGRAM_WRITER_KEY`   | `daemon`                             | —        | Hex-encoded 32-byte HMAC key; **env only**; required with sync   |
@@ -670,6 +677,188 @@ Flags take precedence over environment variables. `ENGRAM_WRITER_KEY` has no cor
 | `0`  | Success                                                              |
 | `1`  | Subcommand error (missing required flag, validation failure, runtime)|
 | `2`  | Top-level usage error (no args, unknown subcommand, `--help`)        |
+
+## Obsidian Export
+
+Export engram observations into an Obsidian vault as browsable markdown notes,
+with session and topic hub notes, wikilinks between them, and a curated graph
+view. There are two independent moving parts:
+
+- **The exporter** — built into the `engram` binary, either run once by hand
+  (`engram obsidian-export`) or run on a schedule inside `engram daemon`. This
+  is what actually writes the vault.
+- **A read-only viewer plugin** (`plugin/obsidian/`) — reports how fresh the
+  vault is from inside Obsidian. It does not export or sync anything itself.
+  Installing the plugin alone, with nothing keeping the vault fresh, produces
+  a permanently stale or empty vault; the plugin can only say so, not fix it.
+
+### Enabling the scheduled export (recommended)
+
+The primary, unattended way to keep a vault current is the daemon's built-in
+export loop. It is **off by default**.
+
+```bash
+engram config set obsidian_vault /absolute/path/to/vault --db ~/.engram/memories.db
+```
+
+Then restart the daemon — all four `obsidian_*` keys below are
+restart-required; the exporter and its loop are constructed once when the
+daemon starts.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `obsidian_vault` | string | `""` | Absolute path to the vault root. Empty is the master OFF switch for the whole feature. A relative path is rejected at load — it would resolve against the daemon's working directory, which is arbitrary under a service manager. |
+| `obsidian_interval` | duration | `10m` | Export cycle cadence. A value below `1m` is clamped to `1m` with a logged warning; a non-positive or unparseable value is rejected at daemon startup. |
+| `obsidian_project` | string | `""` | Limit the export to a single project. Empty exports every project — see the caveat below. |
+| `obsidian_graph_config` | string | `preserve` | `preserve` \| `force` \| `skip` — see below. |
+
+> **`force` overwrites the graph view unconditionally.** With
+> `obsidian_graph_config: force`, the daemon rewrites
+> `{vault}/.obsidian/graph.json` on the first export cycle of *every* daemon
+> start — including any hand-tuned graph settings already there, with no
+> prompt. `preserve` (the default) only writes the file when it is absent and
+> never touches an existing one; `skip` never touches `.obsidian/` at all. If
+> a vault has graph settings worth keeping, do not set this to `force`.
+
+> **`obsidian_project` disables the stale-hub sweep.** Session and topic hub
+> notes are inherently cross-project — one session hub can list observations
+> from several projects. When a project filter is set, hubs are rebuilt from
+> only that run's scope and the sweep that removes stale hubs does not run at
+> all. Concretely: a filtered run may leave a stale hub note behind, but it
+> will never delete a live one. The default (no filter) sweeps normally.
+
+Measured against a real vault of roughly 4,650 observations: a cold export
+cycle (first run against an empty vault) took on the order of 18-23 seconds;
+a second cycle against unchanged data completed in a few seconds and did no
+disk I/O beyond reading the state file. These are measurements from one
+machine and one vault, not a performance guarantee — cycle time scales with
+vault size.
+
+**Shutdown**: stopping the daemon blocks until the in-flight export cycle
+finishes — deliberately, so a shutdown can never interrupt a note mid-write
+(see the manual-export warning below for why that matters). In the
+measurement above, a cold cycle over ~4,650 observations blocked shutdown for
+about 18 seconds; the worst case observed in HTTP mode was closer to 33
+seconds, because the control server's own shutdown grace period runs
+serially before the export drain begins. The daemon logs that it is waiting
+before it blocks. Treat these numbers as one machine's measurements, not an
+SLA, when sizing an external shutdown timeout (e.g. a service manager's stop
+timeout) against a large vault.
+
+### Manual one-off export (CLI)
+
+```bash
+engram obsidian-export --vault <path> --db <path> [--project <name>] [--limit <n>] [--since <time>] [--force] [--graph-config <preserve|force|skip>]
+```
+
+| Flag | Required | Default | Description |
+|---|---|---|---|
+| `--vault` | Yes | — | Path to the Obsidian vault root |
+| `--db` | Yes (or `ENGRAM_DB`) | — | Path to the local SQLite database |
+| `--project` | No | every project | Limit the export to a single project |
+| `--limit` | No | no cap | **Per-project** cap on exported observations — applied independently to each project the run touches, not to the run as a whole |
+| `--since` | No | state file cutoff | Only export observations updated after this time (RFC3339 or `YYYY-MM-DD`); overrides the incremental state file's cutoff for this run only |
+| `--force` | No | off | Re-evaluate every live observation instead of only what changed since the last run (unchanged files are still skipped, by content not by timestamp); also the recovery path when the state file fails to parse |
+| `--graph-config` | No | `preserve` | Bootstrap `{vault}/.obsidian/graph.json` — `preserve` (write only when absent) \| `force` (overwrite unconditionally) \| `skip` (never touch `.obsidian/`) |
+
+A first run against a real vault of 4,638 observations:
+
+```
+sync: created=4638 updated=0 deleted=0 skipped=0 hubs=508
+```
+
+Running it again with nothing changed is a true no-op:
+
+```
+sync: created=0 updated=0 deleted=0 skipped=4638 hubs=0
+```
+
+> **Do not put this command on cron, Task Scheduler, or launchd.** It opens
+> the SQLite database directly, and every open runs the schema and
+> migrations — a version-mismatched `engram` binary firing on a timer can
+> migrate the database out from under a running `engram daemon`. This command
+> is meant to be run by hand, for a one-off export or a first backfill. To
+> keep a vault continuously fresh, enable the daemon's scheduled export
+> instead (above); it exports from the store the daemon already has open, so
+> a second opener of the database never happens.
+
+### Vault structure
+
+```
+{vault}/
+└── engram/
+    ├── {project}/
+    │   └── {type}/
+    │       └── {slug}-{id}.md
+    ├── _sessions/
+    │   └── {session-id}.md
+    ├── _topics/
+    │   └── {prefix}.md
+    └── .engram-sync-state.json
+{vault}/.obsidian/graph.json        (written only when a graph-config mode applies)
+```
+
+Nothing is written outside `{vault}/engram/` except `.obsidian/graph.json`,
+which is the one deliberate exception.
+
+### Incremental sync
+
+Each export persists its cutoff timestamp and a map of exported notes (and
+hub notes) to `{vault}/engram/.engram-sync-state.json`. Later runs only
+(re)write observations created or updated after that cutoff, and remove
+files for observations that are no longer live. On the real vault used for
+the numbers above, this converges to 4,638 notes, 508 hub notes, and 12,016
+wikilinks — 7,229 of them hub-to-note — all of which resolve to an existing
+file.
+
+### Read-only viewer plugin
+
+`plugin/obsidian/` is a small Obsidian plugin that displays how fresh the
+vault is. It does not export or sync anything — that is entirely the job of
+the exporter above, whether daemon-hosted or run by hand.
+
+The status bar shows exactly one of three states, derived from
+`.engram-sync-state.json`:
+
+| State | Display |
+|---|---|
+| Fresh | `Engram: N notes · updated {relative}` |
+| Stale | `Engram: N notes · stale ({relative})` |
+| Absent (never exported, or the state file is unreadable) | `Engram: no export found` |
+
+Build and install:
+
+```bash
+cd plugin/obsidian
+npm install
+npm run build
+```
+
+Copy `manifest.json` and the built `main.js` into
+`{vault}/.obsidian/plugins/engram-brain/`, then enable the plugin from
+Obsidian's Community Plugins settings. It is desktop-only
+(`isDesktopOnly: true`) — the exporter is a background process, and a hidden
+dotfile-based state file is not something to rely on being replicated to
+mobile.
+
+Settings:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `vaultSubfolder` | `engram` | Vault-relative folder the exporter writes into. The exporter's namespace is currently hard-coded to `engram/`, so this is the only value that will ever find an export — a different value degrades to "no export found" rather than an error. |
+| `projectFilter` | `""` (all) | Restricts the **displayed** counts only; it has no effect on what the exporter exports. That scope is controlled separately by the daemon's `obsidian_project` key. |
+| `staleAfterMinutes` | `60` | Age past which the vault is reported stale. |
+
+This plugin has not been run inside an actual Obsidian installation — no
+Obsidian runtime was available while building and verifying this feature. It
+was type-checked and bundled successfully against the real `obsidian` npm
+package, but the read path rests on one unverified assumption: that
+Obsidian's data adapter (`app.vault.adapter`) can see the dot-prefixed
+`.engram-sync-state.json` file, since Obsidian's indexed vault API is
+documented to exclude dot-prefixed files from its index. If that assumption
+turns out to be wrong, the plugin degrades to a permanent, non-crashing "no
+export found" against a healthy vault rather than throwing — but this has
+not been confirmed against a real Obsidian instance.
 
 ## Wiring into an MCP client
 
