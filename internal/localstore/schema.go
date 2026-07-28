@@ -144,7 +144,25 @@ import (
 //	reuse it without another migration. The table is idempotent (CREATE TABLE IF
 //	NOT EXISTS in ApplySchema), so a fresh DB where ApplySchema already created it
 //	is a no-op in the migration.
-const currentSchemaVersion = 12
+//
+// v12 -> v13: add narratives, a local-only cache of LLM-generated narrative
+//
+//	prose keyed by (project, topic_prefix) (obsidian-narrative Phase B,
+//	decision #4751 decision 2). It carries NO sync_id, NO writer_id, and NO
+//	entity_type: narratives never sync -- each machine regenerates its own,
+//	and this table is deliberately outside the sync/reconciliation plane
+//	entirely, so adding any of those columns would be a scope error, not an
+//	omission. project and topic_prefix store the CASE-FOLDED (strings.ToLower)
+//	key rather than relying on COLLATE NOCASE: SQLite's NOCASE folds ASCII
+//	only, while strings.ToLower folds Unicode, so the two would silently
+//	disagree on a non-ASCII project name. The table is additive-only and
+//	untouched by the memories entity_type CHECK and the FTS triggers (both
+//	are unmodified by this migration) -- narrative prose is therefore
+//	structurally excluded from memories_fts and can never surface in
+//	mem_search. The table is idempotent (CREATE TABLE IF NOT EXISTS in
+//	ApplySchema), so a fresh DB where ApplySchema already created it is a
+//	no-op in the migration.
+const currentSchemaVersion = 13
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -419,6 +437,48 @@ const promptTombstonesTableDDL = `CREATE TABLE IF NOT EXISTS prompt_tombstones (
 	deleted_by TEXT    NOT NULL DEFAULT ''
 )`
 
+// narrativesTableDDL is the authoritative CREATE TABLE statement for the
+// narratives table (schema v13) -- a LOCAL CACHE ONLY of LLM-generated
+// narrative prose, one row per (project, topic_prefix) unit.
+//
+// Deliberately carries NO sync_id, NO writer_id, and NO entity_type: it is
+// outside the sync plane entirely (obsidian-narrative decision #4751,
+// decision 2). Adding any of those would imply a new domain.EntityType
+// threaded through the reconciliation pipeline, which this change is
+// explicitly scoped to avoid.
+//
+// project / topic_prefix store the CASE-FOLDED (strings.ToLower) key.
+// SQLite TEXT PRIMARY KEY is BINARY-collated, and both the exporter and the
+// narrative-generation loop derive this unit from data whose casing drifts.
+// COLLATE NOCASE is deliberately NOT used: it folds ASCII only, while
+// strings.ToLower folds Unicode, so the two would silently disagree on a
+// non-ASCII project name.
+//
+// model / template_version are stored as descriptive columns for
+// debuggability (see the design's "the columns are descriptive; the hash is
+// authoritative" note) -- the narrative loop's cache-key comparison never
+// reads them directly; it recomputes a source hash and compares that.
+// renderer_version is likewise descriptive-only and is deliberately NOT part
+// of any cache-invalidation predicate: a cosmetic rendering change must not
+// force a paid regeneration, and writeIfChanged already catches byte-level
+// rendering changes for free.
+const narrativesTableDDL = `CREATE TABLE IF NOT EXISTS narratives (
+	project          TEXT    NOT NULL,
+	topic_prefix     TEXT    NOT NULL,
+	body             TEXT    NOT NULL,
+	source_hash      TEXT    NOT NULL,
+	model            TEXT    NOT NULL,
+	template_version TEXT    NOT NULL,
+	renderer_version TEXT    NOT NULL,
+	source_count     INTEGER NOT NULL DEFAULT 0,
+	source_writers   TEXT    NOT NULL DEFAULT '',
+	unverified_paths TEXT    NOT NULL DEFAULT '',
+	truncated        INTEGER NOT NULL DEFAULT 0,
+	stale            INTEGER NOT NULL DEFAULT 0,
+	generated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+	PRIMARY KEY (project, topic_prefix)
+)`
+
 // runMigrations inspects PRAGMA user_version and applies any pending migrations
 // in order.  It is idempotent: a DB already at currentSchemaVersion is a no-op.
 // Migrations are applied inside individual transactions so a failure leaves the
@@ -526,9 +586,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 12
 	}
 
+	if ver < 13 {
+		if err := migrateV12ToV13(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 13
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 12` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 13` migration block.
+	// the final `ver = 13` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 14` migration block.
 	_ = ver
 	return nil
 }
@@ -1258,6 +1326,34 @@ func migrateV11ToV12(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV12ToV13 creates the narratives table -- a local-only cache of
+// LLM-generated narrative prose, one row per (project, topic_prefix) unit
+// (obsidian-narrative Phase B, decision #4751 decision 2).
+//
+// A fresh DB created by ApplySchema already has narratives (via
+// CREATE TABLE IF NOT EXISTS), so this migration is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 12.
+func migrateV12ToV13(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(narrativesTableDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 13`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1369,6 +1465,14 @@ func ApplySchema(db *sql.DB) error {
 		// ── daemon_meta — generic daemon-scoped key/value settings (v12) ─────
 		// First consumer: honored_purge_epoch (remote-purge feature).
 		daemonMetaTableDDL,
+
+		// ── narratives — local-only LLM narrative cache (v13) ────────────────
+		// NO sync_id, NO writer_id, NO entity_type — outside the sync plane
+		// entirely (obsidian-narrative decision #4751 decision 2). NOT
+		// FTS-indexed: the FTS triggers below are all ON memories, so this
+		// sibling table is invisible to them and narrative prose can never
+		// surface in mem_search.
+		narrativesTableDDL,
 
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic
