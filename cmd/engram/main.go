@@ -56,6 +56,7 @@ Usage:
   engram memories edit <id> --title <t> --content <c> [--type <type>] [--db <path>]
   engram memories delete <id> [--yes] [--db <path>]
   engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
+  engram obsidian-export --vault <path> --db <path> [--project <name>] [--limit <n>] [--since <time>] [--force]
   engram version
 
 Environment:
@@ -84,6 +85,7 @@ Subcommands:
   sync      Trigger an immediate sync cycle (requires daemon --http).
   memories  Browse, review, edit, or delete stored memories (requires daemon --http).
   import    Import memories, prompts, and sessions from an old-generation engram database.
+  obsidian-export  Export observations into an Obsidian-compatible markdown vault.
   version   Print binary version, GOOS/GOARCH, and Go runtime version.
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
@@ -180,6 +182,12 @@ func run(args []string) int {
 	case "import":
 		if err := runImportCmd(args[1:]); err != nil {
 			log.Printf("engram import: %v", err)
+			return 1
+		}
+		return 0
+	case "obsidian-export":
+		if err := runObsidianExportCmd(args[1:]); err != nil {
+			log.Printf("engram obsidian-export: %v", err)
 			return 1
 		}
 		return 0
