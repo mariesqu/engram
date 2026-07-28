@@ -1,0 +1,21 @@
+{
+  "name": "engram-brain",
+  "version": "1.0.0",
+  "description": "Read-only freshness viewer for an Obsidian vault kept fresh by the engram daemon's scheduled export. Does not sync.",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [],
+  "author": "engram",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.4.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "engram-brain",
+  "name": "Engram Brain",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Read-only freshness viewer for a vault kept up to date by the engram daemon's scheduled Obsidian export. This plugin does not sync anything itself.",
+  "author": "engram",
+  "authorUrl": "https://github.com/mariesqu/engram",
+  "isDesktopOnly": true
+}
