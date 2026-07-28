@@ -105,6 +105,54 @@ func TestObsidianPackageImportsOnlyStdlibAndDomain(t *testing.T) {
 	}
 }
 
+// TestExportHasNoPathIntoTheGenerationProvider pins REQ-NARR-03: Export()'s
+// call graph must contain zero calls into the generation provider or the
+// generation gate. TestObsidianPackageImportsOnlyStdlibAndDomain (above)
+// already makes an internal/generation import a build failure -- its
+// allow-list is exactly internal/domain -- so this test is a mechanical
+// restatement, not a new guarantee; it exists so a future reader sees WHY
+// the import is forbidden (the specific requirement), not just that it is,
+// when this test's name shows up in a failure or a coverage report.
+func TestExportHasNoPathIntoTheGenerationProvider(t *testing.T) {
+	const forbidden = "github.com/mariesqu/engram/internal/generation"
+
+	fset := token.NewFileSet()
+	checked := 0
+	for _, path := range goFilesInPackageDir(t) {
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		checked++
+		for _, spec := range f.Imports {
+			p, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("%s: unquote import %s: %v", filepath.Base(path), spec.Path.Value, err)
+			}
+			if p == forbidden {
+				t.Errorf(
+					"%s imports %q — REQ-NARR-03: Export()'s call graph must contain zero calls "+
+						"into the generation provider or the gate. internal/obsidian reaches "+
+						"cached narrative data only through its own narrow reader interface "+
+						"(NarrativeReader, a later phase), never by importing internal/generation.",
+					filepath.Base(path), p)
+			}
+		}
+	}
+	if checked < 10 {
+		t.Errorf("only %d files parsed; the package has many more — the guard is not covering the package", checked)
+	}
+}
+
+// TestExportSignatureTakesNoContext is a compile-time signature pin (not a
+// behavioural test): REQ-NARR-03 requires Export() to NEVER gain a
+// context.Context parameter -- it is the drain guarantee REQ-WATCH-05
+// already relies on (see obsidian.Loop's Exportable interface doc comment
+// in loop.go). If this file fails to compile, the signature changed.
+func TestExportSignatureTakesNoContext(t *testing.T) {
+	var _ func() (*ExportResult, error) = (&Exporter{}).Export
+}
+
 // goFilesInPackageDir lists every .go file next to this test. Using the working
 // directory is safe and deliberate: `go test` always runs a package's tests
 // with the package directory as the working directory, so no build-tag-aware
