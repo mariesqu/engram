@@ -100,6 +100,16 @@ type ExportConfig struct {
 	// that can only OVER-flag, never under-flag, relative to
 	// Store.ReviewStatus.
 	ReviewWindowDays int
+
+	// Narratives is the narrow read surface onto cached LLM-generated
+	// narrative rows (REQ-NARR-05..07, REQ-PROV-02/-04). NIL means the
+	// feature is OFF — presence of the coordinate is the switch, the same
+	// idiom GraphConfig's zero value already uses: a nil reader renders
+	// NOTHING (no {vault}/engram/_narratives/ directory, no narrative
+	// frontmatter anywhere, zero log lines mentioning narrative
+	// generation) rather than a placeholder that would churn the git diff
+	// every cycle for every below-threshold topic.
+	Narratives NarrativeReader
 }
 
 // Exporter renders engram observations into an Obsidian vault.
@@ -509,6 +519,111 @@ func (e *Exporter) Export() (*ExportResult, error) {
 		}
 		for identity, relPath := range renderedHubs {
 			state.Hubs[identity] = relPath
+		}
+	}
+
+	// Narrative notes (REQ-NARR-05..07, REQ-PROV-02/-04). e.cfg.Narratives
+	// nil means the feature is OFF; this whole block is then skipped
+	// entirely — no directory created, no file written, no log line
+	// emitted (REQ-NARR-05/REQ-GEN-04's rendering-side counterpart).
+	if e.cfg.Narratives != nil {
+		all, err := e.cfg.Narratives.NarrativesForExport()
+		if err != nil {
+			return nil, fmt.Errorf("obsidian: list narratives: %w", err)
+		}
+
+		// renderedNarratives is THIS cycle's complete rendered set — the
+		// SAME "identity -> vault-relative path" shape renderedHubs uses
+		// above, and it drives the sweep below exactly the same way.
+		renderedNarratives := map[string]string{}
+
+		for key, n := range all {
+			// The key is UNTRUSTED in the sense that NarrativeReader is an
+			// interface this package does not control the implementation
+			// of: a key missing the "\x00" identity separator, or one
+			// carrying a SECOND embedded NUL beyond the single expected
+			// delimiter, is not a well-formed (project, topic_prefix)
+			// identity and must be refused outright rather than coerced
+			// into a plausible-but-wrong path.
+			project, topicPrefix, ok := strings.Cut(key, "\x00")
+			if !ok || strings.Contains(project, "\x00") || strings.Contains(topicPrefix, "\x00") {
+				e.logf("obsidian: refusing malformed narrative key %q", key)
+				continue
+			}
+
+			// Narratives ARE per-project-scopable, unlike hubs (design
+			// #4754 §6, decision #4751 decision 3's second dividend): the
+			// unit IS (project, topic_prefix), so a --project-filtered run
+			// can restrict both rendering and the sweep below to exactly
+			// its own scope, never touching another project's narratives.
+			if e.cfg.Project != "" && !strings.EqualFold(project, e.cfg.Project) {
+				continue
+			}
+
+			// engram/_narratives/{safeFilename(project)}/{safeFilename(topic_prefix)}.md
+			// — inside engram/, so resolveVaultPath's containment guard
+			// applies unchanged, and the project+prefix are BOTH
+			// safeFilename'd (never a bare filepath.Join of uncontrolled
+			// values) so a hostile identity cannot escape the vault. The
+			// TWO-LEVEL nesting (project, THEN topic_prefix) is
+			// deliberate: it can never alias onto a topic hub's flat
+			// "_topics/{prefix}.md" or a session hub's flat
+			// "_sessions/{id}.md" layout, so a narrative note can never
+			// collide with — and therefore never corrupt — a hub note.
+			relPath := vaultJoin(engramDir, "_narratives", safeFilename(project), safeFilename(topicPrefix)+".md")
+			absPath, err := e.resolveVaultPath(relPath)
+			if err != nil {
+				e.logf("obsidian: refusing unsafe narrative key %q (%q): %v", key, relPath, err)
+				continue
+			}
+
+			wrote, err := writeIfChanged(absPath, NarrativeMarkdown(key, n))
+			if err != nil {
+				return nil, fmt.Errorf("obsidian: write narrative %q: %w", key, err)
+			}
+			if wrote {
+				result.Narratives++
+			}
+			renderedNarratives[key] = relPath
+		}
+
+		// Sweep: a narrative tracked in a PRIOR cycle but absent from
+		// THIS cycle's rendered set is removed from disk and from state,
+		// through the SAME containment guard already applied to Files and
+		// Hubs above. UNLIKE the hub sweep (which disables entirely under
+		// a --project filter because a hub is inherently cross-project),
+		// this sweep RUNS under a filter, scoped to exactly that
+		// project's own narrative identities — the second dividend of
+		// decision #4751 decision 3 already noted above.
+		for identity, relPath := range state.Narratives {
+			if _, ok := renderedNarratives[identity]; ok {
+				continue
+			}
+			if e.cfg.Project != "" {
+				project, _, ok := strings.Cut(identity, "\x00")
+				if !ok || !strings.EqualFold(project, e.cfg.Project) {
+					// Out of this filtered run's scope entirely: leave it
+					// alone, neither swept nor reported stale.
+					continue
+				}
+			}
+			// relPath is UNTRUSTED, exactly like state.Files/state.Hubs
+			// above — read verbatim from the in-vault, Obsidian-Sync-
+			// writable state file. A refusal is reported and the entry is
+			// RETAINED (never removed from state.Narratives) rather than
+			// swept blind, and the cycle is never aborted by it.
+			absPath, err := e.resolveVaultPath(relPath)
+			if err != nil {
+				e.logf("obsidian: refusing unsafe narrative state entry %q (%q): %v", identity, relPath, err)
+				continue
+			}
+			if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("obsidian: remove stale narrative %s: %w", relPath, err)
+			}
+			delete(state.Narratives, identity)
+		}
+		for identity, relPath := range renderedNarratives {
+			state.Narratives[identity] = relPath
 		}
 	}
 

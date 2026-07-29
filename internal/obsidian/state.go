@@ -87,6 +87,16 @@ type ExportResult struct {
 	Deleted int
 	Skipped int
 	Hubs    int
+
+	// Narratives counts narrative notes WRITTEN this cycle (mirroring how
+	// Hubs counts writes, not total membership — see the write loop in
+	// Export()). Deliberately NOT part of Summary()'s REQ-EXPORT-11 wire
+	// format: REQ-NARR-09 requires narrative activity to be reported
+	// SEPARATELY (a later phase's status object) and to never move the
+	// four structural counters above, on pain of breaking the "second run
+	// over unchanged data is a true no-op" regression bar those four
+	// counters exist to prove.
+	Narratives int
 }
 
 // Summary renders r in the exact REQ-EXPORT-11 wire format. This is the
