@@ -180,6 +180,38 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	return results, rows.Err()
 }
 
+// MostRecentSessionDirectory returns the directory of the most recently
+// started session recorded for project (ordered by started_at DESC, id DESC
+// as a deterministic tie-breaker -- the same ordering RecentSessions uses),
+// or "" if project has no known session.
+//
+// "" is a valid NOT-FOUND result, never an error: the caller
+// (internal/generation's REQ-PROV-02 path verification, obsidian-narrative
+// design #4754 §8) treats an empty directory as "no known session
+// directory for this project" and marks every extracted path unverified
+// rather than silently presenting them as confirmed -- see
+// generation.VerifyPaths's identical empty-sessionDir handling.
+func (s *Store) MostRecentSessionDirectory(project string) (string, error) {
+	project = normalizeProject(project)
+	if project == "" {
+		return "", nil
+	}
+
+	var dir string
+	err := s.db.QueryRow(
+		`SELECT directory FROM sessions WHERE LOWER(project) = ?
+		 ORDER BY datetime(started_at) DESC, id DESC LIMIT 1`,
+		project,
+	).Scan(&dir)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // nullableStr converts an empty string to a SQL NULL so that summary="" is
 // stored as NULL rather than an empty string, matching old_code behaviour.
 func nullableStr(s string) sql.NullString {

@@ -156,6 +156,19 @@ type NarrativeStore interface {
 	// folded key is deferred over budget while its stored source_hash no
 	// longer matches (REQ-NARR-06). An empty slice issues no statement.
 	MarkNarrativesStale(keys []string) error
+
+	// MostRecentSessionDirectory returns the directory of the most
+	// recently started session known for project, or "" if none is known.
+	// This backs REQ-PROV-02's GENERATION-TIME path verification: runCycle
+	// extracts path-like tokens from a unit's generated prose (paths.go's
+	// ExtractPaths) and os.Stats each one relative to this directory
+	// (paths.go's VerifyPaths) before persisting the row -- never at
+	// render time, so the rendered bytes stay a pure function of the row
+	// (design #4754 §6/§8). "" is a valid not-found result, not an error;
+	// VerifyPaths already treats an empty session directory as "mark
+	// every path unverified" rather than silently presenting them as
+	// confirmed.
+	MostRecentSessionDirectory(project string) (string, error)
 }
 
 // ensure *localstore.Store satisfies NarrativeStore at compile time.
@@ -509,6 +522,17 @@ func (l *Loop) runCycle(ctx context.Context) error {
 		staleKeys                          []string
 	)
 
+	// sessionDirCache resolves REQ-PROV-02's generation-time path
+	// verification: MostRecentSessionDirectory is queried AT MOST ONCE per
+	// project per cycle (mirroring the "query shape is the real answer,
+	// bounded, does not grow with note count" discipline design #4754 §5
+	// already holds every other store call in this loop to), never once
+	// per unit. comma-ok on this map alone tracks "already queried this
+	// cycle" -- an empty-string result is cached exactly like a non-empty
+	// one, so a project with no known session is not re-queried on every
+	// one of its units either.
+	sessionDirCache := map[string]string{}
+
 cycleLoop:
 	for i, m := range misses {
 		if ctx.Err() != nil {
@@ -577,6 +601,30 @@ cycleLoop:
 		consecutiveErrors = 0
 		generated++
 
+		// REQ-PROV-02: extract path-like tokens from the model's own prose
+		// and os.Stat each one against the project's most recently known
+		// session directory, NOW at generation time -- never deferred to
+		// render time, which would make the rendered bytes depend on the
+		// filesystem AT RENDER TIME (paths.go's VerifyPaths doc comment;
+		// design #4754 §6/§8). A path that cannot be resolved is listed,
+		// never silently dropped and never silently presented as
+		// confirmed.
+		var unverifiedPaths []string
+		if candidates := ExtractPaths(text); len(candidates) > 0 {
+			sessionDir, cached := sessionDirCache[m.unit.ProjectKey]
+			if !cached {
+				dir, serr := l.store.MostRecentSessionDirectory(m.unit.ProjectKey)
+				if serr != nil {
+					l.cfg.Logger.Warn("narrative loop: MostRecentSessionDirectory failed, treating as unknown",
+						"project", m.unit.ProjectKey, "error", serr)
+					dir = ""
+				}
+				sessionDirCache[m.unit.ProjectKey] = dir
+				sessionDir = dir
+			}
+			_, unverifiedPaths = VerifyPaths(sessionDir, candidates)
+		}
+
 		row := localstore.NarrativeRow{
 			Project:         m.unit.ProjectKey,
 			TopicPrefix:     m.unit.TopicPrefixKey,
@@ -587,14 +635,18 @@ cycleLoop:
 			RendererVersion: rendererVersion,
 			SourceCount:     len(m.unit.Records),
 			SourceWriters:   joinedSourceWriters(m.unit.Records),
-			// UnverifiedPaths is deliberately left empty in this phase:
-			// wiring generation-time path verification (ExtractPaths +
-			// VerifyPaths, paths.go, Phase 5) into the loop is not among
-			// this phase's tasks -- see the apply report's flagged gap.
-			UnverifiedPaths: "",
-			Truncated:       false,
-			Stale:           false,
-			GeneratedAt:     time.Now().UTC(),
+			UnverifiedPaths: strings.Join(unverifiedPaths, "\n"),
+			// Truncated remains hard-coded false: GenerationProvider.Generate
+			// returns (string, error) only -- there is no channel for a
+			// provider to signal it truncated its own output.
+			// REQ-GEN-07's client-side output bound is explicitly Phase 10
+			// scope (tasks 10.7/10.8, internal/generation/mistral.go, the
+			// provider that will actually decode and bound an HTTP
+			// response) -- see the gap-closing apply report's port-impact
+			// note on whether that requires widening this signature.
+			Truncated:   false,
+			Stale:       false,
+			GeneratedAt: time.Now().UTC(),
 		}
 		if uerr := l.store.UpsertNarrative(row); uerr != nil {
 			l.cfg.Logger.Warn("narrative loop: UpsertNarrative failed",

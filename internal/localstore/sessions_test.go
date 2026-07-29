@@ -270,6 +270,88 @@ func TestCreateSession_NormalizesProject(t *testing.T) {
 	}
 }
 
+// ── MostRecentSessionDirectory ────────────────────────────────────────────────
+//
+// Backs obsidian-narrative REQ-PROV-02's generation-time path verification
+// (gap-closing batch): internal/generation resolves a project's most
+// recently known session directory through this method before calling
+// VerifyPaths, exactly as design #4754 §8 specifies ("resolved against the
+// narrated project's most recently known sessions directory").
+
+func TestMostRecentSessionDirectory_ReturnsLatestForProject(t *testing.T) {
+	s := openTempStore(t)
+
+	if err := s.CreateSession("older", "proj-a", "/old/dir"); err != nil {
+		t.Fatalf("CreateSession older: %v", err)
+	}
+	// Force a distinguishable started_at ordering rather than relying on two
+	// datetime('now') calls landing in different seconds.
+	if _, err := s.db.Exec(`UPDATE sessions SET started_at = '2020-01-01 00:00:00' WHERE id = 'older'`); err != nil {
+		t.Fatalf("backdate older: %v", err)
+	}
+	if err := s.CreateSession("newer", "proj-a", "/new/dir"); err != nil {
+		t.Fatalf("CreateSession newer: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE sessions SET started_at = '2025-01-01 00:00:00' WHERE id = 'newer'`); err != nil {
+		t.Fatalf("date newer: %v", err)
+	}
+
+	got, err := s.MostRecentSessionDirectory("proj-a")
+	if err != nil {
+		t.Fatalf("MostRecentSessionDirectory: %v", err)
+	}
+	if got != "/new/dir" {
+		t.Errorf("MostRecentSessionDirectory = %q, want %q (the most recently started session)", got, "/new/dir")
+	}
+}
+
+func TestMostRecentSessionDirectory_NoSessionsReturnsEmptyNotError(t *testing.T) {
+	s := openTempStore(t)
+
+	got, err := s.MostRecentSessionDirectory("never-seen-project")
+	if err != nil {
+		t.Fatalf("MostRecentSessionDirectory on an unknown project must not error, got: %v", err)
+	}
+	if got != "" {
+		t.Errorf("MostRecentSessionDirectory = %q, want \"\" (no known session directory)", got)
+	}
+}
+
+func TestMostRecentSessionDirectory_IgnoresOtherProjects(t *testing.T) {
+	s := openTempStore(t)
+
+	if err := s.CreateSession("a-sess", "proj-a", "/a/dir"); err != nil {
+		t.Fatalf("CreateSession proj-a: %v", err)
+	}
+	if err := s.CreateSession("b-sess", "proj-b", "/b/dir"); err != nil {
+		t.Fatalf("CreateSession proj-b: %v", err)
+	}
+
+	got, err := s.MostRecentSessionDirectory("proj-b")
+	if err != nil {
+		t.Fatalf("MostRecentSessionDirectory: %v", err)
+	}
+	if got != "/b/dir" {
+		t.Errorf("MostRecentSessionDirectory(proj-b) = %q, want %q -- must not leak proj-a's directory", got, "/b/dir")
+	}
+}
+
+func TestMostRecentSessionDirectory_NormalizesProjectCasing(t *testing.T) {
+	s := openTempStore(t)
+
+	if err := s.CreateSession("cased", "MyProject", "/cased/dir"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	got, err := s.MostRecentSessionDirectory("myproject")
+	if err != nil {
+		t.Fatalf("MostRecentSessionDirectory: %v", err)
+	}
+	if got != "/cased/dir" {
+		t.Errorf("MostRecentSessionDirectory case-insensitive lookup = %q, want %q", got, "/cased/dir")
+	}
+}
+
 // ── v7 migration: applies on a fresh store (user_version already 7) ───────────
 
 func TestMigrateV6ToV7_FreshStore(t *testing.T) {

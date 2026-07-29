@@ -152,13 +152,22 @@ type fakeLoopStore struct {
 
 	upsertCalls    []localstore.NarrativeRow
 	markStaleCalls [][]string
+
+	// sessionDirByProject and sessionDirErrByProject back
+	// MostRecentSessionDirectory -- see the gap-closing wiring tests
+	// (TestGeneratedNarrativeCapturesUnverifiedPaths and siblings).
+	sessionDirByProject    map[string]string
+	sessionDirErrByProject map[string]error
+	sessionDirCalls        []string
 }
 
 func newFakeLoopStore() *fakeLoopStore {
 	return &fakeLoopStore{
-		recordsByProject: map[string][]*domain.Record{},
-		rows:             map[string]localstore.NarrativeRow{},
-		recentObsErr:     map[string]error{},
+		recordsByProject:       map[string][]*domain.Record{},
+		rows:                   map[string]localstore.NarrativeRow{},
+		recentObsErr:           map[string]error{},
+		sessionDirByProject:    map[string]string{},
+		sessionDirErrByProject: map[string]error{},
 	}
 }
 
@@ -269,6 +278,48 @@ func (f *fakeLoopStore) markStaleCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.markStaleCalls)
+}
+
+// setSessionDirectory scripts the directory MostRecentSessionDirectory
+// returns for project. Unset projects default to "" (not-found, not an
+// error) -- matching *localstore.Store's real behaviour.
+func (f *fakeLoopStore) setSessionDirectory(project, dir string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessionDirByProject[project] = dir
+}
+
+// setSessionDirectoryErr scripts MostRecentSessionDirectory to fail for
+// project.
+func (f *fakeLoopStore) setSessionDirectoryErr(project string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessionDirErrByProject[project] = err
+}
+
+func (f *fakeLoopStore) MostRecentSessionDirectory(project string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessionDirCalls = append(f.sessionDirCalls, project)
+	if err := f.sessionDirErrByProject[project]; err != nil {
+		return "", err
+	}
+	return f.sessionDirByProject[project], nil
+}
+
+// sessionDirCallCountFor returns how many times MostRecentSessionDirectory
+// was called for project -- used to pin that the Loop resolves a project's
+// session directory AT MOST ONCE per cycle, not once per unit.
+func (f *fakeLoopStore) sessionDirCallCountFor(project string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, p := range f.sessionDirCalls {
+		if p == project {
+			n++
+		}
+	}
+	return n
 }
 
 // ensure fakeLoopStore satisfies NarrativeStore at compile time.
@@ -1175,5 +1226,138 @@ func TestLoopLastResult(t *testing.T) {
 	// later cycle-level failure.
 	if failed.Generated != success.Generated {
 		t.Errorf("Generated = %d after a failed cycle, want it preserved at %d from the prior success", failed.Generated, success.Generated)
+	}
+}
+
+// ===========================================================================
+// Gap-closing batch -- REQ-PROV-02's generation-time path verification,
+// wired into runCycle. Phase 5 (paths.go) built ExtractPaths/VerifyPaths as
+// pure functions with no store access "by design"; Phase 6's own doc
+// comment on NarrativeRow.UnverifiedPaths admitted the wiring was "not
+// among this phase's tasks". No task in 6.x, 8.x or 9.x named this wiring
+// (tasks artifact Risks item 13) -- these tests close that gap directly in
+// the Loop, where NarrativeRow.UnverifiedPaths is actually written.
+// ===========================================================================
+
+// TestGeneratedNarrativeCapturesUnverifiedPaths pins the end-to-end wiring:
+// a successful generation whose text mentions both a resolvable and an
+// unresolvable path persists ONLY the unresolvable one in
+// NarrativeRow.UnverifiedPaths (newline-joined, matching the DDL's stored
+// shape) -- the resolvable path is verified and silently NOT listed,
+// exactly as REQ-PROV-02 and VerifyPaths already specify.
+func TestGeneratedNarrativeCapturesUnverifiedPaths(t *testing.T) {
+	sessionDir := t.TempDir()
+	// ExtractPaths only qualifies a token containing a path separator (see
+	// paths.go's looksLikePath), so the fixtures below deliberately carry a
+	// "/" even though they resolve flat inside sessionDir.
+	if err := os.WriteFile(filepath.Join(sessionDir, "exists.go"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+
+	store := newFakeLoopStore()
+	store.addRecords("proj-a", eligibleUnitRecords("proj-a", "topic/only", 3))
+	store.setSessionDirectory("proj-a", sessionDir)
+
+	provider := &fakeLoopProvider{
+		body: "See `./exists.go` for the working code and `./missing.go` for the removed one.",
+	}
+	loop := NewLoop(store, provider, LoopConfig{})
+
+	if err := loop.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle() = %v, want nil", err)
+	}
+
+	row, ok := store.rowFor("proj-a", "topic/only")
+	if !ok {
+		t.Fatal("expected a stored narrative row for proj-a/topic/only")
+	}
+	if want := "./missing.go"; row.UnverifiedPaths != want {
+		t.Errorf("UnverifiedPaths = %q, want %q (only the unresolvable path, the resolvable one must not appear)",
+			row.UnverifiedPaths, want)
+	}
+}
+
+// TestUnverifiedPathsEmptyWhenProseNamesNoPaths guards the negative case:
+// generated text with no path-like tokens leaves UnverifiedPaths empty, and
+// -- because ExtractPaths finds nothing -- MostRecentSessionDirectory is
+// never even called, so a project with no session history is never
+// penalised for narrative text that never referenced a file.
+func TestUnverifiedPathsEmptyWhenProseNamesNoPaths(t *testing.T) {
+	store := newFakeLoopStore()
+	store.addRecords("proj-a", eligibleUnitRecords("proj-a", "topic/only", 3))
+
+	provider := &fakeLoopProvider{body: "This narrative mentions no files at all."}
+	loop := NewLoop(store, provider, LoopConfig{})
+
+	if err := loop.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle() = %v, want nil", err)
+	}
+
+	row, ok := store.rowFor("proj-a", "topic/only")
+	if !ok {
+		t.Fatal("expected a stored narrative row for proj-a/topic/only")
+	}
+	if row.UnverifiedPaths != "" {
+		t.Errorf("UnverifiedPaths = %q, want \"\" (prose named no paths)", row.UnverifiedPaths)
+	}
+	if n := store.sessionDirCallCountFor("proj-a"); n != 0 {
+		t.Errorf("MostRecentSessionDirectory called %d times for proj-a, want 0 -- no path was ever extracted", n)
+	}
+}
+
+// TestSessionDirectoryResolvedOnceProjectPerCycle pins the query-shape
+// discipline design #4754 §5 holds the whole loop to ("query SHAPE is the
+// real answer... bounded, and does NOT grow with note count"): two units
+// under the SAME project, both mentioning paths, must resolve
+// MostRecentSessionDirectory for that project AT MOST ONCE per cycle, not
+// once per unit.
+func TestSessionDirectoryResolvedOnceProjectPerCycle(t *testing.T) {
+	sessionDir := t.TempDir()
+
+	store := newFakeLoopStore()
+	store.addRecords("proj-a", eligibleUnitRecords("proj-a", "topic/one", 3))
+	store.addRecords("proj-a", eligibleUnitRecords("proj-a", "topic/two", 3))
+	store.setSessionDirectory("proj-a", sessionDir)
+
+	provider := &fakeLoopProvider{body: "Only `./missing.go` is mentioned here."}
+	loop := NewLoop(store, provider, LoopConfig{})
+
+	if err := loop.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle() = %v, want nil", err)
+	}
+
+	if got := store.upsertCount(); got != 2 {
+		t.Fatalf("upsertCount() = %d, want 2 (two distinct units under proj-a)", got)
+	}
+	if n := store.sessionDirCallCountFor("proj-a"); n != 1 {
+		t.Errorf("MostRecentSessionDirectory called %d times for proj-a across the cycle, want exactly 1 (cached per project per cycle)", n)
+	}
+}
+
+// TestSessionDirectoryLookupFailureMarksPathsUnverifiedNotFatal pins the
+// honest-failure-mode: a store error resolving the session directory must
+// NOT fail the unit or the cycle -- it degrades to treating the directory
+// as unknown, so every extracted path is reported unverified (REQ-PROV-02's
+// honesty property: never silently dropped, never silently presented as
+// confirmed) rather than the generation being lost entirely.
+func TestSessionDirectoryLookupFailureMarksPathsUnverifiedNotFatal(t *testing.T) {
+	store := newFakeLoopStore()
+	store.addRecords("proj-a", eligibleUnitRecords("proj-a", "topic/only", 3))
+	store.setSessionDirectoryErr("proj-a", errors.New("simulated session lookup failure"))
+
+	provider := &fakeLoopProvider{body: "Only `some/file.go` is mentioned here."}
+	loop := NewLoop(store, provider, LoopConfig{})
+
+	if err := loop.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle() = %v, want nil -- a session-directory lookup failure must not fail the cycle", err)
+	}
+
+	row, ok := store.rowFor("proj-a", "topic/only")
+	if !ok {
+		t.Fatal("expected a stored narrative row despite the session-directory lookup failure")
+	}
+	if want := "some/file.go"; row.UnverifiedPaths != want {
+		t.Errorf("UnverifiedPaths = %q, want %q (lookup failure degrades to unknown directory, not to skipping the path)",
+			row.UnverifiedPaths, want)
 	}
 }
