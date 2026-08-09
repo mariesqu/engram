@@ -919,13 +919,25 @@ func (a *localStoreAdapter) GetPolicy(project string) (controlapi.Policy, error)
 	return controlapi.Policy(p), err
 }
 
-func (a *localStoreAdapter) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+// ListMemoriesFiltered adapts controlapi.MemoryListOptions onto the two
+// localstore read paths: SearchMemoriesFiltered (FTS) when a query is
+// present, BrowseMemories (recency + paging) otherwise. Both paths share the
+// same localstore.SearchFilter shape for Type/Scope/CreatedFrom/CreatedTo.
+func (a *localStoreAdapter) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
+	filter := localstore.SearchFilter{
+		Type:        opts.Type,
+		Scope:       opts.Scope,
+		CreatedFrom: opts.CreatedFrom,
+		CreatedTo:   opts.CreatedTo,
+		Offset:      opts.Offset,
+	}
+
 	var records []*domain.Record
 	var err error
-	if query != "" {
-		records, _, err = a.store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{})
+	if opts.Query != "" {
+		records, _, err = a.store.SearchMemoriesFiltered(opts.Query, opts.Project, opts.Limit, filter)
 	} else {
-		records, err = a.store.RecentObservations(project, "", limit)
+		records, err = a.store.BrowseMemories(opts.Project, filter, opts.Limit)
 	}
 	if err != nil {
 		return nil, err
@@ -935,6 +947,11 @@ func (a *localStoreAdapter) ListMemories(query, project string, limit int) ([]co
 		out = append(out, recordToSummary(r))
 	}
 	return out, nil
+}
+
+// CountsByProject adapts localstore.Store.CountsByProject to controlapi.Store.
+func (a *localStoreAdapter) CountsByProject() (map[string]int, error) {
+	return a.store.CountsByProject()
 }
 
 // recordToSummary converts a domain.Record to a controlapi.MemorySummary.
@@ -962,6 +979,17 @@ func (a *localStoreAdapter) UpdateMemory(id int64, title, content, typ string) (
 
 func (a *localStoreAdapter) DeleteMemory(id int64) error {
 	return a.store.DeleteMemory(id, a.writerID)
+}
+
+// GetMemory adapts localstore.Store.GetObservation (a direct by-id read,
+// independent of any recency window) to controlapi.Store.
+func (a *localStoreAdapter) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	rec, err := a.store.GetObservation(id)
+	if err != nil {
+		return nil, err
+	}
+	summary := recordToSummary(rec)
+	return &summary, nil
 }
 
 func (a *localStoreAdapter) PurgeProjectLocal(project string) (int, error) {

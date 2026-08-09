@@ -7,7 +7,9 @@
   for (var i = 0; i < links.length; i++) {
     var href = links[i].getAttribute("href");
     // "/ui/" (Status) matches only its exact path; every other tab also
-    // matches its sub-paths (e.g. /ui/memories/5/edit highlights Memories).
+    // matches its sub-paths (e.g. /ui/projects/foo/memories highlights Projects).
+    // The memory edit page (/ui/memories/{id}/edit) is reached via the
+    // Projects drill-in modal and has no owning nav tab, so it highlights none.
     if (href === path || (href !== "/ui/" && path.indexOf(href) === 0)) {
       links[i].classList.add("active");
     }

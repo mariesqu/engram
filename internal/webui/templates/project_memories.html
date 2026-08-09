@@ -1,0 +1,78 @@
+{{/* project-memories-modal is the FULL drill-in modal (backdrop + panel +
+     filter bar + first page of rows). Rendered into #modal-root when a
+     project row on the Projects page is clicked, and again by the "Clear"
+     filter link (a fresh, filter-free render resets the filter form). */}}
+{{define "project-memories-modal"}}
+<div class="modal-backdrop" data-modal-open>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">
+        <div class="modal-header">
+            <h2 id="modal-title">{{.Project}} <span class="badge modal-count">{{.Count}} {{pluralize .Count "memory" "memories"}}</span></h2>
+            <button type="button" class="modal-close" data-modal-close aria-label="Close">&times;</button>
+        </div>
+        <form class="modal-filters"
+              hx-get="/ui/projects/{{.ProjectPath}}/memories/rows"
+              hx-target="#memory-rows-list"
+              hx-swap="innerHTML"
+              hx-trigger="input changed delay:400ms, submit">
+            <input type="text" name="q" value="{{.Query}}" placeholder="Search this project…" class="search-input">
+            <select name="type" class="policy-select">
+                <option value="">any type</option>
+                {{range .TypeOptions}}<option value="{{.}}"{{if eq . $.Type}} selected{{end}}>{{.}}</option>{{end}}
+                {{if .ExtraTypeOption}}<option value="{{.ExtraTypeOption}}" selected>{{.ExtraTypeOption}}</option>{{end}}
+            </select>
+            <select name="scope" class="policy-select">
+                <option value="">any scope</option>
+                <option value="project"{{if eq $.Scope "project"}} selected{{end}}>project</option>
+                <option value="personal"{{if eq $.Scope "personal"}} selected{{end}}>personal</option>
+            </select>
+            <input type="date" name="from" value="{{.From}}" class="date-input" aria-label="Created from">
+            <input type="date" name="to" value="{{.To}}" class="date-input" aria-label="Created to">
+            <button type="submit" class="btn btn-small">Filter</button>
+            <button type="button" class="btn btn-small"
+                    hx-get="/ui/projects/{{.ProjectPath}}/memories"
+                    hx-target="#modal-root"
+                    hx-swap="innerHTML">Clear</button>
+        </form>
+        <div class="modal-body" id="memory-rows-list">
+            {{template "memory-rows" .}}
+        </div>
+    </div>
+</div>
+{{end}}
+
+{{/* memory-rows renders JUST the row batch — reused for (a) the first page
+     embedded in project-memories-modal, (b) a filter-change refetch that
+     swaps the whole #memory-rows-list innerHTML, and (c) a lazy-load page
+     append (triggered when the last row's sentinel intersects the viewport)
+     that swaps in afterend of the current last row. Because it never wraps
+     its own container, all three swap modes work against the same fragment
+     shape. */}}
+{{define "memory-rows"}}
+{{if .Memories}}
+{{range .Memories}}
+<div class="memory-card" id="memory-row-{{.ID}}"
+     {{if and .IsLast $.HasMore}}hx-get="/ui/projects/{{$.ProjectPath}}/memories/rows?{{$.NextPageQuery}}" hx-trigger="intersect once" hx-swap="afterend"{{end}}>
+    <div class="memory-card-head">
+        <span class="memory-card-title">{{.Title}}</span>
+        <span class="badge">{{.Type}}</span>
+        <span class="muted small mono">{{shortDate .CreatedAt}}</span>
+    </div>
+    <p class="memory-card-preview muted">{{truncateContent .Content 280}}</p>
+    <div class="memory-card-actions">
+        <a href="/ui/memories/{{.ID}}/edit" class="btn btn-small">Edit</a>
+        <form method="POST" action="/ui/memories/{{.ID}}/delete" class="inline-form"
+              hx-post="/ui/memories/{{.ID}}/delete"
+              hx-target="closest .memory-card"
+              hx-swap="outerHTML">
+            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+            <button type="submit" class="btn btn-small btn-danger">Delete</button>
+        </form>
+    </div>
+</div>
+{{end}}
+{{else if .Filtered}}
+<p class="muted">No memories match these filters.</p>
+{{else}}
+<p class="muted">No memories yet in this project.</p>
+{{end}}
+{{end}}

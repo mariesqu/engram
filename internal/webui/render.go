@@ -31,6 +31,22 @@ var sharedFuncs = template.FuncMap{
 		}
 		return string(runes[:n]) + "…"
 	},
+	// shortDate trims an RFC3339 timestamp ("2006-01-02T15:04:05Z") down to
+	// just its date portion for compact display in the memory row cards.
+	"shortDate": func(s string) string {
+		if len(s) >= 10 {
+			return s[:10]
+		}
+		return s
+	},
+	// pluralize returns singular when n == 1, plural otherwise — used for the
+	// drill-in modal's "N memory"/"N memories" count badge.
+	"pluralize": func(n int, singular, plural string) string {
+		if n == 1 {
+			return singular
+		}
+		return plural
+	},
 }
 
 // pageTmpl is a parsed (layout + page) template pair for a full HTML page.
@@ -45,7 +61,6 @@ var (
 	statusTmpl     *pageTmpl
 	projectsTmpl   *pageTmpl
 	configTmpl     *pageTmpl
-	memoriesTmpl   *pageTmpl
 	memoryEditTmpl *pageTmpl
 )
 
@@ -73,12 +88,6 @@ func init() {
 		"templates/config.html",
 	)
 
-	// Memories page: layout + memories page.
-	memoriesTmpl = mustParsePage(
-		"templates/layout.html",
-		"templates/memories.html",
-	)
-
 	// Memory edit form page: layout + edit form.
 	memoryEditTmpl = mustParsePage(
 		"templates/layout.html",
@@ -86,13 +95,15 @@ func init() {
 	)
 
 	// Partial template set: all named {{define}} blocks used for HTMX swaps.
-	// This includes status-partial (polled every 3s) and projects-rows
-	// (returned after a policy toggle POST).
+	// This includes status-partial (polled every 3s), projects-rows (returned
+	// after a policy toggle POST), and the project-memories-modal / memory-rows
+	// pair (the drill-in modal shell and its lazily-loaded row batches).
 	var err error
 	partialTmpl, err = template.New("").Funcs(sharedFuncs).ParseFS(
 		TemplatesFS,
 		"templates/status_partial.html",
 		"templates/projects_rows.html",
+		"templates/project_memories.html",
 	)
 	if err != nil {
 		panic("webui: parse partial templates: " + err.Error())

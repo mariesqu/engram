@@ -2,6 +2,7 @@ package webui_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,7 @@ func (m *mockStore) SetPolicy(project string, p controlapi.Policy) error {
 func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 	return controlapi.PolicySynced, nil
 }
-func (m *mockStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *mockStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return nil, nil
 }
 func (m *mockStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -52,6 +53,12 @@ func (m *mockStore) PurgeProjectLocal(project string) (int, error) {
 }
 func (m *mockStore) TombstoneProject(project string) (int, error) {
 	return 0, nil
+}
+func (m *mockStore) CountsByProject() (map[string]int, error) {
+	return nil, nil
+}
+func (m *mockStore) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	return nil, errors.New("memory not found")
 }
 
 // mockConfigStore is a minimal controlapi.ConfigStore for unit tests.
@@ -92,7 +99,7 @@ func (m *recordingStore) SetPolicy(project string, p controlapi.Policy) error {
 func (m *recordingStore) GetPolicy(project string) (controlapi.Policy, error) {
 	return controlapi.PolicySynced, nil
 }
-func (m *recordingStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *recordingStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return nil, nil
 }
 func (m *recordingStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -106,6 +113,12 @@ func (m *recordingStore) PurgeProjectLocal(project string) (int, error) {
 }
 func (m *recordingStore) TombstoneProject(project string) (int, error) {
 	return 0, nil
+}
+func (m *recordingStore) CountsByProject() (map[string]int, error) {
+	return nil, nil
+}
+func (m *recordingStore) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	return nil, errors.New("memory not found")
 }
 
 // newTestServer builds a fresh httptest.Server with a real webui.Mount.
@@ -781,6 +794,88 @@ func TestWebUI_PolicyToggle_POST_Valid_200(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "myproject") {
 		t.Error("response body does not contain the project name")
+	}
+}
+
+// TestWebUI_PolicyToggle_POST_PercentInName_200 is a regression guard for a
+// double-decode bug: a project named "100%off" round-trips through the
+// templates as the URL-escaped path segment "100%25off". net/http already
+// decodes r.URL.Path once (to "100%off") before dispatchUI runs, so an
+// extractor that percent-decodes r.URL.Path AGAIN would try to interpret the
+// literal "%of" as a percent-escape and fail, leaving the handler with an
+// empty project (400). The fix parses from r.URL.EscapedPath() and decodes
+// exactly once, so SetPolicy must receive the project name intact.
+func TestWebUI_PolicyToggle_POST_PercentInName_200(t *testing.T) {
+	const secret = "policy-toggle-percent-tok"
+	projects := []controlapi.ProjectPolicy{
+		{Name: "100%off", Policy: controlapi.PolicySynced},
+	}
+	store := &recordingStore{projects: projects}
+	mux := http.NewServeMux()
+	webui.Mount(mux, webui.WebUIDeps{
+		SyncCtrl:    &mockSyncCtrl{},
+		Store:       store,
+		ConfigStore: &mockConfigStore{},
+		Secret:      secret,
+		Port:        7700,
+		Version:     "test-version",
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	resp := authenticatedPostForm(t, srv, secret, "/ui/projects/100%25off/policy", url.Values{
+		"policy": []string{"local-only"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(store.setPolicyCalls) != 1 {
+		t.Fatalf("want 1 SetPolicy call, got %d", len(store.setPolicyCalls))
+	}
+	if call := store.setPolicyCalls[0]; call.Project != "100%off" {
+		t.Errorf("SetPolicy project = %q, want %q", call.Project, "100%off")
+	}
+}
+
+// TestWebUI_PolicyToggle_POST_SpaceInName_200 proves single-decode still
+// decodes legitimate escapes: a project named "my project" is sent as the
+// escaped path segment "my%20project" and must reach SetPolicy decoded back
+// to "my project".
+func TestWebUI_PolicyToggle_POST_SpaceInName_200(t *testing.T) {
+	const secret = "policy-toggle-space-tok"
+	projects := []controlapi.ProjectPolicy{
+		{Name: "my project", Policy: controlapi.PolicySynced},
+	}
+	store := &recordingStore{projects: projects}
+	mux := http.NewServeMux()
+	webui.Mount(mux, webui.WebUIDeps{
+		SyncCtrl:    &mockSyncCtrl{},
+		Store:       store,
+		ConfigStore: &mockConfigStore{},
+		Secret:      secret,
+		Port:        7700,
+		Version:     "test-version",
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	resp := authenticatedPostForm(t, srv, secret, "/ui/projects/my%20project/policy", url.Values{
+		"policy": []string{"local-only"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(store.setPolicyCalls) != 1 {
+		t.Fatalf("want 1 SetPolicy call, got %d", len(store.setPolicyCalls))
+	}
+	if call := store.setPolicyCalls[0]; call.Project != "my project" {
+		t.Errorf("SetPolicy project = %q, want %q", call.Project, "my project")
 	}
 }
 

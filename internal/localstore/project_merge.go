@@ -1,6 +1,9 @@
 package localstore
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // CountLiveByProject returns the number of live (non-deleted) memory rows for the
 // named project (normalized). Used by the `projects consolidate` dry-run to
@@ -16,6 +19,48 @@ func (s *Store) CountLiveByProject(project string) (int, error) {
 		return 0, fmt.Errorf("CountLiveByProject(%q): %w", project, err)
 	}
 	return n, nil
+}
+
+// CountsByProject returns the number of live (non-deleted) memory rows for
+// EVERY project in one query — a single GROUP BY, not N calls to
+// CountLiveByProject. Used by the web UI projects hub to show a live memory
+// count per project without an O(projects) query fan-out.
+//
+// The map is keyed by LOWER(TRIM(project)) — lowercased and trimmed ONLY, no
+// dash/underscore collapsing — so callers can look up a count regardless of
+// the original casing stored in memories.project (central-pulled projects
+// keep mixed case; see ListProjectsWithPolicy). This intentionally does NOT
+// use the stricter normalizeProject (which also collapses repeated "--"/"__")
+// so the key matches the plain lower+trim lookup the web UI and BrowseMemories
+// both use — normalizeProject is a separate, stricter convention used only by
+// the session-tracking helpers. Counts for case-variant rows of the same
+// project are summed under the single key.
+func (s *Store) CountsByProject() (map[string]int, error) {
+	const q = `
+		SELECT project, COUNT(*)
+		FROM memories
+		WHERE deleted_at IS NULL
+		GROUP BY project`
+
+	rows, err := s.db.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("CountsByProject: query: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int)
+	for rows.Next() {
+		var proj string
+		var n int
+		if err := rows.Scan(&proj, &n); err != nil {
+			return nil, fmt.Errorf("CountsByProject: scan: %w", err)
+		}
+		counts[strings.ToLower(strings.TrimSpace(proj))] += n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("CountsByProject: rows: %w", err)
+	}
+	return counts, nil
 }
 
 // MergeProject renames every local row belonging to project `from` so it lives
