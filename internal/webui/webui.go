@@ -170,7 +170,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		project := extractProjectFromMemoriesPath(r, "/memories/rows")
+		project := extractProjectFromActionPath(r, "/memories/rows")
 		if project == "" {
 			http.Error(w, "project name required", http.StatusBadRequest)
 			return
@@ -182,7 +182,7 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		project := extractProjectFromMemoriesPath(r, "/memories")
+		project := extractProjectFromActionPath(r, "/memories")
 		if project == "" {
 			http.Error(w, "project name required", http.StatusBadRequest)
 			return
@@ -453,19 +453,6 @@ func isProjectDeletePath(path string) bool {
 	return middle != "" && !strings.Contains(middle, "/")
 }
 
-// extractProjectFromDeletePath returns the project name from a
-// /ui/projects/{project}/delete path. Returns "" on any parse error.
-func extractProjectFromDeletePath(path string) string {
-	const prefix = "/ui/projects/"
-	const suffix = "/delete"
-	raw := path[len(prefix) : len(path)-len(suffix)]
-	decoded, err := url.PathUnescape(raw)
-	if err != nil || strings.Contains(decoded, "/") {
-		return ""
-	}
-	return decoded
-}
-
 // isProjectMemoriesRowsPath reports whether path matches
 // /ui/projects/{project}/memories/rows — the lazy-load / filter-refetch
 // endpoint that returns ONLY the row batch (no modal shell). Checked before
@@ -508,18 +495,17 @@ func isProjectMemoriesPath(path string) bool {
 	return middle != "" && !strings.Contains(middle, "/")
 }
 
-// extractProjectFromMemoriesPath returns the project name from a
-// /ui/projects/{project}/memories or /ui/projects/{project}/memories/rows
-// path, given the matching suffix ("/memories" or "/memories/rows"). It reads
-// the RAW, still-percent-encoded path via r.URL.EscapedPath() and unescapes
-// the project segment exactly ONCE. r.URL.Path (used by extractProject and
-// extractProjectFromDeletePath) is already decoded once by net/http, so
-// unescaping THAT again here would double-decode: a project literally named
-// "100%off" round-trips to path segment "100%25off"; r.URL.Path already
-// decodes it back to "100%off", and a second PathUnescape then tries to
-// interpret "%of" as a percent-escape and fails (400). Returns "" on any
-// parse error.
-func extractProjectFromMemoriesPath(r *http.Request, suffix string) string {
+// extractProjectFromActionPath returns the project name from any
+// /ui/projects/{project}/{suffix} action path — suffix is "/policy",
+// "/delete", "/memories", or "/memories/rows". It reads the RAW,
+// still-percent-encoded path via r.URL.EscapedPath() and unescapes the
+// project segment exactly ONCE. r.URL.Path is already decoded once by
+// net/http, so parsing from THAT and unescaping again would double-decode: a
+// project literally named "100%off" round-trips to path segment
+// "100%25off"; r.URL.Path already decodes it back to "100%off", and a second
+// PathUnescape then tries to interpret "%of" as a percent-escape and fails
+// (400). Returns "" on any parse error.
+func extractProjectFromActionPath(r *http.Request, suffix string) string {
 	const prefix = "/ui/projects/"
 	path := r.URL.EscapedPath()
 	if len(path) <= len(prefix)+len(suffix) {
@@ -557,22 +543,6 @@ func isPolicyPath(path string) bool {
 	// otherwise extract "a/b" as the project name).
 	middle := path[len(prefix) : len(path)-len(suffix)]
 	return middle != "" && !strings.Contains(middle, "/")
-}
-
-// extractProject returns the project name from a /ui/projects/{project}/policy
-// path. The segment is percent-DECODED (net/http preserves %2F in paths) so a
-// project name round-trips byte-identically; the store normalizes further
-// (trim/lowercase). A segment that decodes to contain "/" is rejected by
-// returning "" (the handler 404s on empty).
-func extractProject(path string) string {
-	const prefix = "/ui/projects/"
-	const suffix = "/policy"
-	raw := path[len(prefix) : len(path)-len(suffix)]
-	decoded, err := url.PathUnescape(raw)
-	if err != nil || strings.Contains(decoded, "/") {
-		return ""
-	}
-	return decoded
 }
 
 // ── View models ──────────────────────────────────────────────────────────────
@@ -1013,7 +983,7 @@ func buildConfigVM(deps WebUIDeps, sessions *sessionStore, errMsg string, restar
 // It calls Store.SetPolicy with the chosen policy and returns the refreshed
 // projects tbody partial for HTMX swap.
 func handlePolicyPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
-	project := extractProject(r.URL.Path)
+	project := extractProjectFromActionPath(r, "/policy")
 	if project == "" {
 		http.Error(w, "project name required", http.StatusBadRequest)
 		return
@@ -1060,7 +1030,7 @@ func handlePolicyPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, se
 // to central (CentralConnected gates the option). After a successful delete the
 // projects list partial is re-rendered so the HTMX swap shows the updated state.
 func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
-	project := extractProjectFromDeletePath(r.URL.Path)
+	project := extractProjectFromActionPath(r, "/delete")
 	if project == "" {
 		http.Error(w, "project name required", http.StatusBadRequest)
 		return

@@ -797,6 +797,88 @@ func TestWebUI_PolicyToggle_POST_Valid_200(t *testing.T) {
 	}
 }
 
+// TestWebUI_PolicyToggle_POST_PercentInName_200 is a regression guard for a
+// double-decode bug: a project named "100%off" round-trips through the
+// templates as the URL-escaped path segment "100%25off". net/http already
+// decodes r.URL.Path once (to "100%off") before dispatchUI runs, so an
+// extractor that percent-decodes r.URL.Path AGAIN would try to interpret the
+// literal "%of" as a percent-escape and fail, leaving the handler with an
+// empty project (400). The fix parses from r.URL.EscapedPath() and decodes
+// exactly once, so SetPolicy must receive the project name intact.
+func TestWebUI_PolicyToggle_POST_PercentInName_200(t *testing.T) {
+	const secret = "policy-toggle-percent-tok"
+	projects := []controlapi.ProjectPolicy{
+		{Name: "100%off", Policy: controlapi.PolicySynced},
+	}
+	store := &recordingStore{projects: projects}
+	mux := http.NewServeMux()
+	webui.Mount(mux, webui.WebUIDeps{
+		SyncCtrl:    &mockSyncCtrl{},
+		Store:       store,
+		ConfigStore: &mockConfigStore{},
+		Secret:      secret,
+		Port:        7700,
+		Version:     "test-version",
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	resp := authenticatedPostForm(t, srv, secret, "/ui/projects/100%25off/policy", url.Values{
+		"policy": []string{"local-only"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(store.setPolicyCalls) != 1 {
+		t.Fatalf("want 1 SetPolicy call, got %d", len(store.setPolicyCalls))
+	}
+	if call := store.setPolicyCalls[0]; call.Project != "100%off" {
+		t.Errorf("SetPolicy project = %q, want %q", call.Project, "100%off")
+	}
+}
+
+// TestWebUI_PolicyToggle_POST_SpaceInName_200 proves single-decode still
+// decodes legitimate escapes: a project named "my project" is sent as the
+// escaped path segment "my%20project" and must reach SetPolicy decoded back
+// to "my project".
+func TestWebUI_PolicyToggle_POST_SpaceInName_200(t *testing.T) {
+	const secret = "policy-toggle-space-tok"
+	projects := []controlapi.ProjectPolicy{
+		{Name: "my project", Policy: controlapi.PolicySynced},
+	}
+	store := &recordingStore{projects: projects}
+	mux := http.NewServeMux()
+	webui.Mount(mux, webui.WebUIDeps{
+		SyncCtrl:    &mockSyncCtrl{},
+		Store:       store,
+		ConfigStore: &mockConfigStore{},
+		Secret:      secret,
+		Port:        7700,
+		Version:     "test-version",
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	resp := authenticatedPostForm(t, srv, secret, "/ui/projects/my%20project/policy", url.Values{
+		"policy": []string{"local-only"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(store.setPolicyCalls) != 1 {
+		t.Fatalf("want 1 SetPolicy call, got %d", len(store.setPolicyCalls))
+	}
+	if call := store.setPolicyCalls[0]; call.Project != "my project" {
+		t.Errorf("SetPolicy project = %q, want %q", call.Project, "my project")
+	}
+}
+
 // TestWebUI_PolicyToggle_POST_CSRFMissing_403 verifies that a policy toggle POST
 // without CSRF returns 403 and SetPolicy is NOT called.
 func TestWebUI_PolicyToggle_POST_CSRFMissing_403(t *testing.T) {
