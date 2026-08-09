@@ -379,11 +379,6 @@ The `"type": "http"` value matches the Claude Code `.mcp.json` schema; other MCP
 
 The `"type": "http"` config above works well for MCP hosts that support the Streamable HTTP transport natively. But not every client does, and even for the ones that do, hardcoding the bearer token means the config breaks every time the daemon restarts (the token rotates on every start — see "Authentication" above). `engram connect` solves both problems: it is a stdio MCP subcommand that bridges to the resident daemon’s `/mcp` endpoint over HTTP internally, so from the client’s point of view it looks like a normal stdio server.
 
-```bash
-# Prerequisite: a resident daemon already running with --transport http
-./engram daemon --db ~/.engram/memories.db --http --transport http
-```
-
 ```json
 {
   "mcpServers": {
@@ -395,7 +390,18 @@ The `"type": "http"` config above works well for MCP hosts that support the Stre
 }
 ```
 
-Every client gets this same trivial config — no token in sight, no per-client daemon process, no per-client SQLite owner. `engram connect` reads the current token from `daemon.json` at startup, and re-reads it automatically if a request comes back `401` (the daemon restarted and rotated its token mid-session) — the client never sees the rotation. If `engram connect` cannot find a resident daemon, or finds one running without `--transport http`, it exits immediately with a message telling you how to fix it.
+Every client gets this same trivial config — no token in sight, no per-client daemon process, no per-client SQLite owner. `engram connect` reads the current token from `daemon.json` at startup, and re-reads it automatically if a request comes back `401` (the daemon restarted and rotated its token mid-session) — the client never sees the rotation.
+
+No prerequisite daemon needed: if `engram connect` finds no resident daemon running (or finds an unhealthy one), it auto-starts one detached (`engram daemon --db <path> --http --transport http`) and waits up to ~10s for it to become healthy before bridging — the same auto-launch behavior as `engram tray`. The FIRST client to connect spawns the resident daemon; every client after that just finds it already running. This makes the single-resident-daemon topology self-healing for stdio-only clients, which (unlike the tray) can't run a background process on their own to keep the daemon alive.
+
+If you'd rather manage the daemon's lifecycle yourself (or you're scripting/diagnosing and want a fast failure instead of a ~10s wait), pass `--no-autostart`:
+
+```bash
+./engram daemon --db ~/.engram/memories.db --http --transport http &
+./engram connect --db ~/.engram/memories.db --no-autostart   # fails fast if the daemon above isn't up yet
+```
+
+Auto-start only ever ADDS a daemon — it never restarts or kills an existing one. A daemon that IS running but was started *without* `--transport http` is left alone; `engram connect` still exits immediately with a message telling you to restart it with `--transport http`.
 
 **Mode matrix**
 
@@ -568,7 +574,7 @@ $env:ENGRAM_DB = "$env:APPDATA\engram\memories.db"
 
 If the resident daemon is not already running when `engram tray` is invoked, the tray will:
 
-1. Spawn `engram daemon --http --db <path>` as a fully detached background process (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
+1. Spawn `engram daemon --db <path> --http --transport http` as a fully detached background process (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
 2. Wait for `daemon.json` to appear next to the database file.
 3. Poll `GET /api/v1/status` until a valid engram response is received (bounded: 10 s, 500 ms intervals).
 4. Display the tray icon once the daemon is healthy.
@@ -622,7 +628,7 @@ engram daemon   [--db <path>] [--central-url <url>] [--writer-id <id>] [--sync-i
 engram status   [--db <path>]
 engram ui       [--db <path>]
 engram tray     [--db <path>]  (Windows only)
-engram connect  [--db <path>]
+engram connect  [--db <path>] [--no-autostart]
 engram central  connect --url <url> --writer-id <id> [--db <path>]
 engram central  disconnect [--db <path>]
 engram projects list   [--db <path>]
