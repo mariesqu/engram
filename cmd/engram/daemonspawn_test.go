@@ -141,9 +141,10 @@ func TestWaitForHealthyDaemon_ContextCancelled(t *testing.T) {
 }
 
 // TestProbeDaemonHTTP_RealServer is a light integration check that
-// probeDaemonHTTP correctly distinguishes a healthy (200, correct token)
-// response from an unhealthy one, using a real httptest server (no
-// daemon.json involved — probeDaemonHTTP takes port/token directly).
+// probeDaemonHTTP correctly distinguishes a healthy (200, correct token,
+// valid engram status body) response from an unhealthy one, using a real
+// httptest server (no daemon.json involved — probeDaemonHTTP takes
+// port/token directly).
 func TestProbeDaemonHTTP_RealServer(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +152,9 @@ func TestProbeDaemonHTTP_RealServer(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"daemon_version":"test"}`))
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -163,5 +166,38 @@ func TestProbeDaemonHTTP_RealServer(t *testing.T) {
 	}
 	if err := probeDaemonHTTP(port, "wrong-token"); err == nil {
 		t.Error("probeDaemonHTTP with wrong token: want error, got nil")
+	}
+}
+
+// TestProbeDaemonHTTP_RejectsNonEngramBody verifies that a 200 response
+// alone is not trusted: if the port has been reused by an unrelated
+// loopback service that happens to answer 200 with a body that isn't an
+// engram controlapi.Status (missing/empty daemon_version), probeDaemonHTTP
+// must return an error instead of treating it as a healthy engram daemon.
+func TestProbeDaemonHTTP_RejectsNonEngramBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty JSON object", body: `{}`},
+		{name: "unrelated HTML body", body: `<html><body>not engram</body></html>`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tt.body))
+			})
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			port := mustParsePort(t, ts.URL)
+
+			if err := probeDaemonHTTP(port, "any-token"); err == nil {
+				t.Error("probeDaemonHTTP with 200 but non-engram body: want error, got nil")
+			}
+		})
 	}
 }

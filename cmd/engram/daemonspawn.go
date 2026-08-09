@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os/exec"
@@ -109,8 +110,23 @@ func waitForHealthyDaemon(
 // probeDaemonHTTP sends a GET /api/v1/status request and checks for a valid
 // response. It is a lightweight probe that does not read daemon.json — the
 // caller provides port+token (typically from a fresh controlapi.ReadDaemonJSON).
+// A 200 status alone is not enough: a stale daemon.json can record a port
+// that has since been reused by an unrelated loopback service, so the body
+// is decoded as controlapi.Status and must carry a non-empty DaemonVersion
+// before the probe is trusted (mirrors probeDaemon's check in daemon.go).
+//
+// Timeout is 5s, not 2s: /api/v1/status does real per-project work and was
+// measured at ~3s on an 84-project DB before the CountPendingEmbeddings N+1
+// fix — a 2s timeout made this probe falsely report "unhealthy" on a live,
+// healthy daemon, causing 'engram connect' to spawn a doomed duplicate. A
+// dead daemon still fails near-instantly (connection refused), so the
+// ~10s spawn wait budget (daemonSpawnMaxAttempts * daemonSpawnInterval)
+// holds for that case; a daemon that accepts the TCP connection but stalls
+// on the response can cost up to the full 5s per attempt, stretching the
+// worst case to attempts*(interval+timeout) (~110s) — the larger timeout
+// only trades that worst case for correctness on the healthy-but-slow path.
 func probeDaemonHTTP(port int, token string) error {
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	req, err := http.NewRequest(http.MethodGet,
 		fmt.Sprintf("http://127.0.0.1:%d/api/v1/status", port), nil)
 	if err != nil {
@@ -124,6 +140,10 @@ func probeDaemonHTTP(port int, token string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("probe: status %d", resp.StatusCode)
+	}
+	var st controlapi.Status
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil || st.DaemonVersion == "" {
+		return fmt.Errorf("probe: not an engram daemon status response")
 	}
 	return nil
 }
