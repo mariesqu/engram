@@ -514,6 +514,12 @@ func TestMCPBridge_StdinEOF_ExitsCleanly(t *testing.T) {
 // (resolveConnectDBPath matches the daemon's full chain, not status.go's
 // flag > env only — connect needs to find the SAME daemon.json the daemon
 // started with, which the daemon may have resolved from the config file).
+//
+// --no-autostart: this test is about DB path resolution, not auto-start —
+// without it, runConnectCmd would try to spawn a real "daemon" process
+// (os.Executable() resolves to the `go test` binary here) before this
+// assertion is ever reached. See TestEnsureConnectDaemon_* for auto-start
+// coverage via injected seams.
 func TestCLI_Connect_DBFlagWins(t *testing.T) {
 	envDir := t.TempDir()
 	t.Setenv("ENGRAM_DB", filepath.Join(envDir, "env.db"))
@@ -522,7 +528,7 @@ func TestCLI_Connect_DBFlagWins(t *testing.T) {
 	flagDir := t.TempDir()
 	flagDB := filepath.Join(flagDir, "flag.db")
 
-	err := runConnectCmd([]string{"--db", flagDB})
+	err := runConnectCmd([]string{"--db", flagDB, "--no-autostart"})
 	if err == nil {
 		t.Fatal("want error for no daemon, got nil")
 	}
@@ -537,12 +543,13 @@ func TestCLI_Connect_DBFlagWins(t *testing.T) {
 }
 
 // TestCLI_Connect_DBEnvFallback verifies ENGRAM_DB is used when --db is omitted.
+// --no-autostart: see TestCLI_Connect_DBFlagWins for why.
 func TestCLI_Connect_DBEnvFallback(t *testing.T) {
 	envDir := t.TempDir()
 	t.Setenv("ENGRAM_DB", filepath.Join(envDir, "env.db"))
 	t.Setenv("ENGRAM_CONFIG_DIR", t.TempDir()) // empty dir → no config.json
 
-	err := runConnectCmd(nil)
+	err := runConnectCmd([]string{"--no-autostart"})
 	if err == nil {
 		t.Fatal("want error for no daemon, got nil")
 	}
@@ -592,18 +599,146 @@ func TestResolveConnectDBPath_ConfigFileFallback(t *testing.T) {
 	}
 }
 
-// TestCLI_Connect_NoDaemon verifies that `engram connect` returns
-// ErrDaemonNotRunning when no daemon.json is present.
+// TestCLI_Connect_NoDaemon verifies that `engram connect --no-autostart`
+// returns ErrDaemonNotRunning when no daemon.json is present. (Without
+// --no-autostart, connect would instead try to auto-start a daemon — see
+// TestEnsureConnectDaemon_* for that behavior.)
 func TestCLI_Connect_NoDaemon(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	err := runConnectCmd([]string{"--db", dbPath})
+	err := runConnectCmd([]string{"--db", dbPath, "--no-autostart"})
 	if err == nil {
 		t.Fatal("want error for no daemon, got nil")
 	}
 	if !errors.Is(err, ErrDaemonNotRunning) {
 		t.Errorf("want ErrDaemonNotRunning, got: %v", err)
+	}
+}
+
+// TestEnsureConnectDaemon_AlreadyHealthy_NoSpawn verifies that when a
+// healthy daemon.json already exists, ensureConnectDaemonWith returns nil
+// without ever calling spawnFn — auto-start must only ADD a daemon, never
+// touch an existing one.
+func TestEnsureConnectDaemon_AlreadyHealthy_NoSpawn(t *testing.T) {
+	dir := t.TempDir()
+	const token = "already-healthy-token"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	port := mustParsePort(t, ts.URL)
+
+	if err := controlapi.WriteDaemonJSON(dir, token, port, os.Getpid()); err != nil {
+		t.Fatalf("WriteDaemonJSON: %v", err)
+	}
+
+	spawned := false
+	spawnFn := func(exe, dbPath string) error {
+		spawned = true
+		return nil
+	}
+
+	err := ensureConnectDaemonWith(context.Background(), dir, filepath.Join(dir, "test.db"),
+		spawnFn, func(time.Duration) {}, func(p int, tok string) error {
+			if p == port && tok == token {
+				return nil
+			}
+			return errors.New("unexpected probe args")
+		})
+	if err != nil {
+		t.Fatalf("ensureConnectDaemonWith: %v", err)
+	}
+	if spawned {
+		t.Error("spawnFn was called even though a healthy daemon already exists")
+	}
+}
+
+// TestEnsureConnectDaemon_SpawnErrorPropagates verifies that a spawn failure
+// (e.g. exec.Command.Start() failing — binary not found, permission denied,
+// ...) is surfaced as a clear error, without attempting to poll for health.
+func TestEnsureConnectDaemon_SpawnErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+
+	wantErr := errors.New("boom: exec failed")
+	spawnFn := func(exe, dbPath string) error { return wantErr }
+
+	polled := false
+	err := ensureConnectDaemonWith(context.Background(), dir, filepath.Join(dir, "test.db"),
+		spawnFn, func(time.Duration) { polled = true }, func(int, string) error { return nil })
+	if err == nil {
+		t.Fatal("want error when spawnFn fails, got nil")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("want wrapped spawn error, got: %v", err)
+	}
+	if polled {
+		t.Error("sleepFn (poll loop) should never run when spawning itself fails")
+	}
+}
+
+// TestEnsureConnectDaemon_SpawnsAndWaitsForHealthy verifies the full
+// auto-start path: no existing daemon.json, spawnFn "succeeds" (a fake, no
+// real process), and the daemon becomes healthy a few poll attempts later —
+// simulating a real daemon writing daemon.json shortly after being spawned.
+func TestEnsureConnectDaemon_SpawnsAndWaitsForHealthy(t *testing.T) {
+	dir := t.TempDir()
+
+	spawnFn := func(exe, dbPath string) error { return nil }
+
+	var attempts int
+	sleepFn := func(time.Duration) {
+		attempts++
+		if attempts == 2 {
+			if err := controlapi.WriteDaemonJSON(dir, "spawned-token", 55555, os.Getpid()); err != nil {
+				t.Fatalf("WriteDaemonJSON: %v", err)
+			}
+		}
+	}
+	probeFn := func(port int, tok string) error {
+		if port == 55555 && tok == "spawned-token" {
+			return nil
+		}
+		return errors.New("not yet healthy")
+	}
+
+	err := ensureConnectDaemonWith(context.Background(), dir, filepath.Join(dir, "test.db"), spawnFn, sleepFn, probeFn)
+	if err != nil {
+		t.Fatalf("ensureConnectDaemonWith: %v", err)
+	}
+	if attempts < 2 {
+		t.Errorf("attempts=%d, want at least 2 (the loop must retry until the spawned daemon is healthy)", attempts)
+	}
+}
+
+// TestEnsureConnectDaemon_TimesOutWithClearError verifies that when the
+// spawned daemon never becomes healthy (e.g. it lost a concurrent-start race
+// and exited, or crashed), ensureConnectDaemonWith fails with an error
+// naming the spawn command it attempted, rather than hanging forever.
+func TestEnsureConnectDaemon_TimesOutWithClearError(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	spawnFn := func(exe, dbPath string) error { return nil }
+	sleepFn := func(time.Duration) {}
+	probeFn := func(int, string) error { return errors.New("never healthy") }
+
+	err := ensureConnectDaemonWith(context.Background(), dir, dbPath, spawnFn, sleepFn, probeFn)
+	if err == nil {
+		t.Fatal("want timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "did not become healthy") {
+		t.Errorf("error should be a clear timeout message; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), dbPath) {
+		t.Errorf("error should name the db path it tried to spawn with; got: %v", err)
 	}
 }
 

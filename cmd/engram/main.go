@@ -42,7 +42,7 @@ Usage:
   engram status   [--db <path>]
   engram ui       [--db <path>]
   engram tray     [--db <path>]  (Windows only)
-  engram connect  [--db <path>]
+  engram connect  [--db <path>] [--no-autostart]
   engram central  connect --url <url> --writer-id <id> [--db <path>]
   engram central  disconnect [--db <path>]
   engram projects list
@@ -76,8 +76,8 @@ Subcommands:
   daemon    Run the local MCP daemon (stdio MCP by default; use --http for resident control plane).
   status    Print status of the running resident daemon (requires daemon --http).
   ui        Open the web UI in the default browser (requires daemon --http).
-  tray      Start the Windows system tray icon (Windows only; auto-launches daemon --http).
-  connect   Bridge stdio MCP to a resident daemon's HTTP MCP endpoint (requires daemon --http --transport http).
+  tray      Start the Windows system tray icon (Windows only; auto-launches daemon --db <path> --http --transport http).
+  connect   Bridge stdio MCP to a resident daemon's HTTP MCP endpoint (auto-starts one if none is running; --no-autostart disables this).
   central   Connect or disconnect the resident daemon from a central sync server (requires daemon --http).
   projects  List, manage policy, consolidate, or delete per-project data (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).

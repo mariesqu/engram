@@ -3,17 +3,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/windows"
 
 	"github.com/mariesqu/engram/internal/controlapi"
 	"github.com/mariesqu/engram/internal/tray"
@@ -23,9 +19,10 @@ const trayUsage = `Usage: engram tray [--db <path>]
 
 Start the engram Windows system tray icon.
 
-The tray connects to the resident daemon (engram daemon --http). If no daemon
-is running, it automatically starts one in the background and waits for it to
-become healthy before displaying the tray icon.
+The tray connects to the resident daemon (engram daemon --db <path> --http
+--transport http). If no daemon is running, it automatically starts one in
+the background and waits for it to become healthy before displaying the tray
+icon.
 
 Menu items:
   Connected / Disconnected    — current central server status (non-interactive)
@@ -78,6 +75,11 @@ func runTrayCmd(args []string) error {
 
 // ensureDaemon probes the daemon and, if not running, spawns it detached.
 // Returns the TrayConfig (port + token from daemon.json) once the daemon is healthy.
+//
+// Spawn + wait are shared with 'engram connect's auto-start (connect.go's
+// ensureConnectDaemon) via spawnDetachedDaemon / waitForHealthyDaemon
+// (daemonspawn.go) — the two topologies (tray, connect) must behave
+// identically here, so the logic lives in one place.
 func ensureDaemon(dbDir, dbPath string) (tray.TrayConfig, error) {
 	// Try to connect to an existing daemon.
 	if d, err := controlapi.ReadDaemonJSON(dbDir); err == nil {
@@ -92,63 +94,16 @@ func ensureDaemon(dbDir, dbPath string) (tray.TrayConfig, error) {
 		exe = "engram"
 	}
 
-	cmd := exec.Command(exe, "daemon", "--db", dbPath, "--http")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS,
-	}
-	// Do not inherit file handles (no console handle for the tray process).
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
-	if err := cmd.Start(); err != nil {
+	if err := spawnDetachedDaemon(exe, dbPath); err != nil {
 		return tray.TrayConfig{}, fmt.Errorf("auto-launch daemon: %w", err)
 	}
 
-	// Wait for the daemon to write daemon.json and become healthy.
-	// Bounded retry: 10s, 500ms intervals = 20 attempts.
-	const (
-		maxAttempts = 20
-		interval    = 500 * time.Millisecond
-	)
-
-	for i := range maxAttempts {
-		time.Sleep(interval)
-
-		d, err := controlapi.ReadDaemonJSON(dbDir)
-		if err != nil {
-			continue // daemon.json not yet written
-		}
-
-		if probeErr := probeDaemonHTTP(d.Port, d.Token); probeErr == nil {
-			return tray.TrayConfig{Port: d.Port, Token: d.Token, DBDir: dbDir, Version: version}, nil
-		}
-		_ = i
-	}
-
-	return tray.TrayConfig{}, fmt.Errorf("daemon did not become healthy within %s after auto-launch",
-		time.Duration(maxAttempts)*interval)
-}
-
-// probeDaemonHTTP sends a GET /api/v1/status request and checks for a valid response.
-// It is a lightweight probe that does not read daemon.json — the caller provides port+token.
-func probeDaemonHTTP(port int, token string) error {
-	client := &http.Client{Timeout: 2 * time.Second}
-	req, err := http.NewRequest(http.MethodGet,
-		fmt.Sprintf("http://127.0.0.1:%d/api/v1/status", port), nil)
+	d, err := waitForHealthyDaemon(context.Background(), dbDir, daemonSpawnMaxAttempts, daemonSpawnInterval,
+		time.Sleep, func(d controlapi.DaemonJSON) error { return probeDaemonHTTP(d.Port, d.Token) })
 	if err != nil {
-		return err
+		return tray.TrayConfig{}, fmt.Errorf("%w after auto-launch", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("probe: status %d", resp.StatusCode)
-	}
-	return nil
+	return tray.TrayConfig{Port: d.Port, Token: d.Token, DBDir: dbDir, Version: version}, nil
 }
 
 // daemonJsonPath returns the path to daemon.json in a given DB directory.

@@ -2376,6 +2376,142 @@ func TestSchema_V10_CheckConstraint(t *testing.T) {
 	}
 }
 
+// insertMemoryForPending inserts a memories row with explicit control over
+// embedding/embedding_model/deleted_at, for exercising CountPendingEmbeddings.
+// embedding and embeddingModel may be nil; deletedAt may be "" for a live row.
+func insertMemoryForPending(t *testing.T, s *Store, syncID, project string, embedding []byte, embeddingModel, deletedAt string) {
+	t.Helper()
+	var embModel, delAt any
+	if embeddingModel != "" {
+		embModel = embeddingModel
+	}
+	if deletedAt != "" {
+		delAt = deletedAt
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id,
+		   embedding, embedding_model, deleted_at)
+		VALUES (?, 'sess1', 'memory', 'manual', 'title', 'content', ?, 'project', 'w1', ?, ?, ?)
+	`, syncID, project, embedding, embModel, delAt)
+	if err != nil {
+		t.Fatalf("insertMemoryForPending(%q, %q): %v", syncID, project, err)
+	}
+}
+
+// TestCountPendingEmbeddings_MixedPoliciesAndCase verifies that
+// CountPendingEmbeddings (the single-query rewrite of the old per-project
+// COUNT loop) preserves the old loop's semantics exactly:
+//   - only rows belonging to SYNCED projects are counted (local-only/omitted
+//     projects are excluded even though their rows are embedding-pending)
+//   - project matching is CASE-INSENSITIVE (a project's memories rows can
+//     carry mixed case — e.g. "FOO" and "foo" — while SetPolicy always
+//     normalizes the stored policy name to lowercase)
+//   - the pending predicate matches the old loop: embedding IS NULL OR
+//     embedding_model IS NULL OR embedding_model != currentModel
+//   - soft-deleted rows (deleted_at set) are excluded
+func TestCountPendingEmbeddings_MixedPoliciesAndCase(t *testing.T) {
+	st := openTempStore(t)
+	st.SetCentralConfiguredFn(func() bool { return true })
+
+	const currentModel = "model-v2"
+
+	// Synced project "FOO", with a case-variant row "foo" — SetPolicy always
+	// normalizes to lowercase, so the explicit policy row is stored as "foo"
+	// while the memories rows keep their original mixed case.
+	if err := st.SetPolicy("foo", PolicySynced); err != nil {
+		t.Fatalf("SetPolicy(foo): %v", err)
+	}
+	insertMemoryForPending(t, st, "p1-null", "FOO", nil, "", "")                          // pending: NULL embedding
+	insertMemoryForPending(t, st, "p1-stale", "foo", []byte{1, 2, 3}, "old-model", "")    // pending: stale model
+	insertMemoryForPending(t, st, "p1-current", "FOO", []byte{1, 2, 3}, currentModel, "") // NOT pending: current model
+	insertMemoryForPending(t, st, "p1-deleted", "FOO", nil, "", "2024-01-01T00:00:00Z")   // excluded: soft-deleted
+
+	// Local-only project — its NULL-embedding row must NOT be counted.
+	if err := st.SetPolicy("bar", PolicyLocalOnly); err != nil {
+		t.Fatalf("SetPolicy(bar): %v", err)
+	}
+	insertMemoryForPending(t, st, "p2-null", "bar", nil, "", "")
+
+	// Omitted project — its NULL-embedding row must NOT be counted either.
+	if err := st.SetPolicy("baz", PolicyOmitted); err != nil {
+		t.Fatalf("SetPolicy(baz): %v", err)
+	}
+	insertMemoryForPending(t, st, "p3-null", "baz", nil, "", "")
+
+	got, err := st.CountPendingEmbeddings(currentModel)
+	if err != nil {
+		t.Fatalf("CountPendingEmbeddings: %v", err)
+	}
+	// Only p1-null and p1-stale are pending, synced, and live.
+	if got != 2 {
+		t.Errorf("CountPendingEmbeddings = %d; want 2 (p1-null + p1-stale only)", got)
+	}
+}
+
+// TestCountPendingEmbeddings_NoSyncedProjects verifies the zero-synced-projects
+// short-circuit: with only local-only/omitted projects present, the count is 0
+// without needing to run the COUNT query at all.
+func TestCountPendingEmbeddings_NoSyncedProjects(t *testing.T) {
+	st := openTempStore(t)
+	st.SetCentralConfiguredFn(func() bool { return false }) // default = local-only
+
+	insertMemoryForPending(t, st, "p1-null", "only-local", nil, "", "")
+
+	got, err := st.CountPendingEmbeddings("model-v2")
+	if err != nil {
+		t.Fatalf("CountPendingEmbeddings: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("CountPendingEmbeddings = %d; want 0 (no synced projects)", got)
+	}
+}
+
+// TestCountPendingEmbeddings_MultipleSyncedProjects verifies that the
+// placeholder-per-project rewrite binds each synced project's own name to
+// its own placeholder, not the same name repeated for every placeholder
+// (e.g. a bug like `args = append(args, synced[0])` inside the build loop
+// would still pass a single-project test but would undercount here: the
+// second project's rows would never match LOWER(project) IN (...) and the
+// total would come back short). Two distinct synced projects each get
+// pending rows — including a case-variant row that only matches the SECOND
+// project's placeholder — and the assertion is on the summed total across
+// both.
+func TestCountPendingEmbeddings_MultipleSyncedProjects(t *testing.T) {
+	st := openTempStore(t)
+	st.SetCentralConfiguredFn(func() bool { return true })
+
+	const currentModel = "model-v2"
+
+	if err := st.SetPolicy("proj-a", PolicySynced); err != nil {
+		t.Fatalf("SetPolicy(proj-a): %v", err)
+	}
+	if err := st.SetPolicy("proj-b", PolicySynced); err != nil {
+		t.Fatalf("SetPolicy(proj-b): %v", err)
+	}
+
+	// proj-a: two pending rows (one NULL embedding, one case-variant with a
+	// stale model), plus one NOT-pending row that must not be counted.
+	insertMemoryForPending(t, st, "a1-null", "proj-a", nil, "", "")
+	insertMemoryForPending(t, st, "a2-stale", "PROJ-A", []byte{1, 2, 3}, "old-model", "")
+	insertMemoryForPending(t, st, "a3-current", "proj-a", []byte{1, 2, 3}, currentModel, "")
+
+	// proj-b: two pending rows, one of which only matches proj-b's own
+	// placeholder (a case-variant name) — this is what a synced[0]-style
+	// binding bug would fail to count.
+	insertMemoryForPending(t, st, "b1-null", "proj-b", nil, "", "")
+	insertMemoryForPending(t, st, "b2-stale", "PROJ-B", []byte{1, 2, 3}, "old-model", "")
+
+	got, err := st.CountPendingEmbeddings(currentModel)
+	if err != nil {
+		t.Fatalf("CountPendingEmbeddings: %v", err)
+	}
+	// a1-null + a2-stale + b1-null + b2-stale = 4; a3-current is excluded.
+	if got != 4 {
+		t.Errorf("CountPendingEmbeddings = %d; want 4 (2 pending in proj-a + 2 pending in proj-b)", got)
+	}
+}
+
 // Compile-time check: Store must satisfy domain.Reader.
 var _ domain.Reader = (*Store)(nil)
 

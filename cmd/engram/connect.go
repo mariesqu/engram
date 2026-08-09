@@ -19,7 +19,7 @@ import (
 	"github.com/mariesqu/engram/internal/controlapi"
 )
 
-const connectUsage = `Usage: engram connect [--db <path>]
+const connectUsage = `Usage: engram connect [--db <path>] [--no-autostart]
 
 Bridge stdio MCP to the resident daemon's Streamable HTTP MCP endpoint.
 
@@ -36,12 +36,26 @@ restart. A static Authorization header baked into a client's mcp.json would
 break after a restart — "engram connect" re-reads daemon.json on a 401 and
 retries once, so clients never see the rotation.
 
-Requires a resident daemon already running with --http --transport http
-(see 'engram daemon --help'). "engram connect" does not start a daemon.
+If no resident daemon is found running with --http --transport http (see
+'engram daemon --help'), "engram connect" auto-starts one, detached, and
+waits (up to ~10s) for it to become healthy before bridging — the same
+auto-launch behavior as 'engram tray'. This makes stdio-only clients (which
+cannot run a background tray) able to bootstrap the single-resident-daemon
+topology on their own: the FIRST client to connect spawns the daemon, every
+later client just finds it already running. Pass --no-autostart to disable
+this and fail fast instead (e.g. for scripting/diagnostics, or when you
+manage the daemon's lifecycle yourself).
+
+A daemon that IS running but was started WITHOUT --transport http is never
+touched by auto-start (auto-start only ever launches a NEW daemon when none
+is found; it never restarts or kills an existing one) — that case still
+surfaces the existing preflight error naming the remedy.
 
 Flags:
-  --db   Path to the local SQLite database (required; or set ENGRAM_DB, or
-         set in the config file's "db_path" key — same precedence as 'engram daemon')
+  --db             Path to the local SQLite database (required; or set ENGRAM_DB, or
+                   set in the config file's "db_path" key — same precedence as 'engram daemon')
+  --no-autostart   Do not auto-start a resident daemon; fail with the old
+                   "no resident engram daemon found" error instead
 
 On stdin EOF, connect exits 0. On SIGINT/SIGTERM it exits cleanly.
 `
@@ -59,6 +73,8 @@ func runConnectCmd(args []string) error {
 	fs.Usage = func() { fmt.Fprint(fs.Output(), connectUsage) }
 
 	db := fs.String("db", "", "path to local SQLite database (required; or set ENGRAM_DB)")
+	noAutostart := fs.Bool("no-autostart", false,
+		"do not auto-start a resident daemon; fail fast if none is running")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -73,20 +89,88 @@ func runConnectCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	bridge, err := newMCPBridge(daemonDir(dbPath))
-	if err != nil {
-		return err
-	}
+	dir := daemonDir(dbPath)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	if !*noAutostart {
+		if err := ensureConnectDaemon(ctx, dir, dbPath); err != nil {
+			return err
+		}
+	}
+
+	bridge, err := newMCPBridge(dir)
+	if err != nil {
+		return err
+	}
 
 	if err := bridge.preflight(ctx); err != nil {
 		return err
 	}
 
 	return bridge.run(ctx, os.Stdin, os.Stdout)
+}
+
+// ensureConnectDaemon checks whether a healthy resident daemon already
+// serves dir and, if not, spawns one detached and waits for it to become
+// healthy — mirroring tray_windows.go's ensureDaemon (auto-launch is the
+// same behavior for both entry points; see spawnDetachedDaemon /
+// waitForHealthyDaemon in daemonspawn.go). Called before newMCPBridge unless
+// --no-autostart was passed.
+//
+// This is a thin wrapper around ensureConnectDaemonWith that hardcodes the
+// real spawn/sleep/probe implementations; ensureConnectDaemonWith itself
+// takes them as parameters so tests can inject fakes instead of spawning a
+// real process or sleeping in real time (see connect_test.go).
+func ensureConnectDaemon(ctx context.Context, dir, dbPath string) error {
+	return ensureConnectDaemonWith(ctx, dir, dbPath, spawnDetachedDaemon, time.Sleep, probeDaemonHTTP)
+}
+
+// ensureConnectDaemonWith is the testable core of ensureConnectDaemon.
+//
+// This only ever ADDS a daemon; it never touches an existing one. In
+// particular, a daemon that IS running but was started WITHOUT
+// --transport http answers /api/v1/status just fine (the control plane is
+// up) — probeHTTPFn treats it as healthy, so this returns nil without
+// spawning anything, and bridge.preflight's existing 404 error path (in
+// runConnectCmd, below newMCPBridge) is what surfaces that misconfiguration
+// to the user. Auto-start must never restart or kill a running daemon.
+//
+// Concurrent-start races are safe: if two clients race to auto-start at the
+// same time, runDaemonHTTP's single-instance port check (daemon.go) makes
+// the loser exit immediately with "refusing to start a second SQLite
+// owner" — this function does not care which process won, it just keeps
+// polling daemon.json + the probe until SOME daemon (the winner's) is
+// healthy, or times out.
+func ensureConnectDaemonWith(
+	ctx context.Context,
+	dir, dbPath string,
+	spawnFn func(exe, dbPath string) error,
+	sleepFn func(time.Duration),
+	probeHTTPFn func(port int, token string) error,
+) error {
+	if d, err := controlapi.ReadDaemonJSON(dir); err == nil {
+		if probeErr := probeHTTPFn(d.Port, d.Token); probeErr == nil {
+			return nil // already healthy — nothing to do
+		}
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "engram"
+	}
+
+	if err := spawnFn(exe, dbPath); err != nil {
+		return fmt.Errorf("connect: auto-start daemon: %w", err)
+	}
+
+	if _, err := waitForHealthyDaemon(ctx, dir, daemonSpawnMaxAttempts, daemonSpawnInterval,
+		sleepFn, func(d controlapi.DaemonJSON) error { return probeHTTPFn(d.Port, d.Token) }); err != nil {
+		return fmt.Errorf("connect: auto-start: %w after spawning %s daemon --db %s --http --transport http",
+			err, exe, dbPath)
+	}
+	return nil
 }
 
 // resolveConnectDBPath resolves the DB path with the same precedence as
