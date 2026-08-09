@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mariesqu/engram/internal/centralstore"
@@ -364,6 +367,196 @@ func TestAcceptance_ServeE2E(t *testing.T) {
 	}
 }
 
+// ── Real-Postgres proof for the retry/fatal-error classification ──────────────
+//
+// serve_test.go's unit tests exercise shouldRetryOpenErr/retryOpen against
+// HAND-CONSTRUCTED *pgconn.PgError values and fake sleep/openFn seams. That
+// proves the classification logic in isolation, but not that errors.As
+// actually reaches a *pgconn.PgError through the REAL wrap chain pgx produces
+// when a genuine connection attempt fails or later succeeds. These two tests
+// close that gap against the package's real embedded Postgres.
+
+// TestAcceptance_RunServe_WrongPassword_FailsFast proves that a wrong-password
+// DSN against the REAL running embedded Postgres surfaces a genuine
+// *pgconn.PgError (SQLState class 28, invalid_password/invalid_authorization)
+// through pgx's actual wrap chain, and that shouldRetryOpenErr classifies it
+// fatal: runServe must return quickly with a non-nil auth error instead of
+// looping the 5s/60s backoff schedule.
+func TestAcceptance_RunServe_WrongPassword_FailsFast(t *testing.T) {
+	badDSN, err := withWrongPassword(pgDSN)
+	if err != nil {
+		t.Fatalf("withWrongPassword: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	runErr := runServe(ctx, "127.0.0.1:0", badDSN)
+	elapsed := time.Since(start)
+
+	if runErr == nil {
+		t.Fatal("runServe with wrong password: got nil error, want an auth failure")
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runErr, context.Canceled) {
+		t.Fatalf("runServe with wrong password: got %v — looks like it retried until the test's ctx timeout instead of failing fast", runErr)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("runServe with wrong password took %s, want a fast (no-retry) failure well under 5s", elapsed)
+	}
+
+	var pgErr *pgconn.PgError
+	if !errors.As(runErr, &pgErr) {
+		t.Fatalf("runServe with wrong password: error %v does not unwrap to *pgconn.PgError via the real pgx wrap chain", runErr)
+	}
+	if len(pgErr.Code) < 2 || pgErr.Code[:2] != "28" {
+		t.Errorf("runServe with wrong password: PgError.Code = %q, want class 28 (login/authentication failure)", pgErr.Code)
+	}
+}
+
+// tcpProxy is a minimal raw-byte TCP forwarder. It lets
+// TestAcceptance_RetryOpen_RecoversWhenPostgresBecomesReachable simulate
+// "Postgres becomes reachable a moment after the caller starts trying"
+// without paying the cost of starting a second embedded-postgres instance:
+// retryOpen dials a port with NOTHING listening (connection refused —
+// retryable) until the proxy starts and forwards to the REAL embedded
+// Postgres already running for this package.
+type tcpProxy struct {
+	backend string // host:port of the real destination
+}
+
+func (p *tcpProxy) serve(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed — test cleanup
+		}
+		go p.handle(conn)
+	}
+}
+
+func (p *tcpProxy) handle(conn net.Conn) {
+	defer conn.Close()
+	backendConn, err := net.Dial("tcp", p.backend)
+	if err != nil {
+		return
+	}
+	defer backendConn.Close()
+
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(backendConn, conn); done <- struct{}{} }()
+	go func() { io.Copy(conn, backendConn); done <- struct{}{} }()
+	<-done
+}
+
+// TestAcceptance_RetryOpen_RecoversWhenPostgresBecomesReachable proves the
+// end-to-end recovery path this whole retry mechanism exists for: retryOpen
+// starts against an address with NOTHING listening (the exact "laptop
+// booting off-network" shape from the incident that motivated this feature),
+// receives connection-refused errors classified retryable by
+// shouldRetryOpenErr, and recovers into a genuinely working *centralstore.Store
+// once the address becomes reachable a short time later — all within a
+// bounded test runtime via an injected fast sleepFn (NOT the production
+// 5s/60s schedule; that seam is exactly what retryOpen exposes sleepFn for).
+func TestAcceptance_RetryOpen_RecoversWhenPostgresBecomesReachable(t *testing.T) {
+	backendCfg, err := pgconn.ParseConfig(pgDSN)
+	if err != nil {
+		t.Fatalf("parse pgDSN: %v", err)
+	}
+	backend := fmt.Sprintf("%s:%d", backendCfg.Host, backendCfg.Port)
+
+	proxyPort, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+
+	schemaName := schemaFor(t)
+	adminCtx := context.Background()
+	adminPool, err := pgxpool.New(adminCtx, pgDSN)
+	if err != nil {
+		t.Fatalf("pgxpool.New admin: %v", err)
+	}
+	if _, err := adminPool.Exec(adminCtx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName)); err != nil {
+		adminPool.Close()
+		t.Fatalf("DROP SCHEMA: %v", err)
+	}
+	if _, err := adminPool.Exec(adminCtx, fmt.Sprintf("CREATE SCHEMA %q", schemaName)); err != nil {
+		adminPool.Close()
+		t.Fatalf("CREATE SCHEMA: %v", err)
+	}
+	adminPool.Close()
+	t.Cleanup(func() {
+		cleanCtx := context.Background()
+		cleanPool, err := pgxpool.New(cleanCtx, pgDSN)
+		if err != nil {
+			return
+		}
+		defer cleanPool.Close()
+		_, _ = cleanPool.Exec(cleanCtx, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schemaName))
+	})
+
+	// dsn points at the proxy port (nothing listening there yet), reusing the
+	// real credentials/database against the isolated schema above.
+	dsn := fmt.Sprintf(
+		"host=127.0.0.1 port=%d user=%s password=%s dbname=%s sslmode=disable options='-c search_path=%s,public'",
+		proxyPort, backendCfg.User, backendCfg.Password, backendCfg.Database, schemaName,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var store *centralstore.Store
+	openFn := func() error {
+		s, err := centralstore.Open(ctx, dsn)
+		if err != nil {
+			return err
+		}
+		store = s
+		return nil
+	}
+
+	// Short, test-only backoff — the production 5s/60s schedule would blow the
+	// test's runtime budget several times over.
+	fastSleep := func(ctx context.Context, _ time.Duration) error {
+		return sleepCtx(ctx, 50*time.Millisecond)
+	}
+
+	// Start the proxy AFTER a short delay so retryOpen's first several
+	// attempts observe "connection refused", proving the recovery path (not
+	// just first-try success).
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
+		if err != nil {
+			t.Errorf("proxy listen: %v", err)
+			return
+		}
+		t.Cleanup(func() { ln.Close() })
+		(&tcpProxy{backend: backend}).serve(ln)
+	}()
+
+	start := time.Now()
+	err = retryOpen(ctx, openFn, fastSleep, shouldRetryOpenErr, noopLogf)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("retryOpen did not recover: %v (elapsed %s)", err, elapsed)
+	}
+	if store == nil {
+		t.Fatal("retryOpen succeeded but produced a nil store")
+	}
+	defer store.Close()
+
+	if elapsed > 8*time.Second {
+		t.Errorf("retryOpen took %s to recover, want well under the 10s test budget", elapsed)
+	}
+
+	// Prove the recovered store is genuinely usable, not just "no error".
+	if _, err := store.WriterKey(ctx, "nonexistent-writer-recovery-check"); !errors.Is(err, centralstore.ErrWriterKeyNotFound) {
+		t.Errorf("WriterKey sanity check on recovered store: got %v, want ErrWriterKeyNotFound (store not genuinely connected)", err)
+	}
+}
+
 // ── Utility helpers ───────────────────────────────────────────────────────────
 
 // freePort returns a random free TCP port on localhost.
@@ -438,4 +631,31 @@ func withSearchPath(dsn, schema string) (string, error) {
 		return u.String(), nil
 	}
 	return fmt.Sprintf("%s options='-c search_path=%s,public'", dsn, schema), nil
+}
+
+// dsnPasswordRE matches a keyword/value-form "password=<value>" token so
+// withWrongPassword can swap it without disturbing the rest of the DSN.
+var dsnPasswordRE = regexp.MustCompile(`password=\S+`)
+
+// withWrongPassword returns dsn with its password replaced by an incorrect
+// value, leaving host/port/dbname/sslmode untouched. Used by
+// TestAcceptance_RunServe_WrongPassword_FailsFast to reach a REAL
+// *pgconn.PgError auth failure through pgx's actual wrap chain — a
+// hand-constructed *pgconn.PgError (as used in serve_test.go's unit tests)
+// cannot prove errors.As unwraps what pgx genuinely produces in production.
+// Mirrors withSearchPath's URL-form vs keyword/value-form handling.
+func withWrongPassword(dsn string) (string, error) {
+	const wrongPassword = "definitely-wrong-password"
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", fmt.Errorf("withWrongPassword: parse DSN: %w", err)
+		}
+		u.User = url.UserPassword(u.User.Username(), wrongPassword)
+		return u.String(), nil
+	}
+	if dsnPasswordRE.MatchString(dsn) {
+		return dsnPasswordRE.ReplaceAllString(dsn, "password="+wrongPassword), nil
+	}
+	return fmt.Sprintf("%s password=%s", dsn, wrongPassword), nil
 }
