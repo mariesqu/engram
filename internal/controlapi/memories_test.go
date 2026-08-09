@@ -8,14 +8,15 @@ import (
 	"github.com/mariesqu/engram/internal/controlapi"
 )
 
-// memoriesStore extends mockStore with ListMemories for the memories handler tests.
+// memoriesStore extends mockStore with ListMemoriesFiltered for the memories
+// handler tests.
 type memoriesStore struct {
 	mockStore
 	memories []controlapi.MemorySummary
 	memErr   error
 }
 
-func (m *memoriesStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *memoriesStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return m.memories, m.memErr
 }
 func (m *memoriesStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -25,15 +26,16 @@ func (m *memoriesStore) DeleteMemory(id int64) error {
 	return m.memErr
 }
 
-// captureMemoriesStore is a mock that lets tests capture calls to ListMemories.
+// captureMemoriesStore is a mock that lets tests capture calls to
+// ListMemoriesFiltered.
 type captureMemoriesStore struct {
 	mockStore
-	onListMemories func(query, project string, limit int) ([]controlapi.MemorySummary, error)
+	onListMemories func(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error)
 }
 
-func (m *captureMemoriesStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *captureMemoriesStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	if m.onListMemories != nil {
-		return m.onListMemories(query, project, limit)
+		return m.onListMemories(opts)
 	}
 	return nil, nil
 }
@@ -126,10 +128,10 @@ func TestHandleMemories_MethodNotAllowed(t *testing.T) {
 }
 
 func TestHandleMemories_SearchParam(t *testing.T) {
-	var capturedQuery string
+	var captured controlapi.MemoryListOptions
 	store := &captureMemoriesStore{
-		onListMemories: func(query, project string, limit int) ([]controlapi.MemorySummary, error) {
-			capturedQuery = query
+		onListMemories: func(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
+			captured = opts
 			return nil, nil
 		},
 	}
@@ -140,8 +142,73 @@ func TestHandleMemories_SearchParam(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
 	}
-	if capturedQuery != "auth bug" {
-		t.Errorf("query: got %q, want %q", capturedQuery, "auth bug")
+	if captured.Query != "auth bug" {
+		t.Errorf("query: got %q, want %q", captured.Query, "auth bug")
+	}
+}
+
+// TestHandleMemories_ExtendedFilterParams verifies that type, scope, from,
+// to, and offset query params are all forwarded onto MemoryListOptions.
+func TestHandleMemories_ExtendedFilterParams(t *testing.T) {
+	var captured controlapi.MemoryListOptions
+	store := &captureMemoriesStore{
+		onListMemories: func(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
+			captured = opts
+			return nil, nil
+		},
+	}
+	_, ts := newTestServer(t, "tok", store, &mockSyncCtrl{}, &mockCfgStore{})
+
+	resp := get(t, ts, "/api/v1/memories?project=proj-a&type=decision&scope=project&from=2024-01-01&to=2024-01-31&offset=10", authHeader("tok"))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	if captured.Project != "proj-a" {
+		t.Errorf("Project = %q, want proj-a", captured.Project)
+	}
+	if captured.Type != "decision" {
+		t.Errorf("Type = %q, want decision", captured.Type)
+	}
+	if captured.Scope != "project" {
+		t.Errorf("Scope = %q, want project", captured.Scope)
+	}
+	if captured.Offset != 10 {
+		t.Errorf("Offset = %d, want 10", captured.Offset)
+	}
+	if captured.CreatedFrom.IsZero() {
+		t.Error("CreatedFrom should be set from ?from=2024-01-01")
+	}
+	if captured.CreatedTo.IsZero() {
+		t.Error("CreatedTo should be set from ?to=2024-01-31")
+	}
+	if !captured.CreatedTo.After(captured.CreatedFrom) {
+		t.Error("CreatedTo should be after CreatedFrom")
+	}
+}
+
+// TestHandleMemories_BackwardCompatible verifies the original q/project/limit
+// contract still works unchanged when no new params are supplied.
+func TestHandleMemories_BackwardCompatible(t *testing.T) {
+	var captured controlapi.MemoryListOptions
+	store := &captureMemoriesStore{
+		onListMemories: func(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
+			captured = opts
+			return nil, nil
+		},
+	}
+	_, ts := newTestServer(t, "tok", store, &mockSyncCtrl{}, &mockCfgStore{})
+
+	resp := get(t, ts, "/api/v1/memories?q=hello&project=proj-x&limit=25", authHeader("tok"))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	if captured.Query != "hello" || captured.Project != "proj-x" || captured.Limit != 25 {
+		t.Errorf("got %+v, want Query=hello Project=proj-x Limit=25", captured)
+	}
+	if captured.Type != "" || captured.Scope != "" || captured.Offset != 0 {
+		t.Errorf("unset new fields should default to zero values, got %+v", captured)
 	}
 }
 

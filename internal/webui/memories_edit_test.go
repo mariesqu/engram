@@ -164,7 +164,7 @@ func readRespBody(t *testing.T, resp *http.Response) string {
 // ── DELETE tests ─────────────────────────────────────────────────────────────
 
 // TestWebUI_MemoryDelete_POST_WithCSRF verifies that a POST with a valid CSRF
-// token returns 303 and redirects to /ui/memories.
+// token returns 303 and redirects to /ui/projects.
 func TestWebUI_MemoryDelete_POST_WithCSRF(t *testing.T) {
 	const secret = "del-tok"
 	memories := []controlapi.MemorySummary{
@@ -182,8 +182,8 @@ func TestWebUI_MemoryDelete_POST_WithCSRF(t *testing.T) {
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Errorf("want 303 on successful delete, got %d", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "/ui/memories" {
-		t.Errorf("Location = %q, want %q", loc, "/ui/memories")
+	if loc := resp.Header.Get("Location"); loc != "/ui/projects" {
+		t.Errorf("Location = %q, want %q", loc, "/ui/projects")
 	}
 }
 
@@ -270,6 +270,31 @@ func TestWebUI_MemoryEdit_GET_ShowsForm(t *testing.T) {
 	}
 }
 
+// TestWebUI_MemoryEdit_GET_FoundBeyondNewest200 verifies that the edit route
+// finds a memory via Store.GetMemory even when it sits far outside the
+// newest-200 window the OLD findMemoryByID helper searched
+// (ListMemoriesFiltered(Limit:200)) — a memory at position 250 would 404
+// under the old logic but must be reachable directly by id now (M2).
+func TestWebUI_MemoryEdit_GET_FoundBeyondNewest200(t *testing.T) {
+	const secret = "edit-beyond200-tok"
+	memories := make([]controlapi.MemorySummary, 250)
+	for i := range memories {
+		memories[i] = controlapi.MemorySummary{
+			ID:      int64(i + 1),
+			Title:   fmt.Sprintf("memory %d", i+1),
+			Type:    "manual",
+			Content: "content",
+		}
+	}
+	srv := newEditTestServer(t, secret, memories, nil, nil)
+
+	body := authenticatedGet(t, srv, secret, "/ui/memories/250/edit")
+
+	if !strings.Contains(body, "memory 250") {
+		t.Error("edit route should find a memory outside the newest-200 window via Store.GetMemory")
+	}
+}
+
 // TestWebUI_MemoryEdit_GET_NotFound verifies that GET for an unknown ID returns 404.
 func TestWebUI_MemoryEdit_GET_NotFound(t *testing.T) {
 	const secret = "edit-404-tok"
@@ -308,7 +333,7 @@ func TestWebUI_MemoryEdit_GET_NoSession(t *testing.T) {
 // ── EDIT POST tests ───────────────────────────────────────────────────────────
 
 // TestWebUI_MemoryEdit_POST_WithCSRF verifies that a valid POST to the edit
-// route returns 303 redirect to /ui/memories.
+// route returns 303 redirect to /ui/projects.
 func TestWebUI_MemoryEdit_POST_WithCSRF(t *testing.T) {
 	const secret = "edit-post-tok"
 	memories := []controlapi.MemorySummary{
@@ -330,8 +355,8 @@ func TestWebUI_MemoryEdit_POST_WithCSRF(t *testing.T) {
 		body := readRespBody(t, resp)
 		t.Errorf("want 303 on edit, got %d — body: %s", resp.StatusCode, body)
 	}
-	if loc := resp.Header.Get("Location"); loc != "/ui/memories" {
-		t.Errorf("Location = %q, want /ui/memories", loc)
+	if loc := resp.Header.Get("Location"); loc != "/ui/projects" {
+		t.Errorf("Location = %q, want /ui/projects", loc)
 	}
 }
 

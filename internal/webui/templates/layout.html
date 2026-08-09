@@ -13,6 +13,8 @@
     <script src="/ui/static/htmx.min.js"></script>
     <!-- Active-tab highlighter (progressive enhancement; CSP script-src 'self'). -->
     <script src="/ui/static/nav-active.js" defer></script>
+    <!-- Project drill-in modal close behavior (Escape / backdrop / × button). -->
+    <script src="/ui/static/modal.js" defer></script>
 </head>
 <body>
 <div class="page">
@@ -22,7 +24,6 @@
         <nav>
             <a href="/ui/">Status</a>
             <a href="/ui/projects">Projects</a>
-            <a href="/ui/memories">Memories</a>
         </nav>
     </header>
     <main>
@@ -30,5 +31,9 @@
     </main>
     <footer>engram daemon {{.DaemonVersion}}</footer>
 </div>
+<!-- Project drill-in modal target. Empty by default; the projects page swaps
+     the project-memories-modal partial into this container via htmx, and
+     modal.js clears it on close (Escape / backdrop click / × button). -->
+<div id="modal-root"></div>
 </body>
 </html>{{end}}

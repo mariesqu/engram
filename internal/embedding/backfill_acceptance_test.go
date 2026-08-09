@@ -277,7 +277,7 @@ func (a *acceptanceStoreAdapter) GetPolicy(project string) (controlapi.Policy, e
 
 // Memory/project-purge methods are unused by the backfill acceptance test;
 // stubbed to satisfy the grown controlapi.Store interface.
-func (a *acceptanceStoreAdapter) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (a *acceptanceStoreAdapter) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return nil, nil
 }
 func (a *acceptanceStoreAdapter) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -286,6 +286,12 @@ func (a *acceptanceStoreAdapter) UpdateMemory(id int64, title, content, typ stri
 func (a *acceptanceStoreAdapter) DeleteMemory(id int64) error             { return nil }
 func (a *acceptanceStoreAdapter) PurgeProjectLocal(p string) (int, error) { return 0, nil }
 func (a *acceptanceStoreAdapter) TombstoneProject(p string) (int, error)  { return 0, nil }
+func (a *acceptanceStoreAdapter) CountsByProject() (map[string]int, error) {
+	return nil, nil
+}
+func (a *acceptanceStoreAdapter) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	return nil, nil
+}
 
 type noopCfgStore struct{}
 

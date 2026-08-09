@@ -102,6 +102,58 @@ func TestWebUI_ProjectDelete_Local_CallsPurge(t *testing.T) {
 	}
 }
 
+// TestWebUI_ProjectDelete_PercentInName_CallsPurge is a regression guard for a
+// double-decode bug: a project named "100%off" round-trips through the
+// templates as the URL-escaped path segment "100%25off". net/http already
+// decodes r.URL.Path once (to "100%off") before dispatchUI runs, so an
+// extractor that percent-decodes r.URL.Path AGAIN would try to interpret the
+// literal "%of" as a percent-escape and fail, leaving the handler with an
+// empty project (400). The fix parses from r.URL.EscapedPath() and decodes
+// exactly once, so PurgeProjectLocal must receive the project name intact.
+func TestWebUI_ProjectDelete_PercentInName_CallsPurge(t *testing.T) {
+	const secret = "proj-del-percent"
+	store := &projectDeleteStore{mockStore: mockStore{projects: []controlapi.ProjectPolicy{}}}
+	srv := newProjectDeleteServer(t, secret, store)
+	client, tok := authenticatedClient(t, srv, secret)
+
+	resp := postForm(t, client, fmt.Sprintf("%s/ui/projects/100%%25off/delete", srv.URL), url.Values{
+		"csrf_token": {tok},
+		"scope":      {"local"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	if len(store.purgeCalls) != 1 || store.purgeCalls[0] != "100%off" {
+		t.Errorf("PurgeProjectLocal calls = %v; want [100%%off]", store.purgeCalls)
+	}
+}
+
+// TestWebUI_ProjectDelete_SpaceInName_CallsPurge proves single-decode still
+// decodes legitimate escapes: a project named "my project" is sent as the
+// escaped path segment "my%20project" and must reach PurgeProjectLocal
+// decoded back to "my project".
+func TestWebUI_ProjectDelete_SpaceInName_CallsPurge(t *testing.T) {
+	const secret = "proj-del-space"
+	store := &projectDeleteStore{mockStore: mockStore{projects: []controlapi.ProjectPolicy{}}}
+	srv := newProjectDeleteServer(t, secret, store)
+	client, tok := authenticatedClient(t, srv, secret)
+
+	resp := postForm(t, client, fmt.Sprintf("%s/ui/projects/my%%20project/delete", srv.URL), url.Values{
+		"csrf_token": {tok},
+		"scope":      {"local"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	if len(store.purgeCalls) != 1 || store.purgeCalls[0] != "my project" {
+		t.Errorf("PurgeProjectLocal calls = %v; want [my project]", store.purgeCalls)
+	}
+}
+
 // TestWebUI_ProjectDelete_BadScope verifies an unknown scope is rejected with 400
 // and touches no store method.
 func TestWebUI_ProjectDelete_BadScope(t *testing.T) {

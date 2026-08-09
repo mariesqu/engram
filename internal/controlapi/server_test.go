@@ -43,7 +43,7 @@ func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 	return controlapi.PolicySynced, m.err
 }
 
-func (m *mockStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *mockStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return nil, m.err
 }
 func (m *mockStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -57,6 +57,12 @@ func (m *mockStore) PurgeProjectLocal(project string) (int, error) {
 }
 func (m *mockStore) TombstoneProject(project string) (int, error) {
 	return 0, m.err
+}
+func (m *mockStore) CountsByProject() (map[string]int, error) {
+	return nil, m.err
+}
+func (m *mockStore) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	return nil, m.err
 }
 
 // mockSyncCtrl implements controlapi.SyncController for tests.

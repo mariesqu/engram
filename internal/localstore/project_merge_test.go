@@ -76,6 +76,72 @@ func TestMergeProject_TopicCollision_TargetWins(t *testing.T) {
 	}
 }
 
+// TestCountsByProject_GroupsLiveRowsPerProject verifies that CountsByProject
+// returns one entry per project with the live (non-deleted) row count, and
+// that soft-deleted rows are excluded.
+func TestCountsByProject_GroupsLiveRowsPerProject(t *testing.T) {
+	s := openTempStore(t)
+	addTestObservation(t, s, "cbp-1", "c1", "proj-x")
+	addTestObservation(t, s, "cbp-2", "c2", "proj-x")
+	addTestObservation(t, s, "cbp-3", "c3", "proj-y")
+	del := addTestObservation(t, s, "cbp-4", "c4", "proj-y")
+	if err := s.DeleteMemory(del.ID, "w1"); err != nil {
+		t.Fatalf("DeleteMemory: %v", err)
+	}
+
+	counts, err := s.CountsByProject()
+	if err != nil {
+		t.Fatalf("CountsByProject: %v", err)
+	}
+	if counts["proj-x"] != 2 {
+		t.Errorf("proj-x count = %d, want 2", counts["proj-x"])
+	}
+	if counts["proj-y"] != 1 {
+		t.Errorf("proj-y count = %d, want 1 (one soft-deleted)", counts["proj-y"])
+	}
+}
+
+// TestCountsByProject_NormalizesCaseVariants verifies that projects differing
+// only by case are summed under a single normalized (lowercase) key.
+func TestCountsByProject_NormalizesCaseVariants(t *testing.T) {
+	s := openTempStore(t)
+	addTestObservation(t, s, "cbp-case-1", "c1", "MixedCase")
+	addTestObservation(t, s, "cbp-case-2", "c2", "mixedcase")
+
+	counts, err := s.CountsByProject()
+	if err != nil {
+		t.Fatalf("CountsByProject: %v", err)
+	}
+	if counts["mixedcase"] != 2 {
+		t.Errorf("normalized count = %d, want 2 (case variants summed)", counts["mixedcase"])
+	}
+}
+
+// TestCountsByProject_NoDashCollapsing verifies the count map is keyed by
+// LOWER(TRIM(project)) only — matching the webui lookup (strings.ToLower +
+// strings.TrimSpace) — and does NOT collapse repeated dashes/underscores the
+// way the (unrelated) normalizeProject session helper does.
+//
+// Uses seedObservation (a raw INSERT) rather than addTestObservation —
+// AddObservation itself runs normalizeProject on the way in, which would
+// collapse "proj--double" to "proj-double" before it ever reached the
+// memories table, defeating the point of this test.
+func TestCountsByProject_NoDashCollapsing(t *testing.T) {
+	s := openTempStore(t)
+	seedObservation(t, s, "cbp-dash", "dashed", "c1", "proj--double", "manual", "project")
+
+	counts, err := s.CountsByProject()
+	if err != nil {
+		t.Fatalf("CountsByProject: %v", err)
+	}
+	if counts["proj--double"] != 1 {
+		t.Errorf("counts[%q] = %d, want 1 (key must not be dash-collapsed)", "proj--double", counts["proj--double"])
+	}
+	if _, collapsed := counts["proj-double"]; collapsed {
+		t.Error("CountsByProject key must not collapse repeated dashes into a separate key")
+	}
+}
+
 // TestMergeProject_DedupsPolicyAndCursor verifies that when BOTH source and
 // target already have a policy row (and a pull cursor), the target row wins and
 // the source row is removed — no UNIQUE/PK conflict.

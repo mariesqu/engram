@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mariesqu/engram/internal/domain"
 )
@@ -33,6 +34,45 @@ type SearchFilter struct {
 	// Mode is additive — all existing callers that do not set Mode get the
 	// identical FTS results they received before this field was added.
 	Mode string
+
+	// CreatedFrom/CreatedTo optionally bound m.created_at (inclusive on both
+	// ends). The zero time.Time disables the corresponding bound. Both fields
+	// are additive — existing callers that leave them zero see byte-identical
+	// results to before these fields were added.
+	//
+	// CAVEAT: honored by the FTS path (mode "" / "fts", including the FTS
+	// half of "hybrid") but NOT by the semantic vector scan (SelectVectors) —
+	// a "semantic" search, or the cosine half of a "hybrid" search, ignores
+	// these bounds entirely. See SearchMemoriesFiltered's filter-semantics
+	// doc block for the full breakdown.
+	CreatedFrom time.Time
+	CreatedTo   time.Time
+
+	// Offset skips the first Offset matching rows before LIMIT is applied —
+	// used for the web UI's paged "load more" browsing. Zero (the default)
+	// changes nothing versus before this field was added. Negative values are
+	// treated as zero by callers that construct SQL from this filter.
+	//
+	// CAVEAT: only honored by the FTS path (mode "" / "fts"). "semantic" and
+	// "hybrid" modes ignore Offset entirely — neither paginates.
+	Offset int
+}
+
+// dateRangeSQL appends CreatedFrom/CreatedTo predicates (if set) to a WHERE
+// clause being built for the given column expression (e.g. "m.created_at" or
+// "created_at"), returning the updated query string and args. datetime(...)
+// wraps both sides so the comparison is robust to the exact stored text
+// format (SQLite's datetime() normalizes common ISO8601/SQL date-time forms).
+func dateRangeSQL(q string, args []any, column string, f SearchFilter) (string, []any) {
+	if !f.CreatedFrom.IsZero() {
+		q += "\n  AND datetime(" + column + ") >= datetime(?)"
+		args = append(args, f.CreatedFrom.UTC().Format(time.RFC3339))
+	}
+	if !f.CreatedTo.IsZero() {
+		q += "\n  AND datetime(" + column + ") <= datetime(?)"
+		args = append(args, f.CreatedTo.UTC().Format(time.RFC3339))
+	}
+	return q, args
 }
 
 // SearchDegradation records why a semantic/hybrid search fell back to FTS.
@@ -53,6 +93,16 @@ type SearchDegradation struct {
 //   - limit:   defaults to 10; max is not enforced here (caller is responsible)
 //   - mode:    "" or "fts" → FTS only (byte-identical to before); "semantic" →
 //     cosine only; "hybrid" → FTS + cosine → RRF(k=60); unknown → fts
+//
+// CAVEAT — mode="semantic"/"hybrid" and f.CreatedFrom/CreatedTo/f.Offset:
+// the cosine candidate set (SelectVectors) does NOT apply CreatedFrom,
+// CreatedTo, or Offset at all — those bounds are silently ignored on the
+// semantic side. In "hybrid" mode the FTS half of the RRF fusion DOES honor
+// CreatedFrom/CreatedTo, but the cosine half does not, so a hybrid result can
+// still include rows outside the requested date range via the cosine path.
+// f.Offset is entirely unused by both "semantic" and "hybrid" — there is no
+// paging on either path; only mode="" / "fts" (runFTS) applies Offset. Only
+// mode="" and "fts" honor all three fields exactly as documented above.
 //
 // FTS injection prevention: the query string is passed through sanitizeFTS
 // (wraps each token in double-quotes) before reaching the FTS5 engine.
@@ -110,9 +160,14 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			q += "\n  AND m.topic_key = ?"
 			args = append(args, f.TopicKey)
 		}
+		q, args = dateRangeSQL(q, args, "m.created_at", f)
 
-		q += "\nORDER BY fts.rank\nLIMIT ?"
-		args = append(args, limit)
+		offset := f.Offset
+		if offset < 0 {
+			offset = 0
+		}
+		q += "\nORDER BY fts.rank\nLIMIT ? OFFSET ?"
+		args = append(args, limit, offset)
 
 		rows, err := s.db.Query(q, args...)
 		if err != nil {
@@ -231,6 +286,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			q += "\n  AND m.topic_key = ?"
 			args = append(args, f.TopicKey)
 		}
+		q, args = dateRangeSQL(q, args, "m.created_at", f)
 		q += "\nORDER BY fts.rank\nLIMIT ?"
 		args = append(args, limit*2)
 		rows, err := s.db.Query(q, args...)
@@ -424,6 +480,78 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.
 		r, err := scanRecordWithIDFromRows(rows)
 		if err != nil {
 			return nil, fmt.Errorf("RecentObservations scan: %w", err)
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// BrowseMemories returns live (non-deleted) memories ordered by
+// created_at DESC, id DESC — the "no query" browse path used by the web UI's
+// project drill-in modal. Unlike RecentObservations (project+scope only, no
+// pagination), BrowseMemories additionally filters on f.Type, f.Scope,
+// f.TopicKey, f.CreatedFrom/CreatedTo and supports offset-based paging via
+// f.Offset, so the modal can lazily load pages of a project's memories under
+// arbitrary filter combinations. limit <= 0 defaults to 20; negative offset is
+// treated as 0.
+//
+// The project filter matches by LOWER(TRIM(project)) ONLY — mirroring the FTS
+// path in SearchMemoriesFiltered — NOT the stricter normalizeProject (which
+// also collapses repeated "--"/"__"). Using normalizeProject here would
+// compare a collapsed query value against the UN-collapsed value stored in
+// memories.project, silently dropping matches for any project name that
+// happens to contain doubled separators.
+func (s *Store) BrowseMemories(project string, f SearchFilter, limit int) ([]*domain.Record, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	project = strings.ToLower(strings.TrimSpace(project))
+
+	q := `
+		SELECT id, sync_id, session_id, entity_type, type, title, content,
+		       project, scope, version, writer_id, last_write_mutation_id,
+		       topic_key, status, parent_sync_id,
+		       created_at, updated_at, deleted_at
+		FROM memories
+		WHERE deleted_at IS NULL`
+	args := []any{}
+
+	if project != "" {
+		q += "\n  AND LOWER(project) = ?"
+		args = append(args, project)
+	}
+	if f.Type != "" {
+		q += "\n  AND type = ?"
+		args = append(args, f.Type)
+	}
+	if f.Scope != "" {
+		q += "\n  AND scope = ?"
+		args = append(args, strings.ToLower(strings.TrimSpace(f.Scope)))
+	}
+	if f.TopicKey != "" {
+		q += "\n  AND topic_key = ?"
+		args = append(args, f.TopicKey)
+	}
+	q, args = dateRangeSQL(q, args, "created_at", f)
+
+	q += "\nORDER BY datetime(created_at) DESC, id DESC\nLIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("BrowseMemories: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*domain.Record
+	for rows.Next() {
+		r, err := scanRecordWithIDFromRows(rows)
+		if err != nil {
+			return nil, fmt.Errorf("BrowseMemories scan: %w", err)
 		}
 		results = append(results, r)
 	}

@@ -284,7 +284,7 @@ All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-
 | `GET`    | `/api/v1/projects`                         | List of projects with their effective policy           |
 | `PUT`    | `/api/v1/projects/{project}/policy`        | Set the sync policy for a project                      |
 | `DELETE` | `/api/v1/projects/{project}?scope=local\|purge-all` | Delete a project locally or propagate deletions via tombstones |
-| `GET`    | `/api/v1/memories`                         | List/search memories (`q`, `project`, `limit` params) |
+| `GET`    | `/api/v1/memories`                         | List/search memories (`q`, `project`, `type`, `scope`, `from`, `to`, `offset`, `limit` params — `from`/`to` are `YYYY-MM-DD` dates bounding `created_at`, inclusive) |
 | `PUT`    | `/api/v1/memories/{id}`                    | Edit a memory in place (`title`, `content`, `type`)   |
 | `DELETE` | `/api/v1/memories/{id}`                    | Soft-delete a memory by numeric ID                     |
 | `POST`   | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
@@ -522,9 +522,12 @@ engram ui --db ~/.engram/memories.db
 |------|---------|------|
 | `/ui/` | **Status page** — central connected state, last sync result (pushed/pulled counts, error), daemon version. Auto-refreshes every 3 s via HTMX polling. | session cookie |
 | `/ui/status` | **Status partial** — HTMX polling fragment (no full page wrapper). | session cookie |
-| `/ui/projects` | **Projects** — table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`) and a per-row policy selector; includes per-row delete (local or purge-all). | session cookie |
-| `/ui/memories` | **Memories** — browse or search the full memory corpus; per-row edit and delete buttons. Accepts `q` (search query) and `project` (filter) query params. | session cookie |
+| `/ui/projects` | **Projects** — the single browse hub: a table of all known projects with their effective policy badge (`synced`, `local-only`, `omitted`), a live memory count per project, and a per-row policy selector; includes per-row delete (local or purge-all). Clicking a project name opens the drill-in modal below instead of navigating to a separate page. | session cookie |
+| `/ui/projects/{project}/memories` | **Project memories modal** (HTMX partial, not a standalone page) — the full drill-in modal: filter bar (text search, type, scope, created-from/to dates) plus the first page of that project's memories, lazily paged. | session cookie |
+| `/ui/projects/{project}/memories/rows` | **Project memories rows** (HTMX partial) — just a batch of memory rows, used both for filter-change refetches (`offset=0`) and for lazy-load page appends (`offset=N`, triggered when the last loaded row scrolls into view). | session cookie |
 | `/ui/config` | **Configuration** — editable `sync_interval`; `central_url` and `writer_key` shown read-only (managed via the connect/disconnect actions on the Status page). | session cookie |
+
+There is no standalone Memories page — Projects is the only browse surface, and every project's memories are reached by drilling into its modal.
 
 ### Mutating actions (PR-④b)
 
@@ -534,8 +537,8 @@ All mutating actions (POST) require both a valid session cookie **and** a CSRF d
 |--------|-------|-------|
 | Change project policy | `POST /ui/projects/{name}/policy` | Calls `Store.SetPolicy`; returns refreshed projects rows via HTMX swap. |
 | Delete project | `POST /ui/projects/{name}/delete` | Form field `scope`: `local` (hard-delete local data, set policy to omitted) or `purge-all` (tombstone all memories so deletions propagate via sync). `unshare` is CLI-only (requires a DSN). Returns refreshed projects rows. |
-| Edit memory | `GET /ui/memories/{id}/edit` / `POST /ui/memories/{id}/edit` | GET renders the edit form pre-populated with the existing title, content, and type. POST applies the change and redirects to `/ui/memories`. |
-| Delete memory | `POST /ui/memories/{id}/delete` | Soft-deletes the memory and redirects to `/ui/memories`. |
+| Edit memory | `GET /ui/memories/{id}/edit` / `POST /ui/memories/{id}/edit` | GET renders the edit form pre-populated with the existing title, content, and type. POST applies the change and redirects to `/ui/projects`. |
+| Delete memory | `POST /ui/memories/{id}/delete` | Soft-deletes the memory and redirects to `/ui/projects`. |
 | Update sync interval | `POST /ui/config` | Validates Go duration server-side; returns updated config form. Shows restart-required notice when applicable. |
 | Trigger sync now | `POST /ui/sync` | Calls `SyncController.TriggerNow`; button hidden/disabled when central is not connected. Returns status partial. |
 | Disconnect from central | `POST /ui/disconnect` | Calls `SyncController.Disconnect`; includes HTMX confirm dialog. Returns status partial. |
@@ -882,7 +885,7 @@ You can also browse and search visually in the web UI. Start it with:
 engram ui
 ```
 
-Then click the **Memories** tab (`/ui/memories`). The page has a search form and lists every memory with edit and delete buttons next to each row.
+Then go to the **Projects** tab (`/ui/projects`) and click a project name — it opens a drill-in modal with a filter bar (text search, type, scope, date range) and a lazily-loaded list of that project's memories, with edit and delete buttons next to each row.
 
 ### Editing a memory
 
@@ -906,7 +909,7 @@ engram memories delete 42
 
 Note: `--yes` is accepted for forward compatibility, but deletion is currently immediate and non-interactive — no confirmation prompt exists yet, with or without the flag.
 
-In the web UI: click **Delete** on any row in the Memories tab. The list refreshes immediately.
+In the web UI: open the project's drill-in modal from the Projects tab and click **Delete** on any row.
 
 ### Deleting a whole project
 
