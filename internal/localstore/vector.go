@@ -113,6 +113,14 @@ type VectorRow = vectorRow
 // project and filter.Type/Scope predicates mirror the FTS path so the cosine
 // scan is scoped the same way as a keyword search.
 //
+// CAVEAT: filter.CreatedFrom, filter.CreatedTo, and filter.Offset are NOT
+// applied here — the semantic/hybrid path scans and ranks ALL matching live
+// vectors before any date bound or paging would be meaningful to apply, and
+// no caller currently needs date/offset-bounded semantic search. A caller
+// that sets those fields on a "semantic" or "hybrid" mode SearchMemoriesFiltered
+// call gets them silently ignored on this path (see the filter-semantics note
+// on SearchMemoriesFiltered).
+//
 // dims must match the configured provider's Dimensions(). Passing 0 skips all
 // rows (returns nil, nil) — safe when NoopProvider is active.
 func SelectVectors(db *sql.DB, project string, filter SearchFilter, dims int) ([]vectorRow, error) {

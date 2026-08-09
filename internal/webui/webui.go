@@ -53,16 +53,24 @@ type WebUIDeps struct {
 //
 // Route table:
 //
-//	GET  /ui/                              → full status page (session required)
-//	GET  /ui/status                        → HTMX partial status fragment (cookie required, polled every 3s)
-//	GET  /ui/projects                      → projects list with policy toggles (cookie required)
-//	GET  /ui/config                        → config form page (cookie required)
-//	POST /ui/projects/{project}/policy     → policy toggle (session + CSRF + Origin)
-//	POST /ui/config                        → update sync_interval (session + CSRF + Origin)
-//	POST /ui/sync                          → trigger sync now (session + CSRF + Origin)
-//	POST /ui/connect                       → connect to central (session + CSRF + Origin)
-//	POST /ui/disconnect                    → disconnect from central (session + CSRF + Origin)
-//	GET  /ui/static/…                      → embedded static assets (no auth)
+//	GET  /ui/                                    → full status page (session required)
+//	GET  /ui/status                              → HTMX partial status fragment (cookie required, polled every 3s)
+//	GET  /ui/projects                            → projects list with policy toggles + memory counts (cookie required)
+//	GET  /ui/projects/{project}/memories         → drill-in modal shell + first page of memories (cookie required)
+//	GET  /ui/projects/{project}/memories/rows    → memory row batch: filter refetch (offset=0) or lazy-load page append (cookie required)
+//	GET  /ui/memories/{id}/edit                  → memory edit form page (cookie required)
+//	GET  /ui/config                              → config form page (cookie required)
+//	POST /ui/projects/{project}/policy           → policy toggle (session + CSRF + Origin)
+//	POST /ui/memories/{id}/edit                  → save memory edit, redirects to /ui/projects (session + CSRF + Origin)
+//	POST /ui/memories/{id}/delete                → delete memory, redirects to /ui/projects (session + CSRF + Origin)
+//	POST /ui/config                              → update sync_interval (session + CSRF + Origin)
+//	POST /ui/sync                                → trigger sync now (session + CSRF + Origin)
+//	POST /ui/connect                             → connect to central (session + CSRF + Origin)
+//	POST /ui/disconnect                          → disconnect from central (session + CSRF + Origin)
+//	GET  /ui/static/…                            → embedded static assets (no auth)
+//
+// There is no standalone "Memories" browse page — Projects is the single hub;
+// clicking a project opens the drill-in modal above.
 //
 // Token exchange (runs before session guard):
 //
@@ -157,12 +165,29 @@ func dispatchUI(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions
 		}
 		handleProjectsPage(w, r, deps, sessions)
 
-	case r.URL.Path == "/ui/memories":
+	case isProjectMemoriesRowsPath(r.URL.Path):
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		handleMemoriesPage(w, r, deps, sessions)
+		project := extractProjectFromMemoriesPath(r, "/memories/rows")
+		if project == "" {
+			http.Error(w, "project name required", http.StatusBadRequest)
+			return
+		}
+		handleProjectMemoriesRows(w, r, deps, sessions, project)
+
+	case isProjectMemoriesPath(r.URL.Path):
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		project := extractProjectFromMemoriesPath(r, "/memories")
+		if project == "" {
+			http.Error(w, "project name required", http.StatusBadRequest)
+			return
+		}
+		handleProjectMemoriesModal(w, r, deps, sessions, project)
 
 	case isMemoryDeletePath(r.URL.Path):
 		if r.Method != http.MethodPost {
@@ -299,7 +324,15 @@ func extractMemoryID(path, suffix string) (int64, bool) {
 }
 
 // handleMemoryDeletePost handles POST /ui/memories/{id}/delete.
-// On success it redirects to /ui/memories. On 404 it returns 404.
+//
+// Non-htmx callers (plain form POST, JS disabled) get the historic 303
+// redirect to /ui/projects. htmx callers (identified by the HX-Request
+// header, sent automatically by every htmx-issued request) instead get a
+// 200 with an empty body — the row's own hx-swap="outerHTML" then removes
+// just that row from the drill-in modal, preserving the modal and its
+// active filters instead of discarding both on every delete.
+//
+// On 404 it returns 404 regardless of caller type.
 func handleMemoryDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, id int64) {
 	if err := deps.Store.DeleteMemory(id); err != nil {
 		if isStoreNotFound(err) {
@@ -309,24 +342,27 @@ func handleMemoryDeletePost(w http.ResponseWriter, r *http.Request, deps WebUIDe
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/ui/memories", http.StatusSeeOther)
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Redirect(w, r, "/ui/projects", http.StatusSeeOther)
 }
 
 // handleMemoryEditGet handles GET /ui/memories/{id}/edit.
-// Fetches the existing memory and renders the edit form.
+// Fetches the existing memory and renders the edit form. Uses Store.GetMemory
+// — a direct by-id lookup, not windowed by recency — so a memory outside the
+// newest N rows is still reachable here (see controlapi.Store.GetMemory).
 func handleMemoryEditGet(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, sessions *sessionStore, id int64) {
-	memories, err := deps.Store.ListMemories("", "", 200)
+	found, err := deps.Store.GetMemory(id)
 	if err != nil {
+		if isStoreNotFound(err) {
+			http.Error(w, "memory not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
-	}
-	// Find the specific memory by id.
-	var found *controlapi.MemorySummary
-	for i := range memories {
-		if memories[i].ID == id {
-			found = &memories[i]
-			break
-		}
 	}
 	if found == nil {
 		http.Error(w, "memory not found", http.StatusNotFound)
@@ -341,7 +377,8 @@ func handleMemoryEditGet(w http.ResponseWriter, _ *http.Request, deps WebUIDeps,
 }
 
 // handleMemoryEditPost handles POST /ui/memories/{id}/edit.
-// Applies the edit and redirects to /ui/memories on success.
+// Applies the edit and redirects to /ui/projects on success (the projects
+// hub is the single browse surface — there is no standalone memories page).
 func handleMemoryEditPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore, id int64) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
@@ -354,13 +391,9 @@ func handleMemoryEditPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps
 
 	if title == "" || content == "" {
 		// Re-render the form with an error.
-		memories, _ := deps.Store.ListMemories("", "", 200)
 		var mem controlapi.MemorySummary
-		for _, m := range memories {
-			if m.ID == id {
-				mem = m
-				break
-			}
+		if found, ferr := deps.Store.GetMemory(id); ferr == nil && found != nil {
+			mem = *found
 		}
 		vm := memoryEditViewModel{
 			DaemonVersion: deps.Version,
@@ -388,7 +421,7 @@ func handleMemoryEditPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/ui/memories", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/projects", http.StatusSeeOther)
 }
 
 // isStoreNotFound reports whether an error from the store layer indicates a
@@ -425,6 +458,76 @@ func isProjectDeletePath(path string) bool {
 func extractProjectFromDeletePath(path string) string {
 	const prefix = "/ui/projects/"
 	const suffix = "/delete"
+	raw := path[len(prefix) : len(path)-len(suffix)]
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || strings.Contains(decoded, "/") {
+		return ""
+	}
+	return decoded
+}
+
+// isProjectMemoriesRowsPath reports whether path matches
+// /ui/projects/{project}/memories/rows — the lazy-load / filter-refetch
+// endpoint that returns ONLY the row batch (no modal shell). Checked before
+// isProjectMemoriesPath in dispatchUI's switch, though the two suffixes
+// ("/memories/rows" vs "/memories") are mutually exclusive so the order does
+// not actually matter.
+func isProjectMemoriesRowsPath(path string) bool {
+	const prefix = "/ui/projects/"
+	const suffix = "/memories/rows"
+	if len(path) <= len(prefix)+len(suffix) {
+		return false
+	}
+	if path[:len(prefix)] != prefix {
+		return false
+	}
+	if path[len(path)-len(suffix):] != suffix {
+		return false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	return middle != "" && !strings.Contains(middle, "/")
+}
+
+// isProjectMemoriesPath reports whether path matches
+// /ui/projects/{project}/memories (the full drill-in modal shell — NOT
+// .../memories/rows, which isProjectMemoriesRowsPath matches instead since
+// its suffix check requires the path to end in exactly "/memories").
+func isProjectMemoriesPath(path string) bool {
+	const prefix = "/ui/projects/"
+	const suffix = "/memories"
+	if len(path) <= len(prefix)+len(suffix) {
+		return false
+	}
+	if path[:len(prefix)] != prefix {
+		return false
+	}
+	if path[len(path)-len(suffix):] != suffix {
+		return false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	return middle != "" && !strings.Contains(middle, "/")
+}
+
+// extractProjectFromMemoriesPath returns the project name from a
+// /ui/projects/{project}/memories or /ui/projects/{project}/memories/rows
+// path, given the matching suffix ("/memories" or "/memories/rows"). It reads
+// the RAW, still-percent-encoded path via r.URL.EscapedPath() and unescapes
+// the project segment exactly ONCE. r.URL.Path (used by extractProject and
+// extractProjectFromDeletePath) is already decoded once by net/http, so
+// unescaping THAT again here would double-decode: a project literally named
+// "100%off" round-trips to path segment "100%25off"; r.URL.Path already
+// decodes it back to "100%off", and a second PathUnescape then tries to
+// interpret "%of" as a percent-escape and fails (400). Returns "" on any
+// parse error.
+func extractProjectFromMemoriesPath(r *http.Request, suffix string) string {
+	const prefix = "/ui/projects/"
+	path := r.URL.EscapedPath()
+	if len(path) <= len(prefix)+len(suffix) {
+		return ""
+	}
+	if path[:len(prefix)] != prefix || path[len(path)-len(suffix):] != suffix {
+		return ""
+	}
 	raw := path[len(prefix) : len(path)-len(suffix)]
 	decoded, err := url.PathUnescape(raw)
 	if err != nil || strings.Contains(decoded, "/") {
@@ -501,11 +604,18 @@ type statusViewModel struct {
 
 // projectRow is one project plus whether it also exists in central. RemoteKnown
 // is false when the daemon is disconnected (we can't tell), so the template shows
-// nothing rather than a misleading "local only".
+// nothing rather than a misleading "local only". MemoryCount is the project's
+// live memory count, drawn from a single bulk CountsByProject query (not one
+// query per project) — see buildProjectRows. PathEscaped is the url.PathEscape
+// of Name, used in every hx-get/hx-post/action URL the templates build for this
+// row — html/template does NOT URL-normalize hx-* attribute values, so a raw
+// Name containing "%" or "#" would corrupt or truncate the request path.
 type projectRow struct {
 	controlapi.ProjectPolicy
 	InRemote    bool
 	RemoteKnown bool
+	MemoryCount int
+	PathEscaped string
 }
 
 // projectsViewModel is the template data for the projects page.
@@ -527,14 +637,63 @@ type configViewModel struct {
 	CSRFToken       string
 }
 
-// memoriesViewModel is the template data for the memories browse page.
-type memoriesViewModel struct {
+// memoryTypeOptions is the fixed type vocabulary offered by the drill-in
+// modal's type filter <select> — mirrors the datalist in memory_edit.html so
+// the filter and the editor agree on the same set of conventional types.
+var memoryTypeOptions = []string{
+	"decision", "bugfix", "architecture", "discovery",
+	"pattern", "config", "preference", "manual", "session_summary",
+}
+
+// projectMemoriesPageSize is the number of memory rows fetched per page for
+// the drill-in modal's lazy "load more" scroll.
+const projectMemoriesPageSize = 30
+
+// memoryRowVM decorates a MemorySummary with the one bit of layout metadata
+// the memory-rows template needs: whether this is the last row in the
+// current batch (and therefore, when HasMore is true, the row that carries
+// the lazy-load "revealed" trigger for the next page).
+type memoryRowVM struct {
+	controlapi.MemorySummary
+	IsLast bool
+}
+
+// projectMemoriesViewModel is the template data shared by BOTH the full
+// drill-in modal shell ("project-memories-modal") and the rows-only partial
+// ("memory-rows") — the latter is rendered directly from this same struct
+// when only a page of rows (not the whole modal) is requested.
+type projectMemoriesViewModel struct {
 	DaemonVersion string
-	Memories      []controlapi.MemorySummary
-	Query         string // current search query (echoed for form)
-	Project       string // current project filter (echoed for form)
-	Searched      bool   // true when a query was submitted (vs first load)
-	CSRFToken     string // needed for delete/edit forms
+	Project       string // display name, HTML-escaped by the template as usual
+	ProjectPath   string // path-escaped project name, for building further hx-get URLs
+	Count         int    // total live memory count for the project (unfiltered)
+
+	// Echoed filter state so the filter bar (and the "load more" link's query
+	// string) carry the currently active filters forward.
+	Query string
+	Type  string
+	Scope string
+	From  string // yyyy-mm-dd or ""
+	To    string // yyyy-mm-dd or ""
+
+	TypeOptions []string
+	// ExtraTypeOption holds the active Type value when it is NOT already one
+	// of TypeOptions (e.g. a legacy or hand-typed type value on the edit
+	// form). The template renders it as an extra, pre-selected <option> so
+	// the active filter is visibly represented and preserved across
+	// requests instead of silently falling back to "any type". Empty when
+	// Type is unset or already covered by TypeOptions.
+	ExtraTypeOption string
+
+	Memories []memoryRowVM
+	Filtered bool // true when any filter is active — selects the empty-state message
+	HasMore  bool
+	// NextPageQuery is the fully-built query string (q=&type=&...&offset=N)
+	// for the lazy-load "revealed" trigger on the last row. Empty when
+	// HasMore is false.
+	NextPageQuery string
+
+	CSRFToken string
 }
 
 // memoryEditViewModel is the template data for the memory edit form page.
@@ -596,18 +755,25 @@ func handleProjectsPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, 
 	renderPage(w, projectsTmpl, vm)
 }
 
-// buildProjectRows lists local projects with their effective policy and annotates
-// each with whether central also has it. Best-effort: a nil or erroring
-// RemoteProjects (daemon disconnected from central) leaves RemoteKnown=false, so
-// the template shows no remote marker rather than a misleading one. The project
-// name is matched case-insensitively (central-pulled names keep their case).
-// Returns the rows plus whether central was reachable (remoteKnown) — the latter
+// buildProjectRows lists local projects with their effective policy, live
+// memory count, and whether central also has it. Best-effort: a nil or
+// erroring RemoteProjects (daemon disconnected from central) leaves
+// RemoteKnown=false, so the template shows no remote marker rather than a
+// misleading one. A failing CountsByProject is likewise non-fatal — the
+// count column simply shows 0 rather than failing the whole page. The
+// project name is matched case-insensitively (central-pulled names keep
+// their case; CountsByProject/ListProjectsWithPolicy agree on this). Returns
+// the rows plus whether central was reachable (remoteKnown) — the latter
 // gates the "unshare" delete scope, which needs a live central connection.
 func buildProjectRows(deps WebUIDeps, r *http.Request) ([]projectRow, bool, error) {
 	projects, err := deps.Store.ListProjectsWithPolicy()
 	if err != nil {
 		return nil, false, err
 	}
+
+	// Single bulk query for ALL projects' counts — not one CountLiveByProject
+	// call per row. A failure here is non-fatal (counts just show 0).
+	counts, _ := deps.Store.CountsByProject()
 
 	var remoteSet map[string]bool
 	remoteKnown := false
@@ -627,6 +793,8 @@ func buildProjectRows(deps WebUIDeps, r *http.Request) ([]projectRow, bool, erro
 			ProjectPolicy: p,
 			RemoteKnown:   remoteKnown,
 			InRemote:      remoteKnown && remoteSet[strings.ToLower(strings.TrimSpace(p.Name))],
+			MemoryCount:   counts[strings.ToLower(strings.TrimSpace(p.Name))],
+			PathEscaped:   url.PathEscape(p.Name),
 		})
 	}
 	return rows, remoteKnown, nil
@@ -637,28 +805,181 @@ func handleConfigPage(w http.ResponseWriter, _ *http.Request, deps WebUIDeps, se
 	renderPage(w, configTmpl, vm)
 }
 
-func handleMemoriesPage(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
-	q := r.URL.Query()
-	query := q.Get("q")
-	project := q.Get("project")
-	// "searched" is true any time the form was submitted (q or project param present).
-	searched := query != "" || project != ""
-
-	memories, err := deps.Store.ListMemories(query, project, 50)
+// handleProjectMemoriesModal handles GET /ui/projects/{project}/memories —
+// returns the FULL drill-in modal shell (backdrop + panel + filter bar +
+// first page of rows), for the initial hx-swap when a project row is
+// clicked, and for the filter bar's "Clear" link (a fresh, filter-free
+// render, which also resets the filter form's own input values).
+func handleProjectMemoriesModal(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore, project string) {
+	// includeCount=true: the modal shell's header badge needs the project's
+	// live memory count.
+	vm, err := buildProjectMemoriesVM(r, deps, sessions, project, 0, true)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	renderPartial(w, "project-memories-modal", vm)
+}
 
-	vm := memoriesViewModel{
-		DaemonVersion: deps.Version,
-		Memories:      memories,
-		Query:         query,
-		Project:       project,
-		Searched:      searched,
-		CSRFToken:     sessions.csrfToken(),
+// handleProjectMemoriesRows handles GET /ui/projects/{project}/memories/rows
+// — returns ONLY the row batch (no modal chrome). It serves two distinct
+// htmx flows against the SAME endpoint, distinguished by the caller's own
+// hx-target/hx-swap: the filter bar re-fetches offset=0 with hx-swap="innerHTML"
+// on #memory-rows-list (replacing the whole list), while a row's own
+// lazy-load trigger requests the next offset with hx-swap="afterend"
+// (appending after itself).
+func handleProjectMemoriesRows(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore, project string) {
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	// includeCount=false: the rows-only fragment never renders the header
+	// badge, so a CountsByProject query on every keystroke/lazy-load page
+	// would be wasted work — see buildProjectMemoriesVM.
+	vm, err := buildProjectMemoriesVM(r, deps, sessions, project, offset, false)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
-	renderPage(w, memoriesTmpl, vm)
+	// A lazy-load page (offset > 0) that comes back empty means the
+	// previous page was already the last one — the "revealed"/"intersect"
+	// sentinel row over-fetched past the end. Returning the normal
+	// empty-state text ("No memories yet…"/"No memories match…") here would
+	// APPEND that paragraph after the already-rendered rows, which reads as
+	// a bug. An offset=0 refetch (filter change) still gets the real
+	// empty-state message.
+	if offset > 0 && len(vm.Memories) == 0 {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	renderPartial(w, "memory-rows", vm)
+}
+
+// buildProjectMemoriesVM parses the filter query params shared by both drill-in
+// modal routes, fetches one page (projectMemoriesPageSize) of matching
+// memories starting at offset, and assembles the shared view model. It
+// over-fetches by one row to detect HasMore without a second COUNT query,
+// then trims back down to the page size before rendering.
+//
+// includeCount gates the CountsByProject query: the header badge it feeds is
+// only rendered by the modal-shell fragment ("project-memories-modal"), never
+// by the rows-only fragment ("memory-rows") — so handleProjectMemoriesRows
+// (called on every filter keystroke and every lazy-load page) passes false to
+// skip a query whose result would never be displayed.
+func buildProjectMemoriesVM(r *http.Request, deps WebUIDeps, sessions *sessionStore, project string, offset int, includeCount bool) (projectMemoriesViewModel, error) {
+	q := r.URL.Query()
+	query := q.Get("q")
+	typ := q.Get("type")
+	scope := q.Get("scope")
+	fromStr := q.Get("from")
+	toStr := q.Get("to")
+
+	opts := controlapi.MemoryListOptions{
+		Query:   query,
+		Project: project,
+		Type:    typ,
+		Scope:   scope,
+		Limit:   projectMemoriesPageSize + 1,
+		Offset:  offset,
+	}
+	if fromStr != "" {
+		if t, err := time.Parse("2006-01-02", fromStr); err == nil {
+			opts.CreatedFrom = t
+		}
+	}
+	if toStr != "" {
+		if t, err := time.Parse("2006-01-02", toStr); err == nil {
+			opts.CreatedTo = controlapi.InclusiveDayEnd(t)
+		}
+	}
+
+	memories, err := deps.Store.ListMemoriesFiltered(opts)
+	if err != nil {
+		return projectMemoriesViewModel{}, err
+	}
+
+	hasMore := len(memories) > projectMemoriesPageSize
+	if hasMore {
+		memories = memories[:projectMemoriesPageSize]
+	}
+
+	rows := make([]memoryRowVM, len(memories))
+	for i, m := range memories {
+		rows[i] = memoryRowVM{MemorySummary: m}
+	}
+	if len(rows) > 0 {
+		rows[len(rows)-1].IsLast = true
+	}
+
+	// Total live count for the project (unfiltered) — the header badge always
+	// shows the project's real size, not the filtered result count. Best
+	// effort: a failure here leaves Count at 0 rather than failing the request.
+	// Only computed when includeCount is set (the modal-shell route) — see the
+	// doc comment above.
+	count := 0
+	if includeCount {
+		if counts, cerr := deps.Store.CountsByProject(); cerr == nil {
+			count = counts[strings.ToLower(strings.TrimSpace(project))]
+		}
+	}
+
+	// ExtraTypeOption: when the active type filter isn't one of the known
+	// memoryTypeOptions, surface it as an extra pre-selected <option> so the
+	// filter bar doesn't silently show "any type" while actually filtering
+	// on something else.
+	extraType := ""
+	if typ != "" {
+		known := false
+		for _, opt := range memoryTypeOptions {
+			if opt == typ {
+				known = true
+				break
+			}
+		}
+		if !known {
+			extraType = typ
+		}
+	}
+
+	var nextPageQuery string
+	if hasMore {
+		nv := url.Values{}
+		if query != "" {
+			nv.Set("q", query)
+		}
+		if typ != "" {
+			nv.Set("type", typ)
+		}
+		if scope != "" {
+			nv.Set("scope", scope)
+		}
+		if fromStr != "" {
+			nv.Set("from", fromStr)
+		}
+		if toStr != "" {
+			nv.Set("to", toStr)
+		}
+		nv.Set("offset", strconv.Itoa(offset+projectMemoriesPageSize))
+		nextPageQuery = nv.Encode()
+	}
+
+	return projectMemoriesViewModel{
+		DaemonVersion:   deps.Version,
+		Project:         project,
+		ProjectPath:     url.PathEscape(project),
+		Count:           count,
+		Query:           query,
+		Type:            typ,
+		Scope:           scope,
+		From:            fromStr,
+		To:              toStr,
+		TypeOptions:     memoryTypeOptions,
+		ExtraTypeOption: extraType,
+		Memories:        rows,
+		Filtered:        query != "" || typ != "" || scope != "" || fromStr != "" || toStr != "",
+		HasMore:         hasMore,
+		NextPageQuery:   nextPageQuery,
+		CSRFToken:       sessions.csrfToken(),
+	}, nil
 }
 
 // buildConfigVM loads the current config from ConfigStore and builds the view model.

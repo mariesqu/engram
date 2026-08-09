@@ -1,12 +1,19 @@
 {{define "projects-rows"}}
 {{range .Projects}}
 <tr id="project-row-{{.Name}}">
-    <td class="project-name">{{.Name}}{{if and .RemoteKnown .InRemote}} <span class="badge badge-remote" title="This project also exists in central">central</span>{{end}}</td>
+    <td class="project-name">
+        <button type="button" class="project-drill-link"
+                hx-get="/ui/projects/{{.PathEscaped}}/memories"
+                hx-target="#modal-root"
+                hx-swap="innerHTML">{{.Name}}</button>
+        {{if and .RemoteKnown .InRemote}} <span class="badge badge-remote" title="This project also exists in central">central</span>{{end}}
+    </td>
+    <td class="mono">{{.MemoryCount}}</td>
     <td>{{policyBadge (printf "%s" .Policy)}}</td>
     <td>
         <form method="POST"
-              action="/ui/projects/{{.Name}}/policy"
-              hx-post="/ui/projects/{{.Name}}/policy"
+              action="/ui/projects/{{.PathEscaped}}/policy"
+              hx-post="/ui/projects/{{.PathEscaped}}/policy"
               hx-target="#projects-table-body"
               hx-swap="innerHTML"
               hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'>
@@ -21,8 +28,8 @@
     </td>
     <td>
         <form method="POST"
-              action="/ui/projects/{{.Name}}/delete"
-              hx-post="/ui/projects/{{.Name}}/delete"
+              action="/ui/projects/{{.PathEscaped}}/delete"
+              hx-post="/ui/projects/{{.PathEscaped}}/delete"
               hx-target="#projects-table-body"
               hx-swap="innerHTML"
               hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'

@@ -33,6 +33,20 @@ func softDelete(t *testing.T, s *Store, syncID string) {
 	}
 }
 
+// setCreatedAt overrides the created_at column for a seeded row, so
+// date-range filter tests can place rows at deterministic points in time
+// instead of relying on datetime('now').
+func setCreatedAt(t *testing.T, s *Store, syncID string, at time.Time) {
+	t.Helper()
+	_, err := s.db.Exec(
+		`UPDATE memories SET created_at = ? WHERE sync_id = ?`,
+		at.UTC().Format(time.RFC3339), syncID,
+	)
+	if err != nil {
+		t.Fatalf("setCreatedAt(%q): %v", syncID, err)
+	}
+}
+
 // ── SearchMemoriesFiltered ────────────────────────────────────────────────────
 
 // TestSearchMemoriesFiltered_TypeFilter verifies that the type filter narrows
@@ -316,6 +330,226 @@ func TestRecentObservations_DefaultLimit(t *testing.T) {
 	results, err := s.RecentObservations("deflimproj", "", 0)
 	if err != nil {
 		t.Fatalf("RecentObservations default limit: %v", err)
+	}
+	if len(results) == 0 {
+		t.Error("default limit (0) should return results, not zero rows")
+	}
+}
+
+// ── SearchMemoriesFiltered: date range + offset ────────────────────────────────
+
+// TestSearchMemoriesFiltered_DateRange verifies that CreatedFrom/CreatedTo
+// exclude rows outside the bound, and are inclusive at the boundary.
+func TestSearchMemoriesFiltered_DateRange(t *testing.T) {
+	s := openTempStore(t)
+
+	seedObservation(t, s, "sf-dr-old", "date range widget", "old content", "dr-proj", "manual", "project")
+	seedObservation(t, s, "sf-dr-mid", "date range widget", "mid content", "dr-proj", "manual", "project")
+	seedObservation(t, s, "sf-dr-new", "date range widget", "new content", "dr-proj", "manual", "project")
+
+	setCreatedAt(t, s, "sf-dr-old", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
+	setCreatedAt(t, s, "sf-dr-mid", time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+	setCreatedAt(t, s, "sf-dr-new", time.Date(2024, 12, 1, 0, 0, 0, 0, time.UTC))
+
+	// Bound to [2024-03-01, 2024-09-01] — only the "mid" row qualifies.
+	results, _, err := s.SearchMemoriesFiltered("widget", "dr-proj", 10, SearchFilter{
+		CreatedFrom: time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC),
+		CreatedTo:   time.Date(2024, 9, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("SearchMemoriesFiltered date range: %v", err)
+	}
+	if len(results) != 1 || results[0].SyncID != "sf-dr-mid" {
+		t.Fatalf("date range filter: got %d results, want [sf-dr-mid]", len(results))
+	}
+
+	// Boundary is inclusive on both ends.
+	results, _, err = s.SearchMemoriesFiltered("widget", "dr-proj", 10, SearchFilter{
+		CreatedFrom: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		CreatedTo:   time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("SearchMemoriesFiltered boundary: %v", err)
+	}
+	if len(results) != 1 || results[0].SyncID != "sf-dr-old" {
+		t.Fatalf("inclusive boundary: got %d results, want [sf-dr-old]", len(results))
+	}
+}
+
+// TestSearchMemoriesFiltered_Offset verifies that Offset skips the requested
+// number of leading (highest-ranked) rows.
+func TestSearchMemoriesFiltered_Offset(t *testing.T) {
+	s := openTempStore(t)
+
+	seedObservation(t, s, "sf-off-1", "offset gadget one", "content", "off-proj", "manual", "project")
+	seedObservation(t, s, "sf-off-2", "offset gadget two", "content", "off-proj", "manual", "project")
+	seedObservation(t, s, "sf-off-3", "offset gadget three", "content", "off-proj", "manual", "project")
+
+	all, _, err := s.SearchMemoriesFiltered("offset gadget", "off-proj", 10, SearchFilter{})
+	if err != nil {
+		t.Fatalf("SearchMemoriesFiltered (baseline): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("baseline: got %d results, want 3", len(all))
+	}
+
+	offset1, _, err := s.SearchMemoriesFiltered("offset gadget", "off-proj", 10, SearchFilter{Offset: 1})
+	if err != nil {
+		t.Fatalf("SearchMemoriesFiltered offset=1: %v", err)
+	}
+	if len(offset1) != 2 {
+		t.Fatalf("offset=1: got %d results, want 2", len(offset1))
+	}
+	if offset1[0].SyncID != all[1].SyncID {
+		t.Errorf("offset=1: first result = %q, want %q (all[1])", offset1[0].SyncID, all[1].SyncID)
+	}
+}
+
+// ── BrowseMemories ───────────────────────────────────────────────────────────
+
+// TestBrowseMemories_OrderNewestFirst verifies newest-first ordering
+// (created_at DESC, id DESC), mirroring RecentObservations.
+func TestBrowseMemories_OrderNewestFirst(t *testing.T) {
+	s := openTempStore(t)
+
+	seedObservation(t, s, "bm-first", "first", "content", "bmproj", "manual", "project")
+	seedObservation(t, s, "bm-second", "second", "content", "bmproj", "manual", "project")
+	seedObservation(t, s, "bm-third", "third", "content", "bmproj", "manual", "project")
+
+	results, err := s.BrowseMemories("bmproj", SearchFilter{}, 10)
+	if err != nil {
+		t.Fatalf("BrowseMemories: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	if results[0].SyncID != "bm-third" {
+		t.Errorf("first result should be newest (bm-third), got %q", results[0].SyncID)
+	}
+}
+
+// TestBrowseMemories_TypeAndScopeFilter verifies the type and scope filters
+// narrow the browse result set.
+func TestBrowseMemories_TypeAndScopeFilter(t *testing.T) {
+	s := openTempStore(t)
+
+	seedObservation(t, s, "bm-ts-decision", "decision", "content", "bmts-proj", "decision", "project")
+	seedObservation(t, s, "bm-ts-bugfix", "bugfix", "content", "bmts-proj", "bugfix", "project")
+	seedObservation(t, s, "bm-ts-personal", "personal decision", "content", "bmts-proj", "decision", "personal")
+
+	results, err := s.BrowseMemories("bmts-proj", SearchFilter{Type: "decision", Scope: "project"}, 10)
+	if err != nil {
+		t.Fatalf("BrowseMemories type+scope filter: %v", err)
+	}
+	if len(results) != 1 || results[0].SyncID != "bm-ts-decision" {
+		t.Fatalf("type+scope filter: got %d results, want [bm-ts-decision]", len(results))
+	}
+}
+
+// TestBrowseMemories_DateRange verifies CreatedFrom/CreatedTo bound the browse
+// result set the same way as SearchMemoriesFiltered.
+func TestBrowseMemories_DateRange(t *testing.T) {
+	s := openTempStore(t)
+
+	seedObservation(t, s, "bm-dr-old", "old", "content", "bmdr-proj", "manual", "project")
+	seedObservation(t, s, "bm-dr-new", "new", "content", "bmdr-proj", "manual", "project")
+	setCreatedAt(t, s, "bm-dr-old", time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC))
+	setCreatedAt(t, s, "bm-dr-new", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	results, err := s.BrowseMemories("bmdr-proj", SearchFilter{
+		CreatedFrom: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+	}, 10)
+	if err != nil {
+		t.Fatalf("BrowseMemories date range: %v", err)
+	}
+	if len(results) != 1 || results[0].SyncID != "bm-dr-new" {
+		t.Fatalf("date range: got %d results, want [bm-dr-new]", len(results))
+	}
+}
+
+// TestBrowseMemories_OffsetPaging verifies that Offset skips the requested
+// number of leading (newest) rows, enabling page-2/page-3 loads.
+func TestBrowseMemories_OffsetPaging(t *testing.T) {
+	s := openTempStore(t)
+
+	for i := 0; i < 5; i++ {
+		seedObservation(t, s, "bm-page-"+string(rune('a'+i)), "page item", "content", "bmpage-proj", "manual", "project")
+	}
+
+	page1, err := s.BrowseMemories("bmpage-proj", SearchFilter{}, 2)
+	if err != nil {
+		t.Fatalf("BrowseMemories page1: %v", err)
+	}
+	if len(page1) != 2 {
+		t.Fatalf("page1: got %d results, want 2", len(page1))
+	}
+
+	page2, err := s.BrowseMemories("bmpage-proj", SearchFilter{Offset: 2}, 2)
+	if err != nil {
+		t.Fatalf("BrowseMemories page2: %v", err)
+	}
+	if len(page2) != 2 {
+		t.Fatalf("page2: got %d results, want 2", len(page2))
+	}
+	if page2[0].SyncID == page1[0].SyncID || page2[0].SyncID == page1[1].SyncID {
+		t.Error("page2 overlaps page1 — offset not applied")
+	}
+
+	page3, err := s.BrowseMemories("bmpage-proj", SearchFilter{Offset: 4}, 2)
+	if err != nil {
+		t.Fatalf("BrowseMemories page3: %v", err)
+	}
+	if len(page3) != 1 {
+		t.Fatalf("page3 (tail): got %d results, want 1", len(page3))
+	}
+}
+
+// TestBrowseMemories_ExcludesDeleted verifies soft-deleted rows never appear.
+func TestBrowseMemories_ExcludesDeleted(t *testing.T) {
+	s := openTempStore(t)
+	seedObservation(t, s, "bm-del-live", "live", "content", "bmdel-proj", "manual", "project")
+	seedObservation(t, s, "bm-del-gone", "gone", "content", "bmdel-proj", "manual", "project")
+	softDelete(t, s, "bm-del-gone")
+
+	results, err := s.BrowseMemories("bmdel-proj", SearchFilter{}, 10)
+	if err != nil {
+		t.Fatalf("BrowseMemories: %v", err)
+	}
+	for _, r := range results {
+		if r.SyncID == "bm-del-gone" {
+			t.Error("soft-deleted row appeared in BrowseMemories")
+		}
+	}
+}
+
+// TestBrowseMemories_NoDashCollapsing verifies BrowseMemories matches the
+// project filter by LOWER(TRIM(project)) only — mirroring the FTS path —
+// WITHOUT collapsing repeated dashes/underscores the way normalizeProject
+// does. The stored project value is never dash-collapsed, so collapsing only
+// the query side would silently drop matches for a project name that
+// contains doubled separators.
+func TestBrowseMemories_NoDashCollapsing(t *testing.T) {
+	s := openTempStore(t)
+	seedObservation(t, s, "bm-dash", "dashed", "content", "proj--double", "manual", "project")
+
+	results, err := s.BrowseMemories("proj--double", SearchFilter{}, 10)
+	if err != nil {
+		t.Fatalf("BrowseMemories: %v", err)
+	}
+	if len(results) != 1 || results[0].SyncID != "bm-dash" {
+		t.Fatalf("BrowseMemories should match project by lower+trim only (no dash-collapsing); got %d results", len(results))
+	}
+}
+
+// TestBrowseMemories_DefaultLimit verifies limit <= 0 defaults to a sensible
+// non-zero value.
+func TestBrowseMemories_DefaultLimit(t *testing.T) {
+	s := openTempStore(t)
+	seedObservation(t, s, "bm-deflim", "default limit", "content", "bmdeflim-proj", "manual", "project")
+
+	results, err := s.BrowseMemories("bmdeflim-proj", SearchFilter{}, 0)
+	if err != nil {
+		t.Fatalf("BrowseMemories default limit: %v", err)
 	}
 	if len(results) == 0 {
 		t.Error("default limit (0) should return results, not zero rows")

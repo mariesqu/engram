@@ -2,6 +2,7 @@ package webui_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,7 @@ func (m *mockStore) SetPolicy(project string, p controlapi.Policy) error {
 func (m *mockStore) GetPolicy(project string) (controlapi.Policy, error) {
 	return controlapi.PolicySynced, nil
 }
-func (m *mockStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *mockStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return nil, nil
 }
 func (m *mockStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -52,6 +53,12 @@ func (m *mockStore) PurgeProjectLocal(project string) (int, error) {
 }
 func (m *mockStore) TombstoneProject(project string) (int, error) {
 	return 0, nil
+}
+func (m *mockStore) CountsByProject() (map[string]int, error) {
+	return nil, nil
+}
+func (m *mockStore) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	return nil, errors.New("memory not found")
 }
 
 // mockConfigStore is a minimal controlapi.ConfigStore for unit tests.
@@ -92,7 +99,7 @@ func (m *recordingStore) SetPolicy(project string, p controlapi.Policy) error {
 func (m *recordingStore) GetPolicy(project string) (controlapi.Policy, error) {
 	return controlapi.PolicySynced, nil
 }
-func (m *recordingStore) ListMemories(query, project string, limit int) ([]controlapi.MemorySummary, error) {
+func (m *recordingStore) ListMemoriesFiltered(opts controlapi.MemoryListOptions) ([]controlapi.MemorySummary, error) {
 	return nil, nil
 }
 func (m *recordingStore) UpdateMemory(id int64, title, content, typ string) (controlapi.MemorySummary, error) {
@@ -106,6 +113,12 @@ func (m *recordingStore) PurgeProjectLocal(project string) (int, error) {
 }
 func (m *recordingStore) TombstoneProject(project string) (int, error) {
 	return 0, nil
+}
+func (m *recordingStore) CountsByProject() (map[string]int, error) {
+	return nil, nil
+}
+func (m *recordingStore) GetMemory(id int64) (*controlapi.MemorySummary, error) {
+	return nil, errors.New("memory not found")
 }
 
 // newTestServer builds a fresh httptest.Server with a real webui.Mount.

@@ -70,6 +70,44 @@ type ProjectPolicy struct {
 	Policy Policy `json:"policy"`
 }
 
+// MemoryListOptions carries all optional filters and paging parameters for
+// Store.ListMemoriesFiltered.
+//
+// Query empty means "browse" (most-recent-first) rather than full-text
+// search. All filter fields are optional — the zero value of each disables
+// that filter, so a zero-value MemoryListOptions{Limit: N} is equivalent to
+// the historic ListMemories("", "", N) browse call. Limit must be positive;
+// callers own defaulting/capping it (handleMemories defaults to 50 and caps
+// at 200, mirroring the pre-existing /api/v1/memories contract).
+type MemoryListOptions struct {
+	Query   string // full-text query; empty = browse (recency) mode
+	Project string // empty = all projects
+	Type    string // empty = any type
+	Scope   string // empty = any scope
+
+	// CreatedFrom/CreatedTo optionally bound the memory's created_at
+	// (inclusive on both ends). The zero time.Time disables that bound.
+	// CreatedTo performs NO adjustment of its own — a caller wanting an
+	// inclusive whole-day "to" bound from a UTC-midnight date value (e.g.
+	// time.Parse("2006-01-02", ...)) must advance it to the day's last
+	// instant first, e.g. via InclusiveDayEnd.
+	CreatedFrom time.Time
+	CreatedTo   time.Time
+
+	Limit  int
+	Offset int
+}
+
+// InclusiveDayEnd returns t advanced to the last representable instant of the
+// same day (t + 24h - 1ns). Callers building an inclusive "to" date bound for
+// MemoryListOptions.CreatedTo (or localstore.SearchFilter.CreatedTo) from a
+// UTC-midnight date value pass the result of this helper directly — shared so
+// server.go's /api/v1/memories handler and the web UI's drill-in modal filter
+// bar apply byte-identical whole-day semantics.
+func InclusiveDayEnd(t time.Time) time.Time {
+	return t.Add(24*time.Hour - time.Nanosecond)
+}
+
 // MemorySummary is the JSON shape for a single memory returned by
 // GET /api/v1/memories. Content is included in full so callers can build
 // previews without a second round-trip.
@@ -192,21 +230,34 @@ type Store interface {
 	ListProjectsWithPolicy() ([]ProjectPolicy, error)
 	SetPolicy(project string, p Policy) error
 	GetPolicy(project string) (Policy, error)
-	// ListMemories returns memories matching the query (FTS when non-empty,
-	// recent otherwise), filtered by project, capped at limit.
-	ListMemories(query, project string, limit int) ([]MemorySummary, error)
+	// ListMemoriesFiltered returns memories matching opts: full-text search
+	// (FTS) when opts.Query is non-empty, most-recent-first browse otherwise.
+	// Type/Scope/CreatedFrom/CreatedTo/Offset are additive filters/paging on
+	// top of the query/project/limit that ListMemories previously took alone.
+	ListMemoriesFiltered(opts MemoryListOptions) ([]MemorySummary, error)
 	// UpdateMemory edits an existing memory row in-place and returns the updated summary.
 	// Returns an error wrapping ErrObservationNotFound when id is missing or deleted.
 	UpdateMemory(id int64, title, content, typ string) (MemorySummary, error)
 	// DeleteMemory soft-deletes the memory row with the given id.
 	// Returns an error wrapping ErrObservationNotFound when id is missing or deleted.
 	DeleteMemory(id int64) error
+	// GetMemory fetches a single live memory by its integer primary key,
+	// independent of any recency window — unlike ListMemoriesFiltered, which
+	// only ever returns the most-recent Limit rows, GetMemory finds the row
+	// regardless of how old it is. Used by the web UI edit form so a memory
+	// outside the newest N rows is still reachable by direct id lookup.
+	// Returns an error wrapping ErrObservationNotFound when id is missing or deleted.
+	GetMemory(id int64) (*MemorySummary, error)
 	// PurgeProjectLocal hard-deletes the project's local data and sets its policy
 	// to omitted. Returns the total rows deleted.
 	PurgeProjectLocal(project string) (int, error)
 	// TombstoneProject soft-deletes every live memory in the project, enqueueing
 	// OpDelete mutations that propagate to all synced nodes. Returns the count.
 	TombstoneProject(project string) (int, error)
+	// CountsByProject returns the number of live memories per project, keyed
+	// by the normalized (lowercased/trimmed) project name. Used by the web UI
+	// projects hub to show a live memory count per project in one query.
+	CountsByProject() (map[string]int, error)
 }
 
 // SyncController is the autosync control port. PR-① uses Status for the
@@ -412,6 +463,12 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, projects)
 }
 
+// handleMemories handles GET /api/v1/memories?q=&project=&type=&scope=&from=&to=&offset=&limit=.
+//
+// All params beyond q/project/limit are additive — q, project, and limit alone
+// reproduce the original (pre-filter) contract byte-for-byte. from/to are
+// dates in "2006-01-02" (RFC 3339 date-only) form; an unparseable or absent
+// value leaves that bound unset rather than erroring the request.
 func (s *Server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -420,20 +477,44 @@ func (s *Server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	query := q.Get("q")
-	project := q.Get("project")
-	limit := 50
+	opts := MemoryListOptions{
+		Query:   q.Get("q"),
+		Project: q.Get("project"),
+		Type:    q.Get("type"),
+		Scope:   q.Get("scope"),
+		Limit:   50,
+	}
 	if raw := q.Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err == nil && n > 0 {
-			limit = n
+			opts.Limit = n
 		}
 	}
-	if limit > 200 {
-		limit = 200
+	if opts.Limit > 200 {
+		opts.Limit = 200
+	}
+	if raw := q.Get("offset"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err == nil && n > 0 {
+			opts.Offset = n
+		}
+	}
+	if opts.Offset > 100000 {
+		opts.Offset = 100000
+	}
+	if raw := q.Get("from"); raw != "" {
+		if t, err := time.Parse("2006-01-02", raw); err == nil {
+			opts.CreatedFrom = t
+		}
+	}
+	if raw := q.Get("to"); raw != "" {
+		if t, err := time.Parse("2006-01-02", raw); err == nil {
+			// Inclusive of the whole day.
+			opts.CreatedTo = InclusiveDayEnd(t)
+		}
 	}
 
-	memories, err := s.store.ListMemories(query, project, limit)
+	memories, err := s.store.ListMemoriesFiltered(opts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
