@@ -117,10 +117,11 @@ func TestAcceptance_WebUI_CookieAuthedStatus_200(t *testing.T) {
 	centralURL := "http://central.acc.test"
 	now := time.Now().UTC()
 	status := controlapi.Status{
-		CentralConnected: true,
-		CentralURL:       &centralURL,
-		LastSyncResult:   controlapi.SyncResult{At: &now, Pushed: 5, Pulled: 2},
-		DaemonVersion:    "test-version",
+		CentralConnected:  true,
+		CentralConfigured: true,
+		CentralURL:        &centralURL,
+		LastSyncResult:    controlapi.SyncResult{At: &now, Pushed: 5, Pulled: 2},
+		DaemonVersion:     "test-version",
 	}
 	srv := newFullTestServer(t, secret, status, nil)
 	body := authenticatedGet(t, srv, secret, "/ui/")
@@ -318,8 +319,9 @@ func TestAcceptance_WebUI_OriginRejection(t *testing.T) {
 	centralURL := "http://central.test"
 	syncCtrl := &mockSyncCtrl{
 		status: controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       &centralURL,
+			CentralConnected:  true,
+			CentralConfigured: true,
+			CentralURL:        &centralURL,
 		},
 	}
 	store := &mockStore{}

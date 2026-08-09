@@ -28,8 +28,18 @@ type MenuItem struct {
 // It is the sole input to BuildMenu — keeping the menu model pure and testable
 // without any Win32 or HTTP calls.
 type StatusSnapshot struct {
-	// Connected is true when the daemon is connected to a central server.
+	// Connected is true when the daemon is connected to central AND its most
+	// recent sync attempt actually succeeded (mirrors controlapi.Status's
+	// CentralConnected). Drives the status label only — NOT action gating,
+	// see Configured.
 	Connected bool
+	// Configured is true whenever central credentials are on file, whether or
+	// not the most recent sync attempt succeeded (mirrors controlapi.Status's
+	// CentralConfigured). Drives the Connect/Disconnect toggle and Sync Now's
+	// enabled state: a configured-but-currently-failing central must still
+	// offer "Disconnect" and an enabled "Sync Now" (manual retry) rather than
+	// being mistaken for "never configured".
+	Configured bool
 	// DaemonRunning is true when we have successfully reached the daemon.
 	DaemonRunning bool
 }
@@ -42,14 +52,19 @@ type StatusSnapshot struct {
 //  1. Status label (disabled)
 //  2. Open UI
 //  3. Connect / Disconnect (context-sensitive)
-//  4. Sync Now (disabled when not connected)
+//  4. Sync Now (disabled when not configured)
 //  5. Check for Updates
 //  6. Separator
 //  7. Quit
 func BuildMenu(s StatusSnapshot) []MenuItem {
 	statusLabel := "Disconnected"
-	if s.Connected {
+	switch {
+	case s.Connected:
 		statusLabel = "Connected"
+	case s.Configured:
+		// Configured but the most recent sync attempt failed — distinct from
+		// both a healthy connection and "never configured".
+		statusLabel = "Sync Error"
 	}
 
 	items := []MenuItem{
@@ -57,14 +72,14 @@ func BuildMenu(s StatusSnapshot) []MenuItem {
 		{ID: MenuIDOpenUI, Label: "Open UI", Disabled: !s.DaemonRunning},
 	}
 
-	if s.Connected {
+	if s.Configured {
 		items = append(items, MenuItem{ID: MenuIDDisconnect, Label: "Disconnect from central"})
 	} else {
 		items = append(items, MenuItem{ID: MenuIDConnect, Label: "Connect to central"})
 	}
 
 	items = append(items,
-		MenuItem{ID: MenuIDSyncNow, Label: "Sync Now", Disabled: !s.Connected},
+		MenuItem{ID: MenuIDSyncNow, Label: "Sync Now", Disabled: !s.Configured},
 		MenuItem{ID: MenuIDCheckUpdate, Label: "Check for Updates"},
 		MenuItem{Separator: true},
 		MenuItem{ID: MenuIDQuit, Label: "Quit"},

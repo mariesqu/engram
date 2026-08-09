@@ -31,7 +31,7 @@ func TestCLI_CentralConnect_HappyPath(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode request body: %v", err)
 		}
-		st := controlapi.Status{CentralConnected: true, DaemonVersion: "test"}
+		st := controlapi.Status{CentralConnected: true, CentralConfigured: true, DaemonVersion: "test"}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(st)
 	}))

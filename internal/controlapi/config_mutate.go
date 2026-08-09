@@ -185,13 +185,16 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 
 // handleSyncTrigger handles POST /api/v1/sync/trigger.
 //
-// If central is not connected it returns 409 Conflict. Otherwise it triggers
-// an immediate sync cycle and returns 202 Accepted.
+// If central is not configured it returns 409 Conflict. Otherwise it triggers
+// an immediate sync cycle and returns 202 Accepted — this is gated on
+// CentralConfigured, not CentralConnected: a configured central whose most
+// recent sync attempt failed is exactly the case a manual trigger exists for
+// (retry now), so it must not be locked out by the reachability bit.
 //
 // The route is registered with WithAuthAndOrigin.
 func (s *Server) handleSyncTrigger(w http.ResponseWriter, r *http.Request) {
 	st := s.syncCtrl.Status()
-	if !st.CentralConnected {
+	if !st.CentralConfigured {
 		writeError(w, http.StatusConflict, "central not configured")
 		return
 	}

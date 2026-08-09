@@ -141,11 +141,23 @@ type EmbeddingBackfill struct {
 }
 
 // Status holds the runtime state snapshot returned by GET /api/v1/status.
+//
+// CentralConnected vs CentralConfigured: CentralConfigured means "a central
+// URL + writer key are on file" (set the moment Reconnect succeeds, before
+// any sync cycle has run). CentralConnected means "configured AND the most
+// recent sync attempt actually succeeded" (LastSyncResult present with a nil
+// Error) — it is false while configured-but-not-yet-synced, and false again
+// the instant a sync cycle fails, even though the daemon remains configured
+// and keeps retrying on its normal interval. Callers that gate a "may I
+// attempt to sync" action (manual trigger, disconnect) should check
+// CentralConfigured, not CentralConnected — a currently-failing central is
+// exactly when a user wants to retry, not be locked out.
 type Status struct {
-	CentralConnected bool       `json:"central_connected"`
-	CentralURL       *string    `json:"central_url,omitempty"` // omitted when not configured
-	LastSyncResult   SyncResult `json:"last_sync_result"`
-	DaemonVersion    string     `json:"daemon_version"`
+	CentralConnected  bool       `json:"central_connected"`
+	CentralConfigured bool       `json:"central_configured"`
+	CentralURL        *string    `json:"central_url,omitempty"` // omitted when not configured
+	LastSyncResult    SyncResult `json:"last_sync_result"`
+	DaemonVersion     string     `json:"daemon_version"`
 	// EmbeddingBackfill is POPULATED BY PR-1b (the backfill loop). Pointer +
 	// omitempty so the field is ABSENT from responses until then — a permanent
 	// {"pending":0} would misreport thousands of unembedded rows as done.

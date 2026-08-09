@@ -21,7 +21,8 @@ Flags:
   --db   Path to the local SQLite database (required; or set ENGRAM_DB)
 
 Output fields:
-  central_connected   Whether the daemon is connected to a central server
+  central_connected   Configured AND the most recent sync attempt succeeded
+  central_configured  Whether central credentials are on file at all
   last_sync           Timestamp and outcome of the most recent sync cycle
   daemon_version      Binary version of the running daemon
 `
@@ -67,29 +68,40 @@ func runStatusCmd(args []string) error {
 	return nil
 }
 
-// printStatus formats a Status for human consumption.
+// printStatus formats a Status for human consumption. Labels are left-padded
+// to a fixed column (%-20s) so the values line up — central_configured: is
+// the longest label, which is why every line was re-padded to match it.
 func printStatus(st controlapi.Status) {
 	connected := "no"
 	if st.CentralConnected {
 		connected = "yes"
 	}
-	fmt.Printf("central_connected: %s\n", connected)
-	if st.CentralURL != nil && *st.CentralURL != "" {
-		fmt.Printf("central_url:       %s\n", *st.CentralURL)
+	configured := "no"
+	if st.CentralConfigured {
+		configured = "yes"
 	}
-	fmt.Printf("daemon_version:    %s\n", st.DaemonVersion)
+	// CentralConnected means "configured AND the most recent sync attempt
+	// succeeded" (see controlapi.Status doc); CentralConfigured is printed
+	// alongside it so "configured but currently failing" reads differently
+	// from "never configured".
+	fmt.Printf("%-20s%s\n", "central_connected:", connected)
+	fmt.Printf("%-20s%s\n", "central_configured:", configured)
+	if st.CentralURL != nil && *st.CentralURL != "" {
+		fmt.Printf("%-20s%s\n", "central_url:", *st.CentralURL)
+	}
+	fmt.Printf("%-20s%s\n", "daemon_version:", st.DaemonVersion)
 
 	sr := st.LastSyncResult
 	if sr.At != nil {
-		fmt.Printf("last_sync_at:      %s\n", sr.At.Format("2006-01-02T15:04:05Z07:00"))
+		fmt.Printf("%-20s%s\n", "last_sync_at:", sr.At.Format("2006-01-02T15:04:05Z07:00"))
 	} else {
-		fmt.Printf("last_sync_at:      (never)\n")
+		fmt.Printf("%-20s%s\n", "last_sync_at:", "(never)")
 	}
 	if sr.Error != nil && *sr.Error != "" {
-		fmt.Printf("last_sync_error:   %s\n", *sr.Error)
+		fmt.Printf("%-20s%s\n", "last_sync_error:", *sr.Error)
 	} else {
-		fmt.Printf("last_sync_error:   (none)\n")
+		fmt.Printf("%-20s%s\n", "last_sync_error:", "(none)")
 	}
-	fmt.Printf("last_sync_pushed:  %d\n", sr.Pushed)
-	fmt.Printf("last_sync_pulled:  %d\n", sr.Pulled)
+	fmt.Printf("%-20s%d\n", "last_sync_pushed:", sr.Pushed)
+	fmt.Printf("%-20s%d\n", "last_sync_pulled:", sr.Pulled)
 }
