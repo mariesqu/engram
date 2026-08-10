@@ -74,7 +74,8 @@ type ObservationResult struct {
 // Mutation construction:
 //   - Op = OpUpsert — observations are always upserts (Decide determines insert vs update).
 //   - EntityType = EntityMemory.
-//   - SyncID = newObsSyncID() — a random "obs-<8-bytes-hex>" prefix, matching old_code.
+//   - SyncID = newObsSyncID() — a random "obs-<8-bytes-hex>" prefix, matching
+//     the legacy predecessor.
 //   - Version = 1 — first version; Decide will apply the LWW tiebreaker on conflict.
 //   - UpdatedAt = time.Now().UTC() — local wall clock.
 //   - WriterID = "" — local writes carry no writer identity until the daemon is
@@ -217,7 +218,7 @@ func (s *Store) GetObservation(id int64) (*domain.Record, error) {
 }
 
 // newObsSyncID generates a random sync_id for a new observation, using the
-// same format as old_code: "obs-<16 hex chars>".
+// same format as the legacy predecessor: "obs-<16 hex chars>".
 func newObsSyncID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {

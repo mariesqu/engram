@@ -5,7 +5,8 @@ import "sync"
 // SessionActivity tracks the most-recently-observed user prompt per session so
 // that mem_save can auto-capture it when capture_prompt=true (default). Only
 // the prompt-relevant state is stored here; nudge, scoring, and recovery-token
-// functionality lives in old_code and is not part of this package.
+// functionality lives in the legacy predecessor codebase (private, pre-rewrite)
+// and is not part of this package.
 //
 // All exported methods are safe for concurrent use.
 type SessionActivity struct {

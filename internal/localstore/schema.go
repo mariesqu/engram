@@ -112,10 +112,12 @@ import (
 //	CREATE TABLE IF NOT EXISTS in ApplySchema makes the migration a no-op for
 //	fresh databases where the table already exists.
 //	    therefore a SOFT (unvalidated) reference.
-//	  - writer_id column is added (absent in old_code) for LWW tiebreaking parity
-//	    with the memories table and the central_user_prompts table.
-//	  - project NOT NULL DEFAULT '' (absent in old_code, which allowed NULL and
-//	    had a migration to backfill to '').  New codebase always sets project.
+//	  - writer_id column is added (absent in the legacy predecessor) for LWW
+//	    tiebreaking parity with the memories table and the central_user_prompts
+//	    table.
+//	  - project NOT NULL DEFAULT '' (absent in the legacy predecessor, which
+//	    allowed NULL and had a migration to backfill to '').  New codebase
+//	    always sets project.
 //	  - prompts_fts / FTS triggers are intentionally omitted; prompt search is
 //	    deferred to a later PR.
 //	  - Both tables are idempotent (CREATE TABLE IF NOT EXISTS in ApplySchema).
@@ -250,7 +252,8 @@ END`
 // table. It is shared between ApplySchema (fresh DB) and migrateV6ToV7 so both
 // paths always produce the same column set and constraints.
 //
-// Columns mirror old_code/internal/store/store.go sessions DDL exactly:
+// Columns mirror the sessions DDL of the legacy predecessor codebase (private,
+// pre-rewrite), internal/store/store.go, exactly:
 //   - id TEXT PRIMARY KEY — opaque session identifier supplied by the caller
 //   - project TEXT NOT NULL — normalized project name (lowercased, trimmed)
 //   - directory TEXT NOT NULL — working directory at session start
@@ -367,7 +370,8 @@ const conflictRelationsTableDDL = `CREATE TABLE IF NOT EXISTS conflict_relations
 // the memories→sessions FK in v0→v1.  session_id is a SOFT (unvalidated) ref.
 //
 // writer_id is required for LWW tiebreaking parity with memories and
-// central_user_prompts; absent in old_code but added here from the start.
+// central_user_prompts; absent in the legacy predecessor but added here from
+// the start.
 const userPromptsTableDDL = `CREATE TABLE IF NOT EXISTS user_prompts (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	sync_id    TEXT    NOT NULL UNIQUE,

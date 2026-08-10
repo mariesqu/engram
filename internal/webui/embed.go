@@ -3,8 +3,9 @@
 // JS build step, no code generation, no new Go module dependencies.
 //
 // Design decision #8 (design.md): html/template (stdlib) + go:embed + vendored
-// htmx.min.js 2.0.4. Does NOT use a-h/templ (old_code precedent), which
-// requires a code-gen step and introduces a new module dependency.
+// htmx.min.js 2.0.4. Does NOT use a-h/templ (the legacy predecessor's
+// precedent), which requires a code-gen step and introduces a new module
+// dependency.
 //
 // HTMX version: 2.0.4
 // Source URL:   https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js

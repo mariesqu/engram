@@ -1,12 +1,13 @@
 // Package importer migrates data from an old-generation engram SQLite database
-// (old_code) into a current-generation local store.
+// (the legacy predecessor codebase — private, pre-rewrite) into a
+// current-generation local store.
 //
 // # Source schema
 //
 // The source DB is opened READ-ONLY (mode=ro DSN option) and must contain
-// the tables sessions, observations, and user_prompts as defined by
-// old_code/internal/store/store.go.  Soft-deleted rows (deleted_at IS NOT NULL
-// on observations) are skipped.
+// the tables sessions, observations, and user_prompts as defined by the legacy
+// predecessor codebase (private, pre-rewrite): internal/store/store.go.
+// Soft-deleted rows (deleted_at IS NOT NULL on observations) are skipped.
 //
 // # Idempotency
 //
@@ -46,7 +47,8 @@
 //
 // # Embeddings
 //
-// Imported rows carry NULL embeddings (the old_code columns were never populated).
+// Imported rows carry NULL embeddings (the legacy predecessor's columns were
+// never populated).
 // The embedding backfill loop picks them up automatically via the NULL-as-queue
 // predicate on the next daemon start.
 //

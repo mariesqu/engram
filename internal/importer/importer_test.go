@@ -20,7 +20,8 @@ import (
 
 // legacyDDL is the minimal DDL needed to seed a source DB that matches the
 // old-generation engram schema (observations, user_prompts, sessions).
-// Sourced from old_code/internal/store/store_legacy_ddl_test.go.
+// Sourced from the legacy predecessor codebase (private, pre-rewrite):
+// internal/store/store_legacy_ddl_test.go.
 const legacyDDL = `
 CREATE TABLE IF NOT EXISTS sessions (
     id         TEXT PRIMARY KEY,

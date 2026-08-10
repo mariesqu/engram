@@ -126,9 +126,9 @@ type JudgeRelationParams struct {
 //
 // Unlike sanitizeFTS (which joins tokens with implicit AND for precise search),
 // OR semantics ensure that a single overlapping word is enough to surface a
-// candidate — BM25 ranking then orders by relevance. Port of old_code
-// sanitizeFTSCandidates verbatim: split on whitespace, strip leading/trailing
-// quotes from each token, wrap in "...", join with " OR ".
+// candidate — BM25 ranking then orders by relevance. Port of the legacy
+// predecessor's sanitizeFTSCandidates verbatim: split on whitespace, strip
+// leading/trailing quotes from each token, wrap in "...", join with " OR ".
 func sanitizeFTSCandidates(title string) string {
 	words := strings.Fields(title)
 	if len(words) == 0 {
@@ -150,7 +150,8 @@ func sanitizeFTSCandidates(title string) string {
 // ── newRelSyncID ──────────────────────────────────────────────────────────────
 
 // newRelSyncID generates a random sync_id for a conflict_relations row.
-// Format: "rel-<16 hex chars>" (8 random bytes). Mirrors old_code newSyncID("rel").
+// Format: "rel-<16 hex chars>" (8 random bytes). Mirrors the legacy
+// predecessor's newSyncID("rel").
 func newRelSyncID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -174,7 +175,7 @@ func newRelSyncID() string {
 // cursor is still open would attempt a second connection → SQLITE_BUSY or
 // deadlock. This function therefore drains ALL SELECT rows into a local slice
 // and explicitly calls rows.Close() BEFORE issuing any write. Mirrors the fix
-// in old_code FindCandidates.
+// in the legacy predecessor's FindCandidates.
 //
 // Errors from FindCandidates should be logged and swallowed by callers —
 // candidate detection failure must never fail the originating save.

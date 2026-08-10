@@ -441,7 +441,8 @@ func (s *Store) countNullEmbeddings() int {
 // by created_at DESC, id DESC. project and scope are optional filters; an empty
 // string disables the filter for that dimension. limit <= 0 defaults to 20.
 //
-// Mirrors old_code store.RecentObservations (project+scope variant).
+// Mirrors the legacy predecessor's store.RecentObservations (project+scope
+// variant).
 func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.Record, error) {
 	if limit <= 0 {
 		limit = 20
@@ -569,9 +570,10 @@ func truncateStr(s string, n int) string {
 }
 
 // FormatContext assembles the agent-facing memory context blob from recent
-// sessions and recent observations, mirroring old_code store.FormatContext.
+// sessions and recent observations, mirroring the legacy predecessor's
+// store.FormatContext.
 //
-// Format (faithful to old_code):
+// Format (faithful to the legacy predecessor):
 //
 //	## Memory from Previous Sessions
 //

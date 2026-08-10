@@ -21,7 +21,8 @@ import (
 
 // resolveReadProject resolves the project for a READ tool call. Unlike write
 // tools, read tools are LENIENT: no hard errors on ambiguous or invalid config.
-// The policy mirrors old_code handleSearch/handleContext (REQ-310 lenient path):
+// The policy mirrors the legacy predecessor's handleSearch/handleContext
+// (REQ-310 lenient path):
 //
 //  1. Explicit project argument wins (normalized, used as-is — no store lookup).
 //  2. Detect from cwd via DetectProjectFull.
@@ -483,7 +484,8 @@ FORMAT — use this exact structure in the content field:
 // id (required) and directory (optional) arguments, resolves the project from
 // directory via internal/project.DetectProject, and calls CreateSession.
 //
-// Project detection (mirrors old_code handleSessionStart / REQ-308):
+// Project detection (mirrors the legacy predecessor's handleSessionStart,
+// REQ-308):
 //   - If directory is supplied, detect from that path.
 //   - If directory is empty, detect from os.Getwd().
 //   - DetectProject never errors — it returns "unknown" on failure.
@@ -507,8 +509,8 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			}
 		}
 		// Surface broken-config and ambiguous-project resolution errors as tool
-		// errors (faithful to old_code) rather than silently storing the session
-		// under a wrong/basename project. ErrInvalidConfig = malformed
+		// errors (faithful to the legacy predecessor) rather than silently storing
+		// the session under a wrong/basename project. ErrInvalidConfig = malformed
 		// .engram/config.json; ErrAmbiguousProject = the directory is a parent of
 		// multiple repos so no single project can be chosen. Any other error falls
 		// back to the basename.
@@ -570,14 +572,15 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 }
 
 // resolveSaveProject resolves the project for a write tool call using the same
-// precedence as handleSessionStart (mirrors old_code write-tool contract):
+// precedence as handleSessionStart (mirrors the legacy predecessor's write-tool
+// contract):
 //
 //  1. Explicit "project" argument if non-empty (caller override).
 //  2. DetectProjectFull(cwd) — repo config / git remote / git root / dir basename.
 //
 // ErrInvalidConfig and ErrAmbiguousProject are surfaced as tool errors exactly
 // like handleSessionStart so agents get actionable feedback on misconfigured
-// repos (faithful to old_code handleSave precedence).
+// repos (faithful to the legacy predecessor's handleSave precedence).
 //
 // Conflict detection (explicit project vs store's known projects) is DEFERRED
 // to a future PR.
@@ -731,7 +734,8 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		}
 
 		if len(candidates) > 0 {
-			// Build judgment envelope — faithful to old_code handleSave envelope format.
+			// Build judgment envelope — faithful to the legacy predecessor's
+			// handleSave envelope format.
 			var b strings.Builder
 			b.WriteString(msg)
 			b.WriteString(fmt.Sprintf("\nCONFLICT REVIEW PENDING — %d candidate(s); use mem_judge to record verdicts.", len(candidates)))
@@ -1144,8 +1148,9 @@ func handleJudge(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		// confidence is a JSON number → float64. Default 1.0 when absent.
-		// Reject out-of-range values (faithful to old_code) so the agent heuristic
-		// (e.g. "confidence < 0.7 → surface to user") can never be corrupted.
+		// Reject out-of-range values (faithful to the legacy predecessor) so the
+		// agent heuristic (e.g. "confidence < 0.7 → surface to user") can never be
+		// corrupted.
 		confidence := 1.0
 		if v, ok := args["confidence"].(float64); ok {
 			if v < 0 || v > 1 {

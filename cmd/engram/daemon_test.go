@@ -420,7 +420,8 @@ func TestDaemonTool_SessionStart_CreatesRow(t *testing.T) {
 
 // TestDaemonTool_SessionStart_InvalidConfig verifies that a malformed
 // .engram/config.json surfaces as a tool error rather than silently storing the
-// session under "unknown" (faithful to old_code's ErrInvalidConfig handling).
+// session under "unknown" (faithful to the legacy predecessor's
+// ErrInvalidConfig handling).
 func TestDaemonTool_SessionStart_InvalidConfig(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "engram.db")
 	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
@@ -454,8 +455,9 @@ func TestDaemonTool_SessionStart_InvalidConfig(t *testing.T) {
 }
 
 // TestDaemonTool_SessionStart_AmbiguousProject verifies that a directory which is
-// the parent of multiple git repos surfaces as a tool error (faithful to old_code)
-// rather than silently storing the session under the parent's basename.
+// the parent of multiple git repos surfaces as a tool error (faithful to the
+// legacy predecessor) rather than silently storing the session under the
+// parent's basename.
 func TestDaemonTool_SessionStart_AmbiguousProject(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "engram.db")
 	components, err := buildDaemon(daemonCfg{db: dbPath, syncInterval: 30 * time.Second})
