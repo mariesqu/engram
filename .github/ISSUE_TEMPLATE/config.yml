@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/mariesqu/engram/security/advisories/new
+    about: >
+      Never open a public issue for anything exploitable. Report it privately via
+      GitHub Security Advisories — see SECURITY.md for the threat model and scope.
