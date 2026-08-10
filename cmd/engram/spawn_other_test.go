@@ -2,7 +2,10 @@
 
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // TestDetachedSysProcAttr_SetsSetsid verifies detachedSysProcAttr sets
 // Setsid — an empty &syscall.SysProcAttr{} would satisfy a bare non-nil
@@ -19,7 +22,9 @@ func TestDetachedSysProcAttr_SetsSetsid(t *testing.T) {
 // TestBuildSpawnCmd_UnixSetsid verifies buildSpawnCmd's returned *exec.Cmd
 // carries Setsid on its SysProcAttr, not just a non-nil placeholder.
 func TestBuildSpawnCmd_UnixSetsid(t *testing.T) {
-	cmd := buildSpawnCmd("engram", "/tmp/test.db")
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	cmd := buildSpawnCmd("engram", dbPath)
+	closeSpawnLog(t, cmd)
 
 	attr := cmd.SysProcAttr
 	if attr == nil {
