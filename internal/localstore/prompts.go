@@ -82,7 +82,8 @@ func (s *Store) AddPrompt(p AddPromptParams) (Prompt, error) {
 // Dedup is over LIVE rows only. If the prompt was previously DELETED (a tombstone
 // exists, no live row), the same content is captured again as a NEW occurrence
 // with a fresh sync_id — a re-prompt after a delete is a new event, not a
-// resurrection. This matches old_code's AddPromptIfMissing semantics.
+// resurrection. This matches the legacy predecessor's AddPromptIfMissing
+// semantics.
 //
 // Atomicity: the dedup-read AND the write are performed under a single s.mu
 // acquisition (same lock held from check to commit) so no concurrent
@@ -219,7 +220,7 @@ func (s *Store) CountPromptsForSession(sessionID, project, content string) (int,
 }
 
 // newPromptSyncID generates a random sync_id for a new prompt, using the same
-// format as old_code: "prompt-<16 hex chars>".
+// format as the legacy predecessor: "prompt-<16 hex chars>".
 func newPromptSyncID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {

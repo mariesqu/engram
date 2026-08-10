@@ -45,6 +45,29 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 > **New to engram?** [Quickstart: local-only mode](#quickstart-local-only-mode) gets you running in two commands. Once memories start accumulating, [Managing your memories](#managing-your-memories) shows how to browse, search, edit, and clean them up from the CLI or web UI — no agent required.
 
+## Contents
+
+- [Architecture](#architecture)
+- [Features](#features)
+- [Install from release](#install-from-release)
+- [Build from source](#build-from-source)
+- [Quickstart: local-only mode](#quickstart-local-only-mode)
+- [Quickstart: central sync](#quickstart-central-sync)
+- [Resident daemon](#resident-daemon)
+- [Web UI](#web-ui)
+- [Windows tray](#windows-tray)
+- [CLI reference](#cli-reference)
+- [Wiring into an MCP client](#wiring-into-an-mcp-client)
+- [Using engram from your agent](#using-engram-from-your-agent)
+- [MCP tools](#mcp-tools)
+- [Managing your memories](#managing-your-memories)
+- [Semantic search](#semantic-search)
+- [Development](#development)
+- [Importing from the original Engram](#importing-from-the-original-engram)
+- [Acknowledgments](#acknowledgments)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Install from release
 
 Pre-built binaries for Linux, macOS, and Windows are published on the
@@ -1239,6 +1262,17 @@ work to learn from.
 
 Gracias, Alan. Honor a quien honor merece.
 
+## Contributing
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it
+covers the ground rules (pure Go, no CGO, no Docker in the test path), the
+commands to run before opening a PR, and the invariants that must not be broken.
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). For
+anything exploitable, do not open a public issue — follow
+[SECURITY.md](SECURITY.md) and report it privately.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Third-party assets bundled in the binary (the
+vendored web-UI fonts and htmx) keep their own licenses — see
+[THIRD_PARTY.md](THIRD_PARTY.md).

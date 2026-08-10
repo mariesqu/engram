@@ -50,6 +50,9 @@ Start with `README.md`, then the archived design documents under
 design decisions, and a closing report. They are the canonical record of *why*
 the code is shaped the way it is.
 
+**Glossary:** comments referencing *"the legacy predecessor"* refer to engram's
+private pre-rewrite codebase; its behavior is preserved by the tests that cite it.
+
 ## Security issues
 
 See [SECURITY.md](SECURITY.md) — never open a public issue for a vulnerability.

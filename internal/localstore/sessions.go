@@ -31,8 +31,9 @@ type SessionSummary struct {
 var ErrSessionNotFound = errors.New("session not found")
 
 // normalizeProject lowercases and trims the project name, collapsing repeated
-// hyphens and underscores. Mirrors old_code NormalizeProject semantics without
-// the warning return value, which is unused by localstore callers.
+// hyphens and underscores. Mirrors the legacy predecessor's NormalizeProject
+// semantics without the warning return value, which is unused by localstore
+// callers.
 func normalizeProject(project string) string {
 	n := strings.TrimSpace(strings.ToLower(project))
 	for strings.Contains(n, "--") {
@@ -46,8 +47,8 @@ func normalizeProject(project string) string {
 
 // CreateSession upserts a session row. If a session with the same id already
 // exists, project and directory are updated only when they were previously
-// empty — matching old_code createSessionTx semantics (REQ-308: no overwrite
-// of a populated project with a new one).
+// empty — matching the legacy predecessor's createSessionTx semantics
+// (REQ-308: no overwrite of a populated project with a new one).
 func (s *Store) CreateSession(id, project, directory string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -65,13 +66,14 @@ func (s *Store) CreateSession(id, project, directory string) error {
 
 // EndSession records ended_at = now and stores the summary for the given
 // session id. If the session does not exist the call is a no-op (returns nil),
-// mirroring old_code EndSession behaviour: rows==0 is not an error.
+// mirroring the legacy predecessor's EndSession behaviour: rows==0 is not an
+// error.
 func (s *Store) EndSession(id, summary string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// An UPDATE affecting zero rows (unknown id) is intentionally NOT an error —
-	// it is a no-op, mirroring old_code EndSession.
+	// it is a no-op, mirroring the legacy predecessor's EndSession.
 	_, err := s.db.Exec(
 		`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
 		nullableStr(summary), id,
@@ -132,9 +134,10 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // ordered by started_at DESC with id DESC as a deterministic tie-breaker.
 // If project is empty all projects are included. limit <= 0 defaults to 5.
 //
-// TODO(PR4+): old_code orders by MAX(COALESCE(obs.created_at, started_at)) DESC
-// (latest ACTIVITY). This uses started_at DESC as a simplification until the
-// observations table exists — revisit the ORDER BY when it lands.
+// TODO(PR4+): the legacy predecessor orders by
+// MAX(COALESCE(obs.created_at, started_at)) DESC (latest ACTIVITY). This uses
+// started_at DESC as a simplification until the observations table exists —
+// revisit the ORDER BY when it lands.
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	project = normalizeProject(project)
 	if limit <= 0 {
@@ -181,7 +184,8 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 }
 
 // nullableStr converts an empty string to a SQL NULL so that summary="" is
-// stored as NULL rather than an empty string, matching old_code behaviour.
+// stored as NULL rather than an empty string, matching the legacy
+// predecessor's behaviour.
 func nullableStr(s string) sql.NullString {
 	if s == "" {
 		return sql.NullString{}

@@ -113,7 +113,8 @@ func Open(path string) (*Store, error) {
 	// writer at a time. One open connection eliminates SQLITE_BUSY contention.
 	db.SetMaxOpenConns(1)
 
-	// Pragmas verbatim from old_code store.go:602.
+	// Pragmas verbatim from the legacy predecessor codebase (private,
+	// pre-rewrite): internal/store/store.go:602.
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA busy_timeout = 5000",
@@ -462,7 +463,8 @@ func (s *Store) SearchMemories(query, project string, limit int) ([]*domain.Reco
 // ── sanitizeFTS ───────────────────────────────────────────────────────────────
 
 // sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars
-// or operator keywords. Port of old_code store.go:6227.
+// or operator keywords. Port from the legacy predecessor codebase (private,
+// pre-rewrite): internal/store/store.go:6227.
 // "fix auth bug" → `"fix" "auth" "bug"`
 //
 // Interior double-quotes are removed entirely (not just leading/trailing) before

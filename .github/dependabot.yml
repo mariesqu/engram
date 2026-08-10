@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Go module dependencies. New modules are a deliberate decision here (see
+  # CONTRIBUTING.md) — these PRs only bump what is already vendored in go.mod.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+
+  # Workflow actions are SHA-pinned; dependabot updates the SHA and refreshes
+  # the trailing "# vN" comment, which is the whole point of pinning.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore

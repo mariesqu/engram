@@ -1,9 +1,8 @@
 /*
  * engram daemon console — product-branded stylesheet.
  *
- * Identity shared with the wider product brand (mario-esquivel portfolio, Quill):
- * an "editorial terminal" — warm near-black ground, parchment-cream text, a GOLD
- * engineer accent (#e8a845) with a TERRACOTTA prose accent (#c4785a), DM Serif
+ * Identity: an "editorial terminal" — warm near-black ground, parchment-cream text,
+ * a GOLD engineer accent (#e8a845) with a TERRACOTTA prose accent (#c4785a), DM Serif
  * Display for the wordmark, JetBrains Mono for data/console, and a faint film-grain
  * overlay. Fonts + grain are vendored under /ui/static (self-hosted) so the daemon's
  * own CSP (default-src 'self') is satisfied — no CDN, no inline styles.
