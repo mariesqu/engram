@@ -392,7 +392,7 @@ The `"type": "http"` config above works well for MCP hosts that support the Stre
 
 Every client gets this same trivial config — no token in sight, no per-client daemon process, no per-client SQLite owner. `engram connect` reads the current token from `daemon.json` at startup, and re-reads it automatically if a request comes back `401` (the daemon restarted and rotated its token mid-session) — the client never sees the rotation.
 
-No prerequisite daemon needed: if `engram connect` finds no resident daemon running (or finds an unhealthy one), it auto-starts one detached (`engram daemon --db <path> --http --transport http`) and waits up to ~10s for it to become healthy before bridging — the same auto-launch behavior as `engram tray`. The FIRST client to connect spawns the resident daemon; every client after that just finds it already running. This makes the single-resident-daemon topology self-healing for stdio-only clients, which (unlike the tray) can't run a background process on their own to keep the daemon alive.
+No prerequisite daemon needed: if `engram connect` finds no resident daemon running (or finds an unhealthy one), it auto-starts one detached (`engram daemon --db <path> --http --transport http`) and waits up to ~10s for it to become healthy before bridging — the same spawn/log/health-check mechanics as `engram tray`'s auto-launch, but without the retry loop. The FIRST client to connect spawns the resident daemon; every client after that just finds it already running. This makes the single-resident-daemon topology self-healing for stdio-only clients, which (unlike the tray) can't run a background process on their own to keep the daemon alive.
 
 If you'd rather manage the daemon's lifecycle yourself (or you're scripting/diagnosing and want a fast failure instead of a ~10s wait), pass `--no-autostart`:
 
@@ -577,10 +577,12 @@ $env:ENGRAM_DB = "$env:APPDATA\engram\memories.db"
 
 If the resident daemon is not already running when `engram tray` is invoked, the tray will:
 
-1. Spawn `engram daemon --db <path> --http --transport http` as a fully detached background process (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
+1. Spawn `engram daemon --db <path> --http --transport http` as a fully detached background process (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`). The spawned process's stdout/stderr stay wired to `daemon-spawn.log` next to `daemon.json` for the daemon's *entire resident lifetime*, not just its startup — instead of being discarded, so a daemon that fails to start (or logs errors later) leaves a diagnosable trace. The log is checked for rotation at the start of each new spawn attempt: past ~5 MB it is renamed to `daemon-spawn.log.old`, or, if a still-running daemon holds the file open (renaming an open file fails on Windows), truncated in place instead.
 2. Wait for `daemon.json` to appear next to the database file.
 3. Poll `GET /api/v1/status` until a valid engram response is received (bounded: 10 s, 500 ms intervals).
 4. Display the tray icon once the daemon is healthy.
+
+If the daemon does not become healthy within that 10 s window (e.g. a cold boot with a slow central server), the tray retries the whole auto-launch with exponential backoff (5 s, doubling, capped at 60 s) instead of exiting immediately — up to 15 attempts (~14 minutes total, assuming fast-failing probes (connection refused); slower if probes stall) before it gives up and exits with an error, so a permanent failure is still visible instead of retrying invisibly forever. 'engram connect's auto-start (see above) uses the same spawn/log/health-check mechanics, one attempt at a time (no retry loop of its own).
 
 If the daemon is already running and healthy, the tray attaches to it without starting a second instance.
 
