@@ -20,7 +20,7 @@ jobs:
       contents: write # gh release create
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Shallow is fine: the version comes from GITHUB_REF_NAME (the Actions
           # environment, not local git), and gh's --notes-from-tag reads the tag
@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
