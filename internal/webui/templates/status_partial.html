@@ -11,6 +11,8 @@
         <span class="field-value">
             {{if .CentralConnected}}
                 <span class="badge badge-connected">connected</span>
+            {{else if .CentralConfigured}}
+                <span class="badge badge-warning" title="Configured, but the most recent sync attempt failed — see Last sync result below">sync failing</span>
             {{else}}
                 <span class="badge badge-disconnected">disconnected</span>
             {{end}}
@@ -51,7 +53,7 @@
         <span class="field-value mono">{{.DaemonVersion}}</span>
     </div>
 
-    {{if .CentralConnected}}
+    {{if .CentralConfigured}}
     <div class="action-row">
         <form method="POST" action="/ui/sync"
               hx-post="/ui/sync"

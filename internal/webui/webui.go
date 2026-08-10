@@ -554,13 +554,22 @@ func isPolicyPath(path string) bool {
 // PR-④b adds CSRF-related fields and connect-form fields so the partial can
 // render the sync-now / disconnect / connect forms in the same fragment.
 type statusViewModel struct {
+	// CentralConnected is true only once a central is configured AND its most
+	// recent sync attempt actually succeeded — see controlapi.Status doc.
 	CentralConnected bool
-	CentralURL       string // empty when not configured
-	LastSyncAt       string // RFC3339 or empty
-	LastSyncError    string // empty when last sync succeeded or never ran
-	LastSyncPushed   int
-	LastSyncPulled   int
-	DaemonVersion    string
+	// CentralConfigured is true whenever a central URL + writer key are on
+	// file, regardless of whether the most recent sync attempt succeeded.
+	// The template uses this (not CentralConnected) to decide whether to show
+	// the sync/disconnect actions or the "connect to central" form: a
+	// configured-but-currently-failing central must still offer Sync/
+	// Disconnect, not be mistaken for "never configured".
+	CentralConfigured bool
+	CentralURL        string // empty when not configured
+	LastSyncAt        string // RFC3339 or empty
+	LastSyncError     string // empty when last sync succeeded or never ran
+	LastSyncPushed    int
+	LastSyncPulled    int
+	DaemonVersion     string
 
 	// CSRF fields (④b) — present on the status partial for the action forms.
 	CSRFToken string
@@ -678,11 +687,12 @@ type memoryEditViewModel struct {
 // csrfToken is injected from the per-session CSRF store.
 func newStatusVM(st controlapi.Status, version, csrfToken string) statusViewModel {
 	vm := statusViewModel{
-		CentralConnected: st.CentralConnected,
-		DaemonVersion:    version,
-		LastSyncPushed:   st.LastSyncResult.Pushed,
-		LastSyncPulled:   st.LastSyncResult.Pulled,
-		CSRFToken:        csrfToken,
+		CentralConnected:  st.CentralConnected,
+		CentralConfigured: st.CentralConfigured,
+		DaemonVersion:     version,
+		LastSyncPushed:    st.LastSyncResult.Pushed,
+		LastSyncPulled:    st.LastSyncResult.Pulled,
+		CSRFToken:         csrfToken,
 	}
 	if st.CentralURL != nil {
 		vm.CentralURL = *st.CentralURL
@@ -1090,11 +1100,16 @@ func handleProjectDeletePost(w http.ResponseWriter, r *http.Request, deps WebUID
 
 // handleSyncPost handles POST /ui/sync.
 // Calls SyncController.TriggerNow and returns the refreshed status partial.
+//
+// Gated on CentralConfigured, not CentralConnected: a configured central
+// whose most recent sync attempt failed is exactly the case the "Sync now"
+// button exists for (manual retry), so a currently-failing central must not
+// be treated the same as "never configured".
 func handleSyncPost(w http.ResponseWriter, r *http.Request, deps WebUIDeps, sessions *sessionStore) {
 	st := deps.SyncCtrl.Status()
-	if !st.CentralConnected {
+	if !st.CentralConfigured {
 		// Return the partial with the disconnect state — the button was somehow
-		// submitted while disconnected (race/stale page). Treat as 409.
+		// submitted while not configured (race/stale page). Treat as 409.
 		vm := newStatusVM(st, deps.Version, sessions.csrfToken())
 		renderPartialStatus(w, "status-partial", vm, http.StatusConflict)
 		return

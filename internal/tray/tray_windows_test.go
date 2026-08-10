@@ -3,6 +3,7 @@
 package tray
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -121,7 +122,7 @@ func TestTrayRun_SyncNow_CallsAPI(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v1/status":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"central_connected":true,"daemon_version":"0.1.0"}`))
+			_, _ = w.Write([]byte(`{"central_connected":true,"central_configured":true,"daemon_version":"0.1.0"}`))
 		case "/api/v1/sync/trigger":
 			w.WriteHeader(http.StatusAccepted)
 			select {
@@ -244,5 +245,105 @@ func (f *sequencedFakeWin32) PumpMessages(_ uintptr, quit <-chan struct{}, onCal
 		case <-ticker.C:
 			onCallback(wm_TrayCallback, 0, 0x0205)
 		}
+	}
+}
+
+// ── Mixed-version daemon compatibility ─────────────────────────────────────────
+
+// TestApplyStatus_LegacyDaemon_TreatsConnectedAsConfigured decodes a status
+// body shaped like an OLD daemon's response — central_connected=true and no
+// central_configured key at all — and verifies the resulting snapshot is
+// self-consistent: Configured must be true (never Connected=true with
+// Configured=false), and BuildMenu must render "Disconnect from central"
+// plus an enabled "Sync Now" rather than the contradictory "Connected" +
+// "Connect to central" + disabled "Sync Now" combination.
+func TestApplyStatus_LegacyDaemon_TreatsConnectedAsConfigured(t *testing.T) {
+	legacyBody := []byte(`{"central_connected":true}`) // no central_configured key
+
+	var st statusResponse
+	if err := json.Unmarshal(legacyBody, &st); err != nil {
+		t.Fatalf("unmarshal legacy status body: %v", err)
+	}
+	if st.CentralConfigured {
+		t.Fatal("test setup invalid: central_configured must decode false when absent")
+	}
+
+	snap := StatusSnapshot{DaemonRunning: true}
+	applyStatus(&snap, st)
+
+	if !snap.Connected {
+		t.Error("Connected = false, want true")
+	}
+	if !snap.Configured {
+		t.Error("Configured = false, want true (legacy connected=true implies configured)")
+	}
+
+	items := BuildMenu(snap)
+	if item := findItem(items, MenuIDStatus); item == nil || item.Label != "Connected" {
+		t.Errorf("status label = %+v, want \"Connected\"", item)
+	}
+	if findItem(items, MenuIDDisconnect) == nil {
+		t.Error("menu missing \"Disconnect from central\" — legacy status must not show \"Connect to central\"")
+	}
+	if findItem(items, MenuIDConnect) != nil {
+		t.Error("menu unexpectedly shows \"Connect to central\" for a legacy-connected daemon")
+	}
+	syncItem := findItem(items, MenuIDSyncNow)
+	if syncItem == nil {
+		t.Fatal("Sync Now item not found")
+	}
+	if syncItem.Disabled {
+		t.Error("Sync Now is disabled, want enabled — a configured daemon must allow manual sync")
+	}
+}
+
+// TestApplyStatus_NewDaemon_RoundTrips verifies a NEW daemon's status body
+// (both fields present) maps through unchanged, so the legacy fallback in
+// applyStatus never masks a genuine "connected but not configured" case —
+// which cannot happen on a new daemon anyway, since central_connected can
+// only be true when central_configured is true — nor a genuine
+// "not connected, but configured" (Sync Error) case.
+func TestApplyStatus_NewDaemon_RoundTrips(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		wantConnected  bool
+		wantConfigured bool
+	}{
+		{
+			name:           "connected and configured",
+			body:           `{"central_connected":true,"central_configured":true}`,
+			wantConnected:  true,
+			wantConfigured: true,
+		},
+		{
+			name:           "configured but sync failing",
+			body:           `{"central_connected":false,"central_configured":true}`,
+			wantConnected:  false,
+			wantConfigured: true,
+		},
+		{
+			name:           "never configured",
+			body:           `{"central_connected":false,"central_configured":false}`,
+			wantConnected:  false,
+			wantConfigured: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var st statusResponse
+			if err := json.Unmarshal([]byte(tt.body), &st); err != nil {
+				t.Fatalf("unmarshal status body: %v", err)
+			}
+			var snap StatusSnapshot
+			applyStatus(&snap, st)
+			if snap.Connected != tt.wantConnected {
+				t.Errorf("Connected = %v, want %v", snap.Connected, tt.wantConnected)
+			}
+			if snap.Configured != tt.wantConfigured {
+				t.Errorf("Configured = %v, want %v", snap.Configured, tt.wantConfigured)
+			}
+		})
 	}
 }

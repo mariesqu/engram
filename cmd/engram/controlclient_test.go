@@ -199,9 +199,10 @@ func TestCLI_Status_PrintsOutput(t *testing.T) {
 			return
 		}
 		st := controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       &centralURL,
-			DaemonVersion:    "0.1.0-test",
+			CentralConnected:  true,
+			CentralConfigured: true, // CentralConnected=true implies configured; keep the fixture consistent
+			CentralURL:        &centralURL,
+			DaemonVersion:     "0.1.0-test",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(st)

@@ -191,8 +191,9 @@ func TestStatus_Connected(t *testing.T) {
 	errNil := (*string)(nil)
 	syncCtrl := &mockSyncCtrl{
 		status: controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       ptrString("https://central.example.com"),
+			CentralConnected:  true,
+			CentralConfigured: true, // CentralConnected=true implies configured; keep the fixture consistent
+			CentralURL:        ptrString("https://central.example.com"),
 			LastSyncResult: controlapi.SyncResult{
 				At:     &now,
 				Error:  errNil,
@@ -285,6 +286,46 @@ func TestStatus_AfterFailedSync(t *testing.T) {
 	}
 	if st.LastSyncResult.Error == nil || *st.LastSyncResult.Error == "" {
 		t.Error("want last_sync_result.error to be non-empty after failed sync")
+	}
+}
+
+// TestStatus_ConfiguredButSyncFailing verifies the wire contract for the
+// "central is set up but currently unreachable" case: central_connected must
+// be false (the UI must not lie about reachability) while central_configured
+// stays true (the UI must not offer the "not configured yet" connect form for
+// a central that IS configured, just failing).
+func TestStatus_ConfiguredButSyncFailing(t *testing.T) {
+	errMsg := "dial tcp: lookup central.example.com: no such host"
+	centralURL := "https://central.example.com"
+	syncCtrl := &mockSyncCtrl{
+		status: controlapi.Status{
+			CentralConnected:  false,
+			CentralConfigured: true,
+			CentralURL:        &centralURL,
+			LastSyncResult: controlapi.SyncResult{
+				Error: &errMsg,
+			},
+		},
+	}
+	_, ts := newTestServer(t, "tok", &mockStore{}, syncCtrl, &mockCfgStore{})
+
+	resp := get(t, ts, "/api/v1/status", authHeader("tok"))
+	defer resp.Body.Close()
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var connected, configured bool
+	_ = json.Unmarshal(raw["central_connected"], &connected)
+	_ = json.Unmarshal(raw["central_configured"], &configured)
+
+	if connected {
+		t.Error("want central_connected=false when the last sync attempt failed")
+	}
+	if !configured {
+		t.Error("want central_configured=true when a central URL is on file")
 	}
 }
 

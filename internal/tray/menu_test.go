@@ -10,7 +10,7 @@ import (
 // ── BuildMenu model tests ─────────────────────────────────────────────────────
 
 func TestBuildMenu_Connected_HasDisconnect(t *testing.T) {
-	items := BuildMenu(StatusSnapshot{Connected: true, DaemonRunning: true})
+	items := BuildMenu(StatusSnapshot{Connected: true, Configured: true, DaemonRunning: true})
 
 	if items[0].Label != "Connected" {
 		t.Errorf("status label = %q, want Connected", items[0].Label)
@@ -32,7 +32,7 @@ func TestBuildMenu_Connected_HasDisconnect(t *testing.T) {
 }
 
 func TestBuildMenu_Disconnected_HasConnect(t *testing.T) {
-	items := BuildMenu(StatusSnapshot{Connected: false, DaemonRunning: true})
+	items := BuildMenu(StatusSnapshot{Connected: false, Configured: false, DaemonRunning: true})
 
 	if items[0].Label != "Disconnected" {
 		t.Errorf("status label = %q, want Disconnected", items[0].Label)
@@ -46,7 +46,32 @@ func TestBuildMenu_Disconnected_HasConnect(t *testing.T) {
 		t.Fatal("Sync Now item missing")
 	}
 	if !syncItem.Disabled {
-		t.Error("Sync Now must be disabled when disconnected")
+		t.Error("Sync Now must be disabled when not configured")
+	}
+}
+
+// TestBuildMenu_ConfiguredButSyncFailing_HasDisconnectAndEnabledSync verifies
+// the manual-retry case: central is configured but the most recent sync
+// attempt failed (Connected=false, Configured=true). The menu must still
+// offer "Disconnect from central" (not mistake this for "never configured")
+// and keep "Sync Now" enabled (that button IS the retry), while the status
+// label distinguishes this from a healthy connection.
+func TestBuildMenu_ConfiguredButSyncFailing_HasDisconnectAndEnabledSync(t *testing.T) {
+	items := BuildMenu(StatusSnapshot{Connected: false, Configured: true, DaemonRunning: true})
+
+	if items[0].Label != "Sync Error" {
+		t.Errorf("status label = %q, want %q", items[0].Label, "Sync Error")
+	}
+
+	assertMenuHasID(t, items, MenuIDDisconnect, "Disconnect from central")
+	assertMenuLacksID(t, items, MenuIDConnect)
+
+	syncItem := findItem(items, MenuIDSyncNow)
+	if syncItem == nil {
+		t.Fatal("Sync Now item missing")
+	}
+	if syncItem.Disabled {
+		t.Error("Sync Now must be enabled when configured, even if the last sync attempt failed")
 	}
 }
 

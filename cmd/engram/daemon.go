@@ -1313,10 +1313,21 @@ func (a *runtimeSyncAdapter) Status() controlapi.Status {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	lastResult := a.lastSyncResultLocked()
+	// CentralConnected is reachability, not configuration: a.connected only
+	// means "a central URL + loop are on file" (see CentralConfigured doc on
+	// the Status type). Report true only once a sync cycle has actually
+	// completed successfully — before that (fresh Reconnect, or every cycle
+	// after a failure) CentralConnected is false even though the daemon is
+	// configured and its sync loop keeps retrying on its own interval. This
+	// closes the "central_connected: true while every sync attempt fails"
+	// gap that made the status endpoint lie to the UI during an outage.
+	syncSucceeded := lastResult.At != nil && lastResult.Error == nil
 	st := controlapi.Status{
-		CentralConnected: a.connected,
-		LastSyncResult:   a.lastSyncResultLocked(),
-		DaemonVersion:    version,
+		CentralConfigured: a.connected,
+		CentralConnected:  a.connected && syncSucceeded,
+		LastSyncResult:    lastResult,
+		DaemonVersion:     version,
 	}
 	if a.centralURL != "" {
 		u := a.centralURL

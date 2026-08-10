@@ -288,8 +288,9 @@ func TestWebUI_GetStatus_200_HTML(t *testing.T) {
 	now := time.Now().UTC()
 	centralURL := "http://central.example.com"
 	status := controlapi.Status{
-		CentralConnected: true,
-		CentralURL:       &centralURL,
+		CentralConnected:  true,
+		CentralConfigured: true,
+		CentralURL:        &centralURL,
 		LastSyncResult: controlapi.SyncResult{
 			At:     &now,
 			Pushed: 3,
@@ -330,9 +331,10 @@ func TestWebUI_PollingPartial_Status(t *testing.T) {
 	const secret = "partial-tok"
 	centralURL := "http://central.test"
 	status := controlapi.Status{
-		CentralConnected: true,
-		CentralURL:       &centralURL,
-		DaemonVersion:    "test-version",
+		CentralConnected:  true,
+		CentralConfigured: true,
+		CentralURL:        &centralURL,
+		DaemonVersion:     "test-version",
 	}
 	srv := newTestServer(t, secret, status, nil)
 	body := authenticatedGet(t, srv, secret, "/ui/status")
@@ -407,10 +409,11 @@ func TestNoExternalAssetReferences(t *testing.T) {
 		{Name: "proj-a", Policy: controlapi.PolicySynced},
 	}
 	status := controlapi.Status{
-		CentralConnected: true,
-		CentralURL:       &centralURL,
-		LastSyncResult:   controlapi.SyncResult{At: &now},
-		DaemonVersion:    "test-version",
+		CentralConnected:  true,
+		CentralConfigured: true,
+		CentralURL:        &centralURL,
+		LastSyncResult:    controlapi.SyncResult{At: &now},
+		DaemonVersion:     "test-version",
 	}
 	srv := newTestServer(t, secret, status, projects)
 
@@ -948,8 +951,9 @@ func TestWebUI_Origin_WrongOrigin_403(t *testing.T) {
 	centralURL := "http://central.test"
 	ctrl := &recordingSyncCtrl{
 		status: controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       &centralURL,
+			CentralConnected:  true,
+			CentralConfigured: true,
+			CentralURL:        &centralURL,
 		},
 	}
 	mux := http.NewServeMux()
@@ -994,8 +998,9 @@ func TestWebUI_Sync_POST_Connected_202(t *testing.T) {
 	centralURL := "http://central.test"
 	ctrl := &recordingSyncCtrl{
 		status: controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       &centralURL,
+			CentralConnected:  true,
+			CentralConfigured: true,
+			CentralURL:        &centralURL,
 		},
 	}
 	mux := http.NewServeMux()
@@ -1023,11 +1028,11 @@ func TestWebUI_Sync_POST_Connected_202(t *testing.T) {
 }
 
 // TestWebUI_Sync_POST_Disconnected_409 verifies that POST /ui/sync returns
-// 409 when central is not connected and TriggerNow is NOT called.
+// 409 when central is not configured and TriggerNow is NOT called.
 func TestWebUI_Sync_POST_Disconnected_409(t *testing.T) {
 	const secret = "sync-disconnected-tok"
 	ctrl := &recordingSyncCtrl{
-		status: controlapi.Status{CentralConnected: false},
+		status: controlapi.Status{CentralConnected: false, CentralConfigured: false},
 	}
 	mux := http.NewServeMux()
 	webui.Mount(mux, webui.WebUIDeps{
@@ -1049,7 +1054,46 @@ func TestWebUI_Sync_POST_Disconnected_409(t *testing.T) {
 		t.Errorf("want 409, got %d: %s", resp.StatusCode, body)
 	}
 	if ctrl.triggerNowCalled {
-		t.Error("TriggerNow must NOT be called when central is disconnected")
+		t.Error("TriggerNow must NOT be called when central is not configured")
+	}
+}
+
+// TestWebUI_Sync_POST_ConfiguredButFailing_202 verifies that POST /ui/sync
+// still triggers a manual retry (202) when central is configured but the most
+// recent sync attempt failed (CentralConnected=false) — the "Sync now" button
+// exists precisely for this case, so it must not be blocked by the
+// reachability bit.
+func TestWebUI_Sync_POST_ConfiguredButFailing_202(t *testing.T) {
+	const secret = "sync-configured-failing-tok"
+	centralURL := "http://central.test"
+	ctrl := &recordingSyncCtrl{
+		status: controlapi.Status{
+			CentralConnected:  false,
+			CentralConfigured: true,
+			CentralURL:        &centralURL,
+		},
+	}
+	mux := http.NewServeMux()
+	webui.Mount(mux, webui.WebUIDeps{
+		SyncCtrl:    ctrl,
+		Store:       &mockStore{},
+		ConfigStore: &mockConfigStore{},
+		Secret:      secret,
+		Port:        7700,
+		Version:     "test-version",
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	resp := authenticatedPost(t, srv, secret, "/ui/sync")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("want 202, got %d: %s", resp.StatusCode, body)
+	}
+	if !ctrl.triggerNowCalled {
+		t.Error("TriggerNow must be called on sync POST when configured, even if the last sync attempt failed")
 	}
 }
 
@@ -1059,7 +1103,7 @@ func TestWebUI_Disconnect_POST_Calls_Disconnect(t *testing.T) {
 	const secret = "disconnect-tok"
 	centralURL := "http://central.test"
 	ctrl := &recordingSyncCtrl{
-		status: controlapi.Status{CentralConnected: true, CentralURL: &centralURL},
+		status: controlapi.Status{CentralConnected: true, CentralConfigured: true, CentralURL: &centralURL},
 	}
 	mux := http.NewServeMux()
 	webui.Mount(mux, webui.WebUIDeps{
@@ -1356,7 +1400,7 @@ func TestWebUI_Config_GET_DoesNotEchoWriterKey(t *testing.T) {
 // cookie and header — must be rejected.
 func TestCSRF_SessionBound_StaleTokenAfterRotation(t *testing.T) {
 	const secret = "tok-rotate"
-	srv := newTestServer(t, secret, controlapi.Status{CentralConnected: true}, nil)
+	srv := newTestServer(t, secret, controlapi.Status{CentralConnected: true, CentralConfigured: true}, nil)
 
 	// Exchange #1: capture both cookies.
 	sess1, csrf1 := exchangeGetBothCookies(t, srv, secret)

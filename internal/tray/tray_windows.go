@@ -628,16 +628,22 @@ func runTray(cfg TrayConfig, w win32) error {
 					snapshot.DaemonRunning = false
 				} else {
 					snapshot.DaemonRunning = true
-					snapshot.Connected = st.CentralConnected
+					applyStatus(&snapshot, st)
 				}
 				snapshotMu.Unlock()
 
-				// Update tooltip.
+				// Update tooltip. Mirrors BuildMenu's status label: a
+				// configured-but-currently-failing central gets its own
+				// wording rather than being shown as either healthy or
+				// never-configured.
 				h := hwndAtomic.Load()
 				if h != 0 {
 					tooltip := "engram — disconnected"
-					if snapshot.Connected {
+					switch {
+					case snapshot.Connected:
 						tooltip = "engram — connected"
+					case snapshot.Configured:
+						tooltip = "engram — sync error"
 					}
 					_ = w.UpdateTrayIcon(h, tooltip)
 				}
@@ -752,7 +758,25 @@ func postControl(cfg TrayConfig, path string, body any) error {
 
 // statusResponse is the subset of /api/v1/status we need for menu state.
 type statusResponse struct {
-	CentralConnected bool `json:"central_connected"`
+	CentralConnected  bool `json:"central_connected"`
+	CentralConfigured bool `json:"central_configured"`
+}
+
+// applyStatus copies a decoded statusResponse into s.
+//
+// Mixed-version compatibility: an OLD daemon's /api/v1/status body has no
+// central_configured key at all (it decodes to the zero value, false), but
+// its central_connected field meant "configured" under the old, single-field
+// status model — there was no separate "configured but currently failing"
+// state. A NEW tray talking to an OLD daemon must not take that JSON at face
+// value: Connected=true + Configured=false renders as the "Connected" label
+// while also offering "Connect to central" and a disabled "Sync Now", which
+// is a self-contradictory menu. Since an old daemon cannot report
+// central_connected=true without being configured, treat connected=true as
+// proof of configured=true regardless of what central_configured decoded to.
+func applyStatus(s *StatusSnapshot, st statusResponse) {
+	s.Connected = st.CentralConnected
+	s.Configured = st.CentralConfigured || st.CentralConnected
 }
 
 // getStatus polls GET /api/v1/status and returns the connectivity state.

@@ -78,10 +78,15 @@ func (s *realSyncCtrl) Status() controlapi.Status {
 		url = &s.centralURL
 	}
 	return controlapi.Status{
-		CentralConnected: s.centralURL != "",
-		CentralURL:       url,
-		LastSyncResult:   controlapi.SyncResult{},
-		DaemonVersion:    "acceptance-test",
+		// This stub models no real sync outcomes, so CentralConnected simply
+		// mirrors "a URL is set" here — real production code additionally
+		// requires the most recent sync attempt to have succeeded (see
+		// controlapi.Status doc / cmd/engram's runtimeSyncAdapter.Status).
+		CentralConnected:  s.centralURL != "",
+		CentralConfigured: s.centralURL != "",
+		CentralURL:        url,
+		LastSyncResult:    controlapi.SyncResult{},
+		DaemonVersion:     "acceptance-test",
 	}
 }
 

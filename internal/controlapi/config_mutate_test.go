@@ -211,9 +211,10 @@ func TestConnect_ValidCreds_200_StatusConnected(t *testing.T) {
 	centralURL := "https://central.example.com"
 	sync := &mockSyncControllerFull{
 		status: controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       &centralURL,
-			DaemonVersion:    "test-version",
+			CentralConnected:  true,
+			CentralConfigured: true, // CentralConnected=true implies configured; keep the fixture consistent
+			CentralURL:        &centralURL,
+			DaemonVersion:     "test-version",
 		},
 	}
 	srv := newServerPR3(t, sync, nil)
@@ -327,7 +328,7 @@ func TestDisconnect_200_SyncHalted(t *testing.T) {
 func TestSyncTrigger_Connected_202(t *testing.T) {
 	centralURL := "https://central.example.com"
 	sync := &mockSyncControllerFull{
-		status: controlapi.Status{CentralConnected: true, CentralURL: &centralURL},
+		status: controlapi.Status{CentralConnected: true, CentralConfigured: true, CentralURL: &centralURL},
 	}
 	srv := newServerPR3(t, sync, nil)
 
@@ -340,9 +341,29 @@ func TestSyncTrigger_Connected_202(t *testing.T) {
 	}
 }
 
+// TestSyncTrigger_ConfiguredButSyncFailing_202 verifies the manual-retry case:
+// central is configured but the most recent sync attempt failed
+// (CentralConnected=false), yet the trigger must still be allowed — a manual
+// "sync now" while the connection is down is exactly what the button is for.
+func TestSyncTrigger_ConfiguredButSyncFailing_202(t *testing.T) {
+	centralURL := "https://central.example.com"
+	sync := &mockSyncControllerFull{
+		status: controlapi.Status{CentralConnected: false, CentralConfigured: true, CentralURL: &centralURL},
+	}
+	srv := newServerPR3(t, sync, nil)
+
+	req := buildPOST(t, "/api/v1/sync/trigger", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("sync trigger configured-but-failing: got %d, want 202; body: %s", w.Code, w.Body)
+	}
+}
+
 func TestSyncTrigger_Disconnected_409(t *testing.T) {
 	sync := &mockSyncControllerFull{
-		status: controlapi.Status{CentralConnected: false},
+		status: controlapi.Status{CentralConnected: false, CentralConfigured: false},
 	}
 	srv := newServerPR3(t, sync, nil)
 

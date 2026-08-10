@@ -173,8 +173,9 @@ func TestCSRF_Valid_Passes(t *testing.T) {
 	centralURL := "http://central.test"
 	ctrl := &recordingSyncCtrl{
 		status: controlapi.Status{
-			CentralConnected: true,
-			CentralURL:       &centralURL,
+			CentralConnected:  true,
+			CentralConfigured: true,
+			CentralURL:        &centralURL,
 		},
 	}
 	mux := http.NewServeMux()
@@ -201,8 +202,8 @@ func TestCSRF_Valid_Passes(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// 202 Accepted (sync triggered) or 409 Conflict depending on connected state.
-	// We set CentralConnected=true so expect 202.
+	// 202 Accepted (sync triggered) or 409 Conflict depending on configured state.
+	// We set CentralConfigured=true so expect 202.
 	if resp.StatusCode != http.StatusAccepted {
 		t.Errorf("want 202 (sync triggered), got %d", resp.StatusCode)
 	}
