@@ -45,6 +45,15 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 > **New to engram?** [Quickstart: local-only mode](#quickstart-local-only-mode) gets you running in two commands. Once memories start accumulating, [Managing your memories](#managing-your-memories) shows how to browse, search, edit, and clean them up from the CLI or web UI — no agent required.
 
+<p align="center">
+  <a href="docs/how-it-works.md">
+    <img src="docs/assets/how-it-works.png" width="720"
+         alt="Poster: how engram works — the notebook-and-librarian analogy, FTS5 keyword search, embeddings and cosine similarity, RRF hybrid fusion, the detect-flag-judge conflict flow, and local-first sync.">
+  </a>
+</p>
+
+> **Prefer the story to the manual?** [How it works](docs/how-it-works.md) explains the engine in plain language — the notebook-and-librarian analogy, FTS5 + BM25, embeddings and cosine similarity, RRF hybrid fusion, the conflict-judgment flow, and local-first sync.
+
 ## Contents
 
 - [Architecture](#architecture)
