@@ -16,6 +16,7 @@ import (
 	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/remote"
 	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/transport"
 	"github.com/mariesqu/engram/internal/wireauth"
 )
 
@@ -405,22 +406,105 @@ func TestClient_Apply_TruncatedBody_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestClient_Apply_OversizedBody_ReturnsError proves the client rejects a response
-// body larger than maxResponseBytes with an explicit error (fail-fast) instead of
-// silently truncating it. The server returns 200 with a body one byte over the cap.
-func TestClient_Apply_OversizedBody_ReturnsError(t *testing.T) {
+// oversizedBodyServer returns a test server that answers every request with the
+// given status and a body one byte over maxResponseBytes, so the client's overflow
+// guard trips. The status is a parameter because the client must treat an oversized
+// 2xx (a genuinely too-big payload) and an oversized non-2xx (a server error page)
+// as DIFFERENT failures.
+func oversizedBodyServer(t *testing.T, status int) *httptest.Server {
+	t.Helper()
 	const oversized = (4 << 20) + 1 // maxResponseBytes (4 MiB) + 1
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(status)
 		_, _ = w.Write(make([]byte, oversized))
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestClient_Apply_OversizedBody_ReturnsError proves the client rejects a response
+// body larger than maxResponseBytes with an explicit error (fail-fast) instead of
+// silently truncating it. The server returns 200 with a body one byte over the cap.
+// The error must wrap transport.ErrResponseTooLarge: overflow is a TYPED condition
+// callers classify with errors.Is, never by matching on message text.
+func TestClient_Apply_OversizedBody_ReturnsError(t *testing.T) {
+	srv := oversizedBodyServer(t, http.StatusOK)
 
 	c := remote.New(srv.URL, nil, "writer-test", testKey())
 	m := testMutation(t, "sdd/test/oversized", "hello")
-	if err := c.Apply(context.Background(), m); err == nil {
-		t.Error("Apply returned nil on an oversized response body; want an explicit overflow error")
+	err := c.Apply(context.Background(), m)
+	if err == nil {
+		t.Fatal("Apply returned nil on an oversized response body; want an explicit overflow error")
+	}
+	if !errors.Is(err, transport.ErrResponseTooLarge) {
+		t.Errorf("Apply overflow error = %v; want an error wrapping transport.ErrResponseTooLarge", err)
+	}
+}
+
+// TestClient_PullSince_OversizedBody_WrapsErrResponseTooLarge is the client half of
+// the v1.5.2 pull-wedge fix. A full 1000-mutation pull batch can legitimately blow
+// past the 4 MiB response cap, and when it did the daemon reported an anonymous
+// fmt.Errorf that nothing could match — so syncer.Pull could not shrink the batch,
+// the cursor never advanced, and the same oversized window was re-requested forever.
+// Wrapping transport.ErrResponseTooLarge is what makes the halving retry possible;
+// this test is the guard against that wrapper being dropped.
+//
+// The message must still name the method and the cap: that string is what operators
+// see in daemon logs, and losing it turns a diagnosable overflow into a mystery.
+func TestClient_PullSince_OversizedBody_WrapsErrResponseTooLarge(t *testing.T) {
+	srv := oversizedBodyServer(t, http.StatusOK)
+
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
+	_, err := c.PullSince(context.Background(), "engram", 0, 1000)
+	if err == nil {
+		t.Fatal("PullSince returned nil on an oversized response body; want an explicit overflow error")
+	}
+	if !errors.Is(err, transport.ErrResponseTooLarge) {
+		t.Fatalf("PullSince overflow error = %v; want an error wrapping transport.ErrResponseTooLarge — "+
+			"without the sentinel syncer.Pull cannot halve the batch and the pull cursor wedges", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "remote.PullSince") || !strings.Contains(got, "exceeds cap") {
+		t.Errorf("PullSince overflow message = %q; want it to name the method and the cap", got)
+	}
+}
+
+// TestClient_PullSince_OversizedErrorBody_IsStatusErrorNotOverflow pins the
+// ordering of the two guards: STATUS is classified before SIZE.
+//
+// A 5xx whose body blows the cap is ordinary reality — a proxy or WAF HTML error
+// page, or a verbose stack dump. If the size check ran first, that server failure
+// would be reported as transport.ErrResponseTooLarge and two things would break at
+// once: syncer.Pull would halve 1000→1 (≈9 useless round-trips) against a central
+// that is merely erroring, and StatusError.Retryable — the Loop's whole 5xx-backoff
+// vs 4xx-cooldown signal — would be thrown away. Size may truncate the body text;
+// it must never erase the status.
+func TestClient_PullSince_OversizedErrorBody_IsStatusErrorNotOverflow(t *testing.T) {
+	srv := oversizedBodyServer(t, http.StatusInternalServerError)
+
+	c := remote.New(srv.URL, nil, "writer-test", testKey())
+	_, err := c.PullSince(context.Background(), "engram", 0, 1000)
+	if err == nil {
+		t.Fatal("PullSince returned nil on a 500 with an oversized body; want a *StatusError")
+	}
+	if errors.Is(err, transport.ErrResponseTooLarge) {
+		t.Errorf("PullSince misclassified a 500 as an oversized batch: %v — "+
+			"the status check must run BEFORE the size cap, or Pull halves against a broken server", err)
+	}
+
+	var se *remote.StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("PullSince error is %T, want *remote.StatusError", err)
+	}
+	if se.Code != http.StatusInternalServerError {
+		t.Errorf("StatusError.Code = %d; want 500", se.Code)
+	}
+	if !se.Retryable() {
+		t.Error("a 500 MUST stay retryable even when its body exceeds the cap")
+	}
+	// Body is bounded: complete up to the cap, truncated beyond it.
+	if len(se.Body) > (4 << 20) {
+		t.Errorf("StatusError.Body = %d bytes; want it truncated to at most maxResponseBytes (4 MiB)", len(se.Body))
 	}
 }
 

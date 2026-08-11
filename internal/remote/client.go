@@ -29,6 +29,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/transport"
 	"github.com/mariesqu/engram/internal/wireauth"
 )
 
@@ -38,13 +39,24 @@ import (
 // start in CI without masking genuine hangs.
 const defaultTimeout = 30 * time.Second
 
-// maxResponseBytes is the maximum response body the client accepts. A full
-// PullResponse with the default 100-mutation limit is well under 1 MiB; the server
-// already rejects oversized request bodies — this mirrors that discipline on the
-// response side. A larger response is rejected with an explicit error: the client
-// reads maxResponseBytes+1 and fails fast if the body exceeds the cap, rather than
-// silently truncating it (which would also leave the connection undrained and
-// unreusable).
+// maxResponseBytes is the maximum response body the client accepts. The server
+// already rejects oversized REQUEST bodies (cloudserve maxRequestBytes, 1 MiB per
+// pushed mutation) — this mirrors that discipline on the response side, bounding
+// the memory one hostile or misbehaving central can make the daemon buffer.
+// Overflow is detected by reading maxResponseBytes+1 and failing fast, rather than
+// silently truncating (which would also leave the connection undrained and unreusable).
+//
+// This cap is NOT a "should never happen" guard on pulls. The daemon pulls up to
+// syncer.pullLimit (1000) mutations per batch and cloudserve clamps at pullMaxLimit
+// (also 1000), while each mutation may be up to ~1 MiB at ingest — so a perfectly
+// legitimate 1000-mutation batch can exceed 4 MiB. An over-cap 2xx body therefore
+// returns an error wrapping [transport.ErrResponseTooLarge] (a NON-2xx body is
+// classified as a *StatusError first — status beats size), which syncer.Pull matches with
+// errors.Is to halve the batch limit and retry the SAME cursor until the batch
+// fits. Before that sentinel existed the error was unmatchable, the cursor never
+// advanced, and every subsequent round re-requested the identical oversized window
+// — a permanent pull wedge (the v1.5.2 bug). Raising this constant alone would only
+// move the wall; the halving retry is what makes progress guaranteed.
 const maxResponseBytes = 4 << 20 // 4 MiB
 
 // StatusError is returned whenever the server responds with a non-2xx status.
@@ -56,10 +68,24 @@ const maxResponseBytes = 4 << 20 // 4 MiB
 type StatusError struct {
 	// Code is the HTTP status code returned by the server (e.g. 400, 500).
 	Code int
-	// Body is the full response body text. It is never truncated: a response that
-	// exceeds maxResponseBytes is rejected with a separate overflow error before any
-	// StatusError is constructed, so Body always holds the complete (≤ cap) body.
+	// Body is the response body text, complete up to maxResponseBytes and TRUNCATED
+	// beyond it (see statusBody). Every method checks the status BEFORE the size cap
+	// precisely so an oversized error page still arrives as a StatusError: status
+	// classification — retryable 5xx vs terminal 4xx — must never be sacrificed to
+	// body size. Only a 2xx body over the cap yields the overflow error instead.
 	Body string
+}
+
+// statusBody renders a response body for a [StatusError]. Bodies are read through
+// an io.LimitReader bounded at maxResponseBytes+1, so this trims an over-cap body
+// back to exactly the cap. Truncating is the right trade here: a 5 MiB HTML error
+// page from a proxy still carries a status worth classifying, and dropping the
+// status to report "body too large" would cost the caller its backoff signal.
+func statusBody(b []byte) string {
+	if len(b) > maxResponseBytes {
+		return string(b[:maxResponseBytes])
+	}
+	return string(b)
 }
 
 // Error implements the error interface.
@@ -182,12 +208,14 @@ func (c *Client) Apply(ctx context.Context, m domain.Mutation) error {
 	if err != nil {
 		return fmt.Errorf("remote.Apply: read response body: %w", err)
 	}
-	if len(respBody) > maxResponseBytes {
-		return fmt.Errorf("remote.Apply: response body exceeds cap of %d bytes", maxResponseBytes)
-	}
-
+	// Status is classified BEFORE the size cap: an oversized NON-2xx body is a
+	// server failure, not an oversized payload. See statusBody.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+		return &StatusError{Code: resp.StatusCode, Body: statusBody(respBody)}
+	}
+	if len(respBody) > maxResponseBytes {
+		return fmt.Errorf("remote.Apply: response body exceeds cap of %d bytes: %w",
+			maxResponseBytes, transport.ErrResponseTooLarge)
 	}
 
 	// Decode the PushResponse best-effort; ignore errors (the 200 status is
@@ -235,12 +263,20 @@ func (c *Client) PullSince(ctx context.Context, project string, sinceSeq int64, 
 	if err != nil {
 		return nil, fmt.Errorf("remote.PullSince: read response body: %w", err)
 	}
-	if len(respBody) > maxResponseBytes {
-		return nil, fmt.Errorf("remote.PullSince: response body exceeds cap of %d bytes", maxResponseBytes)
-	}
-
+	// Status FIRST, size cap second — the ordering is load-bearing for pulls. A
+	// non-2xx body over the cap (a proxy/WAF error page, a verbose 5xx) reported as
+	// overflow would send syncer.Pull halving 1000→1 against a server that is simply
+	// erroring, burning ~9 useless round-trips AND discarding StatusError.Retryable,
+	// which is what drives the Loop's 5xx backoff vs 4xx cooldown.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+		return nil, &StatusError{Code: resp.StatusCode, Body: statusBody(respBody)}
+	}
+	if len(respBody) > maxResponseBytes {
+		// Wrapping transport.ErrResponseTooLarge is load-bearing: syncer.Pull matches
+		// it with errors.Is and retries the same cursor with a halved limit. See the
+		// maxResponseBytes doc comment.
+		return nil, fmt.Errorf("remote.PullSince: response body exceeds cap of %d bytes: %w",
+			maxResponseBytes, transport.ErrResponseTooLarge)
 	}
 
 	var pr syncwire.PullResponse
@@ -290,12 +326,14 @@ func (c *Client) ListProjects(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("remote.ListProjects: read response body: %w", err)
 	}
-	if len(respBody) > maxResponseBytes {
-		return nil, fmt.Errorf("remote.ListProjects: response body exceeds cap of %d bytes", maxResponseBytes)
-	}
-
+	// Status before size cap (see Apply): a 404/501 from an older central must stay
+	// a StatusError, or isDiscoveryUnsupported can no longer recognise it.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+		return nil, &StatusError{Code: resp.StatusCode, Body: statusBody(respBody)}
+	}
+	if len(respBody) > maxResponseBytes {
+		return nil, fmt.Errorf("remote.ListProjects: response body exceeds cap of %d bytes: %w",
+			maxResponseBytes, transport.ErrResponseTooLarge)
 	}
 
 	var pr syncwire.ProjectsResponse
@@ -332,12 +370,13 @@ func (c *Client) Unshare(ctx context.Context, project string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("remote.Unshare: read response body: %w", err)
 	}
-	if len(respBody) > maxResponseBytes {
-		return 0, fmt.Errorf("remote.Unshare: response body exceeds cap of %d bytes", maxResponseBytes)
-	}
-
+	// Status before size cap (see Apply).
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return 0, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+		return 0, &StatusError{Code: resp.StatusCode, Body: statusBody(respBody)}
+	}
+	if len(respBody) > maxResponseBytes {
+		return 0, fmt.Errorf("remote.Unshare: response body exceeds cap of %d bytes: %w",
+			maxResponseBytes, transport.ErrResponseTooLarge)
 	}
 
 	var ur syncwire.UnshareResponse
@@ -390,12 +429,14 @@ func (c *Client) State(ctx context.Context) (WriterState, error) {
 	if err != nil {
 		return WriterState{}, fmt.Errorf("remote.State: read response body: %w", err)
 	}
-	if len(respBody) > maxResponseBytes {
-		return WriterState{}, fmt.Errorf("remote.State: response body exceeds cap of %d bytes", maxResponseBytes)
-	}
-
+	// Status before size cap (see Apply): the 501 that means "central has no
+	// writerPurgeEpoch capability" must survive as a StatusError.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return WriterState{}, &StatusError{Code: resp.StatusCode, Body: string(respBody)}
+		return WriterState{}, &StatusError{Code: resp.StatusCode, Body: statusBody(respBody)}
+	}
+	if len(respBody) > maxResponseBytes {
+		return WriterState{}, fmt.Errorf("remote.State: response body exceeds cap of %d bytes: %w",
+			maxResponseBytes, transport.ErrResponseTooLarge)
 	}
 
 	var sr syncwire.StateResponse

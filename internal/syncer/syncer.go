@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
@@ -48,16 +49,66 @@ type Central = transport.Central
 // Node is one sync participant: a local SQLite store plus its own outbox and
 // pull cursor (both persisted inside the store's sync_mutations / sync_state
 // tables). A node owns its SQLite temp file; two nodes = two independent files.
+//
+// A Node also carries the in-memory per-project pull batch limits learned by Pull
+// (see pullLimits). Always use it by pointer — NewNode returns *Node and the
+// embedded mutex makes copies unsafe.
 type Node struct {
 	// Name is a human label used in error messages.
 	Name string
 	// Store is the node's local SQLite store (its own DB file).
 	Store *localstore.Store
+
+	// limitMu guards pullLimits.
+	//
+	// In production Pull is only ever reached from Loop.run's single goroutine, so
+	// this is not contended — but Node, Pull, Sync and SyncAllProjects are all
+	// EXPORTED, so nothing stops a caller from running two loops or a manual sync
+	// against one Node. The lock is taken twice per Pull CALL (not per batch, not
+	// per mutation), which is free at that granularity and removes a whole class of
+	// "is this actually single-threaded?" reasoning.
+	limitMu sync.Mutex
+	// pullLimits remembers, per project, the batch limit Pull settled on last time.
+	//
+	// Deliberately IN-MEMORY ONLY, never persisted: a daemon restart simply re-learns
+	// the value through one halving walk (a handful of round-trips, once). Persisting
+	// it would add a schema, a migration and a staleness question — a poor trade for
+	// re-discovering a number in under a second. It is a HINT, not state: losing it
+	// costs a little latency and never correctness.
+	pullLimits map[string]int
 }
 
 // NewNode wraps an already-open local store as a sync node.
 func NewNode(name string, store *localstore.Store) *Node {
-	return &Node{Name: name, Store: store}
+	return &Node{Name: name, Store: store, pullLimits: make(map[string]int)}
+}
+
+// startLimitFor returns the batch limit Pull should try FIRST for project: the
+// value the previous Pull settled on, or pullLimit when this project has not been
+// pulled yet in this process.
+func (n *Node) startLimitFor(project string) int {
+	n.limitMu.Lock()
+	defer n.limitMu.Unlock()
+	if limit, ok := n.pullLimits[project]; ok && limit > 0 {
+		return limit
+	}
+	return pullLimit
+}
+
+// rememberLimitFor records the limit Pull settled on for project so the next call
+// starts there instead of re-walking the halving ladder from pullLimit. It is
+// called on the way out of Pull whether the call succeeded or failed: a limit
+// learned from a failure is exactly as useful as one learned from a success.
+func (n *Node) rememberLimitFor(project string, limit int) {
+	if limit <= 0 {
+		return
+	}
+	n.limitMu.Lock()
+	defer n.limitMu.Unlock()
+	if n.pullLimits == nil {
+		n.pullLimits = make(map[string]int)
+	}
+	n.pullLimits[project] = limit
 }
 
 // Write applies a new local write on this node (Decide→Apply locally) and
@@ -71,9 +122,29 @@ func (n *Node) Write(m domain.Mutation) (domain.Mutation, error) {
 	return out, nil
 }
 
-// pullLimit bounds a single PullSince call. Large enough that the acceptance tests'
-// mutation counts always come back in one round.
+// pullLimit is the CEILING on a single PullSince batch, and the limit Pull starts
+// from for a project it has not pulled yet in this process.
+//
+// It is not a fixed batch size. A transport may legitimately refuse to buffer a
+// response holding this many mutations (each may be ~1 MiB at ingest, while
+// remote.Client caps a response at 4 MiB); it signals that by returning an error
+// wrapping transport.ErrResponseTooLarge. Pull then halves and retries the same
+// cursor (see pullOneBatch), doubles back toward this ceiling as batches succeed
+// (AIMD), and remembers the settled value per project on the Node so the next call
+// starts where this one finished.
 const pullLimit = 1000
+
+// maxPullBatchesPerCall bounds how many batches one Pull call will drain before
+// returning. It is a PACING backstop, not a correctness one: the cursor is advanced
+// and committed after every batch, so stopping early loses nothing — the Loop's
+// next round resumes exactly where this call stopped.
+//
+// Its real job is to stop one enormous project from monopolising a sync round while
+// other projects wait behind it in SyncAllProjects' sequential loop. At the default
+// limit that is up to 100 000 mutations per project per round, which no realistic
+// backlog reaches; a node that DOES hit it is doing a first-sync of a huge history
+// and will finish over the following rounds.
+const maxPullBatchesPerCall = 100
 
 // Push drains the node's pending outbox and applies each synced mutation to
 // central. Central assigns the authoritative seq and reconciles BY VERSION
@@ -237,35 +308,170 @@ func pushConcurrency() int {
 // the identity tiebreaker is the final authority only when updated_at and version
 // are equal (probed explicitly in tsseq_probe_acceptance_test.go).
 //
-// Returns the number of mutations pulled (applied or no-op'd) this round.
+// Draining: Pull keeps fetching batches until one comes back EMPTY, applying and
+// committing the cursor after each. Termination is signalled by the empty batch and
+// nothing else — there is no has_more flag on the wire, deliberately.
+//
+// That choice is what lets a short batch stay ambiguous, which it must be. A batch
+// can be short because central is drained OR because central truncated it to fit
+// its response byte budget (cloudserve pullResponseByteBudget); treating "short" as
+// "drained" would silently strand the remainder until the next round, once per
+// truncation. Draining until empty behaves identically against an old count-only
+// server and a new byte-budgeting one, needs no wire change and no version
+// negotiation. The cost is exactly one extra empty round-trip per active project
+// per round — a request that returns `{"mutations":[]}`.
+//
+// Batch sizing: each batch asks for up to a per-project limit that Pull tunes
+// itself (AIMD). It starts from the value this Node last settled on for the project
+// (pullLimit for a project not yet pulled in this process), HALVES on
+// transport.ErrResponseTooLarge until the response fits, and DOUBLES back toward
+// pullLimit after any batch that comes back completely full — a full batch is
+// evidence the row limit, not the byte budget, was the binding constraint. The
+// settled value is remembered on the Node on the way out, so a node whose rows are
+// fat pays the halving walk once rather than every round.
+//
+// Returns the number of mutations pulled (applied or no-op'd) across all batches.
 func Pull(ctx context.Context, n *Node, central Central, project string) (int, error) {
 	cursor, err := n.Store.PullCursorFor(project)
 	if err != nil {
 		return 0, fmt.Errorf("pull %s[%s]: read cursor: %w", n.Name, project, err)
 	}
 
-	muts, err := central.PullSince(ctx, project, cursor, pullLimit)
-	if err != nil {
-		return 0, fmt.Errorf("pull %s[%s]: PullSince(since=%d): %w", n.Name, project, cursor, err)
-	}
+	limit := n.startLimitFor(project)
+	pulled := 0
 
-	maxSeq := cursor
-	for _, m := range muts {
-		if err := n.Store.ApplyPulled(m); err != nil {
-			return 0, fmt.Errorf("pull %s[%s]: apply pulled (seq=%d, mutation_id=%s): %w",
-				n.Name, project, m.Seq, m.MutationID, err)
+	for batch := 0; ; batch++ {
+		// Cancellation is checked between batches so a Stop() during a long drain
+		// exits promptly instead of after the whole backlog. (PullSince propagates
+		// ctx too; this covers the gap where the work is local apply time.)
+		if err := ctx.Err(); err != nil {
+			n.rememberLimitFor(project, limit)
+			return pulled, fmt.Errorf("pull %s[%s]: cancelled after %d batches: %w",
+				n.Name, project, batch, err)
 		}
-		if m.Seq > maxSeq {
-			maxSeq = m.Seq
+		if batch >= maxPullBatchesPerCall {
+			slog.Warn("syncer.Pull: batch backstop reached, resuming next round",
+				"node", n.Name,
+				"project", project,
+				"cursor", cursor,
+				"batches", batch,
+				"pulled", pulled,
+			)
+			break
 		}
-	}
 
-	if maxSeq > cursor {
+		muts, settled, err := pullOneBatch(ctx, n, central, project, cursor, limit)
+		limit = settled // keep what halving learned, success or failure
+		if err != nil {
+			n.rememberLimitFor(project, limit)
+			return pulled, err
+		}
+		if len(muts) == 0 {
+			break // empty batch → central is drained for this project
+		}
+
+		maxSeq := cursor
+		for _, m := range muts {
+			if err := n.Store.ApplyPulled(m); err != nil {
+				n.rememberLimitFor(project, limit)
+				return pulled, fmt.Errorf("pull %s[%s]: apply pulled (seq=%d, mutation_id=%s): %w",
+					n.Name, project, m.Seq, m.MutationID, err)
+			}
+			if m.Seq > maxSeq {
+				maxSeq = m.Seq
+			}
+			pulled++
+		}
+
+		if maxSeq <= cursor {
+			// Central returned rows that do not move the cursor forward (seq at or
+			// below it — a Central that ignores sinceSeq, or rows with no seq). Asking
+			// again would return the same rows forever, so stop: the rows WERE applied
+			// (ApplyPulled is idempotent via INV5), only the drain ends here.
+			slog.Warn("syncer.Pull: batch did not advance the cursor, stopping drain",
+				"node", n.Name,
+				"project", project,
+				"cursor", cursor,
+				"batch_size", len(muts),
+			)
+			break
+		}
 		if err := n.Store.SetPullCursorFor(project, maxSeq); err != nil {
-			return len(muts), fmt.Errorf("pull %s[%s]: advance cursor to %d: %w", n.Name, project, maxSeq, err)
+			n.rememberLimitFor(project, limit)
+			return pulled, fmt.Errorf("pull %s[%s]: advance cursor to %d: %w", n.Name, project, maxSeq, err)
+		}
+		cursor = maxSeq
+
+		// AIMD growth. A COMPLETELY full batch is the only evidence that the row
+		// limit — not central's byte budget and not an empty backlog — was the
+		// binding constraint, so it is the only case where asking for more is
+		// justified. Growth is speculative by design: if the next batch turns out to
+		// be too large the halving in pullOneBatch pays a couple of round-trips to
+		// find the ceiling again. That is the "additive-increase, multiplicative-
+		// decrease" trade — it lets a node whose rows shrank recover its throughput
+		// instead of crawling at a limit learned during one fat backlog.
+		if len(muts) == limit && limit < pullLimit {
+			limit = min(limit*2, pullLimit)
 		}
 	}
-	return len(muts), nil
+
+	n.rememberLimitFor(project, limit)
+	return pulled, nil
+}
+
+// pullOneBatch performs ONE PullSince for cursor, halving limit and retrying the
+// SAME cursor while the transport reports the response was too large. It returns
+// the mutations, the limit it settled on (which the caller carries forward so the
+// halving is paid once, not once per batch), and any error.
+//
+// This is the v1.5.2 pull-wedge fix in its smallest form. A full batch can
+// legitimately exceed the transport's response cap — central accepts mutations up
+// to ~1 MiB each at push time, so a thousand of them dwarf remote's 4 MiB response
+// cap. Before the transport.ErrResponseTooLarge sentinel existed that overflow was
+// an unmatchable error: the cursor never advanced and every following round
+// re-requested the identical oversized window forever.
+//
+// Termination: each retry halves limit, and a batch of ONE mutation is bounded by
+// central's ingest cap — comfortably under any response cap — so the loop converges
+// in at most log2(pullLimit) ≈ 10 round-trips. If even limit=1 overflows, that is a
+// genuine anomaly (a mutation that was never pushable through the same transport):
+// THIS CALL returns the error rather than spinning. The daemon does not give up —
+// the overflow error has no Retryable method and loop.isRetryable defaults unknown
+// errors to retryable, so the Loop retries the project on its backoff cadence.
+// Bounded work per call, retries paced by the Loop.
+func pullOneBatch(ctx context.Context, n *Node, central Central, project string, cursor int64, limit int) ([]domain.Mutation, int, error) {
+	startLimit := limit
+	for {
+		muts, err := central.PullSince(ctx, project, cursor, limit)
+		if err == nil {
+			if limit < startLimit {
+				// Summarised ONCE per batch, at the settled limit. The per-step detail
+				// below stays at Debug: a heavy backlog would otherwise emit ~10
+				// warnings per project per round for a condition that heals itself.
+				slog.Warn("syncer.Pull: batch limit reduced (central response exceeded the transport size cap)",
+					"node", n.Name,
+					"project", project,
+					"cursor", cursor,
+					"start_limit", startLimit,
+					"limit", limit,
+					"pulled", len(muts),
+				)
+			}
+			return muts, limit, nil
+		}
+		if !errors.Is(err, transport.ErrResponseTooLarge) || limit <= 1 {
+			return nil, limit, fmt.Errorf("pull %s[%s]: PullSince(since=%d, limit=%d): %w",
+				n.Name, project, cursor, limit, err)
+		}
+		slog.Debug("syncer.Pull: response too large, halving batch limit",
+			"node", n.Name,
+			"project", project,
+			"cursor", cursor,
+			"limit", limit,
+			"next_limit", limit/2,
+		)
+		limit /= 2
+	}
 }
 
 // Sync is one full round for a node: push its local writes to central, then pull

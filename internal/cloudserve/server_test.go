@@ -23,10 +23,11 @@ type mockCentral struct {
 	pullResult []domain.Mutation
 	pullErr    error
 
-	// Captured arguments from the last PullSince call (for clamp assertions).
-	gotProject  string
-	gotSinceSeq int64
-	gotLimit    int
+	// pullCalls records every (sinceSeq, limit) pair, in order. handlePull fetches
+	// in chunks, so "what did the server ask for" is a SEQUENCE, not one value —
+	// which is why the old single-call gotProject/gotSinceSeq/gotLimit captures are
+	// gone rather than kept alongside this.
+	pullCalls []mockPullCall
 
 	// unshare (DeleteProject) — makes mockCentral satisfy the projectDeleter
 	// capability so /v1/unshare can be exercised.
@@ -44,11 +45,38 @@ func (m *mockCentral) DeleteProject(_ context.Context, project string) (int64, e
 	return m.deleteResult, m.deleteErr
 }
 
-func (m *mockCentral) PullSince(_ context.Context, project string, sinceSeq int64, limit int) ([]domain.Mutation, error) {
-	m.gotProject = project
-	m.gotSinceSeq = sinceSeq
-	m.gotLimit = limit
-	return m.pullResult, m.pullErr
+// mockPullCall is one recorded PullSince invocation.
+type mockPullCall struct {
+	sinceSeq int64
+	limit    int
+}
+
+// PullSince serves pullResult the way a real Central must: only rows with
+// seq > sinceSeq, in stored (seq-ascending) order, at most limit of them.
+//
+// Honoring sinceSeq is REQUIRED, not cosmetic. handlePull now fetches in chunks and
+// advances a cursor between them, so a mock that returned its whole fixture on
+// every call would hand back the same chunk forever and duplicate rows into the
+// response — only the iteration backstop would end the request. Before chunking,
+// this mock ignored both arguments; it was changed deliberately as part of that
+// work.
+func (m *mockCentral) PullSince(_ context.Context, _ string, sinceSeq int64, limit int) ([]domain.Mutation, error) {
+	m.pullCalls = append(m.pullCalls, mockPullCall{sinceSeq: sinceSeq, limit: limit})
+	if m.pullErr != nil {
+		return nil, m.pullErr
+	}
+
+	out := make([]domain.Mutation, 0, min(limit, len(m.pullResult)))
+	for _, mut := range m.pullResult {
+		if mut.Seq <= sinceSeq {
+			continue
+		}
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, mut)
+	}
+	return out, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
