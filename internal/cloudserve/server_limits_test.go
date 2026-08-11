@@ -9,14 +9,22 @@ import (
 	"github.com/mariesqu/engram/internal/syncwire"
 )
 
-// TestHandlePull_LimitClamping asserts the server clamps the requested limit before
-// calling central.PullSince: <=0 → default (100), >max (1000) → cap, in-range → as-is.
+// TestHandlePull_LimitClamping asserts the server clamps the requested row limit:
+// <=0 → default (100), >max (1000) → cap, in-range → as-is.
 // (pullDefaultLimit=100 and pullMaxLimit=1000 are unexported constants in the package.)
+//
+// The assertion moved from "the limit handed to a single PullSince call" to "how
+// many mutations come back", because handlePull now fetches in chunks of
+// pullChunkSize: the clamped limit is a TOTAL spread over several queries, so no
+// single call carries it. Asserting the total is the better test anyway — it pins
+// the observable contract instead of an internal call parameter — and it still
+// fails loudly if the clamp is removed, since central here always has more rows
+// available (1200) than the largest clamp.
 func TestHandlePull_LimitClamping(t *testing.T) {
 	cases := []struct {
-		name     string
-		limit    int
-		wantSent int
+		name         string
+		limit        int
+		wantReturned int
 	}{
 		{"zero_uses_default", 0, 100},
 		{"negative_uses_default", -7, 100},
@@ -24,9 +32,10 @@ func TestHandlePull_LimitClamping(t *testing.T) {
 		{"exactly_max_passes_through", 1000, 1000},
 		{"in_range_passes_through", 50, 50},
 	}
+	available := smallMutations(1200)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			central := &mockCentral{}
+			central := &mockCentral{pullResult: available}
 			ts := newTestServer(t, central)
 
 			body, err := json.Marshal(syncwire.PullRequest{Project: "p", SinceSeq: 0, Limit: tc.limit})
@@ -42,8 +51,20 @@ func TestHandlePull_LimitClamping(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200", resp.StatusCode)
 			}
-			if central.gotLimit != tc.wantSent {
-				t.Errorf("PullSince limit = %d, want %d (requested %d)", central.gotLimit, tc.wantSent, tc.limit)
+			var got syncwire.PullResponse
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if len(got.Mutations) != tc.wantReturned {
+				t.Errorf("returned mutations = %d, want %d (requested limit %d)",
+					len(got.Mutations), tc.wantReturned, tc.limit)
+			}
+			// No single chunk query may exceed pullChunkSize (100): that bound is what
+			// keeps the server's working set small regardless of the clamped total.
+			for i, c := range central.pullCalls {
+				if c.limit > 100 {
+					t.Errorf("pullCalls[%d].limit = %d; want <= pullChunkSize (100)", i, c.limit)
+				}
 			}
 		})
 	}

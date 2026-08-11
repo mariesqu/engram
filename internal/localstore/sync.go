@@ -454,11 +454,16 @@ func (s *Store) ListProjects() ([]string, error) {
 // Belt-and-suspenders policy check (PR-②): the steady-state pull filter in
 // SyncAllProjects excludes non-synced projects before calling Pull at all, so
 // ApplyPulled should never receive a mutation for an omitted project.  This
-// check is a defensive guard for the brief flip-to-omitted race window where an
-// in-flight pull cycle could have already fetched mutations from central before
-// the policy flip was visible to SyncAllProjects.  The mutation is refused with
-// ErrOmittedProject — an ERROR, not a silent skip — so the caller (syncer.Pull)
-// does NOT advance the per-project cursor past it.  If it were silently dropped
+// check is a defensive guard for the flip-to-omitted race window, where an
+// in-flight pull cycle has already fetched mutations from central before the
+// policy flip became visible to SyncAllProjects.  That window is bounded by one
+// full Pull call, which drains until central returns an empty batch — up to
+// syncer.maxPullBatchesPerCall round-trips, not a single fetch — so a flip landing
+// mid-drain can be followed by several more batches for the now-omitted project.
+// The guard's behaviour is unchanged and remains correct for every one of them:
+// the mutation is refused with ErrOmittedProject — an ERROR, not a silent skip —
+// so the caller (syncer.Pull) does NOT advance the per-project cursor past it,
+// and the error also ends the drain immediately.  If it were silently dropped
 // the cursor would move past the mutation and a later flip back to synced would
 // never re-pull it: permanent, invisible data loss.  With the error the cursor
 // stays put and the flip-back re-pulls the mutation cleanly.

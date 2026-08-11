@@ -36,6 +36,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -47,8 +48,9 @@ import (
 	"github.com/mariesqu/engram/internal/wireauth"
 )
 
-// pullDefaultLimit is the number of mutations returned when the client sends
-// limit <= 0. pullMaxLimit caps the value to prevent oversized responses.
+// pullDefaultLimit is the MAXIMUM number of mutations returned when the client
+// sends limit <= 0 — a response may carry fewer, because pullResponseByteBudget can
+// truncate it. pullMaxLimit caps the value to prevent oversized responses.
 const (
 	pullDefaultLimit = 100
 	pullMaxLimit     = 1000
@@ -58,6 +60,40 @@ const (
 // CPU/memory spent on JSON decoding (DoS guard). One mutation's canonical payload
 // is far smaller than this.
 const maxRequestBytes = 1 << 20 // 1 MiB
+
+// Pull response sizing. A pull response is bounded by BOTH a row count (the
+// clamped limit) and a byte budget, because rows are not uniform: at the
+// maxRequestBytes ingest cap a single mutation may be ~1 MiB, so pullMaxLimit rows
+// could be a multi-gigabyte response.
+const (
+	// pullResponseByteBudget bounds the encoded size of one pull response. It sits
+	// deliberately BELOW the reference client's response cap (remote.maxResponseBytes,
+	// 4 MiB), leaving ~1 MiB of headroom for JSON escaping and proxy framing.
+	//
+	// The asymmetry is the whole point. A server able to emit a body larger than the
+	// client will accept re-creates the v1.5.2 pull wedge: the client rejects the
+	// response, its cursor never advances, and it re-requests the identical window
+	// forever. The client's halving retry WORKS AROUND that; this budget removes the
+	// cause. It also bounds the failure mode the halving cannot rescue — central
+	// dying (OOM) or timing out mid-marshal surfaces to the client as a network
+	// error, NOT as transport.ErrResponseTooLarge, so no amount of client-side
+	// shrinking would ever be triggered.
+	pullResponseByteBudget = 3 << 20 // 3 MiB
+
+	// pullChunkSize is how many rows handlePull fetches per Central query while
+	// accumulating a response. Typical mutations are a few KB, so most pulls finish
+	// in one or two queries; chunking exists for the pathological tail, where it
+	// caps the worst-case in-memory working set at ~100 MiB (100 rows × the 1 MiB
+	// ingest cap) instead of the multi-GB a single limit=1000 fetch could produce.
+	pullChunkSize = 100
+
+	// pullEnvelopeOverhead reserves bytes for the JSON scaffolding around the
+	// mutation array ({"mutations":[…]}). Together with the +1 per element charged
+	// by encodedWireSize for its separating comma, the budget is compared against a
+	// slight OVER-estimate of the final body. Erring high costs a few bytes of
+	// payload per response; erring low re-introduces the wedge.
+	pullEnvelopeOverhead = 256
+)
 
 // HTTP server timeouts used by Run. They bound how long a single connection can
 // hold server resources, defending an Internet-facing deployment against
@@ -376,7 +412,14 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 //  2. Decode JSON body into [syncwire.PullRequest]. Decode error → 400 or 413.
 //  3. Validate: Project non-empty → else 400.
 //  4. Clamp Limit: ≤0 → pullDefaultLimit; >pullMaxLimit → pullMaxLimit.
-//  5. central.PullSince → error → 500. Success → 200 with [syncwire.PullResponse].
+//  5. collectPullBatch (chunked fetch bounded by the clamped limit AND
+//     pullResponseByteBudget) → error → 500. Success → 200 with
+//     [syncwire.PullResponse].
+//
+// Termination is signalled by an EMPTY response, not by a has_more flag: the
+// client drains a project by pulling until it gets zero mutations. That keeps the
+// wire format unchanged, so a new client talks to an old count-only server and an
+// old client talks to this one with identical semantics.
 func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 	var req syncwire.PullRequest
 	if !decodeBody(w, r, &req) {
@@ -396,19 +439,119 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		limit = pullMaxLimit
 	}
 
-	mutations, err := s.central.PullSince(r.Context(), req.Project, req.SinceSeq, limit)
+	wires, err := s.collectPullBatch(r.Context(), req.Project, req.SinceSeq, limit)
 	if err != nil {
-		s.logger.ErrorContext(r.Context(), "cloudserve: PullSince failed", "error", err)
+		// Generic on purpose: collectPullBatch fails either because central's
+		// PullSince failed OR because a row could not be encoded. Naming only the
+		// former would send an on-call engineer to the database for what may be a
+		// malformed payload.
+		s.logger.ErrorContext(r.Context(), "cloudserve: collect pull batch failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	wires := make([]syncwire.WireMutation, 0, len(mutations))
-	for _, m := range mutations {
-		wires = append(wires, syncwire.ToWire(m))
+	writeJSON(w, http.StatusOK, syncwire.PullResponse{Mutations: wires})
+}
+
+// collectPullBatch fetches mutations for project with seq > sinceSeq in chunks of
+// pullChunkSize and converts them to wire form, stopping at the FIRST of:
+//
+//   - limit mutations accumulated (the caller's already-clamped row budget);
+//   - pullResponseByteBudget bytes accumulated (the size budget);
+//   - a chunk shorter than requested — central has no more rows (drained);
+//   - an iteration backstop that the current logic cannot actually reach (below).
+//
+// What bounds the loop is the ROW ACCUMULATOR, not the backstop. Any iteration that
+// does not break appends every row of its chunk, and it asked for at least one
+// (want ≥ 1 while len(wires) < limit), so each surviving iteration grows wires by at
+// least one row and the len(wires) < limit condition ends the loop within
+// ceil(limit/pullChunkSize) iterations. Even a Central that ignores sinceSeq cannot
+// hang the request — it fills the response with duplicate rows and returns normally
+// (a bug in that Central, visible in its output, not a stall here).
+//
+// The backstop is therefore defense-in-depth against a FUTURE shape of this
+// function — an inner loop that can skip rows, a resumable cursor, a retry — where
+// an iteration could stop making progress. It is kept deliberately: it costs one
+// comparison per iteration and converts a hypothetical infinite loop into a logged,
+// bounded response.
+//
+// At-least-one guarantee: if the FIRST mutation alone exceeds the byte budget it is
+// returned anyway. Since termination is signalled by an empty batch (no has_more
+// flag on the wire), returning zero rows would tell the client "you are drained"
+// and that one fat row would block the project's cursor permanently — the exact
+// wedge this work exists to kill. One over-budget response is recoverable; a
+// stalled cursor is not.
+//
+// The returned slice is in central's seq-ascending order and is always a PREFIX of
+// what the client asked for, so the client can safely advance its cursor to the
+// last element and ask again.
+func (s *Server) collectPullBatch(ctx context.Context, project string, sinceSeq int64, limit int) ([]syncwire.WireMutation, error) {
+	wires := make([]syncwire.WireMutation, 0, min(limit, pullChunkSize))
+	encoded := pullEnvelopeOverhead
+	cursor := sinceSeq
+	// Sized one iteration above the most the row accumulator can ever need
+	// (ceil(limit/pullChunkSize)), so this never fires for any input the current
+	// logic can produce — see the "defense-in-depth" note on the doc comment.
+	maxIterations := limit/pullChunkSize + 2
+
+	for iter := 0; len(wires) < limit; iter++ {
+		if iter >= maxIterations {
+			s.logger.WarnContext(ctx, "cloudserve: pull chunk loop hit its iteration backstop",
+				"project", project,
+				"since_seq", sinceSeq,
+				"cursor", cursor,
+				"accumulated", len(wires),
+				"limit", limit,
+			)
+			break
+		}
+
+		want := min(pullChunkSize, limit-len(wires))
+		chunk, err := s.central.PullSince(ctx, project, cursor, want)
+		if err != nil {
+			return nil, err
+		}
+		if len(chunk) == 0 {
+			break // drained
+		}
+
+		budgetReached := false
+		for _, m := range chunk {
+			wire := syncwire.ToWire(m)
+			size, err := encodedWireSize(wire)
+			if err != nil {
+				return nil, fmt.Errorf("encode mutation %s: %w", m.MutationID, err)
+			}
+			// The budget may only stop a batch that already carries something —
+			// see the at-least-one guarantee above.
+			if len(wires) > 0 && encoded+size > pullResponseByteBudget {
+				budgetReached = true
+				break
+			}
+			wires = append(wires, wire)
+			encoded += size
+			cursor = m.Seq
+		}
+
+		if budgetReached || len(chunk) < want {
+			break
+		}
 	}
 
-	writeJSON(w, http.StatusOK, syncwire.PullResponse{Mutations: wires})
+	return wires, nil
+}
+
+// encodedWireSize reports how many bytes w contributes to the response body: its
+// exact JSON encoding plus one byte for the comma that separates it from the next
+// element. Measuring by marshaling (rather than estimating from field lengths) is
+// what makes the budget trustworthy — payloads are json.RawMessage, and escaping
+// and re-compaction both change the final size.
+func encodedWireSize(w syncwire.WireMutation) (int, error) {
+	b, err := json.Marshal(w)
+	if err != nil {
+		return 0, err
+	}
+	return len(b) + 1, nil
 }
 
 // projectLister is the OPTIONAL capability a [transport.Central] may implement to
