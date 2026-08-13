@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -622,6 +625,138 @@ func TestDaemonTool_MemSessionStart_ExplicitProjectBeatsDaemonCwd(t *testing.T) 
 	}
 }
 
+// TestDaemonTool_MemSessionStart_ExplicitProjectSurvivesUnresolvableDirectory
+// pins the README's multi-repo remedy for session_start. Both directories here
+// hard-fail detection — an ambiguous parent of two repos, and a malformed
+// .engram/config.json — yet the call SUCCEEDS under the named project, because
+// an explicit project skips detection entirely instead of merely outranking its
+// result. If detection ran first, the advice "pass an explicit project" would
+// be useless in exactly the configurations that make it necessary.
+func TestDaemonTool_MemSessionStart_ExplicitProjectSurvivesUnresolvableDirectory(t *testing.T) {
+	ambiguous := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		if err := os.MkdirAll(filepath.Join(ambiguous, name, ".git"), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	broken := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(broken, ".engram"), 0o755); err != nil {
+		t.Fatalf("mkdir .engram: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, ".engram", "config.json"), []byte("{ not valid json"), 0o644); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	cases := map[string]string{
+		"ambiguous multi-repo parent": ambiguous,
+		"malformed .engram/config":    broken,
+	}
+
+	for name, dir := range cases {
+		t.Run(name, func(t *testing.T) {
+			components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "start_rescue.db"), syncInterval: 30 * time.Second})
+			if err != nil {
+				t.Fatalf("buildDaemon: %v", err)
+			}
+			t.Cleanup(components.Close)
+
+			startTool := components.mcpServer.ListTools()["mem_session_start"]
+			result, err := startTool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
+				"id":        "sess-rescued",
+				"project":   "rescued-by-the-agent",
+				"directory": dir,
+			}))
+			if err != nil {
+				t.Fatalf("handler transport error: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("an explicit project must rescue an unresolvable directory, got tool error: %v", result.Content)
+			}
+
+			sess, err := components.store.GetSession("sess-rescued")
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if sess.Project != "rescued-by-the-agent" {
+				t.Errorf("Project = %q, want %q", sess.Project, "rescued-by-the-agent")
+			}
+		})
+	}
+}
+
+// TestDaemonTool_MemSessionStart_ExplicitProjectCorrectsStoredRow covers the
+// repair path end to end: a session already registered under the daemon's junk
+// cwd is re-registered with the same id and an explicit project. The upsert
+// normally REFUSES to overwrite a populated project (REQ-308, so re-detection
+// cannot clobber it), which made the documented fix report success and change
+// nothing — see CreateSessionWithProject.
+func TestDaemonTool_MemSessionStart_ExplicitProjectCorrectsStoredRow(t *testing.T) {
+	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "start_correct.db"), syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	junkProject := chdirToJunkDir(t)
+	startTool := components.mcpServer.ListTools()["mem_session_start"]
+
+	// First registration: no project, no directory — misfiled under the daemon cwd.
+	if result, err := startTool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
+		"id": "sess-to-correct",
+	})); err != nil {
+		t.Fatalf("first handler transport error: %v", err)
+	} else if result.IsError {
+		t.Fatalf("first call returned tool error: %v", result.Content)
+	}
+	if sess, err := components.store.GetSession("sess-to-correct"); err != nil {
+		t.Fatalf("GetSession: %v", err)
+	} else if sess.Project != junkProject {
+		t.Fatalf("setup expected the misfiled project %q, got %q", junkProject, sess.Project)
+	}
+
+	// Corrective re-registration under the same id.
+	if result, err := startTool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
+		"id":      "sess-to-correct",
+		"project": "engram",
+	})); err != nil {
+		t.Fatalf("second handler transport error: %v", err)
+	} else if result.IsError {
+		t.Fatalf("second call returned tool error: %v", result.Content)
+	}
+
+	sess, err := components.store.GetSession("sess-to-correct")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != "engram" {
+		t.Errorf("Project = %q, want %q (an explicit project must correct the stored row)", sess.Project, "engram")
+	}
+
+	// The repair has to be worth making: a LATER call that names only the session
+	// id — mem_session_summary, whose precedence puts the session row above
+	// directory detection — must now inherit the corrected project instead of the
+	// junk one, with the daemon's cwd still pointing at the junk directory.
+	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
+	if result, err := sumTool.Handler(t.Context(), newToolRequest("mem_session_summary", map[string]any{
+		"content":    "## Goal\nsummarize the repaired session",
+		"session_id": "sess-to-correct",
+	})); err != nil {
+		t.Fatalf("mem_session_summary transport error: %v", err)
+	} else if result.IsError {
+		t.Fatalf("mem_session_summary tool error: %v", result.Content)
+	}
+
+	rec, err := components.store.GetObservation(1)
+	if err != nil {
+		t.Fatalf("GetObservation(1): %v", err)
+	}
+	if rec.Project != "engram" {
+		t.Errorf("summary Project = %q, want %q (the corrected session row must carry the whole session, not just its own row)",
+			rec.Project, "engram")
+	}
+}
+
 // TestDaemonTool_MemSessionStart_ForwardedDirectoryBeatsDaemonCwd is the
 // session-tool half of the field incident: with no project named, the CLIENT's
 // directory decides, never the resident daemon's cwd.
@@ -821,6 +956,182 @@ func TestRegisterTools_DirectoryAwareToolsDeclareDirectory(t *testing.T) {
 	}
 }
 
+// ─── every directory-aware handler honours an explicit project ───────────────
+
+// Probe fixtures for the harness below. Both memories share a searchable token,
+// so a handler that resolved the WRONG project still finds something — the
+// assertion is about WHICH one comes back, never about emptiness.
+const (
+	harnessProject     = "named-by-the-agent"
+	harnessProbeToken  = "harnessprobe"
+	harnessTargetTitle = "harnesstarget under the explicit project"
+	harnessDecoyTitle  = "harnessdecoy under the daemon cwd"
+)
+
+// seedHarnessProbes writes one memory under the explicit project and one under
+// the daemon's junk cwd project, so read tools can be asserted BEHAVIOURALLY:
+// the explicit project's memory must come back, the junk one must not.
+func seedHarnessProbes(t *testing.T, store *localstore.Store, junkProject string) {
+	t.Helper()
+	for _, seed := range []struct{ title, project string }{
+		{harnessTargetTitle, harnessProject},
+		{harnessDecoyTitle, junkProject},
+	} {
+		if _, err := store.AddObservation(localstore.AddObservationParams{
+			Title:   seed.title,
+			Content: harnessProbeToken + " probe body",
+			Project: seed.project,
+			Scope:   "project",
+		}); err != nil {
+			t.Fatalf("seed %q: %v", seed.project, err)
+		}
+	}
+}
+
+// assertScopedToExplicitProject is the shared read-tool verdict: the output
+// carries the explicit project's memory and NOT the daemon-cwd decoy.
+func assertScopedToExplicitProject(t *testing.T, _ *localstore.Store, text string) {
+	t.Helper()
+	if !strings.Contains(text, "harnesstarget") {
+		t.Errorf("output does not carry the explicit project's memory:\n%s", text)
+	}
+	if strings.Contains(text, "harnessdecoy") {
+		t.Errorf("output leaked the daemon-cwd project's memory — the explicit project was ignored:\n%s", text)
+	}
+}
+
+// assertFirstObservationProject is the shared write-tool verdict: the single
+// row the handler wrote landed under the explicit project.
+func assertFirstObservationProject(t *testing.T, store *localstore.Store, _ string) {
+	t.Helper()
+	rec, err := store.GetObservation(1)
+	if err != nil {
+		t.Fatalf("GetObservation(1): %v", err)
+	}
+	if rec.Project != harnessProject {
+		t.Errorf("Project = %q, want %q", rec.Project, harnessProject)
+	}
+}
+
+// TestDaemonTools_EveryDirectoryAwareToolHonoursExplicitProject is the generic
+// guard behind the whole precedence contract. Declaring "project" in a schema
+// is cheap; HONOURING it in the handler is what stops the junk-project misfile,
+// and mem_session_start and mem_session_summary both declared nothing and read
+// nothing for two releases.
+//
+// Every tool in directoryAwareTools is invoked with minimal valid arguments, an
+// explicit project, and the daemon chdir'd into the junk directory from the
+// field incident. A handler that ignores "project" resolves "system32" and
+// fails its case. A tool ADDED to directoryAwareTools without a case here fails
+// too — the map is the source of truth, not this table.
+//
+// One legitimate exception is not covered and does not need to be: mem_review
+// with action=mark_reviewed and ids resolves no project at all (the ids name
+// their own rows), so there is nothing for an explicit project to win over. The
+// list action, which does resolve one, is the case exercised below.
+func TestDaemonTools_EveryDirectoryAwareToolHonoursExplicitProject(t *testing.T) {
+	cases := map[string]struct {
+		args   map[string]any // merged over {"project": harnessProject}
+		seed   func(t *testing.T, store *localstore.Store, junkProject string)
+		verify func(t *testing.T, store *localstore.Store, text string)
+	}{
+		"mem_session_start": {
+			args: map[string]any{"id": "harness-session"},
+			verify: func(t *testing.T, store *localstore.Store, _ string) {
+				t.Helper()
+				sess, err := store.GetSession("harness-session")
+				if err != nil {
+					t.Fatalf("GetSession: %v", err)
+				}
+				if sess.Project != harnessProject {
+					t.Errorf("session Project = %q, want %q", sess.Project, harnessProject)
+				}
+			},
+		},
+		"mem_session_summary": {
+			args:   map[string]any{"content": "## Goal\nharness"},
+			verify: assertFirstObservationProject,
+		},
+		"mem_save": {
+			args:   map[string]any{"title": "harness save", "content": "body"},
+			verify: assertFirstObservationProject,
+		},
+		"mem_save_prompt": {
+			args: map[string]any{"content": "harness prompt", "session_id": "harness-prompt-sess"},
+			verify: func(t *testing.T, store *localstore.Store, _ string) {
+				t.Helper()
+				if _, err := store.GetPromptBySessionAndContent("harness-prompt-sess", harnessProject, "harness prompt"); err != nil {
+					t.Errorf("prompt not stored under the explicit project %q: %v", harnessProject, err)
+				}
+			},
+		},
+		"mem_search": {
+			args:   map[string]any{"query": harnessProbeToken},
+			seed:   seedHarnessProbes,
+			verify: assertScopedToExplicitProject,
+		},
+		"mem_context": {
+			args:   map[string]any{},
+			seed:   seedHarnessProbes,
+			verify: assertScopedToExplicitProject,
+		},
+		"mem_review": {
+			// status=all: the probes are freshly written, so the default
+			// needs_review filter would legitimately return nothing.
+			args:   map[string]any{"action": "list", "status": "all"},
+			seed:   seedHarnessProbes,
+			verify: assertScopedToExplicitProject,
+		},
+	}
+
+	for name := range directoryAwareTools {
+		tc, ok := cases[name]
+		if !ok {
+			t.Errorf("directory-aware tool %q has no case here — every tool that accepts "+
+				"\"project\" must be proven to HONOUR it, not just to declare it", name)
+			continue
+		}
+
+		t.Run(name, func(t *testing.T) {
+			components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "harness.db"), syncInterval: 30 * time.Second})
+			if err != nil {
+				t.Fatalf("buildDaemon: %v", err)
+			}
+			t.Cleanup(components.Close)
+
+			junkProject := chdirToJunkDir(t)
+			if tc.seed != nil {
+				tc.seed(t, components.store, junkProject)
+			}
+
+			args := map[string]any{"project": harnessProject}
+			for k, v := range tc.args {
+				args[k] = v
+			}
+
+			tool, ok := components.mcpServer.ListTools()[name]
+			if !ok {
+				t.Fatalf("directoryAwareTools names %q, which is not a registered tool", name)
+			}
+			result, err := tool.Handler(t.Context(), newToolRequest(name, args))
+			if err != nil {
+				t.Fatalf("handler transport error: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("handler returned tool error: %v", result.Content)
+			}
+
+			var text string
+			if len(result.Content) > 0 {
+				if content, ok := result.Content[0].(mcp.TextContent); ok {
+					text = content.Text
+				}
+			}
+			tc.verify(t, components.store, text)
+		})
+	}
+}
+
 // TestRegisterTools_DirectoryAwareToolsDeclareProject is the other half of the
 // lockstep, and the schema-level statement of the precedence contract: `engram
 // connect` SUPPRESSES the injection whenever a call carries a project, so a
@@ -859,6 +1170,32 @@ func TestRegisterTools_DirectoryAwareToolsDeclareProject(t *testing.T) {
 	}
 }
 
+// TestRegisterTools_DirectoryPropertyImpliesDirectoryAware closes the lockstep
+// in the other direction. The two tests above walk directoryAwareTools and check
+// the schemas; this one walks the REGISTERED tools and checks the map, so a new
+// tool that copies the "directory" argument from a neighbour but is never added
+// to directoryAwareTools cannot slip through: its schema would advertise an
+// argument that `engram connect` never injects, and it would silently resolve
+// from the daemon's cwd — the misfile wearing a documented argument as a
+// disguise. The tool list comes from the server, never a hand-written slice.
+func TestRegisterTools_DirectoryPropertyImpliesDirectoryAware(t *testing.T) {
+	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "schema_reverse.db"), syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	for name, tool := range components.mcpServer.ListTools() {
+		if _, declared := tool.Tool.InputSchema.Properties["directory"]; !declared {
+			continue
+		}
+		if !directoryAwareTools[name] {
+			t.Errorf("tool %q declares a \"directory\" argument but is missing from directoryAwareTools — "+
+				"`engram connect` will never inject into it, so it resolves from the daemon's cwd", name)
+		}
+	}
+}
+
 // ─── ENGRAM_CLIENT_DIR escape hatch ──────────────────────────────────────────
 
 // TestResolveClientDir_DefaultsToCwd pins the normal path: with no override,
@@ -870,7 +1207,11 @@ func TestResolveClientDir_DefaultsToCwd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Getwd: %v", err)
 	}
-	if got := resolveClientDir(); got != cwd {
+	got, err := resolveClientDir()
+	if err != nil {
+		t.Fatalf("resolveClientDir: %v", err)
+	}
+	if got != cwd {
 		t.Errorf("resolveClientDir() = %q, want the process cwd %q", got, cwd)
 	}
 }
@@ -881,7 +1222,11 @@ func TestResolveClientDir_EnvOverride(t *testing.T) {
 	want := t.TempDir()
 	t.Setenv("ENGRAM_CLIENT_DIR", want)
 
-	if got := resolveClientDir(); got != want {
+	got, err := resolveClientDir()
+	if err != nil {
+		t.Fatalf("resolveClientDir: %v", err)
+	}
+	if got != want {
 		t.Errorf("resolveClientDir() = %q, want the override %q", got, want)
 	}
 }
@@ -892,9 +1237,123 @@ func TestResolveClientDir_EnvOverride(t *testing.T) {
 func TestResolveClientDir_DisableSentinel(t *testing.T) {
 	for _, v := range []string{"none", "NONE", "  none  "} {
 		t.Setenv("ENGRAM_CLIENT_DIR", v)
-		if got := resolveClientDir(); got != "" {
+		got, err := resolveClientDir()
+		if err != nil {
+			t.Fatalf("ENGRAM_CLIENT_DIR=%q: resolveClientDir: %v", v, err)
+		}
+		if got != "" {
 			t.Errorf("ENGRAM_CLIENT_DIR=%q: resolveClientDir() = %q, want \"\" (forwarding disabled)", v, got)
 		}
+	}
+}
+
+// TestResolveClientDir_InvalidOverrideIsFatal pins the fail-closed rule. The old
+// behavior — warn on stderr, forward the bad path anyway — had the daemon detect
+// a project from the basename of a directory that does not exist, MINTING a junk
+// project instead of curing one. An explicit override that cannot be honored is
+// a configuration error, and the message has to carry both remedies.
+func TestResolveClientDir_InvalidOverrideIsFatal(t *testing.T) {
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "not-a-directory.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cases := map[string]string{
+		"nonexistent path": filepath.Join(tmp, "no", "such", "repo"),
+		"regular file":     file,
+	}
+
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("ENGRAM_CLIENT_DIR", value)
+
+			got, err := resolveClientDir()
+			if err == nil {
+				t.Fatalf("resolveClientDir() = %q, nil — want a startup error for %q", got, value)
+			}
+			if got != "" {
+				t.Errorf("resolveClientDir() returned %q alongside the error; nothing must be forwarded", got)
+			}
+			msg := err.Error()
+			// The path is rendered with %q, which escapes Windows backslashes —
+			// compare against the quoted form, not the raw value.
+			for _, want := range []string{"ENGRAM_CLIENT_DIR", fmt.Sprintf("%q", value), clientDirDisabled} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error must name %q so the user can act on it; got: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveClientDirWith_NonUTF8CwdDisablesForwarding covers the m5 guard on
+// the AUTO-captured cwd. json.Marshal of a Go string REPLACES invalid UTF-8 with
+// U+FFFD rather than failing, so forwarding such a path would have the daemon
+// detect a phantom project nobody can search for. Unlike a bad override this is
+// not the user's doing, so it degrades to the daemon-cwd fallback instead of
+// killing the bridge. getwd is injected because no portable filesystem lets a
+// test chdir into an invalid-UTF-8 directory.
+func TestResolveClientDirWith_NonUTF8CwdDisablesForwarding(t *testing.T) {
+	bad := "/repos/\xff\xfe-broken"
+	if utf8.ValidString(bad) {
+		t.Fatal("test fixture is valid UTF-8; it cannot exercise the guard")
+	}
+
+	got, err := resolveClientDirWith("", func() (string, error) { return bad, nil })
+	if err != nil {
+		t.Fatalf("a non-UTF-8 cwd must not fail the bridge, got: %v", err)
+	}
+	if got != "" {
+		t.Errorf("resolveClientDirWith() = %q, want \"\" (forwarding disabled, daemon cwd takes over)", got)
+	}
+}
+
+// TestResolveClientDirWith_UnreadableCwdDisablesForwarding keeps the other
+// non-fatal cwd path pinned: a Getwd error (deleted working directory) disables
+// forwarding rather than failing, exactly as before this feature existed.
+func TestResolveClientDirWith_UnreadableCwdDisablesForwarding(t *testing.T) {
+	got, err := resolveClientDirWith("", func() (string, error) { return "", errors.New("getwd: no such file or directory") })
+	if err != nil {
+		t.Fatalf("an unreadable cwd must not fail the bridge, got: %v", err)
+	}
+	if got != "" {
+		t.Errorf("resolveClientDirWith() = %q, want \"\"", got)
+	}
+}
+
+// TestNewMCPBridge_InvalidClientDirFails proves the fail-closed check reaches
+// the caller: the constructor refuses BEFORE reading daemon.json, so a typo'd
+// override is reported even when there is no daemon to talk to.
+func TestNewMCPBridge_InvalidClientDirFails(t *testing.T) {
+	dir := t.TempDir() // deliberately no daemon.json
+	t.Setenv("ENGRAM_CLIENT_DIR", filepath.Join(dir, "missing-repo"))
+
+	b, err := newMCPBridge(dir)
+	if err == nil {
+		t.Fatalf("newMCPBridge succeeded with an invalid ENGRAM_CLIENT_DIR; bridge = %+v", b)
+	}
+	if !strings.Contains(err.Error(), "ENGRAM_CLIENT_DIR") {
+		t.Errorf("error should name the variable; got: %v", err)
+	}
+}
+
+// TestRunConnectCmd_InvalidClientDirBeatsDaemonDiscovery pins the ORDER of the
+// two startup checks at the command level: with both a typo'd override and no
+// daemon anywhere, the user must be told about the thing they can fix, not sent
+// chasing a daemon that was never the problem. --no-autostart keeps this test
+// free of side effects; the same gate sits above ensureConnectDaemon, so the
+// autostart path never spawns a daemon for a call that cannot succeed.
+func TestRunConnectCmd_InvalidClientDirBeatsDaemonDiscovery(t *testing.T) {
+	dir := t.TempDir() // no daemon.json — daemon discovery would fail too
+	t.Setenv("ENGRAM_CLIENT_DIR", filepath.Join(dir, "missing-repo"))
+
+	err := runConnectCmd([]string{"--db", filepath.Join(dir, "memories.db"), "--no-autostart"})
+	if err == nil {
+		t.Fatal("runConnectCmd succeeded with an invalid ENGRAM_CLIENT_DIR")
+	}
+	if !strings.Contains(err.Error(), "ENGRAM_CLIENT_DIR") {
+		t.Errorf("the configuration error must win over daemon discovery; got: %v", err)
 	}
 }
 

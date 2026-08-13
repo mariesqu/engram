@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mariesqu/engram/internal/config"
 	"github.com/mariesqu/engram/internal/controlapi"
@@ -69,6 +70,10 @@ Flags:
 Environment:
   ENGRAM_CLIENT_DIR  Directory to forward instead of this process's cwd — for
                      MCP hosts that spawn their servers outside the workspace.
+                     A real value (blank counts as unset) must name an existing
+                     directory: a path that does not exist is a startup error,
+                     not a silent fallback, because forwarding it would invent
+                     a project from its basename.
                      Set it to "none" to disable directory forwarding entirely.
 
 On stdin EOF, connect exits 0. On SIGINT/SIGTERM it exits cleanly.
@@ -107,6 +112,15 @@ func runConnectCmd(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Validate ENGRAM_CLIENT_DIR before anything with side effects. A typo'd
+	// override must not spawn a resident daemon on its way to failing, and an
+	// auto-start failure must not mask the configuration error that would have
+	// stopped us anyway. newMCPBridge resolves it again (one stat) and keeps the
+	// value; this call is purely the early gate.
+	if _, err := resolveClientDir(); err != nil {
+		return err
+	}
 
 	if !*noAutostart {
 		if err := ensureConnectDaemon(ctx, dir, dbPath); err != nil {
@@ -242,6 +256,16 @@ type mcpBridge struct {
 // Mirrors NewControlClient, but the bridge needs raw passthrough (no JSON
 // decode of the response body), so it does not reuse ControlClient directly.
 func newMCPBridge(dir string) (*mcpBridge, error) {
+	// Before daemon.json, so a bad ENGRAM_CLIENT_DIR is reported instead of
+	// "no resident engram daemon found" when both are wrong. The guarantee that
+	// nothing is SPAWNED for a bad override lives in runConnectCmd, which gates
+	// on the same call above ensureConnectDaemon; this one also covers the
+	// callers that construct a bridge directly.
+	clientDir, err := resolveClientDir()
+	if err != nil {
+		return nil, err
+	}
+
 	d, err := controlapi.ReadDaemonJSON(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -254,7 +278,7 @@ func newMCPBridge(dir string) (*mcpBridge, error) {
 	}
 	return &mcpBridge{
 		dir:       dir,
-		clientDir: resolveClientDir(),
+		clientDir: clientDir,
 		port:      d.Port,
 		token:     d.Token,
 		http: &http.Client{
@@ -273,32 +297,80 @@ const clientDirDisabled = "none"
 //
 //  1. ENGRAM_CLIENT_DIR=none — forwarding OFF; the daemon falls back to its own
 //     cwd, i.e. the pre-forwarding behavior.
-//  2. ENGRAM_CLIENT_DIR=<path> — use that path. The escape hatch for MCP hosts
-//     that spawn their servers somewhere other than the workspace (a launcher
-//     starting every server in $HOME would otherwise file everything under the
-//     home directory's name, with nothing the user could do about it).
+//  2. ENGRAM_CLIENT_DIR=<path> — use that path, which MUST be an existing
+//     directory. The escape hatch for MCP hosts that spawn their servers
+//     somewhere other than the workspace (a launcher starting every server in
+//     $HOME would otherwise file everything under the home directory's name,
+//     with nothing the user could do about it).
 //  3. Otherwise this process's cwd, which for a client-spawned bridge IS the
 //     project directory.
 //
-// An unreadable cwd yields "", which disables injection rather than failing the
-// bridge — resolution then falls back to the daemon, exactly as before.
-func resolveClientDir() string {
-	switch v := envOr("ENGRAM_CLIENT_DIR", ""); {
-	case v == "":
-	case strings.EqualFold(v, clientDirDisabled):
-		return ""
+// An explicit override FAILS CLOSED. A typo'd path used to be warned about on
+// stderr and forwarded anyway, which had the daemon detect a project from the
+// basename of a directory that does not exist — a brand-new junk project, the
+// exact disease this variable exists to cure. An explicit user configuration
+// that cannot be honored has to be as loud as a bad --db path, so `engram
+// connect` exits at startup and the error names both remedies. envOr trims the
+// value first, so surrounding whitespace is never part of the forwarded path
+// (and a whitespace-only value reads as UNSET, i.e. plain cwd forwarding).
+//
+// The AUTO-captured cwd stays non-fatal in both of its failure modes (an
+// unreadable cwd, and one that is not valid UTF-8): it yields "", which
+// disables injection and leaves the daemon's own cwd in charge, exactly as
+// before this feature existed. Nothing the user did is being overridden there.
+func resolveClientDir() (string, error) {
+	return resolveClientDirWith(envOr("ENGRAM_CLIENT_DIR", ""), os.Getwd)
+}
+
+// resolveClientDirWith is the testable core of resolveClientDir: env is the
+// already-trimmed ENGRAM_CLIENT_DIR value and getwd stands in for os.Getwd —
+// the same injection shape ensureConnectDaemonWith uses, and the only way to
+// exercise the non-UTF-8 cwd branch without a hostile filesystem.
+func resolveClientDirWith(env string, getwd func() (string, error)) (string, error) {
+	switch {
+	case env == "":
+	case strings.EqualFold(env, clientDirDisabled):
+		return "", nil
 	default:
-		// A typo'd override would silently file memories under a phantom
-		// basename, which is the very failure this flag exists to fix — say so
-		// on stderr (the MCP stdio log channel) instead of failing the bridge.
-		if info, err := os.Stat(v); err != nil || !info.IsDir() {
-			fmt.Fprintf(os.Stderr,
-				"engram connect: ENGRAM_CLIENT_DIR=%q is not an existing directory; forwarding it anyway\n", v)
+		if info, err := os.Stat(env); err != nil || !info.IsDir() {
+			return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%q is not an existing directory\n"+
+				"Either fix the path, or set ENGRAM_CLIENT_DIR=none to turn directory forwarding off\n"+
+				"(the daemon then resolves projects from its own working directory)", env)
 		}
-		return v
+		// json.Marshal of a Go string REPLACES invalid UTF-8 with U+FFFD instead
+		// of failing, so an unvalidated path would reach the daemon corrupted and
+		// resolve to a phantom project — the same class of failure as the typo,
+		// and just as much the user's explicit configuration.
+		//
+		// Deliberately untested: the stat above runs first, so reaching this needs
+		// an EXISTING directory whose name is not valid UTF-8. That is a POSIX-only
+		// filesystem (paths are raw bytes there); on Windows environment values
+		// arrive as UTF-16 and convert to valid UTF-8, making this branch dead
+		// code. It stays because it is the correct guard on POSIX.
+		if !utf8.ValidString(env) {
+			return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%q is not valid UTF-8 and cannot be "+
+				"forwarded without corruption\n"+
+				"Either point it at a UTF-8 path, or set ENGRAM_CLIENT_DIR=none to turn directory "+
+				"forwarding off", env)
+		}
+		return env, nil
 	}
-	cwd, _ := os.Getwd()
-	return cwd
+
+	cwd, err := getwd()
+	if err != nil {
+		return "", nil
+	}
+	if !utf8.ValidString(cwd) {
+		// Nothing to fail on here — the cwd is whatever the MCP host happened to
+		// spawn us in, not a user decision. Forwarding a U+FFFD-mangled path would
+		// invent a project name nobody can search for, so say so on stderr (the
+		// MCP stdio log channel) and let the daemon's own cwd take over.
+		fmt.Fprintf(os.Stderr, "engram connect: working directory %q is not valid UTF-8; "+
+			"directory forwarding is disabled — set ENGRAM_CLIENT_DIR to a UTF-8 path "+
+			"(or a project's directory) to forward one\n", cwd)
+		return "", nil
+	}
+	return cwd, nil
 }
 
 // snapshot returns the current port and token under lock.
@@ -681,6 +753,10 @@ func injectClientDirectory(msg []byte, clientDir string) []byte {
 		return msg
 	}
 
+	// Unreachable in practice: marshaling a Go string cannot fail — invalid UTF-8
+	// is silently REPLACED with U+FFFD rather than rejected, which is precisely
+	// why resolveClientDir validates the path upstream instead of relying on this
+	// error. Kept for symmetry with the re-encode checks below.
 	dirJSON, err := json.Marshal(clientDir)
 	if err != nil {
 		return msg

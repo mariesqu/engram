@@ -45,19 +45,64 @@ func normalizeProject(project string) string {
 	return n
 }
 
-// CreateSession upserts a session row. If a session with the same id already
-// exists, project and directory are updated only when they were previously
-// empty — matching the legacy predecessor's createSessionTx semantics
-// (REQ-308: no overwrite of a populated project with a new one).
+// CreateSession upserts a session row from a DETECTED project. If a session
+// with the same id already exists, project and directory are updated only when
+// they were previously empty — matching the legacy predecessor's
+// createSessionTx semantics (REQ-308: re-detection must never clobber the
+// project a session was registered under).
+//
+// For a project the CALLER named explicitly, use CreateSessionWithProject.
 func (s *Store) CreateSession(id, project, directory string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.createSessionLocked(id, project, directory, false)
+}
+
+// CreateSessionWithProject is CreateSession for a project the caller supplied
+// EXPLICITLY, and it is the one case allowed to overwrite a populated project:
+// re-registering a known id under a named project CORRECTS the stored row.
+//
+// Why the asymmetry with CreateSession: REQ-308 guards against re-DETECTION
+// clobbering a good project (the daemon's cwd flip-flopping between calls). An
+// explicit argument is not detection — it is the user telling us the stored
+// value is wrong, and it is the only lever they have, since `engram connect`
+// suppresses the directory injection as soon as a project is present. Without
+// this, the documented "just re-run mem_session_start with project=X" fix for a
+// misfiled session is a silent no-op.
+//
+// directory keeps CreateSession's fill-when-empty rule: a corrective call
+// typically carries no directory of its own (injection suppressed, so the
+// handler falls back to the daemon's cwd), and overwriting a good stored path
+// with that would trade one wrong field for another.
+//
+// Sessions are LOCAL-ONLY — they are not journaled through internal/mutation
+// and never reach internal/syncer (see EndSessionAt, which relies on the same
+// property) — so a corrected project produces no mutation and needs no sync.
+func (s *Store) CreateSessionWithProject(id, project, directory string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.createSessionLocked(id, project, directory, true)
+}
+
+// createSessionLocked is the shared upsert. The caller must hold mu.
+//
+// forceProject switches only the ON CONFLICT project clause. It is ignored when
+// the normalized project is empty: a blank explicit project is no correction at
+// all, and letting it through would erase a good stored value.
+func (s *Store) createSessionLocked(id, project, directory string, forceProject bool) error {
 	project = normalizeProject(project)
+
+	projectClause := `CASE WHEN sessions.project = '' THEN excluded.project ELSE sessions.project END`
+	if forceProject && project != "" {
+		projectClause = `excluded.project`
+	}
+
 	_, err := s.db.Exec(
 		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
-		   project   = CASE WHEN sessions.project = '' THEN excluded.project ELSE sessions.project END,
+		   project   = `+projectClause+`,
 		   directory = CASE WHEN sessions.directory = '' THEN excluded.directory ELSE sessions.directory END`,
 		id, project, directory,
 	)
