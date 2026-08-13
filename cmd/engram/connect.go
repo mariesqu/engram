@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -51,11 +53,23 @@ touched by auto-start (auto-start only ever launches a NEW daemon when none
 is found; it never restarts or kills an existing one) — that case still
 surfaces the existing preflight error naming the remedy.
 
+Because tool handlers run in the SHARED daemon, "engram connect" also adds
+its OWN working directory (the repo the MCP client launched it in) as the
+"directory" argument of every project-resolving tool call that does not
+already carry a "project" or "directory". Without it the daemon would
+auto-detect projects from ITS cwd — wherever autostart or the tray was
+launched from — and file every repo's memories under that one name.
+
 Flags:
   --db             Path to the local SQLite database (required; or set ENGRAM_DB, or
                    set in the config file's "db_path" key — same precedence as 'engram daemon')
   --no-autostart   Do not auto-start a resident daemon; fail with the old
                    "no resident engram daemon found" error instead
+
+Environment:
+  ENGRAM_CLIENT_DIR  Directory to forward instead of this process's cwd — for
+                     MCP hosts that spawn their servers outside the workspace.
+                     Set it to "none" to disable directory forwarding entirely.
 
 On stdin EOF, connect exits 0. On SIGINT/SIGTERM it exits cleanly.
 `
@@ -203,6 +217,16 @@ func resolveConnectDBPath(flagVal string) (string, error) {
 type mcpBridge struct {
 	dir string // directory containing daemon.json (same dir as the DB)
 
+	// clientDir is the directory forwarded to the daemon, resolved once at
+	// construction (see resolveClientDir): normally THIS process's working
+	// directory. The MCP client spawns `engram connect` in the project it is
+	// working on, so this is the only process in the chain that knows which repo
+	// a tool call belongs to — the resident daemon is shared and its own cwd is
+	// wherever autostart/tray happened to run from. Empty disables forwarding.
+	// Immutable after construction, so it needs no lock. See
+	// injectClientDirectory.
+	clientDir string
+
 	mu    sync.Mutex // guards port/token (read by many goroutines, written by refresh)
 	port  int
 	token string
@@ -229,13 +253,52 @@ func newMCPBridge(dir string) (*mcpBridge, error) {
 		return nil, fmt.Errorf("connect: read daemon.json: %w", err)
 	}
 	return &mcpBridge{
-		dir:   dir,
-		port:  d.Port,
-		token: d.Token,
+		dir:       dir,
+		clientDir: resolveClientDir(),
+		port:      d.Port,
+		token:     d.Token,
 		http: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}, nil
+}
+
+// clientDirDisabled is the sentinel ENGRAM_CLIENT_DIR value that turns
+// directory forwarding off completely, mirroring how "none" explicitly selects
+// the noop embedding provider in the config file.
+const clientDirDisabled = "none"
+
+// resolveClientDir determines the directory `engram connect` forwards, with the
+// same env-beats-default shape the rest of the CLI uses:
+//
+//  1. ENGRAM_CLIENT_DIR=none — forwarding OFF; the daemon falls back to its own
+//     cwd, i.e. the pre-forwarding behavior.
+//  2. ENGRAM_CLIENT_DIR=<path> — use that path. The escape hatch for MCP hosts
+//     that spawn their servers somewhere other than the workspace (a launcher
+//     starting every server in $HOME would otherwise file everything under the
+//     home directory's name, with nothing the user could do about it).
+//  3. Otherwise this process's cwd, which for a client-spawned bridge IS the
+//     project directory.
+//
+// An unreadable cwd yields "", which disables injection rather than failing the
+// bridge — resolution then falls back to the daemon, exactly as before.
+func resolveClientDir() string {
+	switch v := envOr("ENGRAM_CLIENT_DIR", ""); {
+	case v == "":
+	case strings.EqualFold(v, clientDirDisabled):
+		return ""
+	default:
+		// A typo'd override would silently file memories under a phantom
+		// basename, which is the very failure this flag exists to fix — say so
+		// on stderr (the MCP stdio log channel) instead of failing the bridge.
+		if info, err := os.Stat(v); err != nil || !info.IsDir() {
+			fmt.Fprintf(os.Stderr,
+				"engram connect: ENGRAM_CLIENT_DIR=%q is not an existing directory; forwarding it anyway\n", v)
+		}
+		return v
+	}
+	cwd, _ := os.Getwd()
+	return cwd
 }
 
 // snapshot returns the current port and token under lock.
@@ -526,12 +589,172 @@ func drainLine(r *bufio.Reader) error {
 	}
 }
 
+// injectClientDirectory returns msg with clientDir added as the "directory"
+// argument of a tools/call request, so the SHARED daemon resolves the project
+// from the CLIENT's working directory instead of its own.
+//
+// Why this exists: all tool handlers run in the resident daemon, whose cwd is
+// whatever directory autostart or the tray was launched from (on Windows,
+// commonly C:\Windows\system32). Auto-detected projects were therefore filed
+// under that directory's name, mixing every repo's memories into one junk
+// project. This process's cwd is the repo the agent is actually working in.
+//
+// The injection is per-call and stateless — never a bridge-level or daemon-level
+// global — so concurrent `engram connect` clients bridging to the SAME daemon
+// from different repos cannot contaminate each other.
+//
+// It is deliberately conservative; msg is returned VERBATIM whenever any of
+// these hold, so that a client that manages projects itself, an unparseable
+// frame, or a non-tool message behaves byte-for-byte as it did before:
+//
+//   - clientDir is empty (cwd unreadable)
+//   - msg is not a JSON object (JSON-RPC batch array, garbage — let the daemon
+//     produce the protocol error)
+//   - method is not "tools/call"
+//   - the tool is not directory-aware (see directoryAwareTools in tools.go —
+//     the same map the daemon uses to declare the optional argument, so client
+//     and daemon can never disagree about which tools accept it)
+//   - the caller already supplied a non-empty STRING "project" (an explicit
+//     project ALWAYS wins and must not be second-guessed) or any "directory"
+//     value. The two checks are deliberately asymmetric — a NON-STRING project
+//     is not a project: every daemon handler reads it as args["project"].(string)
+//     and gets "", so suppressing on it would leave the call with neither a
+//     project nor a directory, straight back to the daemon-cwd misfile. See
+//     hasNonEmptyString (project) vs hasNonEmptyStringArg (directory).
+//   - re-encoding fails for any reason
+//
+// A JSON null "arguments" is treated as ABSENT (injected into), not as a value
+// to preserve: on the daemon side mcp-go hands the handler a nil arguments map,
+// whose reads are indistinguishable from an empty one, so null and {} mean the
+// same thing to every tool. Note that json.Unmarshal of a literal null into a
+// map NILS it and reports NO error, so the nil map has to be re-made explicitly
+// — writing to it otherwise panics, and a panic in a dispatch goroutine would
+// take the whole bridge down.
+//
+// Re-encoding preserves every value the frame already carried, verbatim: only
+// the containers on the path to "arguments" are decoded, and every sibling is
+// carried through as a raw message. That is what keeps a JSON-RPC "id" above
+// 2^53 exact — decoding it into an `any` would round it through float64 and
+// orphan the client's pending request. Two things do change on an INJECTED
+// frame: key ORDER (Go marshals maps sorted) and HTML escaping (Go's encoder
+// rewrites the characters < > and & into their \u003c-style escapes). Both are
+// semantically lossless and JSON-RPC does not care. A frame returned VERBATIM
+// is untouched at the byte level.
+func injectClientDirectory(msg []byte, clientDir string) []byte {
+	if strings.TrimSpace(clientDir) == "" {
+		return msg
+	}
+
+	var frame map[string]json.RawMessage
+	if err := json.Unmarshal(msg, &frame); err != nil {
+		return msg
+	}
+	var method string
+	if err := json.Unmarshal(frame["method"], &method); err != nil || method != "tools/call" {
+		return msg
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(frame["params"], &params); err != nil {
+		return msg
+	}
+	var name string
+	if err := json.Unmarshal(params["name"], &name); err != nil || !directoryAwareTools[name] {
+		return msg
+	}
+
+	// "arguments" is optional in the MCP schema; an absent one is an empty set.
+	args := map[string]json.RawMessage{}
+	if raw, ok := params["arguments"]; ok {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return msg // present but not an object — the daemon's problem, not ours
+		}
+		if args == nil {
+			// A literal null: Unmarshal nils the map and reports no error, so this
+			// guard is what stands between a "arguments": null frame and an
+			// "assignment to entry in nil map" panic in the dispatch goroutine.
+			// Treated as absent (see the doc comment) — re-make and inject.
+			args = map[string]json.RawMessage{}
+		}
+	}
+	// "project" is checked STRING-only, "directory" is not — see both helpers.
+	if hasNonEmptyString(args, "project") || hasNonEmptyStringArg(args, "directory") {
+		return msg
+	}
+
+	dirJSON, err := json.Marshal(clientDir)
+	if err != nil {
+		return msg
+	}
+	args["directory"] = dirJSON
+
+	if params["arguments"], err = json.Marshal(args); err != nil {
+		return msg
+	}
+	if frame["params"], err = json.Marshal(params); err != nil {
+		return msg
+	}
+	out, err := json.Marshal(frame)
+	if err != nil {
+		return msg
+	}
+	return out
+}
+
+// hasNonEmptyStringArg reports whether args carries a meaningful value for key,
+// i.e. one that injection must not override. A non-string value counts as
+// meaningful: it is the caller's, and rewriting it would hide their error.
+// Absent, JSON null, and blank strings do not count.
+//
+// This is the rule for "directory" (documented in the README): a non-string
+// directory is the caller's error to see, not ours to paper over. "project"
+// uses the stricter hasNonEmptyString below.
+func hasNonEmptyStringArg(args map[string]json.RawMessage, key string) bool {
+	raw, ok := args[key]
+	if !ok {
+		return false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return true
+	}
+	return strings.TrimSpace(s) != ""
+}
+
+// hasNonEmptyString reports whether args carries a non-blank STRING for key. It
+// differs from hasNonEmptyStringArg in exactly one case: a non-string value
+// reports FALSE here.
+//
+// That case is why the "project" check is separate. A project the daemon cannot
+// read is semantically ABSENT — every handler takes it with
+// args["project"].(string), so a number, array, or object yields "". Treating it
+// as a project would suppress the injection and hand the daemon a call with no
+// project AND no directory, which resolves from the daemon's own cwd: the junk
+// project this whole mechanism exists to prevent. The caller's value is still
+// left untouched on the wire; only the suppression decision ignores it.
+func hasNonEmptyString(args map[string]json.RawMessage, key string) bool {
+	raw, ok := args[key]
+	if !ok {
+		return false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return false
+	}
+	return strings.TrimSpace(s) != ""
+}
+
 // forward POSTs a single JSON-RPC message to /mcp and writes the response to
 // w. On 401 it re-reads daemon.json once (token rotation) and retries; a
 // second 401 is a hard error. A 202/empty body (client notification — no
 // "id" field, so no response is expected) writes nothing to w, per the MCP
 // Streamable HTTP spec.
+//
+// The client's working directory is injected here rather than in run's read
+// loop so that BOTH the initial POST and the post-refresh retry send the same
+// bytes, and so a direct forward() caller gets the same contract.
 func (b *mcpBridge) forward(ctx context.Context, msg []byte, w io.Writer) error {
+	msg = injectClientDirectory(msg, b.clientDir)
+
 	body, status, err := b.post(ctx, msg)
 	if err != nil {
 		return err

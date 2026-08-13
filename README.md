@@ -435,6 +435,36 @@ If you'd rather manage the daemon's lifecycle yourself (or you're scripting/diag
 
 Auto-start only ever ADDS a daemon — it never restarts or kills an existing one. A daemon that IS running but was started *without* `--transport http` is left alone; `engram connect` still exits immediately with a message telling you to restart it with `--transport http`.
 
+**Working-directory forwarding**
+
+Tool handlers run in the **shared daemon**, not in `engram connect`. Left to itself, the daemon would auto-detect the project from *its own* working directory — whichever directory the autostart, the tray, or your service manager happened to launch it from (on Windows commonly `C:\Windows\system32`), never the repo you are working in. Every client would then file its memories under that single junk project name.
+
+`engram connect` closes that gap: your MCP client spawns it inside the project directory, and it adds that directory as the `directory` argument of every project-resolving tool call it proxies (`mem_session_start`, `mem_session_summary`, `mem_save`, `mem_save_prompt`, `mem_search`, `mem_context`, `mem_review`). The injection is per call, so several `engram connect` clients in different repos can share one daemon without contaminating each other. Precedence, highest first:
+
+1. An explicit `project` argument — always wins, and suppresses the injection entirely. Only a non-empty *string* counts: the daemon reads this argument as a string, so a number or object is empty to it, and the injection proceeds as if the argument were absent.
+2. A `directory` argument you set yourself. Absent, `null`, or blank counts as *unset* and gets the injected value; any other value (including a non-string, which is your error to see) is left alone. Blank therefore cannot be used to mean "fall back to the daemon's cwd" — use `ENGRAM_CLIENT_DIR=none` below for that.
+3. The daemon's own working directory — the fallback, and the right answer for a per-client `engram daemon --transport stdio`, which your MCP client spawns in the project directory itself.
+
+The resolution runs in the **resident daemon**, not in `engram connect`, so upgrading the binary is not enough: **restart the resident daemon** after the upgrade (quit it from the tray and relaunch, or kill it and let the next `engram connect` auto-start a fresh one). An old daemon does not reject the injected `directory` — unknown arguments are simply dropped — so it keeps resolving from its own cwd with no error anywhere to tell you why your memories are still landing in the junk project.
+
+Forwarding a real directory also makes one previously silent misconfiguration loud: if your client's working directory is a **multi-repo parent** (an editor opened at `~/work`, which contains several checkouts), project detection is ambiguous, and write tools now return an ambiguous-project error instead of quietly filing under the parent's name. Fix it by passing an explicit `project` argument, by pointing `ENGRAM_CLIENT_DIR` at the actual repo, or by dropping an `.engram/config.json` in the parent that pins the project name.
+
+If your MCP host spawns its servers somewhere other than the workspace (some launchers start everything in `$HOME`), point `engram connect` at the right directory with the `ENGRAM_CLIENT_DIR` environment variable, or set it to `none` to switch forwarding off entirely and go back to daemon-cwd detection:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "/path/to/engram",
+      "args": ["connect", "--db", "/home/you/.engram/memories.db"],
+      "env": { "ENGRAM_CLIENT_DIR": "/home/you/work/my-project" }
+    }
+  }
+}
+```
+
+Nothing else on the wire changes: other tool calls, protocol messages, and clients talking to `/mcp` directly are forwarded byte for byte. JSON-RPC batches (a top-level array) are never injected into either — they pass through untouched and fall back to daemon-cwd resolution. A frame that *is* injected into is re-encoded, so it stays semantically identical but its bytes differ in two harmless ways: the re-encoded containers — the frame itself, `params`, and `arguments` — come back with their keys in sorted order, and Go's JSON encoder escapes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`. Values nested *inside* an argument are compacted and escaped the same way, so they are not byte-exact either; what they do keep is their original key order, unlike the three re-encoded containers. Number tokens are copied digit for digit wherever they appear, which is what keeps a JSON-RPC `id` — a sibling in the frame, not an argument value — exact above 2^53.
+
 **Mode matrix**
 
 | Flags | MCP transport | `/mcp` endpoint |
@@ -703,6 +733,7 @@ link time (see [RELEASING.md](RELEASING.md)).
 | `ENGRAM_CONFIG_DIR`   | `daemon`                             | platform | Override the config file directory (see Config file section)     |
 | `ENGRAM_PUSH_CONCURRENCY` | `daemon` (autosync)               | `8`      | Parallel push workers per sync cycle (clamped to `[1, 64]`)       |
 | `ENGRAM_EMBEDDING_KEY`| `daemon`                             | —        | API key for the embedding provider; **env only**; overrides any stored ciphertext |
+| `ENGRAM_CLIENT_DIR`   | `connect`                            | cwd      | Directory forwarded to the daemon for project detection; `none` disables forwarding |
 
 Flags take precedence over environment variables. `ENGRAM_WRITER_KEY` has no corresponding flag and always takes precedence over the file-stored key.
 
@@ -796,6 +827,8 @@ If project auto-detection picks the wrong name (e.g. in a monorepo), create `.en
 ```json
 { "project_name": "my-project" }
 ```
+
+Auto-detection runs against the directory the tool call carries — the client's working directory when you bridge through `engram connect` (see [Working-directory forwarding](#http-mcp-transport)), otherwise the daemon's own. If your memories are landing under a name that matches neither your repo nor this file, that is the directory to check first.
 
 ## Using engram from your agent
 

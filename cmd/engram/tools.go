@@ -19,28 +19,84 @@ import (
 	"github.com/mariesqu/engram/internal/topickey"
 )
 
+// directoryArgDescription is the shared doc string for the optional "directory"
+// argument of every directory-aware tool. It is deliberately identical across
+// tools — agents should leave "directory" to the transport — so it is worded to
+// hold for all of them. Every directory-aware tool also accepts "project", which
+// outranks it (see TestRegisterTools_DirectoryAwareToolsDeclareProject).
+// TestRegisterTools_DirectoryAwareToolsDeclareDirectory pins that every
+// directory-aware tool ships exactly this text.
+const directoryArgDescription = "Directory to resolve the project from. Normally injected automatically by 'engram connect' " +
+	"(the client's working directory); set it by hand only to target a different checkout. " +
+	"Where a tool also accepts 'project', prefer that."
+
+// directoryAwareTools names the MCP tools whose handlers resolve the project
+// from a directory (resolveProjectDir → resolveReadProject / resolveSaveProject
+// / handleSessionStart). It is the single source of truth shared by the daemon
+// (which declares the optional "directory" argument on exactly these tools'
+// schemas, see registerTools) and by the `engram connect` bridge running in the
+// CLIENT process (which injects the client's working directory into exactly
+// these tools/call frames, see injectClientDirectory in connect.go).
+//
+// Tools absent from this map never see a "directory" argument on the wire —
+// their project is either irrelevant (mem_get_observation, mem_update,
+// mem_judge, …) or derived from the data itself (mem_similar reads the source
+// row's project).
+var directoryAwareTools = map[string]bool{
+	"mem_session_start":   true,
+	"mem_session_summary": true,
+	"mem_save":            true,
+	"mem_save_prompt":     true,
+	"mem_search":          true,
+	"mem_context":         true,
+	"mem_review":          true,
+}
+
+// resolveProjectDir returns the directory that project detection must run
+// against, applying the precedence every tool shares:
+//
+//  1. The caller-supplied "directory" argument, when non-empty. `engram connect`
+//     injects the CLIENT process's working directory here (see connect.go) —
+//     the daemon is SHARED and typically resident, so its own cwd is whatever
+//     directory the autostart/tray happened to run from (on Windows commonly
+//     C:\Windows\system32), never the repo the agent is working in.
+//  2. The daemon's own working directory. This is the correct answer for a
+//     per-client `engram daemon --transport stdio`, which the MCP client spawns
+//     in the project directory itself.
+//
+// A "" return (cwd unavailable) is passed through to DetectProjectFull, which
+// treats it as ".".
+func resolveProjectDir(directory string) string {
+	if d := strings.TrimSpace(directory); d != "" {
+		return d
+	}
+	cwd, _ := os.Getwd()
+	return cwd
+}
+
 // resolveReadProject resolves the project for a READ tool call. Unlike write
 // tools, read tools are LENIENT: no hard errors on ambiguous or invalid config.
 // The policy mirrors the legacy predecessor's handleSearch/handleContext
 // (REQ-310 lenient path):
 //
 //  1. Explicit project argument wins (normalized, used as-is — no store lookup).
-//  2. Detect from cwd via DetectProjectFull.
+//  2. Detect from the resolved directory (forwarded "directory" argument, else
+//     the daemon's cwd — see resolveProjectDir) via DetectProjectFull.
 //  3. On ANY detection error (ambiguous, invalid config, no .git, etc.) fall
 //     back to the dir basename via DetectProject. Read tools never return a
 //     project-resolution error to the agent.
 //
 // This contrasts with write tools (resolveSaveProject) which hard-error on
 // ErrInvalidConfig and ErrAmbiguousProject.
-func resolveReadProject(explicitProject string) string {
+func resolveReadProject(explicitProject, directory string) string {
 	if strings.TrimSpace(explicitProject) != "" {
 		return strings.TrimSpace(explicitProject)
 	}
-	cwd, _ := os.Getwd()
-	det := projectpkg.DetectProjectFull(cwd)
+	dir := resolveProjectDir(directory)
+	det := projectpkg.DetectProjectFull(dir)
 	if det.Error != nil {
 		// Lenient: fall back to basename, never error.
-		return projectpkg.DetectProject(cwd)
+		return projectpkg.DetectProject(dir)
 	}
 	return det.Project
 }
@@ -74,8 +130,11 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 				mcp.Required(),
 				mcp.Description("Unique session identifier"),
 			),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project for this session. When omitted the project is auto-detected from the working directory."),
+			),
 			mcp.WithString("directory",
-				mcp.Description("Working directory"),
+				mcp.Description(directoryArgDescription),
 			),
 		),
 		handleSessionStart(store),
@@ -148,6 +207,9 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			mcp.WithString("project",
 				mcp.Description("Optional explicit project for this memory. When omitted the project is auto-detected from the working directory."),
 			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
 			mcp.WithBoolean("capture_prompt",
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
@@ -173,6 +235,9 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			),
 			mcp.WithString("project",
 				mcp.Description("Optional explicit project for this prompt. When omitted the project is auto-detected from the working directory."),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
 			),
 		),
 		handleSavePrompt(store, loop, writerID, activity),
@@ -278,6 +343,9 @@ The suggestion is deterministic — the same title/type/content always yields th
 			mcp.WithString("mode",
 				mcp.Description(`Retrieval mode: "" or "fts" (keyword search, default), "semantic" (cosine only), "hybrid" (FTS + cosine fused via RRF). Semantic modes require an embedding provider to be configured; they degrade gracefully to FTS when unavailable.`),
 			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
 		),
 		handleSearch(store),
 	)
@@ -296,6 +364,9 @@ The suggestion is deterministic — the same title/type/content always yields th
 			),
 			mcp.WithString("scope",
 				mcp.Description("Filter observations by scope: project (default) or personal"),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
 			),
 		),
 		handleContext(store),
@@ -412,6 +483,9 @@ Status is computed at read time: a memory is "needs_review" once it ages past th
 			mcp.WithNumber("limit",
 				mcp.Description("list: max results (default 50, max 200)"),
 			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
 		),
 		handleReview(store),
 	)
@@ -475,20 +549,37 @@ FORMAT — use this exact structure in the content field:
 			mcp.WithString("session_id",
 				mcp.Description("Session ID (default: manual-save-{project})"),
 			),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project for this summary. When omitted the project comes from the session row, else it is auto-detected from the working directory."),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
 		),
 		handleSessionSummary(store, loop, writerID),
 	)
 }
 
 // handleSessionStart returns the handler for mem_session_start. It reads the
-// id (required) and directory (optional) arguments, resolves the project from
-// directory via internal/project.DetectProject, and calls CreateSession.
+// id (required) plus the optional project and directory arguments, resolves the
+// project, and calls CreateSession.
 //
-// Project detection (mirrors the legacy predecessor's handleSessionStart,
-// REQ-308):
-//   - If directory is supplied, detect from that path.
-//   - If directory is empty, detect from os.Getwd().
-//   - DetectProject never errors — it returns "unknown" on failure.
+// Project precedence — the same chain every directory-aware tool follows
+// (resolveSaveProject / resolveReadProject):
+//
+//  1. An explicit "project" argument, when non-empty. It wins outright: no
+//     detection runs, so an ambiguous or misconfigured directory cannot fail a
+//     call that already named its project. This is what makes "always pass
+//     project" a real workaround rather than a way to fall back to the daemon's
+//     cwd — `engram connect` suppresses the directory injection whenever a
+//     project is present (see injectClientDirectory in connect.go).
+//  2. Detection from the resolved directory (mirrors the legacy predecessor's
+//     handleSessionStart, REQ-308): the supplied "directory" if any, else
+//     os.Getwd() — see resolveProjectDir.
+//
+// This tool's optional "directory" argument is the model every other
+// directory-aware tool now follows; `engram connect` fills it with the client's
+// working directory when the caller left both it and "project" empty.
 func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
@@ -498,38 +589,41 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			return mcp.NewToolResultError("mem_session_start: id is required"), nil
 		}
 
+		explicitProject, _ := args["project"].(string)
+		explicitProject = strings.TrimSpace(explicitProject)
 		directory, _ := args["directory"].(string)
 		directory = strings.TrimSpace(directory)
 
-		// Resolve project from directory, falling back to cwd.
-		resolvedDir := directory
-		if resolvedDir == "" {
-			if cwd, err := os.Getwd(); err == nil {
-				resolvedDir = cwd
-			}
-		}
-		// Surface broken-config and ambiguous-project resolution errors as tool
-		// errors (faithful to the legacy predecessor) rather than silently storing
-		// the session under a wrong/basename project. ErrInvalidConfig = malformed
-		// .engram/config.json; ErrAmbiguousProject = the directory is a parent of
-		// multiple repos so no single project can be chosen. Any other error falls
-		// back to the basename.
-		det := projectpkg.DetectProjectFull(resolvedDir)
-		if det.Error != nil {
-			switch {
-			case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
-				return mcp.NewToolResultError("mem_session_start: " + det.Error.Error()), nil
-			case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
-				msg := "mem_session_start: " + det.Error.Error()
-				if len(det.AvailableProjects) > 0 {
-					msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") + "); supply a more specific directory"
+		// The directory the session row records, and — absent an explicit
+		// project — the one detection runs against.
+		resolvedDir := resolveProjectDir(directory)
+
+		project := explicitProject
+		if project == "" {
+			// Surface broken-config and ambiguous-project resolution errors as tool
+			// errors (faithful to the legacy predecessor) rather than silently storing
+			// the session under a wrong/basename project. ErrInvalidConfig = malformed
+			// .engram/config.json; ErrAmbiguousProject = the directory is a parent of
+			// multiple repos so no single project can be chosen. Any other error falls
+			// back to the basename.
+			det := projectpkg.DetectProjectFull(resolvedDir)
+			if det.Error != nil {
+				switch {
+				case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
+					return mcp.NewToolResultError("mem_session_start: " + det.Error.Error()), nil
+				case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
+					msg := "mem_session_start: " + det.Error.Error()
+					if len(det.AvailableProjects) > 0 {
+						msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") +
+							"); pass project= explicitly or supply a more specific directory"
+					}
+					return mcp.NewToolResultError(msg), nil
+				default:
+					det.Project = projectpkg.DetectProject(resolvedDir)
 				}
-				return mcp.NewToolResultError(msg), nil
-			default:
-				det.Project = projectpkg.DetectProject(resolvedDir)
 			}
+			project = det.Project
 		}
-		project := det.Project
 
 		// If the caller supplied a directory, use it; otherwise use the cwd we
 		// detected the project from so the stored path is always meaningful.
@@ -576,21 +670,25 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 // contract):
 //
 //  1. Explicit "project" argument if non-empty (caller override).
-//  2. DetectProjectFull(cwd) — repo config / git remote / git root / dir basename.
+//  2. DetectProjectFull on the resolved directory (forwarded "directory"
+//     argument, else the daemon's cwd — see resolveProjectDir): repo config /
+//     git remote / git root / dir basename.
 //
 // ErrInvalidConfig and ErrAmbiguousProject are surfaced as tool errors exactly
 // like handleSessionStart so agents get actionable feedback on misconfigured
-// repos (faithful to the legacy predecessor's handleSave precedence).
+// repos (faithful to the legacy predecessor's handleSave precedence) — they
+// fire against the resolved directory, so a forwarded directory is diagnosed
+// exactly like a cwd would be.
 //
 // Conflict detection (explicit project vs store's known projects) is DEFERRED
 // to a future PR.
-func resolveSaveProject(store *localstore.Store, explicitProject string) (string, *mcp.CallToolResult) {
+func resolveSaveProject(store *localstore.Store, explicitProject, directory string) (string, *mcp.CallToolResult) {
 	if strings.TrimSpace(explicitProject) != "" {
 		return strings.TrimSpace(explicitProject), nil
 	}
 
-	cwd, _ := os.Getwd()
-	det := projectpkg.DetectProjectFull(cwd)
+	dir := resolveProjectDir(directory)
+	det := projectpkg.DetectProjectFull(dir)
 	if det.Error != nil {
 		switch {
 		case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
@@ -598,12 +696,13 @@ func resolveSaveProject(store *localstore.Store, explicitProject string) (string
 		case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
 			msg := "mem_save: project resolution: " + det.Error.Error()
 			if len(det.AvailableProjects) > 0 {
-				msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") + "); pass project= explicitly"
+				msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") +
+					"); pass project= explicitly or supply a more specific directory"
 			}
 			return "", mcp.NewToolResultError(msg)
 		default:
 			// Other errors (e.g. no .git): fall back to basename.
-			return projectpkg.DetectProject(cwd), nil
+			return projectpkg.DetectProject(dir), nil
 		}
 	}
 	return det.Project, nil
@@ -636,6 +735,7 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		scope, _ := args["scope"].(string)
 		topicKey, _ := args["topic_key"].(string)
 		explicitProject, _ := args["project"].(string)
+		directory, _ := args["directory"].(string)
 
 		// capture_prompt defaults to true when absent; explicit false disables it.
 		capturePrompt := true
@@ -643,7 +743,7 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 			capturePrompt = v
 		}
 
-		project, toolErr := resolveSaveProject(store, explicitProject)
+		project, toolErr := resolveSaveProject(store, explicitProject, directory)
 		if toolErr != nil {
 			return toolErr, nil
 		}
@@ -909,9 +1009,21 @@ func handleSuggestTopicKey() mcpserver.ToolHandlerFunc {
 	}
 }
 
-// handleSessionSummary returns the handler for mem_session_summary.
-// It saves a session_summary-typed observation using the cwd-detected project
-// and optionally triggers autosync.
+// handleSessionSummary returns the handler for mem_session_summary. It saves a
+// session_summary-typed observation and optionally triggers autosync.
+//
+// Project precedence, highest first — the uniform chain, with the session row
+// wedged in where this tool has one:
+//
+//  1. An explicit "project" argument (delegated to resolveSaveProject, which
+//     returns it untouched). It outranks the session row too: an agent that
+//     names a project must not have it silently overridden by whatever a
+//     stale/foreign session_id happens to point at.
+//  2. The session's stored project (captured at mem_session_start from the
+//     client's directory). The daemon is a separate process, so its cwd is not
+//     a reliable per-call signal; the session row is.
+//  3. Detection from the resolved directory (forwarded "directory", else the
+//     daemon's cwd).
 func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID string) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
@@ -923,20 +1035,23 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 
 		sessionID, _ := args["session_id"].(string)
 		sessionID = strings.TrimSpace(sessionID)
+		explicitProject, _ := args["project"].(string)
+		explicitProject = strings.TrimSpace(explicitProject)
 
-		// Project: prefer the session's stored project (captured at mem_session_start
-		// from the client's directory). The daemon is a separate process, so its cwd
-		// is not a reliable per-call signal; the session row is. Fall back to cwd
-		// detection only when there is no usable session project.
+		// Session row: consulted only when the caller named no project, so an
+		// explicit one wins outright (precedence rule 1 above).
 		var project string
-		if sessionID != "" {
+		if explicitProject == "" && sessionID != "" {
 			if sess, gerr := store.GetSession(sessionID); gerr == nil && sess.Project != "" {
 				project = sess.Project
 			}
 		}
 		if project == "" {
+			directory, _ := args["directory"].(string)
 			var toolErr *mcp.CallToolResult
-			project, toolErr = resolveSaveProject(store, "")
+			// Returns explicitProject verbatim when set; otherwise detects from the
+			// forwarded directory / daemon cwd and may hard-error.
+			project, toolErr = resolveSaveProject(store, explicitProject, directory)
 			if toolErr != nil {
 				return toolErr, nil
 			}
@@ -1007,6 +1122,7 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		typ, _ := args["type"].(string)
 		explicitProject, _ := args["project"].(string)
+		directory, _ := args["directory"].(string)
 		scope, _ := args["scope"].(string)
 		mode, _ := args["mode"].(string)
 
@@ -1019,7 +1135,7 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			}
 		}
 
-		project := resolveReadProject(explicitProject)
+		project := resolveReadProject(explicitProject, directory)
 		// REQ-391: personal-scope memories are NOT project-scoped. When scope is
 		// personal and no explicit project was given, search across ALL projects so
 		// personal memories saved under any project remain visible.
@@ -1086,9 +1202,10 @@ func handleContext(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		args := req.GetArguments()
 
 		explicitProject, _ := args["project"].(string)
+		directory, _ := args["directory"].(string)
 		scope, _ := args["scope"].(string)
 
-		project := resolveReadProject(explicitProject)
+		project := resolveReadProject(explicitProject, directory)
 		// REQ-391: personal-scope memories are NOT project-scoped (see handleSearch).
 		if strings.EqualFold(strings.TrimSpace(scope), "personal") && strings.TrimSpace(explicitProject) == "" {
 			project = ""
@@ -1198,7 +1315,8 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		sessionID = strings.TrimSpace(sessionID)
 
 		explicitProject, _ := args["project"].(string)
-		project, toolErr := resolveSaveProject(store, explicitProject)
+		directory, _ := args["directory"].(string)
+		project, toolErr := resolveSaveProject(store, explicitProject, directory)
 		if toolErr != nil {
 			return toolErr, nil
 		}
@@ -1355,10 +1473,11 @@ func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		action, _ := args["action"].(string)
 		action = strings.TrimSpace(strings.ToLower(action))
+		directory, _ := args["directory"].(string)
 		switch action {
 		case "list":
 			explicitProject, _ := args["project"].(string)
-			project := resolveReadProject(explicitProject)
+			project := resolveReadProject(explicitProject, directory)
 
 			status, _ := args["status"].(string)
 
@@ -1406,7 +1525,7 @@ func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			topicKey = strings.TrimSpace(topicKey)
 			if topicKey != "" {
 				explicitProject, _ := args["project"].(string)
-				project := resolveReadProject(explicitProject)
+				project := resolveReadProject(explicitProject, directory)
 				id, err := store.IDByTopicKey(topicKey, project, "project")
 				if err != nil {
 					if errors.Is(err, localstore.ErrObservationNotFound) {
