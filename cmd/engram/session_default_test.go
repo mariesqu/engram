@@ -145,8 +145,8 @@ func TestDaemonTool_MemSavePrompt_SessionIDExplicit(t *testing.T) {
 
 // TestDaemonTool_MemSessionSummary_SessionIDDefault verifies that an omitted
 // session_id is stored as "manual-save-{project}" using the FINAL resolved
-// project name (cwd-detected, since no prior session row exists for an empty
-// session_id and no explicit project argument is supported by this tool).
+// project name (cwd-detected, since this call passes no explicit project and no
+// prior session row exists for an empty session_id).
 func TestDaemonTool_MemSessionSummary_SessionIDDefault(t *testing.T) {
 	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "engram.db"), syncInterval: 30 * time.Second})
 	if err != nil {
