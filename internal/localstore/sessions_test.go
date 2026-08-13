@@ -233,6 +233,75 @@ func TestCreateSession_UpsertDoesNotOverwriteProject(t *testing.T) {
 	}
 }
 
+// ── CreateSessionWithProject corrects a populated project ─────────────────────
+
+// TestCreateSessionWithProject_OverwritesPopulatedProject pins the one case
+// allowed to break the REQ-308 guard: a project the CALLER named explicitly.
+// Re-registering an id under a named project is the documented repair for a
+// session filed under a misdetected one, and it used to be a silent no-op.
+func TestCreateSessionWithProject_OverwritesPopulatedProject(t *testing.T) {
+	s := openTempStore(t)
+
+	if err := s.CreateSession("fix-id", "system32", "/original/dir"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.CreateSessionWithProject("fix-id", "engram", ""); err != nil {
+		t.Fatalf("CreateSessionWithProject: %v", err)
+	}
+
+	got, err := s.GetSession("fix-id")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Project != "engram" {
+		t.Errorf("Project = %q, want %q (an explicit project must correct the row)", got.Project, "engram")
+	}
+	// The corrective call carries no directory of its own — the stored one stays.
+	if got.Directory != "/original/dir" {
+		t.Errorf("Directory = %q, want %q (fill-when-empty, never overwrite)", got.Directory, "/original/dir")
+	}
+}
+
+// TestCreateSessionWithProject_BlankProjectDoesNotErase guards the degenerate
+// call: a blank explicit project corrects nothing, so it must not wipe a good
+// stored value on its way through.
+func TestCreateSessionWithProject_BlankProjectDoesNotErase(t *testing.T) {
+	s := openTempStore(t)
+
+	if err := s.CreateSession("blank-id", "engram", "/dir"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.CreateSessionWithProject("blank-id", "   ", "/dir"); err != nil {
+		t.Fatalf("CreateSessionWithProject: %v", err)
+	}
+
+	got, err := s.GetSession("blank-id")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Project != "engram" {
+		t.Errorf("Project = %q, want %q (a blank explicit project must not erase the row)", got.Project, "engram")
+	}
+}
+
+// TestCreateSessionWithProject_NormalizesAndInserts covers the fresh-id path:
+// no existing row means a plain INSERT, still normalized like CreateSession.
+func TestCreateSessionWithProject_NormalizesAndInserts(t *testing.T) {
+	s := openTempStore(t)
+
+	if err := s.CreateSessionWithProject("new-id", "MyProject", "/dir"); err != nil {
+		t.Fatalf("CreateSessionWithProject: %v", err)
+	}
+
+	got, err := s.GetSession("new-id")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Project != "myproject" {
+		t.Errorf("Project = %q, want %q", got.Project, "myproject")
+	}
+}
+
 // ── normalizeProject lowercases and collapses separators ──────────────────────
 
 func TestNormalizeProject(t *testing.T) {

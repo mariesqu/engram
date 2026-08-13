@@ -131,7 +131,7 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 				mcp.Description("Unique session identifier"),
 			),
 			mcp.WithString("project",
-				mcp.Description("Optional explicit project for this session. When omitted the project is auto-detected from the working directory."),
+				mcp.Description("Optional explicit project for this session. When omitted the project is auto-detected from the working directory. Re-registering a known id with an explicit project UPDATES the stored project — the way to correct a session that was registered under the wrong one. It corrects the SESSION only: observations already saved under the wrong project keep it, use mem_merge_projects for those."),
 			),
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
@@ -572,7 +572,9 @@ FORMAT — use this exact structure in the content field:
 //     call that already named its project. This is what makes "always pass
 //     project" a real workaround rather than a way to fall back to the daemon's
 //     cwd — `engram connect` suppresses the directory injection whenever a
-//     project is present (see injectClientDirectory in connect.go).
+//     project is present (see injectClientDirectory in connect.go). It is also
+//     CORRECTIVE: it rewrites the stored project of an id that already exists
+//     (CreateSessionWithProject), which a detected project never does.
 //  2. Detection from the resolved directory (mirrors the legacy predecessor's
 //     handleSessionStart, REQ-308): the supplied "directory" if any, else
 //     os.Getwd() — see resolveProjectDir.
@@ -631,7 +633,17 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			directory = resolvedDir
 		}
 
-		if err := store.CreateSession(id, project, directory); err != nil {
+		// An explicit project is CORRECTIVE: re-registering an id that was already
+		// stored under a misdetected project rewrites it (CreateSessionWithProject),
+		// whereas a detected project never overwrites a populated row (REQ-308).
+		// Without the split, "just re-run mem_session_start with project=X" — the
+		// only remedy left once a project suppresses the directory injection —
+		// would report success and change nothing.
+		create := store.CreateSession
+		if explicitProject != "" {
+			create = store.CreateSessionWithProject
+		}
+		if err := create(id, project, directory); err != nil {
 			return mcp.NewToolResultError("Failed to start session: " + err.Error()), nil
 		}
 
