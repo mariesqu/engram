@@ -6,7 +6,7 @@ require (
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mark3labs/mcp-go v0.57.0
-	modernc.org/sqlite v1.56.0
+	modernc.org/sqlite v1.57.0
 )
 
 require (
