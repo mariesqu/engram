@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mariesqu/engram/internal/localstore"
 	projectpkg "github.com/mariesqu/engram/internal/project"
 )
 
@@ -22,6 +23,14 @@ const (
 	CheckStaleReviewBacklog              = "stale_review_backlog"
 	CheckSyncBacklog                     = "sync_backlog"
 )
+
+// ReasonUnregisteredSessionSaves is a REASON code, not a check code — it names
+// a FINDING of the orphaned-session check, so it is deliberately not something
+// mem_doctor's check argument accepts. It describes the same shape of data
+// (live observations whose session id has no row in sessions) for the opposite
+// reason: the store's own documented default rather than a session that
+// vanished.
+const ReasonUnregisteredSessionSaves = "unregistered_session_saves"
 
 // Thresholds. They are constants rather than configuration because a threshold
 // nobody tunes is a threshold nobody has to explain, and every one of these is
@@ -48,12 +57,24 @@ const (
 
 // OrphanedObservationSessionCheck finds live observations whose session id has
 // no row in sessions.
+//
+// It reports TWO conditions that look identical in SQL and mean opposite
+// things. An observation naming a session id nobody registered is a warning:
+// something created it, and whatever that was is gone. An observation naming
+// "manual-save-{project}" is the store's own DEFAULT for a save made outside a
+// tracked session — documented, expected, and previously reported as a warning
+// on every single store that had ever seen a plain mem_save. That one is an
+// informational note and does not move the check out of "ok".
 type OrphanedObservationSessionCheck struct{}
 
 func (OrphanedObservationSessionCheck) Code() string { return CheckOrphanedObservationSession }
 
 func (c OrphanedObservationSessionCheck) Run(_ context.Context, scope Scope) (CheckResult, error) {
 	refs, err := scope.Store.OrphanedObservationSessions(scope.Project)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	unregistered, err := scope.Store.UnregisteredSessionSaves(scope.Project)
 	if err != nil {
 		return CheckResult{}, err
 	}
@@ -74,7 +95,49 @@ func (c OrphanedObservationSessionCheck) Run(_ context.Context, scope Scope) (Ch
 			RequiresConfirmation: true,
 		})
 	}
-	return resultFromFindings(c.Code(), map[string]any{"orphaned_session_ids": len(refs)}, findings), nil
+
+	notes := unregisteredSaveNotes(c.Code(), unregistered)
+	evidence := map[string]any{
+		"orphaned_session_ids":     len(refs),
+		"unregistered_session_ids": len(unregistered),
+	}
+	if len(findings) == 0 {
+		return okWithNotes(c.Code(), evidence, notes), nil
+	}
+	return resultFromFindings(c.Code(), evidence, append(findings, notes...)), nil
+}
+
+// unregisteredSaveNotes folds the manual-save rows into at most ONE
+// informational finding. One note per session id would print a line per project
+// for a condition that is the same condition everywhere: "you are saving
+// without registering a session".
+func unregisteredSaveNotes(checkID string, refs []localstore.OrphanedSessionRef) []Finding {
+	if len(refs) == 0 {
+		return nil
+	}
+	total := 0
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		total += ref.ObservationCount
+		ids = append(ids, ref.SessionID)
+	}
+	sort.Strings(ids)
+	return []Finding{{
+		CheckID:    checkID,
+		Severity:   SeverityInfo,
+		ReasonCode: ReasonUnregisteredSessionSaves,
+		Message: fmt.Sprintf("%d observation(s) were saved without a registered session; call mem_session_start at session start.",
+			total),
+		Why: "A save with no session_id is filed under the default \"" + localstore.ManualSaveSessionPrefix +
+			"{project}\" id, which nothing registers. The memories are intact, searchable and synced — they simply " +
+			"carry no session, so mem_context cannot group them with the work they came from.",
+		Evidence: mustJSON(map[string]any{
+			"observation_count": total,
+			"session_ids":       ids,
+		}),
+		SafeNextStep: "Nothing is broken. To get the grouping, call mem_session_start at the beginning of a session " +
+			"and pass its id to mem_save.",
+	}}
 }
 
 // ─── session_project_directory_mismatch ──────────────────────────────────────
@@ -88,7 +151,10 @@ func (SessionProjectDirectoryMismatchCheck) Code() string {
 }
 
 func (c SessionProjectDirectoryMismatchCheck) Run(_ context.Context, scope Scope) (CheckResult, error) {
-	sessions, err := scope.Store.DiagnosticSessions(scope.Project)
+	// scope.Sessions(), not Store.DiagnosticSessions: this check and
+	// ambiguous_active_sessions both need every session row, and one report
+	// should not read the sessions table twice.
+	sessions, err := scope.Sessions()
 	if err != nil {
 		return CheckResult{}, err
 	}
@@ -185,7 +251,7 @@ type AmbiguousActiveSessionsCheck struct{}
 func (AmbiguousActiveSessionsCheck) Code() string { return CheckAmbiguousActiveSessions }
 
 func (c AmbiguousActiveSessionsCheck) Run(_ context.Context, scope Scope) (CheckResult, error) {
-	sessions, err := scope.Store.DiagnosticSessions(scope.Project)
+	sessions, err := scope.Sessions()
 	if err != nil {
 		return CheckResult{}, err
 	}

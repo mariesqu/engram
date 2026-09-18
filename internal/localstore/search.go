@@ -92,15 +92,20 @@ type SearchFilter struct {
 // expression should be measured rather than assumed free.
 const ftsRankExpr = "fts.rank * (CASE WHEN m.pinned = 1 THEN 1.10 ELSE 1.0 END)"
 
-// hybridFullFusionFTSCap bounds the FTS candidate list on an OFFSET hybrid page.
+// hybridFullFusionFTSCap bounds the FTS candidate list of EVERY hybrid query.
 //
-// An offset page fuses the full candidate lists so the ranking does not depend on
-// the offset (see SearchMemoriesFiltered's doc block). "Full" is literal for the
-// cosine half — SelectVectors already scanned those rows — but an unbounded FTS
-// half would let a one-word query pull every matching row in the store into
-// memory to answer a ten-row page. 2000 is far past what any real paging session
-// walks (200 pages of 10) while keeping the worst case a few megabytes, and a
-// page that reaches beyond it returns the rows it can rather than erroring.
+// Hybrid always fuses the full candidate lists so the ranking does not depend on
+// the page being asked for (see SearchMemoriesFiltered's doc block). "Full" is
+// literal for the cosine half — SelectVectors already scanned those rows — but an
+// unbounded FTS half would let a one-word query pull every matching row in the
+// store into memory to answer a ten-row page. 2000 is far past what any real
+// paging session walks (200 pages of 10) while keeping the worst case a few
+// megabytes, and a query that reaches beyond it fuses the rows it has rather
+// than erroring.
+//
+// The cost is real and deliberate: page one of a hybrid search now ranks up to
+// 2000 FTS rows instead of 2×limit. That is what a stable ranking costs, and it
+// is paid on the half of the query that was already scanning every vector row.
 const hybridFullFusionFTSCap = 2000
 
 // dateRangeSQL appends CreatedFrom/CreatedTo predicates (if set) to a WHERE
@@ -149,19 +154,21 @@ type SearchDegradation struct {
 //   - f.Offset skips the first N rows of the FINAL ranked page. "fts" pushes it
 //     into SQL OFFSET; "semantic" applies it after cosine ranking and "hybrid"
 //     after RRF fusion, because neither has a rank order until scoring has run.
-//     The guarantee the two paths make when Offset > 0 is that the RANKING IS
-//     NOT A FUNCTION OF THE OFFSET: every offset page is cut from the same
-//     ranking page one is cut from, so consecutive pages are disjoint and their
-//     union is the unpaged top-(offset+limit). Widening a truncated pool by the
-//     offset — which is what this used to do — does NOT give that: RRF scores
-//     depend on each row's rank WITHIN the candidate lists, so changing how far
-//     those lists are truncated reorders the fused result, and two pages drawn
-//     from two different rankings can repeat rows and skip others. So an offset
-//     page ranks the FULL candidate lists (every vector row for cosine; FTS up
-//     to hybridFullFusionFTSCap) and slices [offset:offset+limit] out of it.
-//     Offset == 0 keeps the historic narrow pool byte-for-byte — page one was
-//     never wrong, and widening it would silently reorder every existing
-//     first-page hybrid result.
+//     The guarantee both paths make is that the RANKING IS NOT A FUNCTION OF
+//     THE PAGE: every page is cut from the same ranking, so consecutive pages
+//     are disjoint and their union is the unpaged top-(offset+limit). An RRF
+//     score depends on each row's rank WITHIN the candidate lists, so changing
+//     how far those lists are truncated reorders the fused result — which means
+//     hybrid ranks the FULL candidate lists (every vector row for cosine, FTS up
+//     to hybridFullFusionFTSCap) for EVERY offset, including zero, and slices
+//     [offset:offset+limit] out of it.
+//     Page one used to keep a narrower pool (2×limit per half) for byte-identity
+//     with the pre-paging release. That made page 0 and page 1 slices of two
+//     DIFFERENT rankings, which is the one thing paging may not do: with the two
+//     halves ranking a corpus differently, a row admitted by the wider pool
+//     outranks rows page one already returned, so the pages repeat some and skip
+//     others. Byte-identity with an unpaged ranking is not worth an incoherent
+//     paged one.
 //   - Paging is stable only for a fixed corpus and a fixed query: a concurrent
 //     write, or an embedding backfill that adds a vector mid-scan, can shift
 //     rows across the page boundary exactly as it can on the FTS path.
@@ -334,17 +341,13 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	}
 
 	// ── Hybrid path: FTS + cosine → RRF ─────────────────────────────────────
-	// Page one keeps the historic pool: 2× the requested rows from each half.
-	// An OFFSET page instead fuses the full candidate lists, because an RRF score
-	// is a property of a row's rank within the lists it was fused from — make the
-	// pool a function of the offset and each page is cut from a DIFFERENT ranking,
-	// which is how pages end up repeating rows and skipping others. Fusing the
-	// same full lists for every offset makes the ranking offset-independent, so
-	// [offset:offset+limit] is a genuine slice of one ordering.
-	ftsPool := limit * 2
-	if offset > 0 {
-		ftsPool = hybridFullFusionFTSCap
-	}
+	// EVERY hybrid query fuses the full candidate lists, page one included. An RRF
+	// score is a property of a row's rank within the lists it was fused from, so a
+	// pool that varies by page cuts each page out of a DIFFERENT ranking — which is
+	// how pages end up repeating rows and skipping others. Fusing the same lists
+	// for every offset makes the ranking page-independent, so [offset:offset+limit]
+	// is a genuine slice of one ordering.
+	ftsPool := hybridFullFusionFTSCap
 
 	// Run FTS for the candidate pool sized above.
 	ftsCandidates, ftsErr := func() ([]*domain.Record, error) {
@@ -416,15 +419,10 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		ftsRecordsByID[r.SyncID] = r
 	}
 
-	// The cosine half mirrors the FTS half: 2×limit on page one, every scanned
-	// vector row on an offset page (SelectVectors has already applied the same
-	// project/type/scope/date predicates, so "all of them" is still a bounded,
-	// correctly-scoped list).
-	cosineK := limit * 2
-	if offset > 0 {
-		cosineK = len(vrows)
-	}
-	cosineCandidates := cosineTopK(queryVec, vrows, cosineK)
+	// The cosine half mirrors the FTS half: every scanned vector row, on every
+	// page (SelectVectors has already applied the same project/type/scope/date
+	// predicates, so "all of them" is still a bounded, correctly-scoped list).
+	cosineCandidates := cosineTopK(queryVec, vrows, len(vrows))
 	cosineRanks := make([]string, len(cosineCandidates))
 	for i, c := range cosineCandidates {
 		cosineRanks[i] = c.syncID

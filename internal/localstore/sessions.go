@@ -7,6 +7,24 @@ import (
 	"time"
 )
 
+// ManualSaveSessionPrefix is the prefix of the session id a write tool invents
+// when the caller supplies none: "manual-save-{project}". Nothing ever registers
+// such a session — it exists to group saves made outside a tracked session, and
+// it is the documented default of mem_save, mem_save_prompt and
+// mem_session_summary.
+//
+// It lives here, in the package that owns session identity, because two very
+// different places have to agree on it: the MCP write handlers that MINT the id
+// (cmd/engram/tools.go) and the diagnostic query that must not report it as an
+// orphan (diagnostic.go). When those two disagreed, every manual save produced
+// a permanent doctor warning about the store's own default.
+const ManualSaveSessionPrefix = "manual-save-"
+
+// DefaultManualSessionID returns the session id a write defaults to for project.
+func DefaultManualSessionID(project string) string {
+	return ManualSaveSessionPrefix + project
+}
+
 // Session represents a tracked MCP coding session.
 type Session struct {
 	ID        string

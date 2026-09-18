@@ -983,7 +983,7 @@ The daemon exposes 18 tools to the connected agent.
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
 | `mem_merge_projects`  | Merge a source project's memories into a target name to fix project name drift (local-only) |
-| `mem_doctor`          | Run read-only diagnostics over the local store and return a structured report (never writes) |
+| `mem_doctor`          | Run read-only diagnostics over the local store and return a structured report (never modifies your memories) |
 
 ### Project probe: `mem_current_project`
 
@@ -1007,7 +1007,7 @@ Read-only checks over the local store, for the moments when something looks wron
 
 | Check | What it catches |
 |-------|-----------------|
-| `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. |
+| `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. Saves filed under the store's own `manual-save-{project}` default are **excluded**: that is what a `mem_save` with no `session_id` does, and warning about it made every store that had ever taken a manual save permanently "warning". They are reported instead as an `info` finding, `unregistered_session_saves`, which does not move the check out of `ok`. |
 | `session_project_directory_mismatch` | A session filed under one project whose directory resolves to another today. Only *declared* identities count (config file, git remote, git root) — comparing two basename guesses would report drift that is not there. |
 | `ambiguous_active_sessions` | Two or more sessions still open for the same project + directory, usually an agent host that exited without firing its session-end hook. |
 | `project_policy_unknown` | Projects with memories but no explicit policy row, **only when central is configured** — they are being pushed on a computed default of `synced` that nobody chose. Informational. |
@@ -1017,7 +1017,9 @@ Read-only checks over the local store, for the moments when something looks wron
 
 Scope: the per-project checks follow the same project resolution as `mem_search` and `mem_context` (explicit `project`, else the forwarded directory); pass `check` to run exactly one. `sqlite_lock_contention` and `sync_backlog` are node-wide either way.
 
-**It never writes.** Every finding ends in a `safe_next_step` for a human to run, and `requires_confirmation: true` marks the ones where the right fix depends on context the store does not have — which of two project names is canonical, which of three open sessions is yours. A repair that guesses at those destroys the evidence on its way.
+**It never modifies your memories.** Every finding ends in a `safe_next_step` for a human to run, and `requires_confirmation: true` marks the ones where the right fix depends on context the store does not have — which of two project names is canonical, which of three open sessions is yours. A repair that guesses at those destroys the evidence on its way. (The wording is deliberate: no row, session or project is ever touched, but `sqlite_lock_contention` probes with `PRAGMA wal_checkpoint(PASSIVE)`, which can move pages out of the WAL. Calling that "never writes" would be a claim the code does not make.)
+
+**Tool errors vs findings.** The call is flagged as an error only when the *request* could not be run — an unknown `check` id. A check that reports `severity: "error"` failed to ANSWER (the lock probe could not read its pragma, say); the other checks still reported, and the call succeeded. A doctor whose calls "fail" is a doctor nobody runs on the store that needs it.
 
 ### Conflict detection
 
@@ -1154,7 +1156,9 @@ The web UI also exposes local and purge-all delete from the **Projects** page. `
 | `created_from` | RFC3339 or `YYYY-MM-DD` | Only memories created at or after this instant. A bare date is read as UTC midnight. |
 | `created_to` | RFC3339 or `YYYY-MM-DD` | Only memories created at or before this instant. A bare date covers the **whole** day. |
 
-The bounds are honoured by every mode — on `"hybrid"` they are pushed into both the FTS predicate and the vector candidate scan, so a row outside the window cannot be re-admitted by the semantic half of the fusion. `offset` is applied in SQL on the keyword path and to the final ranked list on the semantic and hybrid paths; an offset page there is cut from the full fused ranking, so consecutive pages are disjoint.
+The bounds are honoured by every mode — on `"hybrid"` they are pushed into both the FTS predicate and the vector candidate scan, so a row outside the window cannot be re-admitted by the semantic half of the fusion. `offset` is applied in SQL on the keyword path and to the final ranked list on the semantic and hybrid paths.
+
+Hybrid fuses the **full** candidate lists on every page, including page one (every vector row for the cosine half; up to 2000 rows for the FTS half). An RRF score depends on a row's rank *within the lists it was fused from*, so a candidate pool that varied by page would cut each page out of a different ranking — pages that repeat some rows and skip others. One ranking, sliced: consecutive pages are disjoint and their union is the unpaged top-(offset+limit).
 
 ### Configuring an embedding provider
 

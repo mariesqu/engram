@@ -807,7 +807,9 @@ Answers the questions that otherwise surface as confusing symptoms much later: o
 
 Response: {status, project, summary{total,ok,warnings,blocked,errors}, checks[{check_id, result, severity, reason_code, message, why, evidence, safe_next_step, requires_confirmation, findings[]}]}. status rolls up worst-first: error > blocked > warning > ok.
 
-It NEVER writes. Every finding carries a safe_next_step for YOU to run deliberately — the conditions it reports are the ones where the right fix depends on context the store does not have.`),
+It NEVER modifies your memories: it reports, it does not repair. (Not a pure reader of the FILE — the lock probe runs PRAGMA wal_checkpoint(PASSIVE), which may move pages out of the WAL. No row, session or project is touched.) Every finding carries a safe_next_step for YOU to run deliberately — the conditions it reports are the ones where the right fix depends on context the store does not have.
+
+A finding with severity "error" means one CHECK could not answer, not that the call failed; the other checks still report. Only an unrunnable request (an unknown check id) comes back as a tool error.`),
 			mcp.WithTitleAnnotation("Run Diagnostics"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithDestructiveHintAnnotation(false),
@@ -1390,9 +1392,11 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 
 		// Default session_id to "manual-save-{project}" when omitted, using the
 		// FINAL resolved project (auto-detected or explicit) — matches the tool
-		// description's documented default.
+		// description's documented default. The id is minted from the store's own
+		// constant so mem_doctor can recognise it instead of reporting it as an
+		// orphaned session (see localstore.ManualSaveSessionPrefix).
 		if sessionID == "" {
-			sessionID = fmt.Sprintf("manual-save-%s", project)
+			sessionID = localstore.DefaultManualSessionID(project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write.
@@ -1780,10 +1784,11 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 
 		// Default session_id to "manual-save-{project}" when omitted, using the
 		// FINAL resolved project — matches the tool description's documented
-		// default. Applied AFTER the session-lookup above so an explicit empty
-		// session_id still resolves the project from cwd rather than a session row.
+		// default (localstore.ManualSaveSessionPrefix). Applied AFTER the
+		// session-lookup above so an explicit empty session_id still resolves the
+		// project from cwd rather than a session row.
 		if sessionID == "" {
-			sessionID = fmt.Sprintf("manual-save-%s", project)
+			sessionID = localstore.DefaultManualSessionID(project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write —
@@ -2141,9 +2146,9 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 
 		// Default session_id to "manual-save-{project}" when omitted, using the
 		// FINAL resolved project (auto-detected or explicit) — matches the tool
-		// description's documented default.
+		// description's documented default (localstore.ManualSaveSessionPrefix).
 		if sessionID == "" {
-			sessionID = fmt.Sprintf("manual-save-%s", project)
+			sessionID = localstore.DefaultManualSessionID(project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write.
@@ -2467,10 +2472,24 @@ func normalizeForDrift(s string) string {
 // construction: a held lock and an undrained outbox belong to the machine.
 //
 // The result is the diagnostic.Report envelope as JSON. It is marked IsError
-// only when the report's own status is "error" — a report full of warnings is a
-// SUCCESSFUL diagnosis, and flagging it as a tool error would teach an agent
-// that running the doctor is something that fails.
+// only for a RUN-LEVEL failure (Report.IsRunLevelFailure: an unknown check
+// code, a scope the runner could not use) — never for what the report found. A
+// report full of warnings is a SUCCESSFUL diagnosis, and so is one where a
+// single probe could not read its own pragma and said so with severity=error:
+// six other checks answered. Flagging either as a tool error teaches an agent
+// that running the doctor is something that fails, and the agent stops running
+// it — on exactly the store that needed it.
 func handleDoctor(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return handleDoctorWithRunner(store, diagnostic.NewRunner())
+}
+
+// handleDoctorWithRunner is handleDoctor with an injectable runner, so the
+// dispatch (all checks vs exactly one) can be tested against a registry that
+// counts what it was asked to run. With the default registry that assertion is
+// indirect at best: every real check answers ok on a clean store, so a handler
+// that ran ALL of them and then ran one again looked identical in the response
+// — which is precisely how it shipped.
+func handleDoctorWithRunner(store *localstore.Store, runner diagnostic.Runner) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -2487,10 +2506,15 @@ func handleDoctor(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			Now:     time.Now().UTC(),
 		}
 
-		runner := diagnostic.NewRunner()
-		report := runner.RunAll(ctx, scope)
-		if strings.TrimSpace(check) != "" {
-			report = runner.RunOne(ctx, scope, strings.TrimSpace(check))
+		// if/else, not run-then-overwrite: the previous version ran the whole
+		// registry and THREW THE REPORT AWAY whenever check was supplied, so asking
+		// for one check cost a full diagnostic pass — including the WAL checkpoint
+		// probe and two scans of the sessions table.
+		var report diagnostic.Report
+		if check = strings.TrimSpace(check); check != "" {
+			report = runner.RunOne(ctx, scope, check)
+		} else {
+			report = runner.RunAll(ctx, scope)
 		}
 
 		out, err := json.Marshal(report)
@@ -2501,7 +2525,7 @@ func handleDoctor(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			return mcp.NewToolResultError("mem_doctor: encode report: " + err.Error()), nil
 		}
 		result := mcp.NewToolResultText(string(out))
-		result.IsError = report.Status == diagnostic.StatusError
+		result.IsError = report.IsRunLevelFailure()
 		return result, nil
 	}
 }

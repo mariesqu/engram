@@ -26,8 +26,11 @@ import (
 type fakeStore struct {
 	sessions      []localstore.DiagnosticSession
 	sessionsErr   error
+	sessionsCalls int
 	orphans       []localstore.OrphanedSessionRef
 	orphansErr    error
+	unregistered  []localstore.OrphanedSessionRef
+	unregErr      error
 	noPolicy      []string
 	noPolicyErr   error
 	review        localstore.ReviewCounts
@@ -42,12 +45,18 @@ type fakeStore struct {
 
 func (f *fakeStore) DiagnosticSessions(project string) ([]localstore.DiagnosticSession, error) {
 	f.lastProjectIn = project
+	f.sessionsCalls++
 	return f.sessions, f.sessionsErr
 }
 
 func (f *fakeStore) OrphanedObservationSessions(project string) ([]localstore.OrphanedSessionRef, error) {
 	f.lastProjectIn = project
 	return f.orphans, f.orphansErr
+}
+
+func (f *fakeStore) UnregisteredSessionSaves(project string) ([]localstore.OrphanedSessionRef, error) {
+	f.lastProjectIn = project
+	return f.unregistered, f.unregErr
 }
 
 func (f *fakeStore) ProjectsWithoutPolicy(project string) ([]string, error) {
@@ -610,5 +619,164 @@ func TestScope_ProjectReachesEveryPerProjectQuery(t *testing.T) {
 				t.Errorf("check queried project %q, want %q", store.lastProjectIn, "scoped-project")
 			}
 		})
+	}
+}
+
+// ─── the store's own default is not a fault ─────────────────────────────────
+
+// TestOrphanedObservationSessionCheck_ManualSavesAreAnInfoNote is the fix for a
+// warning that fired on every healthy store. A mem_save with no session_id is
+// filed under "manual-save-{project}" — the documented default — and nothing
+// ever registers such a session, so the orphan check reported it as a problem
+// forever. A doctor that warns about its own defaults is a doctor whose
+// warnings get skipped, and the real ones go unread with them.
+func TestOrphanedObservationSessionCheck_ManualSavesAreAnInfoNote(t *testing.T) {
+	store := healthyStore()
+	store.unregistered = []localstore.OrphanedSessionRef{
+		{SessionID: localstore.ManualSaveSessionPrefix + "engram", ObservationCount: 12, Projects: []string{"engram"}},
+	}
+
+	got := runOne(t, OrphanedObservationSessionCheck{}, Scope{Store: store, Project: "engram"})
+
+	if got.Result != StatusOK {
+		t.Errorf("result = %q, want %q: saving without a session is the documented default, not a fault",
+			got.Result, StatusOK)
+	}
+	if got.Severity != SeverityInfo {
+		t.Errorf("severity = %q, want %q", got.Severity, SeverityInfo)
+	}
+	if len(got.Findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly one informational note", got.Findings)
+	}
+	note := got.Findings[0]
+	if note.ReasonCode != ReasonUnregisteredSessionSaves {
+		t.Errorf("reason_code = %q, want %q", note.ReasonCode, ReasonUnregisteredSessionSaves)
+	}
+	if note.Severity != SeverityInfo {
+		t.Errorf("finding severity = %q, want %q", note.Severity, SeverityInfo)
+	}
+	if !strings.Contains(note.Message, "12") || !strings.Contains(note.Message, "mem_session_start") {
+		t.Errorf("message = %q, want the count and the thing to do about it", note.Message)
+	}
+	if note.RequiresConfirmation {
+		t.Error("an informational note must not ask for confirmation; there is nothing to confirm")
+	}
+}
+
+// TestOrphanedObservationSessionCheck_ReportsBothKinds — a store with a genuine
+// orphan AND manual saves is a warning about the orphan, with the note still
+// attached. The two must not be collapsed: one is a session that vanished, the
+// other is a session that was never meant to exist.
+func TestOrphanedObservationSessionCheck_ReportsBothKinds(t *testing.T) {
+	store := healthyStore()
+	store.orphans = []localstore.OrphanedSessionRef{
+		{SessionID: "ghost-1", ObservationCount: 2, Projects: []string{"engram"}},
+	}
+	store.unregistered = []localstore.OrphanedSessionRef{
+		{SessionID: localstore.ManualSaveSessionPrefix + "engram", ObservationCount: 5, Projects: []string{"engram"}},
+	}
+
+	got := runOne(t, OrphanedObservationSessionCheck{}, Scope{Store: store, Project: "engram"})
+
+	if got.Result != StatusWarning {
+		t.Errorf("result = %q, want %q — the real orphan still warns", got.Result, StatusWarning)
+	}
+	if len(got.Findings) != 2 {
+		t.Fatalf("findings = %d, want the orphan warning and the manual-save note", len(got.Findings))
+	}
+	reasons := map[string]string{}
+	for _, f := range got.Findings {
+		reasons[f.ReasonCode] = f.Severity
+	}
+	if reasons[CheckOrphanedObservationSession] != SeverityWarning {
+		t.Errorf("orphan finding severity = %q, want %q", reasons[CheckOrphanedObservationSession], SeverityWarning)
+	}
+	if reasons[ReasonUnregisteredSessionSaves] != SeverityInfo {
+		t.Errorf("manual-save finding severity = %q, want %q", reasons[ReasonUnregisteredSessionSaves], SeverityInfo)
+	}
+}
+
+// TestOrphanedObservationSessionCheck_UnregisteredQueryFailureIsAnError — the
+// note's query is not optional decoration: a check that silently swallowed its
+// failure would report "ok" about a condition it never looked at.
+func TestOrphanedObservationSessionCheck_UnregisteredQueryFailureIsAnError(t *testing.T) {
+	store := healthyStore()
+	store.unregErr = errors.New("database is locked")
+
+	got := runOne(t, OrphanedObservationSessionCheck{}, Scope{Store: store, Project: "engram"})
+
+	if got.Result != StatusError {
+		t.Errorf("result = %q, want %q", got.Result, StatusError)
+	}
+	if !strings.Contains(got.Message, "database is locked") {
+		t.Errorf("message = %q, want the underlying failure", got.Message)
+	}
+}
+
+// ─── one run, one read of the sessions table ────────────────────────────────
+
+// TestRunAll_ReadsSessionsOnce pins the memoization. Two checks
+// (ambiguous_active_sessions and session_project_directory_mismatch) each need
+// every session row, and on a long-lived store that is the most expensive read
+// the doctor does. Running it twice per report is duplication of a query whose
+// answer cannot change mid-run in any way the report should reflect.
+func TestRunAll_ReadsSessionsOnce(t *testing.T) {
+	store := healthyStore()
+	store.sessions = []localstore.DiagnosticSession{
+		{ID: "s1", Project: "engram", Directory: t.TempDir()},
+	}
+
+	NewRunnerWithRegistry(NewRegistry(
+		AmbiguousActiveSessionsCheck{},
+		SessionProjectDirectoryMismatchCheck{},
+	)).RunAll(context.Background(), Scope{Store: store, Project: "engram"})
+
+	if store.sessionsCalls != 1 {
+		t.Errorf("DiagnosticSessions was called %d times in one run, want 1", store.sessionsCalls)
+	}
+}
+
+// TestScope_SessionsWithoutMemoStillWorks — a Scope built by hand (a test, or a
+// caller running a single check directly) has no memo attached. It must still
+// answer, just without the caching.
+func TestScope_SessionsWithoutMemoStillWorks(t *testing.T) {
+	store := healthyStore()
+	store.sessions = []localstore.DiagnosticSession{{ID: "s1", Project: "engram"}}
+
+	scope := Scope{Store: store, Project: "engram"}
+	for i := 0; i < 2; i++ {
+		sessions, err := scope.Sessions()
+		if err != nil {
+			t.Fatalf("Sessions: %v", err)
+		}
+		if len(sessions) != 1 {
+			t.Fatalf("sessions = %d, want 1", len(sessions))
+		}
+	}
+	if store.sessionsCalls != 2 {
+		t.Errorf("DiagnosticSessions was called %d times without a memo, want 2", store.sessionsCalls)
+	}
+}
+
+// ─── run-level failure vs a check that could not answer ─────────────────────
+
+// TestReport_IsRunLevelFailure draws the line the mem_doctor tool marks IsError
+// on. A probe that cannot read its own pragma rolls the report status up to
+// "error" while every other check answered — flagging THAT as a failed tool
+// call is how an agent learns not to run diagnostics.
+func TestReport_IsRunLevelFailure(t *testing.T) {
+	unknown := NewRunner().RunOne(context.Background(), Scope{Store: healthyStore()}, "fix_everything")
+	if !unknown.IsRunLevelFailure() {
+		t.Error("an unknown check code is a run-level failure: nothing was diagnosed")
+	}
+
+	store := healthyStore()
+	store.lockErr = errors.New("unable to open database file")
+	probeFailed := NewRunner().RunAll(context.Background(), Scope{Store: store, Project: "engram"})
+	if probeFailed.Status != StatusError {
+		t.Fatalf("status = %q, want %q for a failed probe", probeFailed.Status, StatusError)
+	}
+	if probeFailed.IsRunLevelFailure() {
+		t.Error("a failed PROBE is a finding, not a failed run: the other checks answered")
 	}
 }

@@ -378,6 +378,22 @@ func TestSearchFiltered_HybridOffsetPagesAreDisjoint_AntiCorrelated(t *testing.T
 		t.Fatalf("unpaged hybrid returned %d rows, want %d", len(full), pages*pageSize)
 	}
 
+	// A page-0 request on its own must be the TOP of that same ranking. It is a
+	// separate call with a smaller limit, and hybrid used to size its candidate
+	// pool from that limit — so this call fused 2*pageSize rows per half while
+	// `full` fused 2*pages*pageSize, and the two answered from different
+	// rankings.
+	top := searchSyncIDs(t, s, project, pageSize, SearchFilter{Mode: "hybrid"})
+	if len(top) != pageSize {
+		t.Fatalf("hybrid top-%d returned %d rows", pageSize, len(top))
+	}
+	for i := range top {
+		if top[i] != full[i] {
+			t.Errorf("hybrid top-%d row %d = %s, want %s — asking for fewer rows changed the ranking",
+				pageSize, i, top[i], full[i])
+		}
+	}
+
 	seen := map[string]int{}
 	for page := 0; page < pages; page++ {
 		offset := page * pageSize
@@ -420,4 +436,131 @@ func searchSyncIDs(t *testing.T, s *Store, project string, limit int, f SearchFi
 		ids[i] = r.SyncID
 	}
 	return ids
+}
+
+// TestSearchFiltered_HybridPageZeroIsCutFromTheSameRankingAsPageOne is the
+// test for the seam that used to sit between page 0 and page 1.
+//
+// Hybrid once fused a NARROW pool (2×limit from each half) when offset == 0 and
+// the FULL lists when offset > 0, to keep page one byte-identical to the
+// pre-paging release. Two pools mean two rankings, and an RRF score is a
+// property of a row's rank within the lists it was fused from — so page 0 and
+// page 1 were slices of different orderings, which is the one thing paging may
+// not do.
+//
+// The fixture is built so the two pools genuinely disagree. 21 rows; FTS ranks
+// them 0..20 by descending term frequency; cosine ranks them by a permutation
+// that puts the FTS top six LAST, the FTS bottom six FIRST, and leaves the
+// middle nine where they are. Row 6 — the "bridge" — therefore sits at rank 6
+// in BOTH halves: outside a 6-wide pool entirely, but the single highest fused
+// score once the full lists are ranked (2/(60+7) beats 1/(60+1) + 1/(60+16)).
+//
+// So: page 0 must contain the bridge. Under the narrow pool it could not, since
+// the row was in neither candidate list.
+func TestSearchFiltered_HybridPageZeroIsCutFromTheSameRankingAsPageOne(t *testing.T) {
+	s := openTempStore(t)
+	const project = "paging"
+	const (
+		rows     = 21
+		pageSize = 3 // narrow pool would have been 2*3 = 6 per half
+		bridge   = 6
+	)
+
+	at := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	// cosineRank maps an FTS position to its cosine position. A bijection on
+	// 0..20 by construction: 0..5 → 15..20, 6..14 → 6..14, 15..20 → 0..5.
+	cosineRank := func(p int) int {
+		switch {
+		case p < 6:
+			return p + 15
+		case p < 15:
+			return p
+		default:
+			return p - 15
+		}
+	}
+
+	ids := make([]string, rows)
+	for p := 0; p < rows; p++ {
+		content := ""
+		for j := 0; j < rows; j++ {
+			if j < rows-p {
+				content += "alpha "
+			} else {
+				content += fmt.Sprintf("pad%d ", j)
+			}
+		}
+		// Leaning further off the query's axis 0 means a lower cosine, so the
+		// cosine position IS the lean.
+		ids[p] = seedVectorRow(t, s, project,
+			fmt.Sprintf("doc %d", p), content, at,
+			map[int]float32{0: 1.0, 1: float32(cosineRank(p)) * 0.25},
+		)
+	}
+
+	fixedQueryVec(t, s, map[int]float32{0: 1.0})
+
+	// Guard the fixture: the whole argument rests on where the bridge row sits
+	// in each half's ranking.
+	ftsOrder := searchSyncIDs(t, s, project, rows, SearchFilter{Mode: "fts"})
+	cosineOrder := searchSyncIDs(t, s, project, rows, SearchFilter{Mode: "semantic"})
+	if len(ftsOrder) != rows || len(cosineOrder) != rows {
+		t.Fatalf("fixture: fts returned %d rows and cosine %d, want %d each", len(ftsOrder), len(cosineOrder), rows)
+	}
+	for p := 0; p < rows; p++ {
+		if ftsOrder[p] != ids[p] {
+			t.Fatalf("fixture: fts rank %d is %s, want doc %d", p, ftsOrder[p], p)
+		}
+		if want := cosineRank(p); cosineOrder[want] != ids[p] {
+			t.Fatalf("fixture: cosine rank %d is %s, want doc %d", want, cosineOrder[want], p)
+		}
+	}
+	// The narrow pool was 2*pageSize per half. If the bridge were inside it, the
+	// fixture would prove nothing.
+	if pool := 2 * pageSize; bridge < pool {
+		t.Fatalf("fixture: the bridge row is inside the historic %d-wide pool", pool)
+	}
+
+	page0 := searchSyncIDs(t, s, project, pageSize, SearchFilter{Mode: "hybrid"})
+	if len(page0) != pageSize {
+		t.Fatalf("page 0 returned %d rows, want %d", len(page0), pageSize)
+	}
+	if !containsID(page0, ids[bridge]) {
+		t.Errorf("page 0 = %v does not contain the bridge row %s — page one is still cut from a narrower pool "+
+			"than the pages after it", page0, ids[bridge])
+	}
+
+	// And the pages remain a partition of one ranking across the 0/1 boundary.
+	unpaged := searchSyncIDs(t, s, project, 2*pageSize, SearchFilter{Mode: "hybrid"})
+	if len(unpaged) != 2*pageSize {
+		t.Fatalf("unpaged hybrid returned %d rows, want %d", len(unpaged), 2*pageSize)
+	}
+	page1 := searchSyncIDs(t, s, project, pageSize, SearchFilter{Mode: "hybrid", Offset: pageSize})
+	joined := append(append([]string{}, page0...), page1...)
+	if len(joined) != len(unpaged) {
+		t.Fatalf("two pages of %d returned %d rows, want %d", pageSize, len(joined), len(unpaged))
+	}
+	for i := range unpaged {
+		if joined[i] != unpaged[i] {
+			t.Errorf("row %d of page 0+1 = %s, want %s (the unpaged ranking)", i, joined[i], unpaged[i])
+		}
+	}
+	seen := map[string]bool{}
+	for _, id := range joined {
+		if seen[id] {
+			t.Errorf("row %s appears on both pages", id)
+		}
+		seen[id] = true
+	}
+}
+
+// containsID reports whether ids holds want.
+func containsID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }

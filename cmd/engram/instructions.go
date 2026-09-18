@@ -47,7 +47,7 @@ TOOLS
   mem_review            — list memories by lifecycle status (active|needs_review|expired), or mark_reviewed to reset the clock. The clock runs from the last save or revision.
   mem_judge             — record a verdict on a conflict candidate surfaced by mem_save.
   mem_merge_projects    — merge a source project's memories into a target name to fix name drift.
-  mem_doctor            — read-only diagnostics over this node's store (orphaned sessions, project drift, lock contention, sync backlog). Run it when something looks wrong; it never writes.
+  mem_doctor            — read-only diagnostics over this node's store (orphaned sessions, project drift, lock contention, sync backlog). Run it when something looks wrong; it never modifies your memories.
   mem_session_start     — register the start of a coding session.
   mem_session_summary   — save the structured end-of-session summary.
   mem_session_end       — mark a session completed.
@@ -81,7 +81,7 @@ LIFECYCLE
 An observation is active, needs_review, or expired. Treat a needs_review memory as STALE CONTEXT, not a trusted fact: surface it and verify against current evidence before relying on it. Never call mem_review with mark_reviewed on your own — only after the user confirms.
 
 WHEN SOMETHING LOOKS WRONG
-mem_doctor runs read-only diagnostics and returns {status, summary, checks[]} with, per finding, a "why" and a "safe_next_step" for YOU to run. It never repairs: the conditions it reports are the ones where the right fix depends on context the store does not have. Do not act on a finding whose requires_confirmation is true without asking the user first.
+mem_doctor runs read-only diagnostics and returns {status, summary, checks[]} with, per finding, a "why" and a "safe_next_step" for YOU to run. It never modifies your memories: it reports, it does not repair — the conditions it reports are the ones where the right fix depends on context the store does not have. Do not act on a finding whose requires_confirmation is true without asking the user first. A check with severity "error" failed to ANSWER; the rest of the report still stands, and the call itself succeeded.
 
 CONFLICTS
 When mem_save returns judgment_required, a similarity scan found candidates. Call mem_judge with the judgment_id from the response and one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict.

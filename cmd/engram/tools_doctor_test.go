@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,8 +89,11 @@ func TestDoctor_CleanStoreReportsOK(t *testing.T) {
 func TestDoctor_FindsOrphanedObservations(t *testing.T) {
 	components := doctorDaemon(t)
 
-	// A save with an explicit session_id that was never registered — exactly what
-	// a manual mem_save or an interrupted session leaves behind.
+	// A save naming a session id that was never registered — what an interrupted
+	// session, or a sync pull that landed an observation before its session,
+	// leaves behind. NOT what a plain mem_save leaves behind: that one is filed
+	// under the store's own "manual-save-{project}" default and is reported as an
+	// informational note instead (TestDoctor_PlainSaveStaysOKWithAnInfoNote).
 	if _, err := components.store.AddObservation(localstore.AddObservationParams{
 		SessionID: "never-registered",
 		Title:     "an orphaned note",
@@ -202,5 +207,166 @@ func TestDoctor_HonoursTheCwdAlias(t *testing.T) {
 
 	if report.Project != "alias-doctor-repo" {
 		t.Errorf("project = %q, want the alias to be honoured", report.Project)
+	}
+}
+
+// ─── the store's own default must not be a permanent warning ────────────────
+
+// TestDoctor_PlainSaveStaysOKWithAnInfoNote is the end-to-end version of the
+// fix: a fresh store, one ordinary mem_save with no session_id, and a doctor
+// that says everything is fine.
+//
+// Before, that save was filed under "manual-save-{project}" — the documented
+// default — which has no session row, so the orphan check reported it as a
+// warning. Every store that had ever taken a manual save was permanently
+// "warning", which is the state in which people stop reading warnings.
+func TestDoctor_PlainSaveStaysOKWithAnInfoNote(t *testing.T) {
+	components := doctorDaemon(t)
+	repo := pinnedProjectDir(t, "plain-save-repo")
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	result, err := saveTool.Handler(t.Context(), newToolRequest("mem_save", map[string]any{
+		"title": "a decision nobody registered a session for", "directory": repo,
+	}))
+	if err != nil {
+		t.Fatalf("mem_save transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("mem_save failed: %v", result.Content)
+	}
+
+	report, isError := callDoctor(t, components, map[string]any{"project": "plain-save-repo"})
+
+	if isError {
+		t.Error("a healthy report must not be marked as a tool error")
+	}
+	if report.Status != diagnostic.StatusOK {
+		t.Fatalf("status = %q, want %q — a plain mem_save is not a fault; checks: %+v",
+			report.Status, diagnostic.StatusOK, report.Checks)
+	}
+
+	var orphan *diagnostic.CheckResult
+	for i := range report.Checks {
+		if report.Checks[i].CheckID == diagnostic.CheckOrphanedObservationSession {
+			orphan = &report.Checks[i]
+		}
+	}
+	if orphan == nil {
+		t.Fatalf("report has no %q check", diagnostic.CheckOrphanedObservationSession)
+	}
+	if len(orphan.Findings) != 1 {
+		t.Fatalf("findings = %+v, want the single informational note", orphan.Findings)
+	}
+	note := orphan.Findings[0]
+	if note.ReasonCode != diagnostic.ReasonUnregisteredSessionSaves {
+		t.Errorf("reason_code = %q, want %q", note.ReasonCode, diagnostic.ReasonUnregisteredSessionSaves)
+	}
+	if note.Severity != diagnostic.SeverityInfo {
+		t.Errorf("severity = %q, want %q", note.Severity, diagnostic.SeverityInfo)
+	}
+	if !strings.Contains(note.Message, "mem_session_start") {
+		t.Errorf("message = %q, want it to name the thing that would fix the grouping", note.Message)
+	}
+}
+
+// ─── dispatch: one check means ONE check ────────────────────────────────────
+
+// countingCheck records how many times it was run.
+type countingCheck struct {
+	code string
+	runs *int32
+}
+
+func (c countingCheck) Code() string { return c.code }
+
+func (c countingCheck) Run(context.Context, diagnostic.Scope) (diagnostic.CheckResult, error) {
+	atomic.AddInt32(c.runs, 1)
+	return diagnostic.CheckResult{CheckID: c.code}, nil
+}
+
+// TestDoctor_RunsOnlyTheRequestedCheck pins the dispatch. The handler used to
+// run RunAll and then OVERWRITE the report with RunOne whenever a check
+// argument was present, so asking for one check quietly cost a full diagnostic
+// pass — including the WAL checkpoint probe and two scans of the sessions
+// table. With the real registry that is invisible: every check answers ok on a
+// clean store, so both versions produce the same response.
+func TestDoctor_RunsOnlyTheRequestedCheck(t *testing.T) {
+	components := doctorDaemon(t)
+
+	var wantedRuns, otherRuns int32
+	registry := diagnostic.NewRegistry(
+		countingCheck{code: "wanted", runs: &wantedRuns},
+		countingCheck{code: "other", runs: &otherRuns},
+	)
+	handler := handleDoctorWithRunner(components.store, diagnostic.NewRunnerWithRegistry(registry))
+
+	if _, err := handler(t.Context(), newToolRequest("mem_doctor", map[string]any{
+		"project": "engram", "check": "wanted",
+	})); err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&wantedRuns); got != 1 {
+		t.Errorf("the requested check ran %d time(s), want 1", got)
+	}
+	if got := atomic.LoadInt32(&otherRuns); got != 0 {
+		t.Errorf("the OTHER check ran %d time(s) for a single-check request — RunAll is still being called first", got)
+	}
+
+	// And with no check argument, everything runs exactly once.
+	atomic.StoreInt32(&wantedRuns, 0)
+	if _, err := handler(t.Context(), newToolRequest("mem_doctor", map[string]any{"project": "engram"})); err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if got := atomic.LoadInt32(&wantedRuns); got != 1 {
+		t.Errorf("full run: check ran %d time(s), want 1", got)
+	}
+	if got := atomic.LoadInt32(&otherRuns); got != 1 {
+		t.Errorf("full run: second check ran %d time(s), want 1", got)
+	}
+}
+
+// ─── a check that could not answer is not a failed call ─────────────────────
+
+// failingCheck reports a finding with severity=error, the way the SQLite lock
+// probe does when it cannot read its own pragma.
+type failingCheck struct{}
+
+func (failingCheck) Code() string { return "probe_that_cannot_answer" }
+
+func (c failingCheck) Run(context.Context, diagnostic.Scope) (diagnostic.CheckResult, error) {
+	return diagnostic.CheckResult{
+		CheckID:  c.Code(),
+		Result:   diagnostic.StatusError,
+		Severity: diagnostic.SeverityError,
+		Message:  "could not read the pragma",
+	}, nil
+}
+
+// TestDoctor_AProbeThatCannotAnswerIsNotAToolError draws the line IsError marks.
+// A single probe failing rolls the report status up to "error" while every
+// other check answered perfectly — and a tool result flagged as an error is
+// what teaches an agent that running mem_doctor is something that fails. It
+// then stops running it, on exactly the store that needed it.
+func TestDoctor_AProbeThatCannotAnswerIsNotAToolError(t *testing.T) {
+	components := doctorDaemon(t)
+	handler := handleDoctorWithRunner(components.store,
+		diagnostic.NewRunnerWithRegistry(diagnostic.NewRegistry(failingCheck{})))
+
+	result, err := handler(t.Context(), newToolRequest("mem_doctor", map[string]any{"project": "engram"}))
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Error("a failed PROBE was reported as a failed CALL; the report itself is the answer")
+	}
+
+	text, _ := result.Content[0].(mcp.TextContent)
+	var report diagnostic.Report
+	if err := json.Unmarshal([]byte(text.Text), &report); err != nil {
+		t.Fatalf("response is not a report (%v): %s", err, text.Text)
+	}
+	if report.Status != diagnostic.StatusError {
+		t.Errorf("status = %q, want %q — the report must still SAY the probe failed", report.Status, diagnostic.StatusError)
 	}
 }

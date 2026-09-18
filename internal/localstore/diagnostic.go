@@ -3,6 +3,7 @@ package localstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -87,15 +88,51 @@ type OrphanedSessionRef struct {
 // out-of-order sync pull can land an observation before its session (see the
 // v0→v1 schema note). It IS a signal worth reporting: those observations can
 // never be grouped back under the session that produced them.
+//
+// The store's OWN default is excluded. A mem_save with no session_id is filed
+// under "manual-save-{project}" (ManualSaveSessionPrefix), a session id nothing
+// ever registers — so every single manual save produced a permanent "orphaned
+// session" warning about behaviour the tool description documents. A doctor
+// that warns about its own defaults is a doctor whose warnings get skipped, and
+// then the real ones go unread with them. Those rows are reported separately
+// and informationally by UnregisteredSessionSaves.
 func (s *Store) OrphanedObservationSessions(project string) ([]OrphanedSessionRef, error) {
+	return s.orphanedSessions("OrphanedObservationSessions", project, false)
+}
+
+// UnregisteredSessionSaves returns the live observations filed under the
+// store's default "manual-save-{project}" session id with no registered
+// session row — i.e. saves made without mem_session_start.
+//
+// It is NOT a fault: it is what the documented default does, and the memories
+// are intact and searchable. It is worth naming once, quietly, because those
+// observations never appear in mem_context's session grouping, which is the
+// thing a user notices later and cannot explain.
+func (s *Store) UnregisteredSessionSaves(project string) ([]OrphanedSessionRef, error) {
+	return s.orphanedSessions("UnregisteredSessionSaves", project, true)
+}
+
+// orphanedSessions is the shared query behind both: live observations whose
+// session id has no row in sessions, split by whether that id is the store's
+// own manual-save default.
+//
+// The projects column is json_group_array, not GROUP_CONCAT: GROUP_CONCAT joins
+// on a comma and the caller split on one, so a project name containing a comma
+// came back as two projects that do not exist.
+func (s *Store) orphanedSessions(caller, project string, manual bool) ([]OrphanedSessionRef, error) {
 	q := `
-		SELECT m.session_id, COUNT(*) AS n, GROUP_CONCAT(DISTINCT m.project)
+		SELECT m.session_id, COUNT(*) AS n, json_group_array(DISTINCT m.project)
 		FROM memories m
 		LEFT JOIN sessions s ON s.id = m.session_id
 		WHERE m.deleted_at IS NULL
 		  AND s.id IS NULL
 		  AND TRIM(m.session_id) <> ''`
-	args := []any{}
+	if manual {
+		q += ` AND m.session_id LIKE ?`
+	} else {
+		q += ` AND m.session_id NOT LIKE ?`
+	}
+	args := []any{ManualSaveSessionPrefix + "%"}
 	if project = normalizeProject(project); project != "" {
 		q += ` AND m.project = ?`
 		args = append(args, project)
@@ -104,7 +141,7 @@ func (s *Store) OrphanedObservationSessions(project string) ([]OrphanedSessionRe
 
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("OrphanedObservationSessions: query: %w", err)
+		return nil, fmt.Errorf("%s: query: %w", caller, err)
 	}
 	defer rows.Close()
 
@@ -115,16 +152,18 @@ func (s *Store) OrphanedObservationSessions(project string) ([]OrphanedSessionRe
 			projects sql.NullString
 		)
 		if err := rows.Scan(&ref.SessionID, &ref.ObservationCount, &projects); err != nil {
-			return nil, fmt.Errorf("OrphanedObservationSessions: scan: %w", err)
+			return nil, fmt.Errorf("%s: scan: %w", caller, err)
 		}
-		if projects.Valid && projects.String != "" {
-			ref.Projects = strings.Split(projects.String, ",")
+		if projects.Valid && strings.TrimSpace(projects.String) != "" {
+			if err := json.Unmarshal([]byte(projects.String), &ref.Projects); err != nil {
+				return nil, fmt.Errorf("%s: decode projects %q: %w", caller, projects.String, err)
+			}
 			sort.Strings(ref.Projects)
 		}
 		out = append(out, ref)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("OrphanedObservationSessions: rows: %w", err)
+		return nil, fmt.Errorf("%s: rows: %w", caller, err)
 	}
 	return out, nil
 }

@@ -293,3 +293,95 @@ func TestCentralConfigured_FollowsTheInjectedFn(t *testing.T) {
 		t.Error("CentralConfigured ignored a fn that reports false")
 	}
 }
+
+// TestOrphanedObservationSessions_ExcludesTheManualSaveDefault splits the two
+// conditions that used to look identical in SQL. A save with no session_id is
+// filed under the store's OWN default ("manual-save-{project}"), which nothing
+// ever registers — so it matched the orphan query and produced a permanent
+// warning about documented behaviour.
+func TestOrphanedObservationSessions_ExcludesTheManualSaveDefault(t *testing.T) {
+	s := openTempStore(t)
+
+	for _, p := range []AddObservationParams{
+		{SessionID: "ghost", Title: "a real orphan", Project: "engram"},
+		{SessionID: DefaultManualSessionID("engram"), Title: "a plain mem_save", Project: "engram"},
+		{SessionID: DefaultManualSessionID("engram"), Title: "another plain mem_save", Project: "engram"},
+	} {
+		if _, err := s.AddObservation(p); err != nil {
+			t.Fatalf("AddObservation(%q): %v", p.Title, err)
+		}
+	}
+
+	refs, err := s.OrphanedObservationSessions("")
+	if err != nil {
+		t.Fatalf("OrphanedObservationSessions: %v", err)
+	}
+	if len(refs) != 1 || refs[0].SessionID != "ghost" {
+		t.Fatalf("orphans = %+v, want only the genuinely orphaned session", refs)
+	}
+
+	manual, err := s.UnregisteredSessionSaves("")
+	if err != nil {
+		t.Fatalf("UnregisteredSessionSaves: %v", err)
+	}
+	if len(manual) != 1 {
+		t.Fatalf("unregistered = %+v, want one session id", manual)
+	}
+	if manual[0].SessionID != DefaultManualSessionID("engram") || manual[0].ObservationCount != 2 {
+		t.Errorf("unregistered = %+v, want the manual-save id with 2 observations", manual[0])
+	}
+}
+
+// TestUnregisteredSessionSaves_IgnoresARegisteredManualSession — the split is
+// by session id, but the \"has no session row\" condition still applies. Someone
+// who registers "manual-save-engram" deliberately has a session like any other,
+// and neither query should report it.
+func TestUnregisteredSessionSaves_IgnoresARegisteredManualSession(t *testing.T) {
+	s := openTempStore(t)
+
+	id := DefaultManualSessionID("engram")
+	if err := s.CreateSession(id, "engram", "/repos/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{SessionID: id, Title: "anchored", Project: "engram"}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	manual, err := s.UnregisteredSessionSaves("")
+	if err != nil {
+		t.Fatalf("UnregisteredSessionSaves: %v", err)
+	}
+	if len(manual) != 0 {
+		t.Errorf("unregistered = %+v, want none: that session exists", manual)
+	}
+}
+
+// TestOrphanedObservationSessions_ProjectNamesWithCommasSurvive is the reason
+// the projects column is json_group_array and not GROUP_CONCAT. GROUP_CONCAT
+// joins on a comma and the caller split on one, so a project whose NAME
+// contains a comma came back as two projects, neither of which exists —
+// evidence that reads like a second problem to chase.
+func TestOrphanedObservationSessions_ProjectNamesWithCommasSurvive(t *testing.T) {
+	s := openTempStore(t)
+
+	const project = "acme, inc"
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "ghost", Title: "orphan", Project: project,
+	}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	refs, err := s.OrphanedObservationSessions("")
+	if err != nil {
+		t.Fatalf("OrphanedObservationSessions: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("orphans = %+v, want 1", refs)
+	}
+	if len(refs[0].Projects) != 1 {
+		t.Fatalf("projects = %q, want ONE project — the name was split on its own comma", refs[0].Projects)
+	}
+	if refs[0].Projects[0] != normalizeProject(project) {
+		t.Errorf("project = %q, want %q", refs[0].Projects[0], normalizeProject(project))
+	}
+}
