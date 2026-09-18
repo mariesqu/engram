@@ -40,12 +40,19 @@ body:
     validations:
       required: true
 
-  - type: input
+  - type: textarea
     id: version
     attributes:
       label: engram version
-      description: Output of `engram version`.
-      placeholder: "v0.1.0"
+      description: >
+        Full output of `engram version --verbose` — BOTH lines. The second one
+        carries GOOS/GOARCH and the Go runtime version, which is what tells a
+        stamped release apart from a local `make build` (git-describe shaped)
+        or an unstamped `go build` (`dev`).
+      placeholder: |
+        engram v0.1.0
+        windows/amd64 go1.26.1
+      render: shell
     validations:
       required: true
 

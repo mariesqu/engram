@@ -131,6 +131,15 @@ For a smaller, stripped release binary:
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o engram ./cmd/engram
 ```
 
+**Version stamping.** A plain `go build` leaves the version at its `dev` default. The Makefile stamps it from `git describe`, which on any commit past a tag produces a *describe-shaped* string:
+
+```bash
+make build            # engram v1.5.5-2-gabcd123   ← NOT probeable
+make build VERSION=v1.5.5   # engram v1.5.5        ← probeable
+```
+
+That distinction matters to integrators: gentle-ai (and anything else using the anchored `^(?:engram\s+)?v?(\d+)\.(\d+)\.(\d+)$` probe described under [CLI reference](#cli-reference)) *rejects* `v1.5.5-2-gabcd123`, silently falls back to its conservative default, and the integration degrades with no error anywhere to explain why. Pass an explicit `VERSION=` when you build a binary something else will probe.
+
 ## Quickstart: local-only mode
 
 No server, no credentials. All data stays in a local SQLite file.
@@ -725,8 +734,13 @@ Integrators probe it by trimming the whole stdout and matching an anchored
 regexp (`^(?:engram\s+)?v?(\d+)\.(\d+)\.(\d+)$`), so any extra token, or a
 second line, fails the match *silently*. GOOS/GOARCH and the Go runtime version
 moved behind `--verbose` (`-v`), which prints them on a second line.
-Local dev builds print `dev` as the version; release binaries are stamped at
-link time (see [RELEASING.md](RELEASING.md)).
+A plain `go build` prints `dev`; `make build` stamps the git-describe string
+(`v1.5.5-2-gabcd123`), which **fails** that probe — pass `make build
+VERSION=v1.5.5` for a probeable binary. Release binaries are stamped at link
+time (see [RELEASING.md](RELEASING.md)).
+
+`engram version --verbose` adds a second line with `GOOS/GOARCH` and the Go
+runtime version — that is the line to paste into a bug report.
 
 ### Environment variables
 
@@ -894,7 +908,7 @@ The daemon exposes 17 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
-| `mem_current_project` | Report the project THIS caller resolves to and how (`fallback` / `writes_blocked` flag a guess); never errors — the recommended first call of a session |
+| `mem_current_project` | Report the project THIS caller resolves to and how (`fallback` / `writes_blocked` / `directory_exists` flag a guess, `hints` say why); never errors — the recommended first call of a session |
 | `mem_session_start`   | Register the start of a coding session; resolves and stores the project name         |
 | `mem_session_end`     | Mark a session as completed with an optional summary                                 |
 | `mem_save`            | Save an observation (decision, bug fix, discovery, …) to persistent memory           |
@@ -911,6 +925,20 @@ The daemon exposes 17 tools to the connected agent.
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
 | `mem_merge_projects`  | Merge a source project's memories into a target name to fix project name drift (local-only) |
+
+### Project probe: `mem_current_project`
+
+Call it first, and read three fields before writing anything:
+
+| Field | Meaning |
+|-------|---------|
+| `fallback: true` | The name is a GUESS — a directory basename, or the lenient fallback after a resolution error. It changes the day the folder is renamed. |
+| `writes_blocked: true` | `mem_save` / `mem_save_prompt` / `mem_session_start` / `mem_session_summary` will REFUSE this directory. Causes: an ambiguous multi-repo parent, a malformed `.engram/config.json`, a directory that does not exist, or a project whose policy is `omitted`. Reads keep answering from the basename. |
+| `directory_exists: false` | The resolved directory is not on this machine (a typo'd `ENGRAM_CLIENT_DIR`, a hallucinated `cwd`). Any project name here was invented from a basename that names nothing. |
+
+Plus `hints`, an **array** of one plain sentence per reason the answer is untrustworthy (they compose — a daemon-cwd answer for a missing directory under an omitted project is three separate problems), `directory_source` (`argument` = injected by `engram connect`; `cwd_alias` = a path the caller supplied; `daemon_cwd` = nobody supplied one, so the answer describes the *daemon's* directory; `invalid_directory_argument` = `directory` was present but not a string, and was ignored), `cwd` (absolute and cleaned), `cwd_input` (the caller's value, verbatim) and `project_path` (the project's canonical directory: the repo root, the directory holding `.engram/config.json`, or the resolved cwd).
+
+`cwd` is accepted as an alias of `directory` by **every** project-resolving tool, and is read only when `directory` is absent or blank — the injected client directory must keep outranking a hand-written path. A `directory` that is present but **not a string** is a caller error: every tool except `mem_current_project` refuses the call (that one reports it in the envelope instead, since it never errors). It is never silently downgraded to the `cwd` alias — `engram connect` leaves a non-string `directory` alone on purpose, so the daemon is the only place left that can tell you about it.
 
 ### Conflict detection
 

@@ -957,6 +957,42 @@ func TestRegisterTools_DirectoryAwareToolsDeclareDirectory(t *testing.T) {
 	}
 }
 
+// TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias pins the third half of
+// the lockstep. The agent protocol engram itself injects tells models to name
+// the workspace in "cwd", and readDirectoryArg honours that alias in EVERY
+// directory-aware handler — so every one of them must also advertise it. A tool
+// that reads an argument it never declares is an argument no agent knows to
+// send, and (under a strict-schema client) one no agent is allowed to send.
+func TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias(t *testing.T) {
+	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "schema_cwd.db"), syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	registered := components.mcpServer.ListTools()
+	for name := range directoryAwareTools {
+		tool, ok := registered[name]
+		if !ok {
+			t.Errorf("directoryAwareTools names %q, which is not a registered tool", name)
+			continue
+		}
+		prop, ok := tool.Tool.InputSchema.Properties["cwd"]
+		if !ok {
+			t.Errorf("tool %q is directory-aware but its schema does not declare the \"cwd\" alias", name)
+			continue
+		}
+		schema, ok := prop.(map[string]any)
+		if !ok {
+			t.Errorf("tool %q: cwd property is %T, want a schema object", name, prop)
+			continue
+		}
+		if got := schema["description"]; got != cwdArgDescription {
+			t.Errorf("tool %q cwd description =\n  %v\nwant\n  %v", name, got, cwdArgDescription)
+		}
+	}
+}
+
 // ─── every directory-aware handler honours an explicit project ───────────────
 
 // Probe fixtures for the harness below. Both memories share a searchable token,

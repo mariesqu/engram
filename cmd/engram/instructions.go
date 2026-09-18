@@ -52,9 +52,12 @@ TOOLS
   mem_session_end      — mark a session completed.
 
 CONFIRM THE PROJECT FIRST
-Open with mem_current_project. Two fields decide what you do next:
-  fallback=true       — the name is only a directory basename; pass an explicit project later if that is not the name you want.
-  writes_blocked=true — reads answer from the basename, but mem_save/mem_session_start will REFUSE until you pass project explicitly.
+Open with mem_current_project. Three fields decide what you do next:
+  fallback=true        — the name is a GUESS (a directory basename, or a lenient fallback after a resolution error); pass an explicit project later if that is not the name you want.
+  writes_blocked=true  — reads answer from the basename, but mem_save/mem_session_start/mem_session_summary will REFUSE until you pass project explicitly (ambiguous directory, malformed .engram/config.json, missing directory, or an "omitted" project).
+  directory_exists=false — the resolved directory is not on this machine; the name was invented from its basename.
+The response also carries hints (an ARRAY, one sentence per reason the answer is untrustworthy) and directory_source: "argument" (injected by engram connect), "cwd_alias" (the path YOU supplied), or "daemon_cwd" (nobody supplied one — this describes the daemon's own directory, typically NOT your repo).
+Every project-resolving tool accepts "directory", and "cwd" as its alias — the alias is read only when "directory" is absent or blank.
 
 PROACTIVE SAVE RULE
 Call mem_save immediately — without being asked — after any of: an architecture or design decision, a tradeoff chosen, a bug fixed (root cause + file), a convention or pattern established, a tool/library choice, a configuration change, a non-obvious discovery, a gotcha or edge case.

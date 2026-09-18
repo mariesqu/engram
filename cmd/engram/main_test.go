@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -330,12 +331,14 @@ func TestRun_Version_Verbose(t *testing.T) {
 			if fields := strings.Fields(lines[0]); len(fields) != 2 || fields[0] != "engram" {
 				t.Errorf("verbose first line = %q, want the bare \"engram <version>\" line", lines[0])
 			}
-			// Second line: GOOS/GOARCH pair plus the "go" runtime prefix.
-			if !strings.Contains(lines[1], "/") {
-				t.Errorf("verbose output missing GOOS/GOARCH pair: %q", out)
-			}
-			if !strings.Contains(lines[1], "go") {
-				t.Errorf("verbose output missing Go runtime version: %q", out)
+			// Second line: the EXACT build identity a bug report is asked for
+			// (.github/ISSUE_TEMPLATE/bug_report.yml says "engram version
+			// --verbose"). Asserting the literal values rather than "contains a
+			// slash and the letters go" is the difference between a triage line
+			// that identifies the binary and one that merely looks like it does.
+			want := runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()
+			if lines[1] != want {
+				t.Errorf("verbose second line = %q, want %q", lines[1], want)
 			}
 		})
 	}

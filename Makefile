@@ -11,9 +11,16 @@ VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 # LDFLAGS stamps the version and strips debug info for release builds.
 RELEASE_LDFLAGS := -s -w -X 'main.version=$(VERSION)'
 
-# Build a development binary in the repo root (no version stamping).
+# Build a development binary in the repo root.
+#
+# VERSION is stamped here too, so `make build VERSION=v1.5.5` yields a binary
+# whose `engram version` line matches the anchored semver probe integrators run
+# (see the CLI reference in README.md). The DEFAULT is git-describe shaped
+# (v1.5.5-2-gabcd123) and does NOT match that probe — deliberately: a local
+# build is not a release, and a version string that claims otherwise is worse
+# than one that fails the check.
 build:
-	CGO_ENABLED=0 go build -o $(BIN) ./cmd/engram
+	CGO_ENABLED=0 go build -ldflags "-X 'main.version=$(VERSION)'" -o $(BIN) ./cmd/engram
 
 # Build a stripped release binary with version stamped via ldflags.
 build-release:

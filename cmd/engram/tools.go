@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,6 +31,92 @@ import (
 const directoryArgDescription = "Directory to resolve the project from. Normally injected automatically by 'engram connect' " +
 	"(the client's working directory); set it by hand only to target a different checkout. " +
 	"Where a tool also accepts 'project', prefer that."
+
+// cwdArgDescription is the shared doc string for the "cwd" alias of the
+// "directory" argument. Every directory-aware tool declares it and every
+// directory-aware handler reads it through readDirectoryArg, so the alias the
+// injected agent protocol tells models to use ("call it with the workspace in
+// cwd") means the same thing everywhere instead of on mem_current_project only.
+// TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias pins the text.
+const cwdArgDescription = "Alias for \"directory\", read ONLY when \"directory\" is absent or blank — " +
+	"'engram connect' injects the real client directory into \"directory\", and that value must keep " +
+	"winning over a hand-written path."
+
+// Directory-source labels. They answer the question an agent cannot otherwise
+// ask — WHOSE idea was the directory this answer describes? — and are reported
+// verbatim in mem_current_project's directory_source field.
+const (
+	// dirSourceArgument: the "directory" argument decided. Normally that is the
+	// CLIENT's working directory, injected by `engram connect`.
+	dirSourceArgument = "argument"
+	// dirSourceCwdAlias: the "cwd" alias decided, i.e. a path the MODEL supplied.
+	// Weaker evidence than dirSourceArgument by construction — see readDirectoryArg.
+	dirSourceCwdAlias = "cwd_alias"
+	// dirSourceDaemonCwd: nothing reached the daemon, so the answer describes the
+	// SHARED daemon's own working directory — the original junk-project misfile.
+	dirSourceDaemonCwd = "daemon_cwd"
+	// dirSourceInvalid: "directory" was present but not a JSON string. Never
+	// silently downgraded to the alias — see readDirectoryArg.
+	dirSourceInvalid = "invalid_directory_argument"
+)
+
+// directoryArg is the outcome of reading the directory a tool call resolves its
+// project from. Source is one of the dirSource* labels; Err is non-nil only for
+// dirSourceInvalid.
+type directoryArg struct {
+	Directory string
+	Source    string
+	Err       error
+}
+
+// readDirectoryArg extracts the directory a directory-aware tool call resolves
+// its project from, applying one precedence for ALL of them:
+//
+//  1. "directory", when it is a non-blank string. `engram connect` injects the
+//     CLIENT process's working directory here — the only value in the chain that
+//     is OBSERVED rather than guessed.
+//  2. "cwd", the alias the injected agent protocol tells models to fill in. It is
+//     consulted ONLY when the "directory" KEY is absent, JSON null, or a blank
+//     string, so a hallucinated path can never re-point a session that already
+//     carries a real directory.
+//  3. Neither — the caller gets "" and resolveProjectDir falls back to the
+//     daemon's own cwd.
+//
+// A "directory" that is PRESENT but not a string is a caller error, reported as
+// such (Err non-nil) rather than treated as absent. That case is the one the
+// bridge cannot help with: injectClientDirectory deliberately suppresses
+// injection for a non-string "directory" (hasNonEmptyStringArg in connect.go —
+// "the caller's error to see, not ours to paper over"), so silently falling
+// through to "cwd" here would resolve the session from a model-supplied path
+// while the caller believes their own argument is in force.
+func readDirectoryArg(args map[string]any) directoryArg {
+	if raw, present := args["directory"]; present && raw != nil {
+		dir, ok := raw.(string)
+		if !ok {
+			return directoryArg{
+				Source: dirSourceInvalid,
+				Err: fmt.Errorf("directory must be a string, got %T; "+
+					"drop it and let 'engram connect' inject the client directory, or pass project explicitly", raw),
+			}
+		}
+		if dir = strings.TrimSpace(dir); dir != "" {
+			return directoryArg{Directory: dir, Source: dirSourceArgument}
+		}
+	}
+	if raw, ok := args["cwd"].(string); ok {
+		if cwd := strings.TrimSpace(raw); cwd != "" {
+			return directoryArg{Directory: cwd, Source: dirSourceCwdAlias}
+		}
+	}
+	return directoryArg{Source: dirSourceDaemonCwd}
+}
+
+// toolError renders a dirSourceInvalid directoryArg as the MCP tool error the
+// calling tool returns. mem_current_project is the one caller that does NOT use
+// it: it never errors, and reports the same condition in its envelope instead.
+func (d directoryArg) toolError(tool string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(tool + ": " + d.Err.Error())
+}
 
 // directoryAwareTools names the MCP tools whose handlers resolve the project
 // from a directory (resolveProjectDir → resolveReadProject / resolveSaveProject
@@ -66,14 +153,27 @@ var directoryAwareTools = map[string]bool{
 //     per-client `engram daemon --transport stdio`, which the MCP client spawns
 //     in the project directory itself.
 //
+// The result is ABSOLUTE and Clean: detection's own basename fallback reads
+// filepath.Base(dir) verbatim, so a relative "." or "./repo" — which an agent
+// filling in the "cwd" alias will write sooner or later — would otherwise
+// resolve to the project "unknown" or "repo" while every neighbouring tool
+// answered from a different name. Abs failing (an unreadable cwd) leaves the
+// input untouched rather than inventing a path.
+//
 // A "" return (cwd unavailable) is passed through to DetectProjectFull, which
 // treats it as ".".
 func resolveProjectDir(directory string) string {
-	if d := strings.TrimSpace(directory); d != "" {
-		return d
+	dir := strings.TrimSpace(directory)
+	if dir == "" {
+		dir, _ = os.Getwd()
 	}
-	cwd, _ := os.Getwd()
-	return cwd
+	if dir == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs // filepath.Abs Cleans its result
+	}
+	return filepath.Clean(dir)
 }
 
 // resolveReadProject resolves the project for a READ tool call. Unlike write
@@ -125,11 +225,12 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 	// project this caller resolves to, before any read or write.
 	srv.AddTool(
 		mcp.NewTool("mem_current_project",
-			mcp.WithDescription(`Detect the project Engram resolves for THIS caller, and how it got there. Returns project, project_source, project_path, cwd, directory_source, available_projects, fallback, writes_blocked and an optional hint. NEVER errors — use it for discovery before writing. Recommended as the first call when starting a new session.
+			mcp.WithDescription(`Detect the project Engram resolves for THIS caller, and how it got there. Returns project, project_source, project_path (the canonical directory of the project — repo root, config directory, or the resolved cwd), cwd (absolute, cleaned), cwd_input (what you passed, verbatim), directory_source, directory_exists, available_projects, fallback, writes_blocked and optional hints. NEVER errors — use it for discovery before writing. Recommended as the first call when starting a new session.
 
-Two fields say "do not trust this name blindly":
-  fallback=true       — the project is only a directory BASENAME (no .engram/config.json, git remote or git root). Pass an explicit project on later calls if that is not the name you want.
-  writes_blocked=true — the directory is ambiguous or misconfigured: reads fall back to the basename but mem_save/mem_session_start will REFUSE it until you pass project explicitly.`),
+Three fields say "do not trust this name blindly":
+  fallback=true         — the project name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Pass an explicit project on later calls if that is not the name you want.
+  writes_blocked=true   — mem_save/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, or an omitted project) until you pass project explicitly.
+  directory_exists=false — the resolved directory does not exist, so any name here is invented from its basename. Pass a real directory or an explicit project.`),
 			mcp.WithTitleAnnotation("Detect Current Project"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithDestructiveHintAnnotation(false),
@@ -142,10 +243,10 @@ Two fields say "do not trust this name blindly":
 				mcp.Description(directoryArgDescription),
 			),
 			mcp.WithString("cwd",
-				mcp.Description("Alias for \"directory\", read ONLY when \"directory\" is absent — 'engram connect' injects the real client directory into \"directory\", and that value must keep winning over a hand-written path."),
+				mcp.Description(cwdArgDescription),
 			),
 		),
-		handleCurrentProject(),
+		handleCurrentProject(store),
 	)
 
 	// ── mem_session_start ────────────────────────────────────────────────────
@@ -166,6 +267,9 @@ Two fields say "do not trust this name blindly":
 			),
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
 			),
 		),
 		handleSessionStart(store),
@@ -241,6 +345,9 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 			mcp.WithBoolean("capture_prompt",
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
@@ -269,6 +376,9 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			),
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
 			),
 		),
 		handleSavePrompt(store, loop, writerID, activity),
@@ -377,6 +487,9 @@ The suggestion is deterministic — the same title/type/content always yields th
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
 		handleSearch(store),
 	)
@@ -398,6 +511,9 @@ The suggestion is deterministic — the same title/type/content always yields th
 			),
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
 			),
 		),
 		handleContext(store),
@@ -554,6 +670,9 @@ Status is computed at read time: a memory is "needs_review" once past its review
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
 		handleReview(store),
 	)
@@ -623,6 +742,9 @@ FORMAT — use this exact structure in the content field:
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
 		handleSessionSummary(store, loop, writerID),
 	)
@@ -636,38 +758,46 @@ FORMAT — use this exact structure in the content field:
 // explicit project → detection from the resolved directory → basename), because
 // that is what mem_search / mem_context / mem_review actually answer from. What
 // it adds on top is the part an agent cannot otherwise see until something goes
-// wrong — the two ways that name is a GUESS rather than an identity:
+// wrong — the ways that name is a GUESS rather than an identity:
 //
-//   - fallback=true: the project is only a directory basename. Nothing declared
-//     it (no .engram/config.json, no git remote, no git root), so it changes the
-//     day the folder is renamed.
+//   - fallback=true: the project is only a directory basename, or a lenient
+//     fallback after a resolution error. Nothing declared it (no
+//     .engram/config.json, no git remote, no git root), so it changes the day
+//     the folder is renamed.
 //   - directory_source="daemon_cwd": no directory reached the daemon, so the
 //     answer describes the DAEMON's working directory. The daemon is shared and
 //     typically resident from wherever autostart or the tray launched it (on
 //     Windows commonly C:\Windows\system32) — the original junk-project misfile.
+//   - directory_source="cwd_alias": the directory came from the MODEL, not from
+//     `engram connect`. It is an assertion about the workspace, not an
+//     observation of it.
+//   - directory_exists=false: the resolved directory is not there at all, so the
+//     basename it yields names nothing that exists.
 //
-// Plus writes_blocked=true for the read/write asymmetry: an ambiguous or
-// misconfigured directory answers reads from the basename but makes every write
-// tool hard-error (resolveSaveProject). Without the flag an agent learns that
-// only from a failed mem_save, halfway through a session.
+// Plus writes_blocked=true for the read/write asymmetry: an ambiguous
+// directory, a broken .engram/config.json, a missing directory, or an omitted
+// project all answer reads from the basename while making every write tool
+// refuse. Without the flag an agent learns that only from a failed mem_save,
+// halfway through a session.
+//
+// store is read ONLY for the project's sync policy (PolicyOmitted ⇒ writes are
+// refused before any row is written — see handleSave). It may be nil, which
+// skips that check; every other field is filesystem-derived.
 //
 // Like its upstream counterpart it NEVER returns a tool error: a discovery call
-// that fails is a discovery call an agent stops making.
-func handleCurrentProject() mcpserver.ToolHandlerFunc {
+// that fails is a discovery call an agent stops making. That holds even for a
+// non-string "directory", which every OTHER directory-aware tool rejects as a
+// caller error — here it is reported in the envelope
+// (directory_source="invalid_directory_argument") so the agent can still see
+// what the daemon would resolve.
+func handleCurrentProject(store *localstore.Store) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
-		if strings.TrimSpace(directory) == "" {
-			// "cwd" alias: the ODD protocol injected into agents tells them to name
-			// the workspace in "cwd". It is consulted ONLY when "directory" is
-			// empty, so the directory `engram connect` injects (this caller's real
-			// working directory) always outranks a model-supplied path.
-			directory, _ = args["cwd"].(string)
-		}
+		dirArg := readDirectoryArg(args)
 
-		envelope := currentProjectEnvelope(explicitProject, directory)
+		envelope := currentProjectEnvelope(store, explicitProject, dirArg)
 
 		out, err := json.Marshal(envelope)
 		if err != nil {
@@ -682,39 +812,86 @@ func handleCurrentProject() mcpserver.ToolHandlerFunc {
 
 // currentProjectEnvelope builds the mem_current_project response body. It is
 // separated from the MCP plumbing so the resolution contract can be tested
-// directly; it reads the filesystem (detection) and, only when no directory was
-// forwarded, the process working directory.
+// directly; it reads the filesystem (detection), the store (policy), and — only
+// when no directory reached the daemon — the process working directory.
 //
-// Every key is ALWAYS present except the three advisory ones (warning,
-// error_hint, hint), which appear only when they have something to say — the
-// shape a consumer can rely on.
-func currentProjectEnvelope(explicitProject, directory string) map[string]any {
-	directory = strings.TrimSpace(directory)
-	dir := resolveProjectDir(directory)
-
-	directorySource := "daemon_cwd"
-	if directory != "" {
-		directorySource = "argument"
-	}
+// Field contract. Always present:
+//
+//	project, project_source, project_path (CANONICAL directory of the project:
+//	the repo root for the git cases, the directory holding .engram/config.json
+//	for a pinned one, else the resolved cwd), cwd (absolute and cleaned),
+//	cwd_input (the caller's value verbatim, "" when none), directory_source,
+//	directory_exists, available_projects (never null), fallback, writes_blocked.
+//
+// Advisory, present only when they have something to say: warning, error_hint,
+// hints. hints is an ARRAY — the reasons a name is untrustworthy compose (a
+// daemon-cwd answer for a missing directory under an omitted project is three
+// separate problems), and a joined sentence makes an agent parse prose to tell
+// them apart.
+func currentProjectEnvelope(store *localstore.Store, explicitProject string, dirArg directoryArg) map[string]any {
+	dir := resolveProjectDir(dirArg.Directory)
 
 	env := map[string]any{
 		"project":            "",
 		"project_source":     "",
 		"project_path":       "",
 		"cwd":                dir,
-		"directory_source":   directorySource,
+		"cwd_input":          dirArg.Directory,
+		"directory_source":   dirArg.Source,
+		"directory_exists":   false,
 		"available_projects": []string{},
 		"fallback":           false,
 		"writes_blocked":     false,
 	}
 
+	var hints []string
+	if dirArg.Err != nil {
+		// The one caller error this tool reports instead of raising: the bridge
+		// leaves a non-string "directory" alone (see injectClientDirectory), so
+		// nothing else in the chain would ever mention it.
+		env["error_hint"] = dirArg.Err.Error()
+		hints = append(hints, "the \"directory\" argument was not a string and was IGNORED (the \"cwd\" alias is "+
+			"deliberately not consulted for it) — this answer describes the daemon's own directory")
+	}
+
+	// Does the directory the answer is about actually exist? Detection happily
+	// derives a basename from a path that is not there, which is how a typo'd
+	// ENGRAM_CLIENT_DIR or a hallucinated "cwd" invents a brand-new project.
+	info, statErr := os.Stat(dir)
+	switch {
+	case statErr == nil && info.IsDir():
+		env["directory_exists"] = true
+	case dir == "":
+		hints = append(hints, "the daemon could not read its own working directory, so no directory could be resolved — pass directory or project explicitly")
+	default:
+		hints = append(hints, "the resolved directory does not exist (or is not a directory), so any project name here is invented from its basename — pass a real directory or an explicit project")
+	}
+
 	// An explicit project wins outright in every other tool (resolveReadProject /
 	// resolveSaveProject), so no detection runs here either: reporting a detected
 	// project beside an explicit one would only invite an agent to second-guess
-	// the name it just supplied.
+	// the name it just supplied. The policy check below still applies — an
+	// explicit name does not make an omitted project writable.
 	if explicitProject = strings.TrimSpace(explicitProject); explicitProject != "" {
 		env["project"] = explicitProject
 		env["project_source"] = projectpkg.SourceExplicitOverride
+		applyPolicyBlock(store, env, &hints)
+		setHints(env, hints)
+		return env
+	}
+
+	if !env["directory_exists"].(bool) {
+		// Detection would answer from the basename of a path that is not there.
+		// Report the name every read tool will use, but never as a normal answer:
+		// missing_directory says the name describes nothing on this machine.
+		env["project"] = projectpkg.DetectProject(dir)
+		env["project_source"] = sourceMissingDirectory
+		env["project_path"] = dir
+		env["fallback"] = true
+		env["writes_blocked"] = true
+		hints = append(hints, "writes (mem_save, mem_session_start, mem_session_summary) should not file memories under a directory that does not exist — pass project explicitly")
+		applyPolicyBlock(store, env, &hints)
+		setHints(env, hints)
 		return env
 	}
 
@@ -729,30 +906,75 @@ func currentProjectEnvelope(explicitProject, directory string) map[string]any {
 		env["warning"] = det.Warning
 	}
 
-	var hints []string
 	if det.Error != nil {
 		// Lenient, exactly like resolveReadProject: reads answer from the basename
-		// rather than erroring.
+		// rather than erroring. project_source keeps det.Source — a broken
+		// .engram/config.json is still a CONFIG answer, and relabelling it
+		// "dir_basename" would send the agent looking for a missing config file
+		// instead of the malformed one it has.
 		env["project"] = projectpkg.DetectProject(dir)
-		env["project_source"] = projectpkg.SourceDirBasename
 		env["project_path"] = dir
+		env["fallback"] = true
 		env["error_hint"] = det.Error.Error()
 		if errors.Is(det.Error, projectpkg.ErrInvalidConfig) || errors.Is(det.Error, projectpkg.ErrAmbiguousProject) {
 			env["writes_blocked"] = true
 			hints = append(hints, "reads fall back to the directory basename but writes (mem_save, mem_session_start, mem_session_summary) will REFUSE this directory — pass project explicitly")
+		}
+		if errors.Is(det.Error, projectpkg.ErrInvalidConfig) {
+			hints = append(hints, "the .engram/config.json in this directory is present but unusable — fix its project_name, or pass project explicitly")
 		}
 	}
 	if env["project_source"] == projectpkg.SourceDirBasename {
 		env["fallback"] = true
 		hints = append(hints, "the project name is only a directory basename (no .engram/config.json, git remote or git root) — pass project explicitly if that is not the name you want")
 	}
-	if directorySource == "daemon_cwd" {
+	switch dirArg.Source {
+	case dirSourceDaemonCwd:
 		hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
+	case dirSourceCwdAlias:
+		hints = append(hints, "this directory came from the \"cwd\" alias you supplied, not from 'engram connect' — if it is not the workspace you are actually in, every later call is filed under the wrong project")
 	}
-	if len(hints) > 0 {
-		env["hint"] = strings.Join(hints, "; ")
-	}
+
+	applyPolicyBlock(store, env, &hints)
+	setHints(env, hints)
 	return env
+}
+
+// sourceMissingDirectory is the project_source reported when the resolved
+// directory does not exist. It is deliberately NOT one of the projectpkg
+// Source* constants: those all describe evidence found on disk, and there is
+// none here.
+const sourceMissingDirectory = "missing_directory"
+
+// applyPolicyBlock sets writes_blocked when the resolved project's sync policy
+// is "omitted", the one reason a write is refused that no amount of filesystem
+// evidence can reveal: mem_save, mem_save_prompt and mem_session_summary check
+// GetPolicy and return "capture refused" BEFORE writing anything, whether the
+// project was detected or named explicitly. A nil store (direct unit tests)
+// skips the check; a failed lookup is reported as a hint rather than swallowed.
+func applyPolicyBlock(store *localstore.Store, env map[string]any, hints *[]string) {
+	project, _ := env["project"].(string)
+	if store == nil || strings.TrimSpace(project) == "" {
+		return
+	}
+	pol, err := store.GetPolicy(project)
+	if err != nil {
+		*hints = append(*hints, fmt.Sprintf("could not read the sync policy for project %q (%v) — writes may still be refused", project, err))
+		return
+	}
+	if pol == localstore.PolicyOmitted {
+		env["writes_blocked"] = true
+		*hints = append(*hints, fmt.Sprintf("project %q has policy \"omitted\": every write tool refuses it (capture refused) — "+
+			"change it with 'engram projects policy %s local-only' or save under a different project", project, project))
+	}
+}
+
+// setHints attaches the advisory hints array, omitting the key entirely when
+// there is nothing to say (the shape the response-schema contract pins).
+func setHints(env map[string]any, hints []string) {
+	if len(hints) > 0 {
+		env["hints"] = hints
+	}
 }
 
 // handleSessionStart returns the handler for mem_session_start. It reads the
@@ -788,8 +1010,11 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		explicitProject, _ := args["project"].(string)
 		explicitProject = strings.TrimSpace(explicitProject)
-		directory, _ := args["directory"].(string)
-		directory = strings.TrimSpace(directory)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_session_start"), nil
+		}
+		directory := dirArg.Directory
 
 		// The directory the session row records, and — absent an explicit
 		// project — the one detection runs against.
@@ -942,7 +1167,11 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		scope, _ := args["scope"].(string)
 		topicKey, _ := args["topic_key"].(string)
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_save"), nil
+		}
+		directory := dirArg.Directory
 
 		// capture_prompt defaults to true when absent; explicit false disables it.
 		capturePrompt := true
@@ -1331,7 +1560,11 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 			}
 		}
 		if project == "" {
-			directory, _ := args["directory"].(string)
+			dirArg := readDirectoryArg(args)
+			if dirArg.Err != nil {
+				return dirArg.toolError("mem_session_summary"), nil
+			}
+			directory := dirArg.Directory
 			var toolErr *mcp.CallToolResult
 			// Returns explicitProject verbatim when set; otherwise detects from the
 			// forwarded directory / daemon cwd and may hard-error.
@@ -1406,7 +1639,11 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		typ, _ := args["type"].(string)
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_search"), nil
+		}
+		directory := dirArg.Directory
 		scope, _ := args["scope"].(string)
 		mode, _ := args["mode"].(string)
 
@@ -1486,7 +1723,11 @@ func handleContext(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		args := req.GetArguments()
 
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_context"), nil
+		}
+		directory := dirArg.Directory
 		scope, _ := args["scope"].(string)
 
 		project := resolveReadProject(explicitProject, directory)
@@ -1599,8 +1840,11 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		sessionID = strings.TrimSpace(sessionID)
 
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
-		project, toolErr := resolveSaveProject(store, explicitProject, directory)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_save_prompt"), nil
+		}
+		project, toolErr := resolveSaveProject(store, explicitProject, dirArg.Directory)
 		if toolErr != nil {
 			return toolErr, nil
 		}
@@ -1757,7 +2001,11 @@ func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		action, _ := args["action"].(string)
 		action = strings.TrimSpace(strings.ToLower(action))
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_review"), nil
+		}
+		directory := dirArg.Directory
 		switch action {
 		case "list":
 			explicitProject, _ := args["project"].(string)

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	mcpserver "github.com/mark3labs/mcp-go/server"
+
 	"github.com/mariesqu/engram/internal/controlapi"
 )
 
@@ -739,6 +741,76 @@ func TestEnsureConnectDaemon_TimesOutWithClearError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), dbPath) {
 		t.Errorf("error should name the db path it tried to spawn with; got: %v", err)
+	}
+}
+
+// TestMCPBridge_EndToEnd_InjectsDirectoryIntoCurrentProject is the end-to-end
+// proof of the whole client-directory mechanism, across the process boundary it
+// exists to cross. Everything below the bridge is REAL: a daemon built by
+// buildDaemon, its MCP server mounted on a live Streamable HTTP endpoint with
+// bearer auth, and a tools/call frame that carries NO "directory" — exactly what
+// an MCP client sends.
+//
+// The daemon's own cwd is the junk directory from the field incident, so a
+// bridge that failed to inject would produce "system32" here with full
+// confidence. The unit tests around injectClientDirectory assert the bytes; this
+// one asserts the ANSWER, which is the thing anyone actually cares about.
+func TestMCPBridge_EndToEnd_InjectsDirectoryIntoCurrentProject(t *testing.T) {
+	chdirToJunkDir(t)
+	clientDir := pinnedProjectDir(t, "bridged-repo")
+	t.Setenv("ENGRAM_CLIENT_DIR", clientDir)
+
+	dir := t.TempDir()
+	const token = "e2e-token"
+
+	components, err := buildDaemon(daemonCfg{
+		db:           filepath.Join(dir, "bridge_e2e.db"),
+		syncInterval: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	mux := http.NewServeMux()
+	controlapi.MountMCP(mux, token, mcpserver.NewStreamableHTTPServer(
+		components.mcpServer,
+		mcpserver.WithStateLess(true),
+	))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	if err := controlapi.WriteDaemonJSON(dir, token, mustParsePort(t, ts.URL), os.Getpid()); err != nil {
+		t.Fatalf("WriteDaemonJSON: %v", err)
+	}
+
+	b, err := newMCPBridge(dir)
+	if err != nil {
+		t.Fatalf("newMCPBridge: %v", err)
+	}
+	if b.clientDir != clientDir {
+		t.Fatalf("bridge clientDir = %q, want the ENGRAM_CLIENT_DIR value %q", b.clientDir, clientDir)
+	}
+
+	in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call",` +
+		`"params":{"name":"mem_current_project","arguments":{}}}` + "\n")
+	var out bytes.Buffer
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.run(ctx, in, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "bridged-repo") {
+		t.Errorf("mem_current_project resolved the wrong project through the bridge; response: %s", got)
+	}
+	if strings.Contains(got, "system32") {
+		t.Errorf("the daemon answered from its OWN cwd — the directory injection did not reach it; response: %s", got)
+	}
+	if !strings.Contains(got, `directory_source`) || !strings.Contains(got, dirSourceArgument) {
+		t.Errorf("response does not report directory_source=%q; response: %s", dirSourceArgument, got)
 	}
 }
 
