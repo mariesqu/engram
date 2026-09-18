@@ -366,3 +366,61 @@ func TestProbeDaemonHTTP_RejectsNonEngramBody(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildSpawnCmd_DirIsNotTheSpawnersCwd pins where a spawned daemon lives.
+//
+// A child inherits its parent's working directory, and every spawner is
+// standing in somebody's repo: a lifecycle hook runs in the agent's workspace,
+// `engram connect` wherever the MCP client launched it. The daemon's cwd is
+// then the answer mem_current_project gives every OTHER client that sends no
+// directory of its own (directory_source="daemon_cwd"), so the first repo to
+// autostart a daemon names the project for every session after it — and on
+// Windows the daemon holds an open handle on that checkout for its whole life,
+// so the directory cannot be renamed, deleted or replaced by a branch switch.
+func TestBuildSpawnCmd_DirIsNotTheSpawnersCwd(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "engram-config")
+	t.Setenv("ENGRAM_CONFIG_DIR", configDir)
+	repo := t.TempDir()
+	chdirTo(t, repo)
+
+	cmd := buildSpawnCmd("engram", filepath.Join(t.TempDir(), "engram.db"))
+	closeSpawnLog(t, cmd)
+
+	if cmd.Dir == "" {
+		t.Fatal("cmd.Dir is empty: the daemon would inherit the spawner's working directory")
+	}
+	if canonicalDir(t, cmd.Dir) == canonicalDir(t, repo) {
+		t.Errorf("cmd.Dir = %q, which is the spawner's cwd", cmd.Dir)
+	}
+	if canonicalDir(t, cmd.Dir) != canonicalDir(t, configDir) {
+		t.Errorf("cmd.Dir = %q, want engram's own config directory %q", cmd.Dir, configDir)
+	}
+	// exec refuses to start a process whose Dir does not exist, so a spawn
+	// directory that is merely computed is worse than none at all.
+	if info, err := os.Stat(cmd.Dir); err != nil || !info.IsDir() {
+		t.Errorf("cmd.Dir %q is not an existing directory (%v)", cmd.Dir, err)
+	}
+}
+
+// TestSpawnWorkingDir_FallsBackToHome — an unusable config directory must not
+// take the spawn down with it. The home directory is not engram's, but it is
+// not a checkout either, which is the whole point.
+func TestSpawnWorkingDir_FallsBackToHome(t *testing.T) {
+	// A FILE where the config directory should be: MkdirAll fails, so the
+	// fallback is the only way to a usable answer.
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	t.Setenv("ENGRAM_CONFIG_DIR", filepath.Join(blocker, "engram"))
+
+	dir := spawnWorkingDir()
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home directory on this host: %v", err)
+	}
+	if dir != home {
+		t.Errorf("spawnWorkingDir() = %q, want the home directory %q", dir, home)
+	}
+}

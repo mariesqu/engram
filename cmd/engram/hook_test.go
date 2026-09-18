@@ -690,3 +690,109 @@ func ageHookState(t *testing.T, path string, by time.Duration) {
 		t.Fatalf("Chtimes %s: %v", path, err)
 	}
 }
+
+// ─── a hook never files under the daemon's own directory ────────────────────
+
+// decoyDaemonCwd points the (in-process) daemon at a directory that resolves to
+// a perfectly valid, perfectly wrong project — the shape of a resident daemon
+// autostarted from somebody else's repo. Every assertion below is that this
+// name never appears in the store.
+const decoyProject = "decoy-daemon-repo"
+
+func decoyDaemonCwd(t *testing.T) {
+	t.Helper()
+	chdirTo(t, pinnedProjectDir(t, decoyProject))
+}
+
+// TestHookSubagentStop_NoCwdSavesNothing is the regression test for a hook that
+// passed only "directory". With no cwd in the payload the argument is empty, the
+// daemon falls back to its OWN working directory, and the subagent's report is
+// filed under whatever project that resolves to — a memory that reads exactly
+// like real work, in a project the user never opens. The hook now resolves the
+// project first (mem_current_project) and refuses to save when the answer
+// describes the daemon rather than the session.
+func TestHookSubagentStop_NoCwdSavesNothing(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	decoyDaemonCwd(t)
+
+	out := runHook(t, "subagent-stop", map[string]any{
+		"session_id":             "hook-subagent-no-cwd",
+		"last_assistant_message": "Found the deadlock in the writer queue",
+	}, "--db", dbPath)
+
+	if obj := decodeHookJSON(t, out); len(obj) != 0 {
+		t.Errorf("subagent-stop must still print {}; got %v", obj)
+	}
+	count, err := components.store.CountLiveByProject(decoyProject)
+	if err != nil {
+		t.Fatalf("CountLiveByProject: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("%d observation(s) landed under the DAEMON's project %q — a payload with no cwd names no workspace",
+			count, decoyProject)
+	}
+	// Belt and braces: nothing anywhere, under any project.
+	results, _, err := components.store.SearchMemoriesFiltered("deadlock", "", 10, localstore.SearchFilter{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("the report was saved under project %q; it should not have been saved at all", results[0].Project)
+	}
+}
+
+// TestHookUserPromptSubmit_NoCwdCapturesNothing is the same gap on the prompt
+// path, which runs on EVERY user message — so a host that omits cwd would fill
+// the daemon's own project with one prompt per message.
+func TestHookUserPromptSubmit_NoCwdCapturesNothing(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	decoyDaemonCwd(t)
+	sessionID := "hook-no-cwd-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	out := runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID,
+		"prompt":     "add the missing index",
+	}, "--db", dbPath)
+
+	// The bootstrap still fires: it is static text and needs no project.
+	obj := decodeHookJSON(t, out)
+	if _, ok := obj["hookSpecificOutput"]; !ok {
+		t.Errorf("first prompt lost its bootstrap because the project was unresolvable: %v", obj)
+	}
+
+	count, err := components.store.CountPromptsForSession(sessionID, decoyProject, "add the missing index")
+	if err != nil {
+		t.Fatalf("CountPromptsForSession: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("the prompt was captured under the DAEMON's project %q", decoyProject)
+	}
+}
+
+// TestHookSubagentStop_NamesTheProjectExplicitly proves the fix does not simply
+// drop everything: with a cwd in the payload the report is saved, and it is
+// saved under the project that cwd resolves to — not under the daemon's, which
+// is a different, equally valid-looking name sitting right there.
+func TestHookSubagentStop_NamesTheProjectExplicitly(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	decoyDaemonCwd(t)
+	repo := pinnedProjectDir(t, "subagent-explicit-repo")
+
+	runHook(t, "subagent-stop", map[string]any{
+		"session_id":             "hook-subagent-explicit",
+		"cwd":                    repo,
+		"last_assistant_message": "Found the deadlock in the writer queue",
+	}, "--db", dbPath)
+
+	results, _, err := components.store.SearchMemoriesFiltered("deadlock", "", 10, localstore.SearchFilter{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("saved observations = %d, want 1", len(results))
+	}
+	if results[0].Project != "subagent-explicit-repo" {
+		t.Errorf("project = %q, want %q", results[0].Project, "subagent-explicit-repo")
+	}
+}

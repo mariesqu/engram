@@ -42,7 +42,9 @@ const directoryArgDescription = "Directory to resolve the project from. Normally
 // TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias pins the text.
 const cwdArgDescription = "Alias for \"directory\", read ONLY when \"directory\" is absent or blank — " +
 	"'engram connect' injects the real client directory into \"directory\", and that value must keep " +
-	"winning over a hand-written path."
+	"winning over a hand-written path. Pass an ABSOLUTE path: a relative one (\".\", \"./repo\") is " +
+	"resolved with filepath.Abs against the DAEMON's working directory — a shared, resident process that " +
+	"is almost never in your repo — so write tools refuse it."
 
 // Directory-source labels. They answer the question an agent cannot otherwise
 // ask — WHOSE idea was the directory this answer describes? — and are reported
@@ -60,7 +62,19 @@ const (
 	// dirSourceInvalid: "directory" was present but not a JSON string. Never
 	// silently downgraded to the alias — see readDirectoryArg.
 	dirSourceInvalid = "invalid_directory_argument"
+	// dirSourceRelativePath: the value that decided (either key) was RELATIVE.
+	// resolveProjectDir resolves it with filepath.Abs, i.e. against the DAEMON's
+	// working directory — so it is neither the caller's directory nor an honest
+	// daemon_cwd answer, and it gets a label of its own.
+	dirSourceRelativePath = "relative_path"
 )
+
+// relativeDirectoryHint is the one sentence every surface uses for a relative
+// directory — the tool errors write tools return and the hint
+// mem_current_project reports. One wording, so an agent that has read it once
+// recognises it wherever it turns up.
+const relativeDirectoryHint = "a RELATIVE path was resolved against the daemon's working directory, not yours — " +
+	"pass an absolute path or an explicit project"
 
 // directoryArg is the outcome of reading the directory a tool call resolves its
 // project from. Source is one of the dirSource* labels; Err is non-nil only for
@@ -69,6 +83,17 @@ type directoryArg struct {
 	Directory string
 	Source    string
 	Err       error
+	// Relative is true when Directory is a non-absolute path (Source is then
+	// dirSourceRelativePath). Write tools REFUSE it: filepath.Abs would resolve
+	// it against the daemon's cwd, filing the memory under whatever directory the
+	// autostart or tray happened to launch from.
+	Relative bool
+	// Warning is an advisory mem_current_project turns into a hint. Today it has
+	// exactly one source: a "cwd" alias that was present but not a string. That is
+	// NOT promoted to Err — the alias is a courtesy, and a malformed one falls
+	// back to the same daemon-cwd answer an absent one would — but it is not
+	// silence either, because the caller believes they supplied a directory.
+	Warning string
 }
 
 // readDirectoryArg extracts the directory a directory-aware tool call resolves
@@ -83,6 +108,13 @@ type directoryArg struct {
 //     carries a real directory.
 //  3. Neither — the caller gets "" and resolveProjectDir falls back to the
 //     daemon's own cwd.
+//
+// A RELATIVE value in either key is kept (reads still answer from it) but
+// labelled dirSourceRelativePath, because resolveProjectDir resolves it with
+// filepath.Abs — against the DAEMON's working directory, not the caller's. "."
+// is the value a model filling in the alias writes sooner or later, and left
+// unlabelled it reads exactly like an observed directory while describing the
+// resident daemon's own folder.
 //
 // A "directory" that is PRESENT but not a string is a caller error, reported as
 // such (Err non-nil) rather than treated as absent. That case is the one the
@@ -102,15 +134,38 @@ func readDirectoryArg(args map[string]any) directoryArg {
 			}
 		}
 		if dir = strings.TrimSpace(dir); dir != "" {
-			return directoryArg{Directory: dir, Source: dirSourceArgument}
+			return newDirectoryArg(dir, dirSourceArgument)
 		}
 	}
-	if raw, ok := args["cwd"].(string); ok {
-		if cwd := strings.TrimSpace(raw); cwd != "" {
-			return directoryArg{Directory: cwd, Source: dirSourceCwdAlias}
+	if raw, present := args["cwd"]; present && raw != nil {
+		cwd, ok := raw.(string)
+		if !ok {
+			// The mirror of the non-string "directory" case, one notch softer: the
+			// alias is optional, so a malformed one resolves like an absent one —
+			// but the caller thinks they named a workspace, so it is reported.
+			return directoryArg{
+				Source: dirSourceDaemonCwd,
+				Warning: fmt.Sprintf("the \"cwd\" alias was not a string (got %T) and was IGNORED — "+
+					"this answer describes the daemon's own directory", raw),
+			}
+		}
+		if cwd = strings.TrimSpace(cwd); cwd != "" {
+			return newDirectoryArg(cwd, dirSourceCwdAlias)
 		}
 	}
 	return directoryArg{Source: dirSourceDaemonCwd}
+}
+
+// newDirectoryArg labels a non-blank directory, downgrading absoluteSource to
+// dirSourceRelativePath when the path is not absolute. The value is kept either
+// way: reads answer from it (leniently, via the daemon-cwd resolution), and
+// mem_current_project reports it verbatim in cwd_input so the caller can see
+// what the daemon did with what they sent.
+func newDirectoryArg(dir, absoluteSource string) directoryArg {
+	if !filepath.IsAbs(dir) {
+		return directoryArg{Directory: dir, Source: dirSourceRelativePath, Relative: true}
+	}
+	return directoryArg{Directory: dir, Source: absoluteSource}
 }
 
 // toolError renders a dirSourceInvalid directoryArg as the MCP tool error the
@@ -118,6 +173,37 @@ func readDirectoryArg(args map[string]any) directoryArg {
 // it: it never errors, and reports the same condition in its envelope instead.
 func (d directoryArg) toolError(tool string) *mcp.CallToolResult {
 	return mcp.NewToolResultError(tool + ": " + d.Err.Error())
+}
+
+// relativeError renders a relative directory as the refusal a WRITE tool
+// returns. Reads stay lenient (they answer from whatever the daemon's cwd makes
+// of it); a write would file a memory under a project nobody chose, and the one
+// thing the caller can do about it is spell the path out or name the project.
+func (d directoryArg) relativeError(tool string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(fmt.Sprintf("%s: directory %q is not absolute — %s", tool, d.Directory, relativeDirectoryHint))
+}
+
+// missingDirectoryError is the write-tool refusal for a directory that is not
+// on this machine. Detection derives a basename from any string, so without it
+// a typo'd path silently CREATES a project — the flag mem_current_project
+// reports as writes_blocked with project_source="missing_directory".
+func missingDirectoryError(tool, dir string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(fmt.Sprintf(
+		"%s: the resolved directory %q does not exist (or is not a directory), so any project name would be "+
+			"invented from its basename — pass a real directory or an explicit project", tool, dir))
+}
+
+// directoryExists reports whether dir is present and is a directory. The empty
+// string (the daemon could not read its own cwd) is NOT treated as missing:
+// DetectProjectFull reads it as ".", which is the historic daemon-cwd answer,
+// and a write tool that refused it would break every caller that never sends a
+// directory at all.
+func directoryExists(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return true
+	}
+	info, err := os.Stat(dir)
+	return err == nil && info.IsDir()
 }
 
 // directoryAwareTools names the MCP tools whose handlers resolve the project
@@ -232,7 +318,7 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 
 Three fields say "do not trust this name blindly":
   fallback=true         — the project name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Pass an explicit project on later calls if that is not the name you want.
-  writes_blocked=true   — mem_save/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, or an omitted project) until you pass project explicitly.
+  writes_blocked=true   — mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, missing, relative, or an omitted project) until you pass project explicitly.
   directory_exists=false — the resolved directory does not exist, so any name here is invented from its basename. Pass a real directory or an explicit project.`),
 			mcp.WithTitleAnnotation("Detect Current Project"),
 			mcp.WithReadOnlyHintAnnotation(true),
@@ -814,6 +900,10 @@ FORMAT — use this exact structure in the content field:
 //   - directory_source="cwd_alias": the directory came from the MODEL, not from
 //     `engram connect`. It is an assertion about the workspace, not an
 //     observation of it.
+//   - directory_source="relative_path": the value was relative, so it was
+//     resolved against the DAEMON's working directory rather than the caller's.
+//     "." is the answer a model gives when asked for its cwd, and it resolves to
+//     a real, existing, entirely unrelated project.
 //   - directory_exists=false: the resolved directory is not there at all, so the
 //     basename it yields names nothing that exists.
 //
@@ -896,6 +986,11 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 		hints = append(hints, "the \"directory\" argument was not a string and was IGNORED (the \"cwd\" alias is "+
 			"deliberately not consulted for it) — this answer describes the daemon's own directory")
 	}
+	if dirArg.Warning != "" {
+		// The alias's own malformed-argument case. It is not an error_hint: nothing
+		// was refused, and the answer below is the one an absent alias would give.
+		hints = append(hints, dirArg.Warning)
+	}
 
 	// Does the directory the answer is about actually exist? Detection happily
 	// derives a basename from a path that is not there, which is how a typo'd
@@ -921,6 +1016,18 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 		applyPolicyBlock(store, env, &hints)
 		setHints(env, hints)
 		return env
+	}
+
+	if dirArg.Relative {
+		// Reported BEFORE the existence check so a relative path that resolves to
+		// nothing still says WHY it resolved there. Writes are blocked for the same
+		// reason resolveSaveProject refuses them: the path was resolved against the
+		// daemon's cwd, so the project it names belongs to the daemon, not to the
+		// caller. Kept out of the explicit-project branch above on purpose — naming
+		// a project skips the directory entirely, so nothing is blocked.
+		env["writes_blocked"] = true
+		hints = append(hints, fmt.Sprintf("the directory you passed (%q) is RELATIVE: %s — "+
+			"every write tool refuses it", dirArg.Directory, relativeDirectoryHint))
 	}
 
 	if !env["directory_exists"].(bool) {
@@ -976,6 +1083,8 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 		hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
 	case dirSourceCwdAlias:
 		hints = append(hints, "this directory came from the \"cwd\" alias you supplied, not from 'engram connect' — if it is not the workspace you are actually in, every later call is filed under the wrong project")
+		// dirSourceRelativePath is deliberately absent: its hint is emitted above,
+		// before the existence check, so it survives the missing-directory return.
 	}
 
 	applyPolicyBlock(store, env, &hints)
@@ -991,9 +1100,9 @@ const sourceMissingDirectory = "missing_directory"
 
 // applyPolicyBlock sets writes_blocked when the resolved project's sync policy
 // is "omitted", the one reason a write is refused that no amount of filesystem
-// evidence can reveal: mem_save, mem_save_prompt and mem_session_summary check
-// GetPolicy and return "capture refused" BEFORE writing anything, whether the
-// project was detected or named explicitly. A nil store (direct unit tests)
+// evidence can reveal: mem_save, mem_save_prompt, mem_session_start and
+// mem_session_summary all check GetPolicy and return "capture refused" BEFORE
+// writing anything, whether the project was detected or named explicitly. A nil store (direct unit tests)
 // skips the check; a failed lookup is reported as a hint rather than swallowed.
 func applyPolicyBlock(store *localstore.Store, env map[string]any, hints *[]string) {
 	project, _ := env["project"].(string)
@@ -1039,6 +1148,14 @@ func setHints(env map[string]any, hints []string) {
 //     handleSessionStart, REQ-308): the supplied "directory" if any, else
 //     os.Getwd() — see resolveProjectDir.
 //
+// It is a WRITE tool and refuses everything the other write tools refuse: a
+// relative or missing directory (resolveSaveProject's two guards, reimplemented
+// here because this handler resolves its own project to keep the corrective
+// CreateSessionWithProject path) and an "omitted" project. Registering a
+// session for a project that cannot accept a single memory is a session row
+// whose only effect is to make mem_context report activity that produced
+// nothing.
+//
 // This tool's optional "directory" argument is the model every other
 // directory-aware tool now follows; `engram connect` fills it with the client's
 // working directory when the caller left both it and "project" empty.
@@ -1065,6 +1182,15 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		project := explicitProject
 		if project == "" {
+			// The same two refusals resolveSaveProject applies, in the same order and
+			// for the same reason: an explicit project skips both (it is the remedy
+			// every writes_blocked hint offers), everything else must not invent one.
+			if dirArg.Relative {
+				return dirArg.relativeError("mem_session_start"), nil
+			}
+			if !directoryExists(resolvedDir) {
+				return missingDirectoryError("mem_session_start", resolvedDir), nil
+			}
 			// Surface broken-config and ambiguous-project resolution errors as tool
 			// errors (faithful to the legacy predecessor) rather than silently storing
 			// the session under a wrong/basename project. ErrInvalidConfig = malformed
@@ -1088,6 +1214,19 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				}
 			}
 			project = det.Project
+		}
+
+		// Policy check: an "omitted" project refuses capture, so registering a
+		// session for one promises a place to save that does not exist. Applied
+		// AFTER resolution so an explicit project is checked too — naming a project
+		// skips detection, not the policy (mem_current_project reports exactly this
+		// as writes_blocked, for mem_session_start by name).
+		pol, polErr := store.GetPolicy(project)
+		if polErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_session_start: policy check for project %q: %v", project, polErr)), nil
+		}
+		if pol == localstore.PolicyOmitted {
+			return mcp.NewToolResultError(fmt.Sprintf("project %q is omitted: capture refused", project)), nil
 		}
 
 		// If the caller supplied a directory, use it; otherwise use the cwd we
@@ -1155,21 +1294,44 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 // fire against the resolved directory, so a forwarded directory is diagnosed
 // exactly like a cwd would be.
 //
+// Before any detection runs it applies the two refusals mem_current_project
+// advertises as writes_blocked and nothing used to enforce:
+//
+//   - a RELATIVE directory (dirSourceRelativePath): filepath.Abs resolves it
+//     against the SHARED daemon's cwd, so the memory would be filed under
+//     whatever folder the autostart or tray happened to launch from;
+//   - a directory that is not on this machine: detection derives a basename
+//     from any string, so a typo'd path silently creates a brand-new project.
+//
+// Both are skipped when the caller named a project. An explicit name is the
+// remedy every writes_blocked hint offers, and honouring it here is what makes
+// that advice true.
+//
+// tool is the caller's tool name, used verbatim in the error text: an agent
+// that reads "mem_save: …" after calling mem_session_summary learns the wrong
+// thing about which call failed.
+//
 // Conflict detection (explicit project vs store's known projects) is DEFERRED
 // to a future PR.
-func resolveSaveProject(store *localstore.Store, explicitProject, directory string) (string, *mcp.CallToolResult) {
+func resolveSaveProject(store *localstore.Store, tool, explicitProject string, dirArg directoryArg) (string, *mcp.CallToolResult) {
 	if strings.TrimSpace(explicitProject) != "" {
 		return strings.TrimSpace(explicitProject), nil
 	}
+	if dirArg.Relative {
+		return "", dirArg.relativeError(tool)
+	}
 
-	dir := resolveProjectDir(directory)
+	dir := resolveProjectDir(dirArg.Directory)
+	if !directoryExists(dir) {
+		return "", missingDirectoryError(tool, dir)
+	}
 	det := projectpkg.DetectProjectFull(dir)
 	if det.Error != nil {
 		switch {
 		case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
-			return "", mcp.NewToolResultError("mem_save: project resolution: " + det.Error.Error())
+			return "", mcp.NewToolResultError(tool + ": project resolution: " + det.Error.Error())
 		case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
-			msg := "mem_save: project resolution: " + det.Error.Error()
+			msg := tool + ": project resolution: " + det.Error.Error()
 			if len(det.AvailableProjects) > 0 {
 				msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") +
 					"); pass project= explicitly or supply a more specific directory"
@@ -1214,7 +1376,6 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		if dirArg.Err != nil {
 			return dirArg.toolError("mem_save"), nil
 		}
-		directory := dirArg.Directory
 
 		// capture_prompt defaults to true when absent; explicit false disables it.
 		capturePrompt := true
@@ -1222,7 +1383,7 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 			capturePrompt = v
 		}
 
-		project, toolErr := resolveSaveProject(store, explicitProject, directory)
+		project, toolErr := resolveSaveProject(store, "mem_save", explicitProject, dirArg)
 		if toolErr != nil {
 			return toolErr, nil
 		}
@@ -1608,11 +1769,10 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 			if dirArg.Err != nil {
 				return dirArg.toolError("mem_session_summary"), nil
 			}
-			directory := dirArg.Directory
 			var toolErr *mcp.CallToolResult
 			// Returns explicitProject verbatim when set; otherwise detects from the
 			// forwarded directory / daemon cwd and may hard-error.
-			project, toolErr = resolveSaveProject(store, explicitProject, directory)
+			project, toolErr = resolveSaveProject(store, "mem_session_summary", explicitProject, dirArg)
 			if toolErr != nil {
 				return toolErr, nil
 			}
@@ -1974,7 +2134,7 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		if dirArg.Err != nil {
 			return dirArg.toolError("mem_save_prompt"), nil
 		}
-		project, toolErr := resolveSaveProject(store, explicitProject, dirArg.Directory)
+		project, toolErr := resolveSaveProject(store, "mem_save_prompt", explicitProject, dirArg)
 		if toolErr != nil {
 			return toolErr, nil
 		}

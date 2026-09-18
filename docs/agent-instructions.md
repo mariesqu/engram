@@ -40,10 +40,12 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 Start a session with `mem_current_project`. It never errors, and it tells you which project every later call will be filed under plus how that name was derived. Three fields decide what you do next:
 
 - `fallback: true` — the name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Nothing declared it, so pass an explicit `project` on later calls if it is not the name you want.
-- `writes_blocked: true` — `mem_save` / `mem_session_start` / `mem_session_summary` will refuse this directory until you pass `project` explicitly. Reads still answer from the basename. Causes: an ambiguous directory (a parent of several repos), a malformed `.engram/config.json`, a directory that does not exist, or a project whose policy is `omitted`.
+- `writes_blocked: true` — `mem_save` / `mem_save_prompt` / `mem_session_start` / `mem_session_summary` will refuse this directory until you pass `project` explicitly. Reads still answer from the basename. Causes: an ambiguous directory (a parent of several repos), a malformed `.engram/config.json`, a directory that does not exist, a RELATIVE directory, or a project whose policy is `omitted`.
 - `directory_exists: false` — the resolved directory is not on this machine, so any name here was invented from its basename. Pass a real directory or an explicit `project`.
 
-The response also carries `hints` — an ARRAY of one plain-language sentence per reason the answer is untrustworthy — plus `directory_source` (`argument` = injected by `engram connect`; `cwd_alias` = the path *you* supplied; `daemon_cwd` = nobody supplied one, so this describes the daemon's own directory, typically NOT your repo), `cwd` (absolute, cleaned), `cwd_input` (what you passed, verbatim) and `project_path` (the project's canonical directory).
+The response also carries `hints` — an ARRAY of one plain-language sentence per reason the answer is untrustworthy — plus `directory_source` (`argument` = injected by `engram connect`; `cwd_alias` = the path *you* supplied; `daemon_cwd` = nobody supplied one, so this describes the daemon's own directory, typically NOT your repo; `relative_path` = you supplied a relative path, which was resolved against the *daemon's* directory rather than yours), `cwd` (absolute, cleaned), `cwd_input` (what you passed, verbatim) and `project_path` (the project's canonical directory).
+
+Always pass an **absolute** path in `directory`/`cwd`. The daemon is a separate, usually resident process, so `.` means *its* directory, not yours — reads answer from it leniently, writes refuse it.
 
 Pass the workspace in `directory` when you have to name one; `cwd` is accepted as an alias by every project-resolving tool and is read only when `directory` is absent or blank.
 

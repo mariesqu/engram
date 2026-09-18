@@ -55,10 +55,10 @@ TOOLS
 CONFIRM THE PROJECT FIRST
 Open with mem_current_project. Three fields decide what you do next:
   fallback=true        — the name is a GUESS (a directory basename, or a lenient fallback after a resolution error); pass an explicit project later if that is not the name you want.
-  writes_blocked=true  — reads answer from the basename, but mem_save/mem_session_start/mem_session_summary will REFUSE until you pass project explicitly (ambiguous directory, malformed .engram/config.json, missing directory, or an "omitted" project).
+  writes_blocked=true  — reads answer from the basename, but mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE until you pass project explicitly (ambiguous directory, malformed .engram/config.json, missing directory, a RELATIVE directory, or an "omitted" project).
   directory_exists=false — the resolved directory is not on this machine; the name was invented from its basename.
-The response also carries hints (an ARRAY, one sentence per reason the answer is untrustworthy) and directory_source: "argument" (injected by engram connect), "cwd_alias" (the path YOU supplied), or "daemon_cwd" (nobody supplied one — this describes the daemon's own directory, typically NOT your repo).
-Every project-resolving tool accepts "directory", and "cwd" as its alias — the alias is read only when "directory" is absent or blank.
+The response also carries hints (an ARRAY, one sentence per reason the answer is untrustworthy) and directory_source: "argument" (injected by engram connect), "cwd_alias" (the path YOU supplied), "daemon_cwd" (nobody supplied one — this describes the daemon's own directory, typically NOT your repo), or "relative_path" (you supplied a relative path, which was resolved against the DAEMON's directory, not yours).
+Every project-resolving tool accepts "directory", and "cwd" as its alias — the alias is read only when "directory" is absent or blank. Always pass an ABSOLUTE path: the daemon is a separate, usually resident process, so "." means its directory, not yours.
 
 PROACTIVE SAVE RULE
 Call mem_save immediately — without being asked — after any of: an architecture or design decision, a tradeoff chosen, a bug fixed (root cause + file), a convention or pattern established, a tool/library choice, a configuration change, a non-obvious discovery, a gotcha or edge case.

@@ -254,34 +254,38 @@ func TestCurrentProject_NonStringDirectoryNeverFallsThroughToCwd(t *testing.T) {
 // every other directory-aware tool must REFUSE it. Silently resolving from the
 // daemon's cwd (or from a model-supplied "cwd") would file the write under a
 // project the caller never named.
+//
+// The table is directoryAwareTools itself, not a hand-written list beside it:
+// the previous version named seven of the nine tools and quietly missed
+// mem_doctor for a whole release. A tool added to the map without an entry in
+// directoryAwareMinimalArgs now fails here until somebody classifies it.
 func TestDirectoryAwareTools_NonStringDirectoryIsACallerError(t *testing.T) {
 	components := currentProjectDaemon(t)
 	guessed := pinnedProjectDir(t, "guessed-repo")
-
-	// Minimal valid arguments per tool, plus the offending "directory".
-	cases := map[string]map[string]any{
-		"mem_save":            {"title": "t"},
-		"mem_save_prompt":     {"content": "c"},
-		"mem_search":          {"query": "q"},
-		"mem_context":         {},
-		"mem_review":          {"action": "list"},
-		"mem_session_start":   {"id": "s1"},
-		"mem_session_summary": {"content": "## Goal\nx"},
-	}
 	registered := components.mcpServer.ListTools()
-	for name, args := range cases {
+
+	for name := range directoryAwareTools {
 		t.Run(name, func(t *testing.T) {
 			tool, ok := registered[name]
 			if !ok {
 				t.Fatalf("%s is not registered", name)
 			}
-			call := map[string]any{"directory": []any{"not", "a", "string"}, "cwd": guessed}
-			for k, v := range args {
-				call[k] = v
-			}
+			call := minimalArgsFor(t, name, map[string]any{
+				"directory": []any{"not", "a", "string"},
+				"cwd":       guessed,
+			})
 			result, err := tool.Handler(t.Context(), newToolRequest(name, call))
 			if err != nil {
 				t.Fatalf("handler transport error: %v", err)
+			}
+			if name == "mem_current_project" {
+				// The one documented exception: the discovery probe never errors, and
+				// reports the bad argument in its envelope instead — see
+				// TestCurrentProject_NonStringDirectoryNeverFallsThroughToCwd.
+				if result.IsError {
+					t.Fatalf("mem_current_project returned a tool error; it never may: %v", result.Content)
+				}
+				return
 			}
 			if !result.IsError {
 				t.Fatalf("%s accepted a non-string directory; want a tool error: %v", name, result.Content)
@@ -291,6 +295,32 @@ func TestDirectoryAwareTools_NonStringDirectoryIsACallerError(t *testing.T) {
 				t.Errorf("%s error = %q, want it to name the type error", name, text.Text)
 			}
 		})
+	}
+}
+
+// TestCurrentProject_NonStringCwdAliasIsReported covers the alias's own
+// malformed-argument case, which used to be pure silence. A non-string "cwd" is
+// one notch softer than a non-string "directory" — the alias is optional, so
+// the call resolves exactly as it would with no alias at all — but the caller
+// believes they named a workspace, and the answer they get describes the
+// daemon's. Saying nothing makes the two indistinguishable.
+func TestCurrentProject_NonStringCwdAliasIsReported(t *testing.T) {
+	junkProject := chdirToJunkDir(t)
+
+	env := callCurrentProject(t, map[string]any{"cwd": 42})
+
+	if env["project"] != junkProject {
+		t.Errorf("project = %v, want the daemon cwd basename %q", env["project"], junkProject)
+	}
+	if env["directory_source"] != dirSourceDaemonCwd {
+		t.Errorf("directory_source = %v, want %q — an unusable alias resolves like an absent one",
+			env["directory_source"], dirSourceDaemonCwd)
+	}
+	if _, ok := env["error_hint"]; ok {
+		t.Errorf("error_hint = %v, but nothing was refused: the alias is a courtesy", env["error_hint"])
+	}
+	if hints := hintsOf(t, env); !strings.Contains(hints, "\"cwd\" alias was not a string") {
+		t.Errorf("hints = %q, want them to disclose that the alias was ignored", hints)
 	}
 }
 
@@ -531,20 +561,40 @@ func TestCurrentProject_OmittedPolicyBlocksExplicitProjectToo(t *testing.T) {
 	}
 }
 
-// TestCurrentProject_RelativeDirectoryResolvesAbsolute pins the canonicalization
-// added to resolveProjectDir. A relative path is exactly what an agent filling
-// in the "cwd" alias writes, and filepath.Base(".") is "." — which detection
-// turns into the project "unknown". The probe must resolve it the way every
-// other tool now does, report the absolute path in cwd, and keep the caller's
-// verbatim value in cwd_input so the two can be compared.
-func TestCurrentProject_RelativeDirectoryResolvesAbsolute(t *testing.T) {
+// TestCurrentProject_RelativeDirectoryResolvesAgainstTheDaemon pins what a
+// relative path actually means here, which is not what the agent that typed it
+// meant. resolveProjectDir canonicalizes with filepath.Abs — and filepath.Abs
+// resolves against THIS process's working directory, which is the shared,
+// resident daemon's, not the caller's.
+//
+// The daemon therefore sits in the junk directory from the field incident,
+// NOT in the repo: the previous version of this test chdir'd the daemon into
+// the very repo it then claimed the probe had resolved, so it would have passed
+// against a handler that simply echoed the daemon's cwd — which is exactly what
+// this code does, and exactly what the caller must be told.
+//
+// "." is what a model writes when asked for its working directory, so the
+// answer is reported honestly (label, hint, writes blocked) rather than
+// rejected: reads stay lenient everywhere in this file.
+func TestCurrentProject_RelativeDirectoryResolvesAgainstTheDaemon(t *testing.T) {
 	repo := pinnedProjectDir(t, "relative-repo")
-	chdirTo(t, repo)
+	_ = repo // the caller's real workspace: nothing here may resolve to it
+	junk := chdirToJunkDir(t)
 
 	env := callCurrentProject(t, map[string]any{"cwd": "."})
 
-	if env["project"] != "relative-repo" {
-		t.Errorf("project = %v, want %q — a relative directory resolved to a phantom project", env["project"], "relative-repo")
+	if env["project"] != junk {
+		t.Errorf("project = %v, want the DAEMON's cwd basename %q — \".\" is resolved against the daemon",
+			env["project"], junk)
+	}
+	if env["project"] == "relative-repo" {
+		t.Error("the probe claimed the caller's repo; filepath.Abs cannot reach it from the daemon")
+	}
+	if env["directory_source"] != dirSourceRelativePath {
+		t.Errorf("directory_source = %v, want %q", env["directory_source"], dirSourceRelativePath)
+	}
+	if env["writes_blocked"] != true {
+		t.Errorf("writes_blocked = %v, want true: a write would land under the daemon's project", env["writes_blocked"])
 	}
 	if env["cwd_input"] != "." {
 		t.Errorf("cwd_input = %v, want %q verbatim", env["cwd_input"], ".")
@@ -553,8 +603,52 @@ func TestCurrentProject_RelativeDirectoryResolvesAbsolute(t *testing.T) {
 	if !filepath.IsAbs(got) {
 		t.Errorf("cwd = %q, want an absolute path", got)
 	}
-	if canonicalDir(t, got) != canonicalDir(t, repo) {
-		t.Errorf("cwd = %q, want the resolved %q", got, repo)
+	if hints := hintsOf(t, env); !strings.Contains(hints, "RELATIVE") {
+		t.Errorf("hints = %q, want them to say the path was resolved against the daemon", hints)
+	}
+}
+
+// TestCurrentProject_RelativeDirectoryArgumentIsLabelledToo — the label is about
+// the VALUE, not about which key carried it. `engram connect` always injects an
+// absolute path, so a relative "directory" is hand-written and carries exactly
+// the same hazard as a relative alias.
+func TestCurrentProject_RelativeDirectoryArgumentIsLabelledToo(t *testing.T) {
+	chdirToJunkDir(t)
+
+	env := callCurrentProject(t, map[string]any{"directory": "./somewhere"})
+
+	if env["directory_source"] != dirSourceRelativePath {
+		t.Errorf("directory_source = %v, want %q", env["directory_source"], dirSourceRelativePath)
+	}
+	if env["writes_blocked"] != true {
+		t.Errorf("writes_blocked = %v, want true", env["writes_blocked"])
+	}
+}
+
+// TestCurrentProject_ExplicitProjectSurvivesARelativeDirectory — an explicit
+// project skips the directory entirely (resolveSaveProject returns it
+// untouched), so a relative one blocks nothing. If the probe said otherwise it
+// would contradict the remedy every one of its own hints recommends.
+func TestCurrentProject_ExplicitProjectSurvivesARelativeDirectory(t *testing.T) {
+	components := currentProjectDaemon(t)
+	chdirToJunkDir(t)
+
+	env := callCurrentProjectOn(t, components, map[string]any{"project": "named-anyway", "cwd": "."})
+
+	if env["writes_blocked"] != false {
+		t.Errorf("writes_blocked = %v, want false: the caller named the project", env["writes_blocked"])
+	}
+
+	// And the claim is only worth making if it is true — prove mem_save accepts it.
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	result, err := saveTool.Handler(t.Context(), newToolRequest("mem_save", map[string]any{
+		"title": "named anyway", "project": "named-anyway", "cwd": ".",
+	}))
+	if err != nil {
+		t.Fatalf("mem_save transport error: %v", err)
+	}
+	if result.IsError {
+		t.Errorf("mem_save refused a call that named its project: %v", result.Content)
 	}
 }
 
@@ -653,5 +747,167 @@ func TestCurrentProject_MatchesReadToolResolution(t *testing.T) {
 					tc.args, env["project"], want)
 			}
 		})
+	}
+}
+
+// ─── writes_blocked is a promise, and these tools have to keep it ───────────
+
+// writesBlockedFixture is one directory that mem_current_project reports as
+// writes_blocked, plus the arguments every write tool is then handed.
+type writesBlockedFixture struct {
+	name string
+	// setup builds the condition and returns the directory arguments. It runs
+	// against a fresh daemon whose cwd is the junk directory from the field
+	// incident, so nothing here can accidentally resolve to a real repo.
+	setup func(t *testing.T, components *daemonComponents) map[string]any
+}
+
+// TestWriteTools_RefuseEveryWritesBlockedDirectory is the test the flag was
+// missing. mem_current_project has been telling agents that writes_blocked=true
+// means "mem_save / mem_save_prompt / mem_session_start / mem_session_summary
+// will REFUSE this directory until you pass project explicitly" — and for two
+// of the five causes (a missing directory, a relative one) nothing enforced it:
+// the write went through and invented a project from the basename of a path
+// nobody had. For a third (an omitted policy) mem_session_start alone let it
+// through.
+//
+// The loop is the contract, stated once: every fixture that the probe flags,
+// against every tool the probe names. A cause added to the probe without a
+// matching refusal fails here.
+func TestWriteTools_RefuseEveryWritesBlockedDirectory(t *testing.T) {
+	fixtures := []writesBlockedFixture{
+		{
+			name: "ambiguous multi-repo parent",
+			setup: func(t *testing.T, _ *daemonComponents) map[string]any {
+				return map[string]any{"directory": ambiguousProjectDir(t)}
+			},
+		},
+		{
+			name: "malformed .engram/config.json",
+			setup: func(t *testing.T, _ *daemonComponents) map[string]any {
+				return map[string]any{"directory": invalidConfigDir(t)}
+			},
+		},
+		{
+			name: "directory that does not exist",
+			setup: func(t *testing.T, _ *daemonComponents) map[string]any {
+				return map[string]any{"directory": filepath.Join(t.TempDir(), "no-such-checkout")}
+			},
+		},
+		{
+			name: "relative cwd alias",
+			setup: func(t *testing.T, _ *daemonComponents) map[string]any {
+				// "." — the value a model writes when asked for its workspace. It
+				// resolves against the DAEMON's cwd, i.e. the junk directory.
+				return map[string]any{"cwd": "."}
+			},
+		},
+		{
+			name: "omitted project policy",
+			setup: func(t *testing.T, components *daemonComponents) map[string]any {
+				dir := pinnedProjectDir(t, "omitted-fixture-repo")
+				if err := components.store.SetPolicy("omitted-fixture-repo", localstore.PolicyOmitted); err != nil {
+					t.Fatalf("SetPolicy: %v", err)
+				}
+				return map[string]any{"directory": dir}
+			},
+		},
+	}
+
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			components := currentProjectDaemon(t)
+			chdirToJunkDir(t)
+			args := fixture.setup(t, components)
+
+			// The premise: the probe really does flag this directory. Without it the
+			// loop below would be asserting refusals nobody was promised.
+			env := callCurrentProjectOn(t, components, args)
+			if env["writes_blocked"] != true {
+				t.Fatalf("fixture is not writes_blocked, so it proves nothing about writes: %v", env)
+			}
+
+			registered := components.mcpServer.ListTools()
+			for _, name := range directoryAwareWriteTools {
+				t.Run(name, func(t *testing.T) {
+					tool, ok := registered[name]
+					if !ok {
+						t.Fatalf("%s is not registered", name)
+					}
+					result, err := tool.Handler(t.Context(), newToolRequest(name, minimalArgsFor(t, name, args)))
+					if err != nil {
+						t.Fatalf("handler transport error: %v", err)
+					}
+					if !result.IsError {
+						t.Fatalf("%s accepted a directory mem_current_project reports as writes_blocked; "+
+							"the flag is a lie: %v", name, result.Content)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestWriteTools_AcceptAnExplicitProjectForABlockedDirectory is the other half
+// of the promise, and the reason the refusals are worth having: every
+// writes_blocked hint ends in "pass project explicitly", so that remedy must
+// actually work for every one of them. A refusal with no way through would just
+// teach agents to stop writing.
+func TestWriteTools_AcceptAnExplicitProjectForABlockedDirectory(t *testing.T) {
+	components := currentProjectDaemon(t)
+	chdirToJunkDir(t)
+	missing := filepath.Join(t.TempDir(), "no-such-checkout")
+
+	registered := components.mcpServer.ListTools()
+	for _, name := range directoryAwareWriteTools {
+		t.Run(name, func(t *testing.T) {
+			tool, ok := registered[name]
+			if !ok {
+				t.Fatalf("%s is not registered", name)
+			}
+			args := minimalArgsFor(t, name, map[string]any{
+				"directory": missing,
+				"project":   "named-by-the-agent",
+			})
+			result, err := tool.Handler(t.Context(), newToolRequest(name, args))
+			if err != nil {
+				t.Fatalf("handler transport error: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("%s refused a call that named its project; the documented remedy does not work: %v",
+					name, result.Content)
+			}
+		})
+	}
+}
+
+// TestSessionStart_RefusesAnOmittedProject pins the check mem_session_start was
+// missing by name. applyPolicyBlock listed it among the tools that refuse an
+// omitted project, and the agent-facing instructions say so too — but the
+// handler never asked. A session registered for a project that cannot accept a
+// single memory is a row whose only effect is to make mem_context report
+// activity that produced nothing.
+func TestSessionStart_RefusesAnOmittedProject(t *testing.T) {
+	components := currentProjectDaemon(t)
+	if err := components.store.SetPolicy("omitted-session-project", localstore.PolicyOmitted); err != nil {
+		t.Fatalf("SetPolicy: %v", err)
+	}
+
+	tool := components.mcpServer.ListTools()["mem_session_start"]
+	result, err := tool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
+		"id": "omitted-session", "project": "omitted-session-project",
+	}))
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("mem_session_start registered a session for an omitted project: %v", result.Content)
+	}
+	text, _ := result.Content[0].(mcp.TextContent)
+	if !strings.Contains(text.Text, "capture refused") {
+		t.Errorf("error = %q, want the same \"capture refused\" wording the other write tools use", text.Text)
+	}
+	if _, err := components.store.GetSession("omitted-session"); err == nil {
+		t.Error("the refused call still created the session row")
 	}
 }

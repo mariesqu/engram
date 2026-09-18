@@ -363,26 +363,42 @@ func jsonFromMCPBody(body []byte) []byte {
 // project every write tool would refuse anyway. A hook that guessed here would
 // register sessions and file observations under a name nothing else uses, which
 // is the exact failure the probe was built to expose.
+//
+// An EMPTY cwd is refused without asking. The host is the only thing that knows
+// where the session is, so a payload without one leaves nothing to resolve —
+// and the daemon's answer in that case describes the DAEMON's own working
+// directory, which is a real, existing, confidently-reported project that has
+// nothing to do with the session. Filing a subagent report or a prompt there is
+// worse than not filing it: it is indistinguishable from real work. The
+// directory_source check below catches the same answer arriving the long way
+// round (a blank-after-trim cwd, or a relative one resolved against the daemon).
 func hookResolveProject(ctx context.Context, client *mcpBridge, cwd string) string {
+	if strings.TrimSpace(cwd) == "" {
+		fmt.Fprintf(os.Stderr, "engram hook: the hook payload carried no cwd, so there is no workspace to resolve\n")
+		return ""
+	}
 	out, err := client.callTool(ctx, "mem_current_project", map[string]any{"directory": cwd})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook: resolve project: %v\n", err)
 		return ""
 	}
 	var env struct {
-		Project       string `json:"project"`
-		Source        string `json:"project_source"`
-		ErrorHint     string `json:"error_hint"`
-		WritesBlocked bool   `json:"writes_blocked"`
-		DirExists     bool   `json:"directory_exists"`
+		Project         string `json:"project"`
+		Source          string `json:"project_source"`
+		DirectorySource string `json:"directory_source"`
+		ErrorHint       string `json:"error_hint"`
+		WritesBlocked   bool   `json:"writes_blocked"`
+		DirExists       bool   `json:"directory_exists"`
 	}
 	if err := json.Unmarshal([]byte(out), &env); err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook: mem_current_project returned non-JSON: %v\n", err)
 		return ""
 	}
-	if strings.TrimSpace(env.Project) == "" || env.ErrorHint != "" || env.WritesBlocked || !env.DirExists {
-		fmt.Fprintf(os.Stderr, "engram hook: no usable project for %q (source=%q, writes_blocked=%v)\n",
-			cwd, env.Source, env.WritesBlocked)
+	answersAboutTheDaemon := env.DirectorySource == dirSourceDaemonCwd || env.DirectorySource == dirSourceRelativePath
+	if strings.TrimSpace(env.Project) == "" || env.ErrorHint != "" || env.WritesBlocked || !env.DirExists ||
+		answersAboutTheDaemon {
+		fmt.Fprintf(os.Stderr, "engram hook: no usable project for %q (source=%q, directory_source=%q, writes_blocked=%v)\n",
+			cwd, env.Source, env.DirectorySource, env.WritesBlocked)
 		return ""
 	}
 	return env.Project
@@ -530,7 +546,7 @@ func hookUserPromptSubmit(dbFlag string, in hookInput) {
 	ctx, cancel := context.WithDeadline(context.Background(), start.Add(hookBudgetPrompt))
 	defer cancel()
 
-	stateFile := hookStateFile(in.SessionID, "tools-loaded")
+	stateFile := hookStateFile(in.SessionID, hookStateToolsLoaded)
 	firstPrompt := !hookStateExists(stateFile)
 	if firstPrompt {
 		// Written BEFORE any network work: two prompts submitted in quick
@@ -549,10 +565,24 @@ func hookUserPromptSubmit(dbFlag string, in hookInput) {
 		return
 	}
 
+	// Resolved at most ONCE per hook run, lazily: the capture below and the nudge
+	// need the same answer, and a mem_current_project round trip inside a 200ms
+	// budget is not something to pay for twice — or at all on a prompt that has
+	// nothing to save and nothing to remind about.
+	project := onceProject(ctx, client, in.CWD)
+
 	if prompt := strings.TrimSpace(in.Prompt); prompt != "" && strings.TrimSpace(in.SessionID) != "" {
-		if _, err := client.callTool(ctx, "mem_save_prompt", map[string]any{
+		// project, not directory: the daemon is a separate process and a payload
+		// without a cwd would otherwise file the prompt under the DAEMON's own
+		// directory. An unresolvable workspace means the prompt is dropped, with a
+		// line on stderr — a prompt filed under the wrong project is worse than a
+		// prompt nobody kept.
+		if p := project(); p == "" {
+			fmt.Fprintf(os.Stderr, "engram hook user-prompt-submit: no usable project for %q; the prompt was not captured\n", in.CWD)
+		} else if _, err := client.callTool(ctx, "mem_save_prompt", map[string]any{
 			"content":    in.Prompt,
 			"session_id": in.SessionID,
+			"project":    p,
 			"directory":  in.CWD,
 		}); err != nil {
 			// Fire-and-forget by design: a prompt that was not captured costs a
@@ -565,7 +595,25 @@ func hookUserPromptSubmit(dbFlag string, in hookInput) {
 		hookPrintPromptOutput(true, "")
 		return
 	}
-	hookPrintPromptOutput(false, hookSaveNudge(ctx, client, in, stateFile))
+	hookPrintPromptOutput(false, hookSaveNudge(ctx, client, in, stateFile, project))
+}
+
+// onceProject memoizes hookResolveProject for one hook run. The zero answer is
+// memoized too: a workspace that could not be resolved once will not resolve on
+// a second call, and retrying it inside a 200ms budget spends the budget twice
+// to learn the same thing.
+func onceProject(ctx context.Context, client *mcpBridge, cwd string) func() string {
+	var (
+		project string
+		done    bool
+	)
+	return func() string {
+		if !done {
+			project = hookResolveProject(ctx, client, cwd)
+			done = true
+		}
+		return project
+	}
 }
 
 // hookPrintPromptOutput writes the single JSON object a UserPromptSubmit hook is
@@ -649,12 +697,12 @@ func hookBootstrapContext() string {
 //
 // Any failure — unresolvable project, unreachable daemon, unreadable state —
 // returns silence. A nudge is the least important thing this hook does.
-func hookSaveNudge(ctx context.Context, client *mcpBridge, in hookInput, stateFile string) string {
+func hookSaveNudge(ctx context.Context, client *mcpBridge, in hookInput, stateFile string, resolveProject func() string) string {
 	sessionAge, ok := hookStateAge(stateFile)
 	if !ok || sessionAge < hookNudgeMinSessionAge {
 		return ""
 	}
-	project := hookResolveProject(ctx, client, in.CWD)
+	project := resolveProject()
 	if project == "" {
 		return ""
 	}
@@ -673,7 +721,7 @@ func hookSaveNudge(ctx context.Context, client *mcpBridge, in hookInput, stateFi
 		return ""
 	}
 
-	nudgeFile := hookStateFile(in.SessionID, "last-nudge")
+	nudgeFile := hookStateFile(in.SessionID, hookStateLastNudge)
 	if age, ok := hookStateAge(nudgeFile); ok && age < hookNudgeCooldown {
 		return ""
 	}
@@ -750,11 +798,23 @@ func hookSubagentStop(dbFlag string, in hookInput) {
 		return
 	}
 
+	// Resolve BEFORE saving and name the project explicitly. A payload without a
+	// cwd (Codex sends none for some subagent shapes) would otherwise resolve to
+	// the resident daemon's own working directory — and a subagent report filed
+	// under a junk project reads exactly like a real memory, in a project the
+	// user never opens.
+	project := hookResolveProject(ctx, client, in.CWD)
+	if project == "" {
+		fmt.Fprintf(os.Stderr, "engram hook subagent-stop: no usable project for %q; the report was not saved\n", in.CWD)
+		return
+	}
+
 	args := map[string]any{
 		"title":          hookSubagentTitle(message),
 		"content":        truncateForHook(message, hookContextLimit),
 		"type":           "discovery",
 		"capture_prompt": false,
+		"project":        project,
 		"directory":      in.CWD,
 	}
 	if id := strings.TrimSpace(in.SessionID); id != "" {
@@ -814,6 +874,16 @@ func hookSessionEnd(dbFlag string, in hookInput) {
 }
 
 // ── state files ─────────────────────────────────────────────────────────────
+
+// The two per-session markers, named once so a typo cannot silently create a
+// third kind that nothing ever reads.
+const (
+	// hookStateToolsLoaded marks that the first prompt of a session has been
+	// seen; its modification time is also how the nudge measures session age.
+	hookStateToolsLoaded = "tools-loaded"
+	// hookStateLastNudge marks when the save reminder last fired.
+	hookStateLastNudge = "last-nudge"
+)
 
 // hookStateFile returns the path of a per-session marker file. The session id
 // is HASHED rather than embedded: it is host-supplied text that ends up in a

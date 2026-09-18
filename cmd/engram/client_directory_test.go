@@ -1471,3 +1471,108 @@ func TestNewMCPBridge_ClientDirDisabledSkipsInjection(t *testing.T) {
 		t.Errorf("disabled forwarding must leave the frame verbatim;\n got %s\nwant %s", got, msg)
 	}
 }
+
+// ─── the shared directory-contract table ────────────────────────────────────
+
+// directoryAwareMinimalArgs is the smallest valid argument set for each
+// directory-aware tool: everything a handler needs to get PAST its own
+// required-argument checks and reach the directory resolution under test.
+//
+// It exists so that the tests which walk directoryAwareTools — the map the
+// daemon and the `engram connect` bridge already share — can drive every tool
+// on it instead of a hand-written list beside it. The previous non-string
+// -directory table listed seven of the nine tools and silently missed
+// mem_doctor from the day it was added. A tool added to directoryAwareTools
+// with no entry here now FAILS those tests, which is the only way a contract
+// about "every directory-aware tool" stays true.
+var directoryAwareMinimalArgs = map[string]map[string]any{
+	"mem_current_project": {},
+	"mem_doctor":          {},
+	"mem_save":            {"title": "t"},
+	"mem_save_prompt":     {"content": "c"},
+	"mem_search":          {"query": "q"},
+	"mem_context":         {},
+	"mem_review":          {"action": "list"},
+	"mem_session_start":   {"id": "s1"},
+	"mem_session_summary": {"content": "## Goal\nx"},
+}
+
+// directoryAwareWriteTools names the directory-aware tools that WRITE, i.e. the
+// ones mem_current_project's writes_blocked flag makes a promise about. Kept as
+// an explicit list rather than derived from a schema annotation, because "does
+// this call create a row" is a fact about the handler, not about its arguments
+// — and TestDirectoryAwareTools_EveryToolIsClassified fails until a newly added
+// tool is put on one side of the line or the other.
+var directoryAwareWriteTools = []string{
+	"mem_save",
+	"mem_save_prompt",
+	"mem_session_start",
+	"mem_session_summary",
+}
+
+// directoryAwareReadTools is the other half: tools that answer from the store
+// and never write, so a blocked directory only makes their answer a guess.
+var directoryAwareReadTools = []string{
+	"mem_current_project",
+	"mem_context",
+	"mem_doctor",
+	"mem_review",
+	"mem_search",
+}
+
+// minimalArgsFor returns a fresh copy of a tool's minimal arguments with extra
+// merged over it. A tool with no entry fails the test rather than being skipped
+// — a silently skipped case is a contract nobody is checking.
+func minimalArgsFor(t *testing.T, tool string, extra map[string]any) map[string]any {
+	t.Helper()
+	base, ok := directoryAwareMinimalArgs[tool]
+	if !ok {
+		t.Fatalf("directory-aware tool %q has no entry in directoryAwareMinimalArgs — "+
+			"add one so the directory-contract tests actually cover it", tool)
+	}
+	args := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		args[k] = v
+	}
+	for k, v := range extra {
+		args[k] = v
+	}
+	return args
+}
+
+// TestDirectoryAwareTools_EveryToolIsClassified keeps the three tables above in
+// step with the one map that is real. Adding a directory-aware tool without
+// classifying it leaves the writes_blocked contract untested for exactly the
+// tool most likely to break it.
+func TestDirectoryAwareTools_EveryToolIsClassified(t *testing.T) {
+	classified := map[string]int{}
+	for _, name := range directoryAwareWriteTools {
+		classified[name]++
+	}
+	for _, name := range directoryAwareReadTools {
+		classified[name]++
+	}
+	for name := range directoryAwareTools {
+		switch classified[name] {
+		case 0:
+			t.Errorf("directory-aware tool %q is in neither directoryAwareWriteTools nor directoryAwareReadTools — "+
+				"decide whether a blocked directory must REFUSE it or merely make its answer a guess", name)
+		case 1:
+		default:
+			t.Errorf("tool %q is classified as both a read and a write tool", name)
+		}
+		if _, ok := directoryAwareMinimalArgs[name]; !ok {
+			t.Errorf("directory-aware tool %q has no entry in directoryAwareMinimalArgs", name)
+		}
+	}
+	for name := range classified {
+		if !directoryAwareTools[name] {
+			t.Errorf("%q is classified here but is not in directoryAwareTools", name)
+		}
+	}
+	for name := range directoryAwareMinimalArgs {
+		if !directoryAwareTools[name] {
+			t.Errorf("directoryAwareMinimalArgs names %q, which is not directory-aware", name)
+		}
+	}
+}
