@@ -12,6 +12,7 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 
 | Tool | Purpose |
 |------|---------|
+| `mem_current_project` | Report which project THIS caller resolves to, and how (`fallback`/`writes_blocked` flag a guess) — the recommended first call of a session |
 | `mem_session_start` | Register the start of a coding session |
 | `mem_session_end` | Mark a session as completed with an optional summary |
 | `mem_save` | Save an observation (decision, bug fix, discovery, …) to persistent memory |
@@ -26,6 +27,15 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_session_summary` | Save a structured end-of-session summary |
 | `mem_judge` | Record a verdict on a conflict candidate surfaced by `mem_save` |
 | `mem_merge_projects` | Merge a source project's memories into a target name to fix name drift (local-only) |
+
+---
+
+### Confirm the project first
+
+Start a session with `mem_current_project`. It never errors, and it tells you which project every later call will be filed under plus how that name was derived. Two fields decide what you do next:
+
+- `fallback: true` — the name is only a directory basename. Nothing declared it, so pass an explicit `project` on later calls if it is not the name you want.
+- `writes_blocked: true` — the directory is ambiguous or misconfigured: reads answer from the basename, but `mem_save` / `mem_session_start` will refuse it until you pass `project` explicitly.
 
 ---
 

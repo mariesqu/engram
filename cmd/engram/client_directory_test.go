@@ -20,6 +20,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/controlapi"
 	"github.com/mariesqu/engram/internal/localstore"
+	projectpkg "github.com/mariesqu/engram/internal/project"
 )
 
 // These tests cover the client-directory forwarding contract end to end: the
@@ -1035,6 +1036,24 @@ func TestDaemonTools_EveryDirectoryAwareToolHonoursExplicitProject(t *testing.T)
 		seed   func(t *testing.T, store *localstore.Store, junkProject string)
 		verify func(t *testing.T, store *localstore.Store, text string)
 	}{
+		"mem_current_project": {
+			args: map[string]any{},
+			verify: func(t *testing.T, _ *localstore.Store, text string) {
+				t.Helper()
+				var env map[string]any
+				if err := json.Unmarshal([]byte(text), &env); err != nil {
+					t.Fatalf("response is not JSON (%v): %s", err, text)
+				}
+				if env["project"] != harnessProject {
+					t.Errorf("project = %v, want %q — the explicit project was ignored:\n%s",
+						env["project"], harnessProject, text)
+				}
+				if env["project_source"] != projectpkg.SourceExplicitOverride {
+					t.Errorf("project_source = %v, want %q:\n%s",
+						env["project_source"], projectpkg.SourceExplicitOverride, text)
+				}
+			},
+		},
 		"mem_session_start": {
 			args: map[string]any{"id": "harness-session"},
 			verify: func(t *testing.T, store *localstore.Store, _ string) {

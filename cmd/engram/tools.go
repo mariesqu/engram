@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -43,6 +44,7 @@ const directoryArgDescription = "Directory to resolve the project from. Normally
 // mem_judge, …) or derived from the data itself (mem_similar reads the source
 // row's project).
 var directoryAwareTools = map[string]bool{
+	"mem_current_project": true,
 	"mem_session_start":   true,
 	"mem_session_summary": true,
 	"mem_save":            true,
@@ -117,6 +119,35 @@ func resolveReadProject(explicitProject, directory string) string {
 // activity must be non-nil; it is shared across all write handlers so that
 // mem_save_prompt can record the current prompt and mem_save can auto-capture it.
 func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) {
+	// ── mem_current_project ──────────────────────────────────────────────────
+	// Registered first because it is meant to be CALLED first: agent protocols
+	// (gentle-ai's ODD protocol among them) open a session by asking which
+	// project this caller resolves to, before any read or write.
+	srv.AddTool(
+		mcp.NewTool("mem_current_project",
+			mcp.WithDescription(`Detect the project Engram resolves for THIS caller, and how it got there. Returns project, project_source, project_path, cwd, directory_source, available_projects, fallback, writes_blocked and an optional hint. NEVER errors — use it for discovery before writing. Recommended as the first call when starting a new session.
+
+Two fields say "do not trust this name blindly":
+  fallback=true       — the project is only a directory BASENAME (no .engram/config.json, git remote or git root). Pass an explicit project on later calls if that is not the name you want.
+  writes_blocked=true — the directory is ambiguous or misconfigured: reads fall back to the basename but mem_save/mem_session_start will REFUSE it until you pass project explicitly.`),
+			mcp.WithTitleAnnotation("Detect Current Project"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project. When set it is echoed back verbatim with project_source=\"explicit_override\" and no detection runs — the way to confirm the exact name your later calls will use."),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description("Alias for \"directory\", read ONLY when \"directory\" is absent — 'engram connect' injects the real client directory into \"directory\", and that value must keep winning over a hand-written path."),
+			),
+		),
+		handleCurrentProject(),
+	)
+
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -558,6 +589,133 @@ FORMAT — use this exact structure in the content field:
 		),
 		handleSessionSummary(store, loop, writerID),
 	)
+}
+
+// handleCurrentProject returns the handler for mem_current_project — the
+// session-bootstrap probe. It answers one question: which project will THIS
+// caller's tool calls resolve to, and how was that name derived?
+//
+// It reports the LENIENT read resolution (the resolveReadProject chain:
+// explicit project → detection from the resolved directory → basename), because
+// that is what mem_search / mem_context / mem_review actually answer from. What
+// it adds on top is the part an agent cannot otherwise see until something goes
+// wrong — the two ways that name is a GUESS rather than an identity:
+//
+//   - fallback=true: the project is only a directory basename. Nothing declared
+//     it (no .engram/config.json, no git remote, no git root), so it changes the
+//     day the folder is renamed.
+//   - directory_source="daemon_cwd": no directory reached the daemon, so the
+//     answer describes the DAEMON's working directory. The daemon is shared and
+//     typically resident from wherever autostart or the tray launched it (on
+//     Windows commonly C:\Windows\system32) — the original junk-project misfile.
+//
+// Plus writes_blocked=true for the read/write asymmetry: an ambiguous or
+// misconfigured directory answers reads from the basename but makes every write
+// tool hard-error (resolveSaveProject). Without the flag an agent learns that
+// only from a failed mem_save, halfway through a session.
+//
+// Like its upstream counterpart it NEVER returns a tool error: a discovery call
+// that fails is a discovery call an agent stops making.
+func handleCurrentProject() mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		explicitProject, _ := args["project"].(string)
+		directory, _ := args["directory"].(string)
+		if strings.TrimSpace(directory) == "" {
+			// "cwd" alias: the ODD protocol injected into agents tells them to name
+			// the workspace in "cwd". It is consulted ONLY when "directory" is
+			// empty, so the directory `engram connect` injects (this caller's real
+			// working directory) always outranks a model-supplied path.
+			directory, _ = args["cwd"].(string)
+		}
+
+		envelope := currentProjectEnvelope(explicitProject, directory)
+
+		out, err := json.Marshal(envelope)
+		if err != nil {
+			// Unreachable: the envelope holds only strings, bools and []string.
+			// Degrade to the one field that matters rather than to an error — the
+			// never-errors contract is the point of this tool.
+			return mcp.NewToolResultText(fmt.Sprintf("project: %v", envelope["project"])), nil
+		}
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+// currentProjectEnvelope builds the mem_current_project response body. It is
+// separated from the MCP plumbing so the resolution contract can be tested
+// directly; it reads the filesystem (detection) and, only when no directory was
+// forwarded, the process working directory.
+//
+// Every key is ALWAYS present except the three advisory ones (warning,
+// error_hint, hint), which appear only when they have something to say — the
+// shape a consumer can rely on.
+func currentProjectEnvelope(explicitProject, directory string) map[string]any {
+	directory = strings.TrimSpace(directory)
+	dir := resolveProjectDir(directory)
+
+	directorySource := "daemon_cwd"
+	if directory != "" {
+		directorySource = "argument"
+	}
+
+	env := map[string]any{
+		"project":            "",
+		"project_source":     "",
+		"project_path":       "",
+		"cwd":                dir,
+		"directory_source":   directorySource,
+		"available_projects": []string{},
+		"fallback":           false,
+		"writes_blocked":     false,
+	}
+
+	// An explicit project wins outright in every other tool (resolveReadProject /
+	// resolveSaveProject), so no detection runs here either: reporting a detected
+	// project beside an explicit one would only invite an agent to second-guess
+	// the name it just supplied.
+	if explicitProject = strings.TrimSpace(explicitProject); explicitProject != "" {
+		env["project"] = explicitProject
+		env["project_source"] = projectpkg.SourceExplicitOverride
+		return env
+	}
+
+	det := projectpkg.DetectProjectFull(dir)
+	env["project"] = det.Project
+	env["project_source"] = det.Source
+	env["project_path"] = det.Path
+	if len(det.AvailableProjects) > 0 {
+		env["available_projects"] = det.AvailableProjects
+	}
+	if det.Warning != "" {
+		env["warning"] = det.Warning
+	}
+
+	var hints []string
+	if det.Error != nil {
+		// Lenient, exactly like resolveReadProject: reads answer from the basename
+		// rather than erroring.
+		env["project"] = projectpkg.DetectProject(dir)
+		env["project_source"] = projectpkg.SourceDirBasename
+		env["project_path"] = dir
+		env["error_hint"] = det.Error.Error()
+		if errors.Is(det.Error, projectpkg.ErrInvalidConfig) || errors.Is(det.Error, projectpkg.ErrAmbiguousProject) {
+			env["writes_blocked"] = true
+			hints = append(hints, "reads fall back to the directory basename but writes (mem_save, mem_session_start, mem_session_summary) will REFUSE this directory — pass project explicitly")
+		}
+	}
+	if env["project_source"] == projectpkg.SourceDirBasename {
+		env["fallback"] = true
+		hints = append(hints, "the project name is only a directory basename (no .engram/config.json, git remote or git root) — pass project explicitly if that is not the name you want")
+	}
+	if directorySource == "daemon_cwd" {
+		hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
+	}
+	if len(hints) > 0 {
+		env["hint"] = strings.Join(hints, "; ")
+	}
+	return env
 }
 
 // handleSessionStart returns the handler for mem_session_start. It reads the
