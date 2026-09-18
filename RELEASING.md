@@ -73,9 +73,10 @@ Download the binary for your platform from the Releases page and run:
 # Linux/macOS
 sha256sum --check SHA256SUMS   # Linux; macOS: shasum -a 256 --check SHA256SUMS
 
-# Confirm the version prints correctly
+# Confirm the version prints correctly — ONE bare line, nothing else
 ./engram-v0.2.0-linux-amd64 version
-# Expected: engram v0.2.0 linux/amd64 go1.26.x
+# Expected: engram v0.2.0
+# (platform + Go runtime: ./engram-v0.2.0-linux-amd64 version --verbose)
 ```
 
 If the checksum fails or the version string is wrong, delete the release on

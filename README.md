@@ -110,7 +110,7 @@ Pre-built binaries for Linux, macOS, and Windows are published on the
 
    ```bash
    engram version
-   # engram vX.Y.Z linux/amd64 go1.26.x
+   # engram vX.Y.Z
    ```
 
 ## Build from source
@@ -717,10 +717,14 @@ engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
 engram import   [--from <old-db>] [--db <dest-db>] [--dry-run] [--writer-id <id>]
-engram version
+engram version [--verbose]
 ```
 
-`engram version` prints the binary version, GOOS/GOARCH, and Go runtime version.
+`engram version` prints ONE bare line — `engram vX.Y.Z` and nothing else.
+Integrators probe it by trimming the whole stdout and matching an anchored
+regexp (`^(?:engram\s+)?v?(\d+)\.(\d+)\.(\d+)$`), so any extra token, or a
+second line, fails the match *silently*. GOOS/GOARCH and the Go runtime version
+moved behind `--verbose` (`-v`), which prints them on a second line.
 Local dev builds print `dev` as the version; release binaries are stamped at
 link time (see [RELEASING.md](RELEASING.md)).
 

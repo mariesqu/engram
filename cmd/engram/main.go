@@ -56,7 +56,7 @@ Usage:
   engram memories edit <id> --title <t> --content <c> [--type <type>] [--db <path>]
   engram memories delete <id> [--yes] [--db <path>]
   engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
-  engram version
+  engram version [--verbose]
 
 Environment:
   ENGRAM_ADDR            default listen address for 'serve' (default ":8080")
@@ -84,7 +84,7 @@ Subcommands:
   sync      Trigger an immediate sync cycle (requires daemon --http).
   memories  Browse, review, edit, or delete stored memories (requires daemon --http).
   import    Import memories, prompts, and sessions from an old-generation engram database.
-  version   Print binary version, GOOS/GOARCH, and Go runtime version.
+  version   Print the binary version as one bare line ("engram vX.Y.Z"); --verbose adds GOOS/GOARCH and the Go runtime version.
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
 `
