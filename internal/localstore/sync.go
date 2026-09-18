@@ -80,7 +80,10 @@ func (s *Store) LocalWrite(m domain.Mutation) (domain.Mutation, error) {
 //     not at all: a crash between the two can never leave the local memory table
 //     updated without a corresponding outbox entry.
 func (s *Store) localWriteLocked(m domain.Mutation) (domain.Mutation, error) {
-	m = normalizeMutation(m)
+	if err := validateSuppliedPayload(m); err != nil {
+		return m, fmt.Errorf("LocalWrite: %w", err)
+	}
+	m = normalizeLocalMutation(m)
 
 	// Open the transaction FIRST so that Decide, applyTx, and enqueueOutboxTx all
 	// run on the same snapshot.
@@ -141,9 +144,9 @@ func (s *Store) localWriteLocked(m domain.Mutation) (domain.Mutation, error) {
 //
 // NormalizeTopicKey runs FIRST so that when normalizeMutation derives the
 // canonical payload (and therefore the content-addressed MutationID), no-topic
-// writes always reflect nil — &"" and nil converge — and '' never reaches any
+// writes always reflect nil — &"" and nil converge — and ” never reaches any
 // index (every partial topic index uses `WHERE topic_key IS NOT NULL`, which is
-// complete once '' is normalised away at store entry).
+// complete once ” is normalised away at store entry).
 func normalizeMutation(m domain.Mutation) domain.Mutation {
 	m = domain.NormalizeTopicKey(m) // fold &"" → nil before payload/ID derivation
 	if len(m.Payload) == 0 {
@@ -156,6 +159,37 @@ func normalizeMutation(m domain.Mutation) domain.Mutation {
 		m.OccurredAt = time.Now().UTC()
 	}
 	return m
+}
+
+// normalizeLocalMutation prepares a newly-created local mutation. When no
+// canonical payload was supplied, the sanitized fields are the sole source of
+// truth for materialization, payload construction, and mutation-ID derivation.
+// Any caller-supplied ID without a payload is therefore replaced by the hash of
+// the payload we construct. An externally supplied payload remains immutable.
+func normalizeLocalMutation(m domain.Mutation) domain.Mutation {
+	if len(m.Payload) == 0 {
+		m = mutation.SanitizeTextFields(m)
+		m = domain.NormalizeTopicKey(m)
+		m.Payload = mutation.CanonicalPayload(m)
+		m.MutationID = mutation.NewMutationID(m.Payload)
+	}
+	return normalizeMutation(m)
+}
+
+// validateSuppliedPayload validates, but never rewrites, an externally supplied
+// canonical payload. New local mutations have no payload and are sanitized by
+// normalizeMutation instead.
+func validateSuppliedPayload(m domain.Mutation) error {
+	if len(m.Payload) == 0 {
+		return nil
+	}
+	if err := mutation.ValidateCanonicalPayloadText(m.Payload); err != nil {
+		return fmt.Errorf("invalid supplied canonical payload: %w", err)
+	}
+	if err := mutation.ValidateTextFields(m); err != nil {
+		return fmt.Errorf("invalid supplied mutation: %w", err)
+	}
+	return nil
 }
 
 // enqueueOutboxTx inserts the mutation into sync_mutations on the given
@@ -468,6 +502,9 @@ func (s *Store) ListProjects() ([]string, error) {
 // never re-pull it: permanent, invisible data loss.  With the error the cursor
 // stays put and the flip-back re-pulls the mutation cleanly.
 func (s *Store) ApplyPulled(m domain.Mutation) error {
+	if err := validateSuppliedPayload(m); err != nil {
+		return fmt.Errorf("ApplyPulled: %w", err)
+	}
 	// Defensive policy check (outside the write lock — GetPolicy is safe for
 	// concurrent reads).
 	pol, err := s.GetPolicy(m.Project)

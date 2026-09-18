@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/mariesqu/engram/internal/domain"
+	"github.com/mariesqu/engram/internal/mutation"
 )
 
 // Apply is the central (push-apply) reconciliation: it takes a single mutation
@@ -64,6 +65,18 @@ import (
 // tiebreaker; it serves only as the pull-cursor / journal ordering authority
 // (see writeWins in domain/reconcile.go).
 func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
+	// Reject unsupported text before beginning a transaction. The wire boundary
+	// performs the same validation for an actionable 400 response; this check
+	// protects direct Store callers and guarantees PostgreSQL never sees U+0000.
+	if len(m.Payload) > 0 {
+		if err := mutation.ValidateCanonicalPayloadText(m.Payload); err != nil {
+			return fmt.Errorf("Apply: invalid canonical payload: %w", err)
+		}
+	}
+	if err := mutation.ValidateTextFields(m); err != nil {
+		return fmt.Errorf("Apply: invalid mutation: %w", err)
+	}
+
 	// Normalize TopicKey at store entry: fold &"" → nil so '' never reaches any
 	// central index. Every partial topic index uses `WHERE topic_key IS NOT NULL`,
 	// which is the complete no-topic exclusion once '' is normalised away here.

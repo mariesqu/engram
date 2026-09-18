@@ -240,6 +240,38 @@ func TestAddPromptIfMissing_Dedup(t *testing.T) {
 	}
 }
 
+func TestAddPromptIfMissing_SanitizesNULBeforeDedupAndPersistence(t *testing.T) {
+	s := openTempStore(t)
+	p := AddPromptParams{
+		SessionID: "session-nul",
+		Project:   "engram",
+		Content:   "prompt\x00body\x01",
+		WriterID:  "writer-nul",
+	}
+
+	first, err := s.AddPromptIfMissing(p)
+	if err != nil {
+		t.Fatalf("first AddPromptIfMissing: %v", err)
+	}
+	second, err := s.AddPromptIfMissing(p)
+	if err != nil {
+		t.Fatalf("second AddPromptIfMissing: %v", err)
+	}
+	if first.SyncID != second.SyncID {
+		t.Fatalf("sanitized prompt was not deduplicated: %q != %q", first.SyncID, second.SyncID)
+	}
+	if first.Content != "promptbody\x01" {
+		t.Fatalf("stored content = %q, want NUL removed and U+0001 preserved", first.Content)
+	}
+	entries, err := s.DrainOutbox(0)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Mutation.Content != first.Content {
+		t.Fatalf("outbox = %+v, want one prompt with content %q", entries, first.Content)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TestTombstone_DeleteRevive
 // ─────────────────────────────────────────────────────────────────────────────

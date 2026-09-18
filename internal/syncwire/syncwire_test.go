@@ -1,7 +1,9 @@
 package syncwire_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -649,4 +651,105 @@ func TestFromWire_RejectsEmptyMutationID(t *testing.T) {
 	if _, err := syncwire.FromWire(syncwire.ToWire(makeMutation(t, nil))); err != nil {
 		t.Errorf("FromWire(valid mutation_id): unexpected error: %v", err)
 	}
+}
+
+func TestFromWire_RejectsCanonicalPayloadContainingNUL(t *testing.T) {
+	m := makeMutation(t, nil)
+	m.Content = "bad\x00content"
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+	w := syncwire.ToWire(m)
+	originalPayload := append([]byte(nil), w.Payload...)
+
+	_, err := syncwire.FromWire(w)
+	if err == nil || !strings.Contains(err.Error(), `"content"`) || !strings.Contains(err.Error(), "U+0000") {
+		t.Fatalf("FromWire error = %v, want actionable content/U+0000 error", err)
+	}
+	if !bytes.Equal(w.Payload, originalPayload) {
+		t.Fatal("FromWire mutated externally supplied payload")
+	}
+}
+
+func TestFromWire_RejectsNULAnywhereInCanonicalJSON(t *testing.T) {
+	base := makeMutation(t, nil)
+	basePayload := mutation.CanonicalPayload(base)
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name:    "unknown field value",
+			payload: appendJSONField(t, basePayload, `"unknown":"bad\u0000value"`),
+		},
+		{
+			name:    "object key",
+			payload: appendJSONField(t, basePayload, `"bad\u0000key":"value"`),
+		},
+		{
+			name:    "shadowed earlier duplicate field",
+			payload: prependJSONField(t, basePayload, `"content":"bad\u0000shadow"`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalPayload := append([]byte(nil), tt.payload...)
+			w := syncwire.WireMutation{
+				MutationID: mutation.NewMutationID(tt.payload),
+				OccurredAt: base.OccurredAt.UTC().Format(time.RFC3339Nano),
+				Payload:    tt.payload,
+			}
+
+			_, err := syncwire.FromWire(w)
+			if err == nil || !strings.Contains(err.Error(), "U+0000") {
+				t.Fatalf("FromWire error = %v, want actionable U+0000 error", err)
+			}
+			if !bytes.Equal(w.Payload, originalPayload) {
+				t.Fatal("FromWire mutated externally supplied payload")
+			}
+		})
+	}
+}
+
+func TestFromWire_AllowsU0001AndPreservesWireIdentity(t *testing.T) {
+	base := makeMutation(t, nil)
+	payload := appendJSONField(t, mutation.CanonicalPayload(base), `"unknown":"allowed\u0001value"`)
+	w := syncwire.WireMutation{
+		MutationID: "externally-supplied-id",
+		OccurredAt: base.OccurredAt.UTC().Format(time.RFC3339Nano),
+		Payload:    payload,
+	}
+
+	got, err := syncwire.FromWire(w)
+	if err != nil {
+		t.Fatalf("FromWire rejected U+0001: %v", err)
+	}
+	if got.MutationID != w.MutationID {
+		t.Fatalf("MutationID = %q, want externally supplied %q", got.MutationID, w.MutationID)
+	}
+	if !bytes.Equal(got.Payload, payload) {
+		t.Fatalf("Payload = %q, want externally supplied bytes %q", got.Payload, payload)
+	}
+}
+
+func appendJSONField(t *testing.T, payload []byte, field string) []byte {
+	t.Helper()
+	if len(payload) == 0 || payload[len(payload)-1] != '}' {
+		t.Fatalf("test payload is not a JSON object: %q", payload)
+	}
+	result := append([]byte(nil), payload[:len(payload)-1]...)
+	result = append(result, ',')
+	result = append(result, field...)
+	return append(result, '}')
+}
+
+func prependJSONField(t *testing.T, payload []byte, field string) []byte {
+	t.Helper()
+	if len(payload) == 0 || payload[0] != '{' {
+		t.Fatalf("test payload is not a JSON object: %q", payload)
+	}
+	result := []byte{'{'}
+	result = append(result, field...)
+	result = append(result, ',')
+	return append(result, payload[1:]...)
 }

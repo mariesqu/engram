@@ -13,19 +13,19 @@
 //
 // Field split:
 //
-//   IN the canonical payload (reconstructed by mutation.FromCanonicalPayload):
-//     Op, SyncID, SessionID, EntityType, Type, Title, Content, Project, Scope,
-//     TopicKey, Status, ParentSyncID, Version, UpdatedAt, WriterID.
+//	IN the canonical payload (reconstructed by mutation.FromCanonicalPayload):
+//	  Op, SyncID, SessionID, EntityType, Type, Title, Content, Project, Scope,
+//	  TopicKey, Status, ParentSyncID, Version, UpdatedAt, WriterID.
 //
-//   OUTSIDE the payload (siblings on the wire):
-//     mutation_id  — SHA-256 of the payload bytes.
-//     occurred_at  — RFC3339Nano UTC string; the SENDER's local write time
-//                    (set by LocalWrite/normalizeMutation), not part of the
-//                    payload. Required on the wire: ToWire always emits it and
-//                    FromWire rejects an empty value.
-//     seq          — central_mutations BIGSERIAL; 0 / omitted on push,
-//                    positive on pull.
-//     payload      — the raw canonical JSON bytes (embedded as a JSON sub-object).
+//	OUTSIDE the payload (siblings on the wire):
+//	  mutation_id  — SHA-256 of the payload bytes.
+//	  occurred_at  — RFC3339Nano UTC string; the SENDER's local write time
+//	                 (set by LocalWrite/normalizeMutation), not part of the
+//	                 payload. Required on the wire: ToWire always emits it and
+//	                 FromWire rejects an empty value.
+//	  seq          — central_mutations BIGSERIAL; 0 / omitted on push,
+//	                 positive on pull.
+//	  payload      — the raw canonical JSON bytes (embedded as a JSON sub-object).
 package syncwire
 
 import (
@@ -132,6 +132,9 @@ func FromWire(w WireMutation) (domain.Mutation, error) {
 	if err != nil {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: decode payload: %w", err)
 	}
+	if err := mutation.ValidateCanonicalPayloadText(w.Payload); err != nil {
+		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: invalid canonical payload: %w", err)
+	}
 
 	// Parse occurred_at — it must be a valid RFC3339Nano timestamp in UTC (Z suffix).
 	if w.OccurredAt == "" {
@@ -195,13 +198,13 @@ type PushRequest struct {
 // push (failures are signaled by a non-2xx HTTP status, not this body).
 //
 //   - Status     — always "ok". The server cannot distinguish a fresh apply from an
-//                  idempotent re-push or a version-guard NoOp, because
-//                  centralstore.Apply returns nil for all of them. Surfacing that
-//                  distinction would require an additive ApplyWithOutcome on
-//                  centralstore (the deferred 409; see package cloudserve).
+//     idempotent re-push or a version-guard NoOp, because
+//     centralstore.Apply returns nil for all of them. Surfacing that
+//     distinction would require an additive ApplyWithOutcome on
+//     centralstore (the deferred 409; see package cloudserve).
 //   - MutationID — the mutation_id the server processed (echoes the request's).
 //   - Applied    — always true on success, meaning "the server accepted and
-//                  processed the mutation" — NOT "this write won the LWW merge".
+//     processed the mutation" — NOT "this write won the LWW merge".
 type PushResponse struct {
 	Status     string `json:"status"`
 	MutationID string `json:"mutation_id"`
