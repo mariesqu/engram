@@ -18,6 +18,7 @@ package main
 // two in sync — and keep BOTH honest about the tool surface actually registered
 // in registerTools. Naming a tool here that the server does not register is
 // worse than omitting it: the agent will call it and get a protocol error.
+// TestServerInstructions_OnlyNameRegisteredTools enforces exactly that.
 
 // serverInstructions is the protocol text handed to MCP clients in the
 // initialize result. It is a package-level constant so the acceptance tests can
@@ -42,6 +43,7 @@ TOOLS
   mem_update           — edit one observation in place by id; omitted fields keep their value.
   mem_suggest_topic_key— a stable topic_key so re-saves UPSERT one chain instead of duplicating.
   mem_context          — recent sessions and observations. Call at session start and after any compaction.
+  mem_pin / mem_unpin  — keep a memory in front of you: pinned rows lead mem_context and rank higher in search. Local to this machine, never synced.
   mem_review           — list memories by lifecycle status (active|needs_review|expired), or mark_reviewed to reset the clock.
   mem_judge            — record a verdict on a conflict candidate surfaced by mem_save.
   mem_merge_projects   — merge a source project's memories into a target name to fix name drift.

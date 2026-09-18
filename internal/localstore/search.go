@@ -60,6 +60,30 @@ type SearchFilter struct {
 	Offset int
 }
 
+// ftsPinnedBoost is the multiplicative boost a pinned row gets in the FTS
+// ORDER BY: 10%, ported from the upstream composite rank.
+//
+// It multiplies rather than adds because bm25() returns a NEGATIVE score (more
+// negative = better match) and the results are ordered ASC — scaling by 1.10
+// moves a pinned row further from zero, i.e. earlier. It is deliberately small:
+// pinning should break a near-tie in the pinned row's favour, not drag an
+// irrelevant memory to the top of an unrelated search.
+//
+// Only the pinned term of upstream's composite rank is ported. Upstream also
+// multiplies in a recency term (from last_seen_at) and a stability term (from
+// revision_count + duplicate_count); this schema has none of those three
+// columns, so there is nothing to compute them from. Adding a recency term off
+// updated_at instead would silently reorder every existing search result, which
+// is not something a pinning feature gets to do — it belongs in its own change
+// with its own before/after evidence.
+const ftsPinnedBoost = 1.10
+
+// ftsRankExpr is the ORDER BY expression shared by the FTS-only path and the
+// FTS half of hybrid, so the two can never rank the same corpus differently.
+// It requires the memories table to be aliased `m` and the FTS table `fts`.
+var ftsRankExpr = fmt.Sprintf(
+	"fts.rank * (CASE WHEN m.pinned = 1 THEN %.2f ELSE 1.0 END)", ftsPinnedBoost)
+
 // dateRangeSQL appends CreatedFrom/CreatedTo predicates (if set) to a WHERE
 // clause being built for the given column expression (e.g. "m.created_at" or
 // "created_at"), returning the updated query string and args. datetime(...)
@@ -177,7 +201,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		if offset < 0 {
 			offset = 0
 		}
-		q += "\nORDER BY fts.rank\nLIMIT ? OFFSET ?"
+		q += "\nORDER BY " + ftsRankExpr + "\nLIMIT ? OFFSET ?"
 		args = append(args, limit, offset)
 
 		rows, err := s.db.Query(q, args...)
@@ -321,7 +345,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			args = append(args, f.TopicKey)
 		}
 		q, args = dateRangeSQL(q, args, "m.created_at", f)
-		q += "\nORDER BY fts.rank\nLIMIT ?"
+		q += "\nORDER BY " + ftsRankExpr + "\nLIMIT ?"
 		args = append(args, poolSize)
 		rows, err := s.db.Query(q, args...)
 		if err != nil {
@@ -480,13 +504,45 @@ func (s *Store) countNullEmbeddings() int {
 	return n
 }
 
+// pinFilter selects which side of the pinned flag a recent-observations query
+// covers. It exists so the three variants share one query body instead of three
+// near-identical copies that can drift.
+type pinFilter int
+
+const (
+	pinAny      pinFilter = iota // no pinned predicate — every live row
+	pinOnly                      // pinned = 1
+	pinExcluded                  // pinned = 0
+)
+
 // RecentObservations returns the most recent live (non-deleted) memories ordered
 // by created_at DESC, id DESC. project and scope are optional filters; an empty
 // string disables the filter for that dimension. limit <= 0 defaults to 20.
 //
-// Mirrors the legacy predecessor's store.RecentObservations (project+scope
-// variant).
+// It ignores the pinned flag entirely — pinning changes where a memory is
+// SURFACED, not whether it exists. Callers that want the split use
+// PinnedObservations / RecentUnpinnedObservations.
 func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.Record, error) {
+	return s.recentObservations(project, scope, limit, pinAny)
+}
+
+// PinnedObservations returns the live PINNED memories for project/scope, newest
+// first. Pinning is an explicit, hand-bounded act, but the caller still caps it
+// (FormatContext at 20) so one over-enthusiastic pinning session cannot crowd
+// every recent observation out of the context blob.
+func (s *Store) PinnedObservations(project, scope string, limit int) ([]*domain.Record, error) {
+	return s.recentObservations(project, scope, limit, pinOnly)
+}
+
+// RecentUnpinnedObservations is RecentObservations minus the pinned rows. It is
+// the second half of the context split: pinned memories are rendered in their
+// own section, so repeating them under "Recent Observations" would spend the
+// caller's context window saying the same thing twice.
+func (s *Store) RecentUnpinnedObservations(project, scope string, limit int) ([]*domain.Record, error) {
+	return s.recentObservations(project, scope, limit, pinExcluded)
+}
+
+func (s *Store) recentObservations(project, scope string, limit int, pin pinFilter) ([]*domain.Record, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -501,6 +557,14 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.
 		WHERE deleted_at IS NULL`
 	args := []any{}
 
+	switch pin {
+	case pinOnly:
+		q += "\n  AND pinned = 1"
+	case pinExcluded:
+		q += "\n  AND pinned = 0"
+	case pinAny:
+		// no predicate
+	}
 	if project != "" {
 		q += "\n  AND LOWER(project) = ?"
 		args = append(args, project)
@@ -612,6 +676,19 @@ func truncateStr(s string, n int) string {
 	return string(runes[:n]) + "..."
 }
 
+// contextPinnedLimit caps the "### Pinned" section of FormatContext. Pinning is
+// a deliberate act, but nothing stops a user from pinning fifty memories, and an
+// unbounded section would push every recent observation out of the caller's
+// context window.
+const contextPinnedLimit = 20
+
+// writeObservationBullet renders one observation line. Shared by the "### Pinned"
+// and "### Recent Observations" sections so the two can never drift into
+// different shapes for the same data.
+func writeObservationBullet(b *strings.Builder, obs *domain.Record) {
+	fmt.Fprintf(b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncateStr(obs.Content, 300))
+}
+
 // FormatContext assembles the agent-facing memory context blob from recent
 // sessions and recent observations, mirroring the legacy predecessor's
 // store.FormatContext.
@@ -623,8 +700,19 @@ func truncateStr(s string, n int) string {
 //	### Recent Sessions
 //	- **project** (started_at → last_activity_at)[: summary] [N observations]
 //
+//	### Pinned
+//	- [type] **title**: content_preview
+//
 //	### Recent Observations
 //	- [type] **title**: content_preview
+//
+// Pinned comes FIRST and Recent Observations excludes pinned rows. Both halves
+// of that matter: a pin is the user saying "this one, always", so burying it in
+// recency order defeats the point — and repeating it below would spend the
+// caller's context window saying the same thing twice. The section is capped
+// (contextPinnedLimit) so an over-enthusiastic pinning session cannot crowd out
+// every recent observation. It is omitted entirely when nothing is pinned, so a
+// store that has never used mem_pin renders exactly as it always did.
 //
 // The session bullet carries BOTH timestamps because the list is ordered by
 // last activity (see RecentSessions): showing only started_at would leave the
@@ -641,12 +729,17 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", fmt.Errorf("FormatContext: RecentSessions: %w", err)
 	}
 
-	observations, err := s.RecentObservations(project, scope, 20)
+	pinned, err := s.PinnedObservations(project, scope, contextPinnedLimit)
 	if err != nil {
-		return "", fmt.Errorf("FormatContext: RecentObservations: %w", err)
+		return "", fmt.Errorf("FormatContext: PinnedObservations: %w", err)
 	}
 
-	if len(sessions) == 0 && len(observations) == 0 {
+	observations, err := s.RecentUnpinnedObservations(project, scope, 20)
+	if err != nil {
+		return "", fmt.Errorf("FormatContext: RecentUnpinnedObservations: %w", err)
+	}
+
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 {
 		return "", nil
 	}
 
@@ -687,11 +780,18 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("\n")
 	}
 
+	if len(pinned) > 0 {
+		b.WriteString("### Pinned\n")
+		for _, obs := range pinned {
+			writeObservationBullet(&b, obs)
+		}
+		b.WriteString("\n")
+	}
+
 	if len(observations) > 0 {
 		b.WriteString("### Recent Observations\n")
 		for _, obs := range observations {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncateStr(obs.Content, 300))
+			writeObservationBullet(&b, obs)
 		}
 		b.WriteString("\n")
 	}

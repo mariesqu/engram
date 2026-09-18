@@ -146,7 +146,22 @@ import (
 //	reuse it without another migration. The table is idempotent (CREATE TABLE IF
 //	NOT EXISTS in ApplySchema), so a fresh DB where ApplySchema already created it
 //	is a no-op in the migration.
-const currentSchemaVersion = 12
+//
+// v12 → v13: add memories.pinned (BOOLEAN NOT NULL DEFAULT 0), backing mem_pin /
+//
+//	mem_unpin. A plain additive ALTER TABLE ADD COLUMN guarded by PRAGMA
+//	table_info, so a fresh DB (where memoriesTableDDL already declares it) is a
+//	no-op. Existing rows default to 0 — unpinned is the correct state for every
+//	memory saved before the feature existed.
+//
+//	pinned is LOCAL-ONLY by construction: it is absent from the canonical payload
+//	(mutation.CanonicalPayload) and therefore from the sync wire, and no
+//	reconciliation path reads it. "This matters to ME, on THIS machine" is a
+//	per-node judgment — the same posture as review_after — so it deliberately does
+//	not travel, and no central-store or reconcile invariant changes because of it.
+//	The FTS index is untouched (pinned is not a searchable text column), so the
+//	triggers need no rebuild.
+const currentSchemaVersion = 13
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -300,6 +315,9 @@ const memoriesTableDDL = `CREATE TABLE IF NOT EXISTS memories (
 	deleted_at      TEXT,
 	review_after    TEXT,
 	expires_at      TEXT,
+	-- pinned is LOCAL-ONLY: never in the canonical payload, never on the wire,
+	-- never read by reconciliation. See the v12 → v13 note above.
+	pinned          BOOLEAN NOT NULL DEFAULT 0,
 	-- Application-level invariants encoded as CHECK constraints.
 	-- Only 'memory' rows may omit status.
 	CHECK(entity_type = 'memory' OR status IS NOT NULL),
@@ -530,9 +548,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 12
 	}
 
+	if ver < 13 {
+		if err := migrateV12ToV13(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 13
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 12` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 13` migration block.
+	// the final `ver = 13` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 14` migration block.
 	_ = ver
 	return nil
 }
@@ -1257,6 +1283,36 @@ func migrateV11ToV12(db *sql.DB) error {
 	}
 
 	if _, err := tx.Exec(`PRAGMA user_version = 12`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV12ToV13 adds memories.pinned, the local-only flag behind mem_pin /
+// mem_unpin.  Purely additive: existing rows default to 0 (unpinned), which is
+// the correct state for every memory saved before the feature existed.  Guarded
+// by PRAGMA table_info so a fresh DB — where ApplySchema already created the
+// column from memoriesTableDDL — is a no-op.
+func migrateV12ToV13(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	exists, err := columnExists(tx, "memories", "pinned")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := tx.Exec(
+			`ALTER TABLE memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT 0`,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 13`); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -24,6 +24,8 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_similar` | Find observations semantically nearest a given memory (by sync_id) |
 | `mem_review` | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the clock (local-only) |
 | `mem_context` | Assemble recent sessions and observations into a context summary |
+| `mem_pin` | Pin a memory so it leads `mem_context` and ranks higher in keyword search (local-only) |
+| `mem_unpin` | Unpin a memory, returning it to normal recency order (local-only) |
 | `mem_session_summary` | Save a structured end-of-session summary |
 | `mem_judge` | Record a verdict on a conflict candidate surfaced by `mem_save` |
 | `mem_merge_projects` | Merge a source project's memories into a target name to fix name drift (local-only) |
@@ -70,6 +72,14 @@ When the user references past work ("remember…", "how did we…", "what was th
 3. If a result looks relevant, call `mem_get_observation` with its numeric ID to get the full untruncated content (search results are truncated)
 
 Also search **proactively** at the start of a session when the user's first message references a project, feature, or problem — call `mem_search` before responding.
+
+---
+
+### Pinning
+
+`mem_pin` keeps a memory in front of you: pinned observations render in their own `### Pinned` section at the top of `mem_context` (ahead of recent observations, which exclude them) and get a small ranking boost in keyword search. Reserve it for the handful of facts that must not scroll away — the stack decision, the gotcha that keeps biting. `mem_unpin` reverses it.
+
+Pinned state is **local to this machine** and never syncs: it is your judgment about your own context, not shared truth.
 
 ---
 

@@ -890,7 +890,7 @@ If the agent's context is cleared or compacted, the persistent store is unaffect
 
 ## MCP tools
 
-The daemon exposes 15 tools to the connected agent.
+The daemon exposes 17 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
@@ -906,6 +906,8 @@ The daemon exposes 15 tools to the connected agent.
 | `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
 | `mem_review`          | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the staleness clock (local-only) |
 | `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
+| `mem_pin`             | Pin a memory so it leads `mem_context` and ranks higher in keyword search (local-only) |
+| `mem_unpin`           | Unpin a memory, returning it to normal recency order (local-only)                    |
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
 | `mem_merge_projects`  | Merge a source project's memories into a target name to fix project name drift (local-only) |

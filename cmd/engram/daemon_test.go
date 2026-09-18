@@ -351,6 +351,8 @@ func TestBuildDaemon_MCPServerTools(t *testing.T) {
 		"mem_session_summary",
 		"mem_search",
 		"mem_context",
+		"mem_pin",
+		"mem_unpin",
 		"mem_judge",
 		"mem_save_prompt",
 		"mem_similar",
