@@ -358,6 +358,7 @@ func TestBuildDaemon_MCPServerTools(t *testing.T) {
 		"mem_similar",
 		"mem_review",
 		"mem_merge_projects",
+		"mem_doctor",
 	}
 	if len(tools) != len(wantTools) {
 		names := make([]string, 0, len(tools))

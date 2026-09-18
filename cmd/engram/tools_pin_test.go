@@ -171,7 +171,7 @@ func TestMemPin_SurfacesInMemContext(t *testing.T) {
 }
 
 // TestRegisterTools_PinToolsAreRegistered keeps the tool surface honest: the
-// server must advertise exactly the 17 tools the docs and the MCP instructions
+// server must advertise exactly the 18 tools the docs and the MCP instructions
 // text promise, with mem_pin/mem_unpin among them.
 func TestRegisterTools_PinToolsAreRegistered(t *testing.T) {
 	c := newPinDaemon(t)
@@ -181,7 +181,7 @@ func TestRegisterTools_PinToolsAreRegistered(t *testing.T) {
 		"mem_current_project", "mem_session_start", "mem_session_end", "mem_save",
 		"mem_save_prompt", "mem_get_observation", "mem_update", "mem_suggest_topic_key",
 		"mem_search", "mem_context", "mem_pin", "mem_unpin", "mem_judge", "mem_similar",
-		"mem_review", "mem_merge_projects", "mem_session_summary",
+		"mem_review", "mem_merge_projects", "mem_session_summary", "mem_doctor",
 	}
 	if len(tools) != len(want) {
 		names := make([]string, 0, len(tools))

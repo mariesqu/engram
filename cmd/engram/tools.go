@@ -14,6 +14,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/mariesqu/engram/internal/diagnostic"
 	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 	projectpkg "github.com/mariesqu/engram/internal/project"
@@ -132,6 +133,7 @@ func (d directoryArg) toolError(tool string) *mcp.CallToolResult {
 // row's project).
 var directoryAwareTools = map[string]bool{
 	"mem_current_project": true,
+	"mem_doctor":          true,
 	"mem_session_start":   true,
 	"mem_session_summary": true,
 	"mem_save":            true,
@@ -698,6 +700,37 @@ Renames every local memory under "from" to live under "to", and dedups the per-p
 			),
 		),
 		handleMergeProjects(store),
+	)
+
+	// ── mem_doctor ───────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_doctor",
+			mcp.WithDescription(`Run read-only operational diagnostics over the local store and return a structured report.
+
+Answers the questions that otherwise surface as confusing symptoms much later: observations whose session no longer exists, a session filed under a project its directory no longer resolves to, several sessions still "open" for the same directory, projects syncing on a default nobody chose, SQLite lock contention, a review backlog that has swallowed the lifecycle signal, and an outbox that is not draining.
+
+Response: {status, project, summary{total,ok,warnings,blocked,errors}, checks[{check_id, result, severity, reason_code, message, why, evidence, safe_next_step, requires_confirmation, findings[]}]}. status rolls up worst-first: error > blocked > warning > ok.
+
+It NEVER writes. Every finding carries a safe_next_step for YOU to run deliberately — the conditions it reports are the ones where the right fix depends on context the store does not have.`),
+			mcp.WithTitleAnnotation("Run Diagnostics"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project to scope the per-project checks to. When omitted it is auto-detected from the working directory, exactly as mem_search and mem_context resolve it. The node-wide checks (sqlite_lock_contention, sync_backlog) report the same either way."),
+			),
+			mcp.WithString("check",
+				mcp.Description("Optional single check to run: "+strings.Join(diagnostic.RegisteredCodes(), ", ")+". Omit to run all of them."),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
+		),
+		handleDoctor(store),
 	)
 
 	// ── mem_session_summary ──────────────────────────────────────────────────
@@ -2151,3 +2184,52 @@ func normalizeForDrift(s string) string {
 
 // (levenshtein/min3 removed: the name-drift warning is now case/separator-only,
 // see nearVariantProject.)
+
+// handleDoctor returns the handler for mem_doctor — the read-only diagnostics
+// pass over this node's store.
+//
+// Project scope follows the LENIENT read resolution (resolveReadProject), the
+// same chain mem_search and mem_context answer from, so the per-project checks
+// describe the project the agent's other calls are actually using. The two
+// node-wide checks (sqlite_lock_contention, sync_backlog) ignore the scope by
+// construction: a held lock and an undrained outbox belong to the machine.
+//
+// The result is the diagnostic.Report envelope as JSON. It is marked IsError
+// only when the report's own status is "error" — a report full of warnings is a
+// SUCCESSFUL diagnosis, and flagging it as a tool error would teach an agent
+// that running the doctor is something that fails.
+func handleDoctor(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		explicitProject, _ := args["project"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_doctor"), nil
+		}
+		check, _ := args["check"].(string)
+
+		scope := diagnostic.Scope{
+			Store:   store,
+			Project: resolveReadProject(explicitProject, dirArg.Directory),
+			Now:     time.Now().UTC(),
+		}
+
+		runner := diagnostic.NewRunner()
+		report := runner.RunAll(ctx, scope)
+		if strings.TrimSpace(check) != "" {
+			report = runner.RunOne(ctx, scope, strings.TrimSpace(check))
+		}
+
+		out, err := json.Marshal(report)
+		if err != nil {
+			// Unreachable in practice (the report holds strings, ints and
+			// pre-marshaled evidence), but a diagnostics tool that dies on its own
+			// formatting would be a poor advertisement for diagnostics.
+			return mcp.NewToolResultError("mem_doctor: encode report: " + err.Error()), nil
+		}
+		result := mcp.NewToolResultText(string(out))
+		result.IsError = report.Status == diagnostic.StatusError
+		return result, nil
+	}
+}

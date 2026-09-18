@@ -620,6 +620,7 @@ var hookMCPToolNames = []string{
 	"mem_unpin",
 	"mem_judge",
 	"mem_merge_projects",
+	"mem_doctor",
 }
 
 // hookBootstrapContext is the first-prompt injection: what to call first, and

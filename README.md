@@ -958,7 +958,7 @@ If the agent's context is cleared or compacted, the persistent store is unaffect
 
 ## MCP tools
 
-The daemon exposes 17 tools to the connected agent.
+The daemon exposes 18 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
@@ -979,6 +979,7 @@ The daemon exposes 17 tools to the connected agent.
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
 | `mem_merge_projects`  | Merge a source project's memories into a target name to fix project name drift (local-only) |
+| `mem_doctor`          | Run read-only diagnostics over the local store and return a structured report (never writes) |
 
 ### Project probe: `mem_current_project`
 
@@ -993,6 +994,24 @@ Call it first, and read three fields before writing anything:
 Plus `hints`, an **array** of one plain sentence per reason the answer is untrustworthy (they compose — a daemon-cwd answer for a missing directory under an omitted project is three separate problems), `directory_source` (`argument` = injected by `engram connect`; `cwd_alias` = a path the caller supplied; `daemon_cwd` = nobody supplied one, so the answer describes the *daemon's* directory; `invalid_directory_argument` = `directory` was present but not a string, and was ignored), `cwd` (absolute and cleaned), `cwd_input` (the caller's value, verbatim) and `project_path` (the project's canonical directory: the repo root, the directory holding `.engram/config.json`, or the resolved cwd).
 
 `cwd` is accepted as an alias of `directory` by **every** project-resolving tool, and is read only when `directory` is absent or blank — the injected client directory must keep outranking a hand-written path. A `directory` that is present but **not a string** is a caller error: every tool except `mem_current_project` refuses the call (that one reports it in the envelope instead, since it never errors). It is never silently downgraded to the `cwd` alias — `engram connect` leaves a non-string `directory` alone on purpose, so the daemon is the only place left that can tell you about it.
+
+### Diagnostics: `mem_doctor`
+
+Read-only checks over the local store, for the moments when something looks wrong and nothing says why. `mem_doctor` returns `{status, project, summary{total,ok,warnings,blocked,errors}, checks[]}`; `status` rolls up worst-first (`error` > `blocked` > `warning` > `ok`), and each check carries a `message`, a `why`, an `evidence` blob and a `safe_next_step`.
+
+| Check | What it catches |
+|-------|-----------------|
+| `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. |
+| `session_project_directory_mismatch` | A session filed under one project whose directory resolves to another today. Only *declared* identities count (config file, git remote, git root) — comparing two basename guesses would report drift that is not there. |
+| `ambiguous_active_sessions` | Two or more sessions still open for the same project + directory, usually an agent host that exited without firing its session-end hook. |
+| `project_policy_unknown` | Projects with memories but no explicit policy row, **only when central is configured** — they are being pushed on a computed default of `synced` that nobody chose. Informational. |
+| `sqlite_lock_contention` | A WAL checkpoint that cannot complete (another process is holding the database), or a `busy_timeout` of 0, which turns ordinary contention into a failed `mem_save`. |
+| `stale_review_backlog` | Most of a project flagged `needs_review` or `expired`, at which point the lifecycle flag has stopped distinguishing anything. |
+| `sync_backlog` | Mutations waiting in the outbound journal. Informational between cycles; a warning once the oldest is hours old or the queue is large — that is a sync that *cannot* complete, and those memories exist on one machine only. |
+
+Scope: the per-project checks follow the same project resolution as `mem_search` and `mem_context` (explicit `project`, else the forwarded directory); pass `check` to run exactly one. `sqlite_lock_contention` and `sync_backlog` are node-wide either way.
+
+**It never writes.** Every finding ends in a `safe_next_step` for a human to run, and `requires_confirmation: true` marks the ones where the right fix depends on context the store does not have — which of two project names is canonical, which of three open sessions is yours. A repair that guesses at those destroys the evidence on its way.
 
 ### Conflict detection
 

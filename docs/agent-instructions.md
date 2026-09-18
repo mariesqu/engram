@@ -31,6 +31,7 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_session_summary` | Save a structured end-of-session summary |
 | `mem_judge` | Record a verdict on a conflict candidate surfaced by `mem_save` |
 | `mem_merge_projects` | Merge a source project's memories into a target name to fix name drift (local-only) |
+| `mem_doctor` | Run read-only diagnostics over this node's store (orphaned sessions, project drift, SQLite lock contention, sync backlog) |
 
 ---
 
@@ -139,3 +140,11 @@ If you see a compaction notice or a "context cleared" event:
 3. Only then continue working
 
 The persistent store survives compaction — the agent just needs to re-read it.
+
+---
+
+### Diagnostics
+
+When something looks wrong — memories landing under a name nobody recognises, saves failing, context that never mentions a session you are sure happened — call `mem_doctor`. It runs read-only checks over this node's store and returns `{status, project, summary, checks[]}`, each check carrying a `message`, a `why`, an `evidence` blob and a `safe_next_step`.
+
+It never repairs anything, and neither should you on its say-so: a finding with `requires_confirmation: true` describes a condition whose correct fix depends on context the store does not have (which of two project names is canonical, which of three open sessions is yours). Surface the finding and its `safe_next_step` to the user, and let them choose.

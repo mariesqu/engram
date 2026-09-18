@@ -1137,6 +1137,22 @@ func TestDaemonTools_EveryDirectoryAwareToolHonoursExplicitProject(t *testing.T)
 			seed:   seedHarnessProbes,
 			verify: assertScopedToExplicitProject,
 		},
+		"mem_doctor": {
+			args: map[string]any{},
+			verify: func(t *testing.T, _ *localstore.Store, text string) {
+				t.Helper()
+				var report struct {
+					Project string `json:"project"`
+				}
+				if err := json.Unmarshal([]byte(text), &report); err != nil {
+					t.Fatalf("response is not a diagnostic report (%v): %s", err, text)
+				}
+				if report.Project != harnessProject {
+					t.Errorf("report project = %q, want %q — the diagnostics were scoped to the daemon's cwd",
+						report.Project, harnessProject)
+				}
+			},
+		},
 	}
 
 	for name := range directoryAwareTools {
