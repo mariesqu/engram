@@ -35,16 +35,15 @@ type SearchFilter struct {
 	// identical FTS results they received before this field was added.
 	Mode string
 
-	// CreatedFrom/CreatedTo optionally bound m.created_at (inclusive on both
+	// CreatedFrom/CreatedTo optionally bound created_at (inclusive on both
 	// ends). The zero time.Time disables the corresponding bound. Both fields
 	// are additive — existing callers that leave them zero see byte-identical
 	// results to before these fields were added.
 	//
-	// CAVEAT: honored by the FTS path (mode "" / "fts", including the FTS
-	// half of "hybrid") but NOT by the semantic vector scan (SelectVectors) —
-	// a "semantic" search, or the cosine half of a "hybrid" search, ignores
-	// these bounds entirely. See SearchMemoriesFiltered's filter-semantics
-	// doc block for the full breakdown.
+	// Honored by EVERY mode: the FTS predicate bounds m.created_at and
+	// SelectVectors bounds created_at on the cosine candidate scan, so a row
+	// outside the window can reach no page through either half of a hybrid
+	// fusion.
 	CreatedFrom time.Time
 	CreatedTo   time.Time
 
@@ -53,8 +52,11 @@ type SearchFilter struct {
 	// changes nothing versus before this field was added. Negative values are
 	// treated as zero by callers that construct SQL from this filter.
 	//
-	// CAVEAT: only honored by the FTS path (mode "" / "fts"). "semantic" and
-	// "hybrid" modes ignore Offset entirely — neither paginates.
+	// Honored by every mode, but at different layers: "fts" pushes it into SQL
+	// OFFSET, while "semantic" and "hybrid" apply it to the FINAL ranked list
+	// (after cosine ranking / after RRF fusion) because rank order does not
+	// exist until scoring has run. See SearchMemoriesFiltered's filter-semantics
+	// doc block.
 	Offset int
 }
 
@@ -94,15 +96,24 @@ type SearchDegradation struct {
 //   - mode:    "" or "fts" → FTS only (byte-identical to before); "semantic" →
 //     cosine only; "hybrid" → FTS + cosine → RRF(k=60); unknown → fts
 //
-// CAVEAT — mode="semantic"/"hybrid" and f.CreatedFrom/CreatedTo/f.Offset:
-// the cosine candidate set (SelectVectors) does NOT apply CreatedFrom,
-// CreatedTo, or Offset at all — those bounds are silently ignored on the
-// semantic side. In "hybrid" mode the FTS half of the RRF fusion DOES honor
-// CreatedFrom/CreatedTo, but the cosine half does not, so a hybrid result can
-// still include rows outside the requested date range via the cosine path.
-// f.Offset is entirely unused by both "semantic" and "hybrid" — there is no
-// paging on either path; only mode="" / "fts" (runFTS) applies Offset. Only
-// mode="" and "fts" honor all three fields exactly as documented above.
+// Date bounds and paging across modes:
+//   - f.CreatedFrom / f.CreatedTo are pushed into SQL on BOTH halves — the FTS
+//     predicate and SelectVectors' cosine candidate scan — so no mode can
+//     surface a row outside the window. Pushing them down (rather than
+//     post-filtering the ranked page) is load-bearing for "hybrid": RRF fuses
+//     the two candidate lists, so an out-of-range row surviving the cosine half
+//     would be re-admitted into the fused page the FTS half had excluded.
+//   - f.Offset skips the first N rows of the FINAL ranked page. "fts" pushes it
+//     into SQL OFFSET; "semantic" applies it after cosine ranking and "hybrid"
+//     after RRF fusion, because neither has a rank order until scoring has run.
+//     To keep the page well-formed, both widen their candidate pools by Offset
+//     before ranking — an offset page is drawn from a pool that actually
+//     reaches past it, not from a pool sized for page one.
+//   - Paging is stable only for a fixed corpus and a fixed query: a concurrent
+//     write, or an embedding backfill that adds a vector mid-scan, can shift
+//     rows across the page boundary exactly as it can on the FTS path.
+//   - When a semantic/hybrid search DEGRADES to FTS (see below), the fallback
+//     is runFTS, which applies Offset in SQL — so paging survives degradation.
 //
 // FTS injection prevention: the query string is passed through sanitizeFTS
 // (wraps each token in double-quotes) before reaching the FTS5 engine.
@@ -227,6 +238,13 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 
 	queryVec := l2Normalize(vecs[0])
 
+	// Offset is applied to the ranked page below, never to the candidate scans.
+	// Negative values mean "page one" (same normalization runFTS applies).
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
 	// ── Cosine-only ("semantic") path ────────────────────────────────────────
 	if mode == "semantic" {
 		vrows, svErr := SelectVectors(s.db, project, f, dims)
@@ -239,11 +257,20 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			return results, SearchDegradation{Reason: "semantic results not ready; showing keyword results"}, err
 		}
 
-		topK := cosineTopK(queryVec, vrows, limit)
+		// Rank offset+limit candidates, then drop the first `offset` — the page
+		// boundary only exists once the cosine scores have ordered the rows.
+		topK := cosineTopK(queryVec, vrows, offset+limit)
 		if len(topK) == 0 {
 			results, err := runFTS()
 			return results, SearchDegradation{Reason: "semantic results not ready; showing keyword results"}, err
 		}
+		if offset >= len(topK) {
+			// Paged past the end of the ranked list. This is an EMPTY page, not a
+			// degradation — falling back to FTS here would answer a "give me rows
+			// 50-59" request with rows 0-9 of a different ranking.
+			return nil, SearchDegradation{}, nil
+		}
+		topK = topK[offset:]
 
 		syncIDs := make([]string, len(topK))
 		for i, c := range topK {
@@ -254,6 +281,13 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	}
 
 	// ── Hybrid path: FTS + cosine → RRF ─────────────────────────────────────
+	// Both candidate pools are sized 2× the rows the caller could possibly be
+	// asking for — the requested page PLUS everything it skips. Sizing them at
+	// 2×limit alone would make an offset page fuse from a pool that never
+	// reaches it, and page 2 would come back empty on a corpus that has plenty
+	// of rows left.
+	poolSize := (offset + limit) * 2
+
 	// Run FTS with 2× candidates.
 	ftsCandidates, ftsErr := func() ([]*domain.Record, error) {
 		ftsQ := sanitizeFTS(query)
@@ -288,7 +322,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		}
 		q, args = dateRangeSQL(q, args, "m.created_at", f)
 		q += "\nORDER BY fts.rank\nLIMIT ?"
-		args = append(args, limit*2)
+		args = append(args, poolSize)
 		rows, err := s.db.Query(q, args...)
 		if err != nil {
 			return nil, fmt.Errorf("hybrid FTS: %w", err)
@@ -324,7 +358,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		ftsRecordsByID[r.SyncID] = r
 	}
 
-	cosineCandidates := cosineTopK(queryVec, vrows, limit*2)
+	cosineCandidates := cosineTopK(queryVec, vrows, poolSize)
 	cosineRanks := make([]string, len(cosineCandidates))
 	for i, c := range cosineCandidates {
 		cosineRanks[i] = c.syncID
@@ -337,8 +371,17 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		return results, SearchDegradation{Reason: reason}, err
 	}
 
-	// Fuse and return top-limit results.
-	fusedIDs := rrfFuse(ftsRanks, cosineRanks, 60, limit)
+	// Fuse, then cut the requested page out of the fused ranking. Fusing to
+	// offset+limit and slicing is the only order that gives a correct page:
+	// RRF scores are a property of the fused list, so there is nothing to skip
+	// until it exists.
+	fusedIDs := rrfFuse(ftsRanks, cosineRanks, 60, offset+limit)
+	if offset >= len(fusedIDs) {
+		// Paged past the end of the fused ranking — an empty page, not a
+		// degradation (see the semantic path for why the distinction matters).
+		return nil, SearchDegradation{}, nil
+	}
+	fusedIDs = fusedIDs[offset:]
 
 	// Build the result set from fused IDs. Records may come from FTS cache or
 	// need a fresh fetch for cosine-only entries.
