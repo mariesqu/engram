@@ -961,6 +961,25 @@ func (a *localStoreAdapter) CountsByProject() (map[string]int, error) {
 	return a.store.CountsByProject()
 }
 
+// LookupSession implements controlapi.SessionLookup — the optional capability
+// behind GET /api/v1/sessions/{id}. The store's own sentinel is translated
+// once, here, so the HTTP layer can answer 404 without matching on an error
+// message.
+func (a *localStoreAdapter) LookupSession(id string) (controlapi.SessionRef, error) {
+	sess, err := a.store.GetSession(id)
+	if err != nil {
+		if errors.Is(err, localstore.ErrSessionNotFound) {
+			return controlapi.SessionRef{}, controlapi.ErrSessionNotFound
+		}
+		return controlapi.SessionRef{}, err
+	}
+	return controlapi.SessionRef{
+		ID:        sess.ID,
+		Project:   sess.Project,
+		Directory: sess.Directory,
+	}, nil
+}
+
 // recordToSummary converts a domain.Record to a controlapi.MemorySummary.
 func recordToSummary(r *domain.Record) controlapi.MemorySummary {
 	return controlapi.MemorySummary{

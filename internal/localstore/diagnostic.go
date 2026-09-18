@@ -81,58 +81,67 @@ type OrphanedSessionRef struct {
 	Projects         []string `json:"projects"`
 }
 
-// OrphanedObservationSessions returns the session ids referenced by live
-// observations but absent from the sessions table, newest-heaviest first.
+// OrphanedSessions is the split result of ONE scan over the live observations
+// whose session id has no row in sessions.
 //
-// This is not a foreign-key violation — the FK was deliberately removed so an
-// out-of-order sync pull can land an observation before its session (see the
-// v0→v1 schema note). It IS a signal worth reporting: those observations can
-// never be grouped back under the session that produced them.
+// Orphans is the signal: a session id nothing registered, so those observations
+// can never be grouped back under the session that produced them. This is not a
+// foreign-key violation — the FK was deliberately removed so an out-of-order
+// sync pull can land an observation before its session (see the v0→v1 schema
+// note) — but it IS worth reporting.
 //
-// The store's OWN default is excluded. A mem_save with no session_id is filed
-// under "manual-save-{project}" (ManualSaveSessionPrefix), a session id nothing
-// ever registers — so every single manual save produced a permanent "orphaned
-// session" warning about behaviour the tool description documents. A doctor
-// that warns about its own defaults is a doctor whose warnings get skipped, and
-// then the real ones go unread with them. Those rows are reported separately
-// and informationally by UnregisteredSessionSaves.
-func (s *Store) OrphanedObservationSessions(project string) ([]OrphanedSessionRef, error) {
-	return s.orphanedSessions("OrphanedObservationSessions", project, false)
+// Unregistered is the store's OWN default. A mem_save with no session_id is
+// filed under "manual-save-{project}" (DefaultManualSessionID), a session id
+// nothing ever registers — so every single manual save produced a permanent
+// "orphaned session" warning about behaviour the tool description documents. A
+// doctor that warns about its own defaults is a doctor whose warnings get
+// skipped, and then the real ones go unread with them. Those rows are reported
+// separately and informationally.
+type OrphanedSessions struct {
+	Orphans      []OrphanedSessionRef
+	Unregistered []OrphanedSessionRef
 }
 
-// UnregisteredSessionSaves returns the live observations filed under the
-// store's default "manual-save-{project}" session id with no registered
-// session row — i.e. saves made without mem_session_start.
+// OrphanedSessions returns both classes of orphaned session reference in one
+// pass, newest-heaviest first within each.
 //
-// It is NOT a fault: it is what the documented default does, and the memories
-// are intact and searchable. It is worth naming once, quietly, because those
-// observations never appear in mem_context's session grouping, which is the
-// thing a user notices later and cannot explain.
-func (s *Store) UnregisteredSessionSaves(project string) ([]OrphanedSessionRef, error) {
-	return s.orphanedSessions("UnregisteredSessionSaves", project, true)
-}
-
-// orphanedSessions is the shared query behind both: live observations whose
-// session id has no row in sessions, split by whether that id is the store's
-// own manual-save default.
+// One query, not two. The predicate that splits them is a CASE over the same
+// rows, so running the scan twice with complementary WHERE clauses read the
+// whole memories table twice to answer one question — on the store where it
+// matters (a large one), doctor is exactly the caller you do not want doing
+// that.
+//
+// The split is an EXACT match against the id the store itself would mint for
+// the row's project, not a prefix LIKE. LIKE 'manual-save-%' is
+// case-insensitive by default in SQLite and matches any tail, so
+// "manual-save-other-project" sitting in project "engram" — a session id no
+// code here produces — was silently reclassified as "the store's own default"
+// and demoted to an informational note. Whatever wrote that row is precisely
+// what an orphan warning is for. COLLATE BINARY keeps "MANUAL-SAVE-x" on the
+// warning side too.
+//
+// The exactness relies on DefaultManualSessionID minting its id from the
+// NORMALIZED project name, which is what the memories row stores.
 //
 // The projects column is json_group_array, not GROUP_CONCAT: GROUP_CONCAT joins
 // on a comma and the caller split on one, so a project name containing a comma
 // came back as two projects that do not exist.
-func (s *Store) orphanedSessions(caller, project string, manual bool) ([]OrphanedSessionRef, error) {
+func (s *Store) OrphanedSessions(project string) (OrphanedSessions, error) {
+	const caller = "OrphanedSessions"
+
+	// MIN, not MAX: a group is the store's own default only when EVERY row in it
+	// is. One row of a shared session id that does NOT match its project's
+	// default is the surprise a doctor exists to surface, and an info note is
+	// where surprises go to be ignored.
 	q := `
-		SELECT m.session_id, COUNT(*) AS n, json_group_array(DISTINCT m.project)
+		SELECT m.session_id, COUNT(*) AS n, json_group_array(DISTINCT m.project),
+		       MIN(CASE WHEN m.session_id = (? || m.project) COLLATE BINARY THEN 1 ELSE 0 END) AS is_default
 		FROM memories m
 		LEFT JOIN sessions s ON s.id = m.session_id
 		WHERE m.deleted_at IS NULL
 		  AND s.id IS NULL
 		  AND TRIM(m.session_id) <> ''`
-	if manual {
-		q += ` AND m.session_id LIKE ?`
-	} else {
-		q += ` AND m.session_id NOT LIKE ?`
-	}
-	args := []any{ManualSaveSessionPrefix + "%"}
+	args := []any{ManualSaveSessionPrefix}
 	if project = normalizeProject(project); project != "" {
 		q += ` AND m.project = ?`
 		args = append(args, project)
@@ -141,29 +150,34 @@ func (s *Store) orphanedSessions(caller, project string, manual bool) ([]Orphane
 
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("%s: query: %w", caller, err)
+		return OrphanedSessions{}, fmt.Errorf("%s: query: %w", caller, err)
 	}
 	defer rows.Close()
 
-	var out []OrphanedSessionRef
+	var out OrphanedSessions
 	for rows.Next() {
 		var (
-			ref      OrphanedSessionRef
-			projects sql.NullString
+			ref       OrphanedSessionRef
+			projects  sql.NullString
+			isDefault int
 		)
-		if err := rows.Scan(&ref.SessionID, &ref.ObservationCount, &projects); err != nil {
-			return nil, fmt.Errorf("%s: scan: %w", caller, err)
+		if err := rows.Scan(&ref.SessionID, &ref.ObservationCount, &projects, &isDefault); err != nil {
+			return OrphanedSessions{}, fmt.Errorf("%s: scan: %w", caller, err)
 		}
 		if projects.Valid && strings.TrimSpace(projects.String) != "" {
 			if err := json.Unmarshal([]byte(projects.String), &ref.Projects); err != nil {
-				return nil, fmt.Errorf("%s: decode projects %q: %w", caller, projects.String, err)
+				return OrphanedSessions{}, fmt.Errorf("%s: decode projects %q: %w", caller, projects.String, err)
 			}
 			sort.Strings(ref.Projects)
 		}
-		out = append(out, ref)
+		if isDefault == 1 {
+			out.Unregistered = append(out.Unregistered, ref)
+			continue
+		}
+		out.Orphans = append(out.Orphans, ref)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%s: rows: %w", caller, err)
+		return OrphanedSessions{}, fmt.Errorf("%s: rows: %w", caller, err)
 	}
 	return out, nil
 }

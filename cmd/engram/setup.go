@@ -186,6 +186,18 @@ func writeHookSettings(path string, merged, existing []byte) (string, error) {
 		_ = os.Remove(tmpPath)
 		return backup, fmt.Errorf("write temp file: %w", err)
 	}
+	// Sync BEFORE the rename, or the atomicity above is only atomic against a
+	// crashed process. A rename is a metadata operation: the OS is free to
+	// publish the new directory entry while the file's CONTENT is still in the
+	// page cache, so a machine that loses power between the two leaves the user's
+	// settings.json pointing at a zero-length file — the exact outcome the temp
+	// file exists to prevent, arrived at the long way round. Not fatal on its
+	// own: a filesystem that refuses fsync (some network mounts) is a reason to
+	// warn, not a reason to abandon a write that is otherwise complete.
+	if err := tmp.Sync(); err != nil {
+		fmt.Fprintf(os.Stderr, "engram setup hooks: could not flush %s to disk (%v); "+
+			"the write is still atomic against a crashed process, but not against a power loss\n", tmpPath, err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return backup, fmt.Errorf("close temp file: %w", err)

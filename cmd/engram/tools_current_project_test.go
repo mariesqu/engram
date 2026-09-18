@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -623,6 +624,130 @@ func TestCurrentProject_RelativeDirectoryArgumentIsLabelledToo(t *testing.T) {
 	if env["writes_blocked"] != true {
 		t.Errorf("writes_blocked = %v, want true", env["writes_blocked"])
 	}
+}
+
+// TestDirectoryArg_WindowsPathShapes covers the two spellings filepath.IsAbs
+// gets wrong on Windows, at the one place every directory-aware tool reads its
+// argument.
+//
+//   - "/c/GitLab/x" is what Git Bash, MSYS and WSL print. IsAbs calls it
+//     relative, so it was refused with a sentence about the daemon's working
+//     directory that explains nothing to someone whose shell just printed it —
+//     and filepath.Abs would have made it "C:\c\GitLab\x", a directory that is
+//     not there, whose basename becomes a project nobody has.
+//   - "\\?\C:\x" is the extended-length form. IsAbs accepts it, so nothing ever
+//     refused it; it simply travelled on in a spelling that compares unequal to
+//     every other reference to the same directory.
+//
+// cwd_input keeps the ORIGINAL in both cases: it is the field that answers
+// "what did engram do with what I sent?", and a rewritten value there answers
+// nothing.
+func TestDirectoryArg_WindowsPathShapes(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("these shapes are Windows-only; on Unix /c/GitLab/x IS an absolute path")
+	}
+
+	cases := []struct {
+		name       string
+		in         string
+		wantDir    string
+		wantSource string
+		relative   bool
+	}{
+		{"git bash", "/c/GitLab/x", `C:\GitLab\x`, dirSourceTranslatedPosix, false},
+		{"wsl", "/mnt/c/x", `C:\x`, dirSourceTranslatedPosix, false},
+		{"extended length", `\\?\C:\x`, `C:\x`, dirSourceArgument, false},
+		// A drive no machine mounts: not translatable, so it stays refused — but
+		// as a Git Bash path, not as "relative".
+		{"unmountable drive", "/q/x", "/q/x", dirSourceRelativePath, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := readDirectoryArg(map[string]any{"directory": tc.in})
+
+			if got.Directory != tc.wantDir {
+				t.Errorf("Directory = %q, want %q", got.Directory, tc.wantDir)
+			}
+			if got.Input != tc.in {
+				t.Errorf("Input = %q, want the caller's value %q verbatim", got.Input, tc.in)
+			}
+			if got.Source != tc.wantSource {
+				t.Errorf("Source = %q, want %q", got.Source, tc.wantSource)
+			}
+			if got.Relative != tc.relative {
+				t.Errorf("Relative = %v, want %v", got.Relative, tc.relative)
+			}
+		})
+	}
+}
+
+// TestDirectoryArg_UntranslatableGitBashPathSaysSo pins the wording a write
+// tool returns and mem_current_project reports. "pass an absolute path" is
+// unactionable advice for someone who just passed what their shell calls one,
+// so that path gets a sentence naming its own shape instead.
+func TestDirectoryArg_UntranslatableGitBashPathSaysSo(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("a leading slash is a perfectly good absolute path off Windows")
+	}
+	arg := readDirectoryArg(map[string]any{"directory": "/q/nowhere"})
+
+	result := arg.relativeError("mem_save")
+	if !result.IsError {
+		t.Fatal("a directory that names no drive on this machine must be refused")
+	}
+	msg := result.Content[0].(mcp.TextContent).Text
+	for _, want := range []string{"mem_save", `"/q/nowhere"`, "Git Bash/MSYS path", `C:\`} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal must mention %q; got: %s", want, msg)
+		}
+	}
+	if strings.Contains(msg, relativeDirectoryHint) {
+		t.Errorf("the generic relative-path sentence is the wrong advice here: %s", msg)
+	}
+}
+
+// TestCurrentProject_GitBashPathIsTranslated is the same shape through the
+// probe an agent is told to call first: the answer describes the real
+// directory, the source says a translation happened, and writes are NOT blocked
+// — the path names a workspace, it was just spelled by a shell.
+func TestCurrentProject_GitBashPathIsTranslated(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Git Bash paths are a Windows problem")
+	}
+	repo := pinnedProjectDir(t, "git-bash-repo")
+	posix := windowsPathAsGitBash(t, repo)
+	chdirToJunkDir(t)
+
+	env := callCurrentProject(t, map[string]any{"directory": posix})
+
+	if env["project"] != "git-bash-repo" {
+		t.Errorf("project = %v, want %q — the path names that repo, whatever the shell calls it",
+			env["project"], "git-bash-repo")
+	}
+	if env["directory_source"] != dirSourceTranslatedPosix {
+		t.Errorf("directory_source = %v, want %q", env["directory_source"], dirSourceTranslatedPosix)
+	}
+	if env["cwd_input"] != posix {
+		t.Errorf("cwd_input = %v, want the caller's value %q verbatim", env["cwd_input"], posix)
+	}
+	if env["writes_blocked"] != false {
+		t.Errorf("writes_blocked = %v, want false: the directory exists and is the caller's", env["writes_blocked"])
+	}
+	if hints := hintsOf(t, env); !strings.Contains(hints, "translated") {
+		t.Errorf("hints = %q, want them to say the path was rewritten", hints)
+	}
+}
+
+// windowsPathAsGitBash spells an absolute Windows path the way Git Bash would:
+// C:\Users\x → /c/Users/x.
+func windowsPathAsGitBash(t *testing.T, dir string) string {
+	t.Helper()
+	volume := filepath.VolumeName(dir)
+	if len(volume) != 2 || volume[1] != ':' {
+		t.Fatalf("%q has no drive letter to translate", dir)
+	}
+	rest := strings.ReplaceAll(dir[len(volume):], `\`, "/")
+	return "/" + strings.ToLower(volume[:1]) + rest
 }
 
 // TestCurrentProject_ExplicitProjectSurvivesARelativeDirectory — an explicit

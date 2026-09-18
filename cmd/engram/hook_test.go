@@ -108,8 +108,17 @@ func runHook(t *testing.T, event string, input map[string]any, args ...string) s
 }
 
 // runHookRaw is runHook with a verbatim stdin body, for the malformed-input cases.
+//
+// It isolates the hook state directory itself rather than trusting each test to
+// remember: every hook run here touches markers, and the one test that forgot
+// wrote them into the developer's REAL cache directory
+// (%LOCALAPPDATA%\engram\hooks), where they outlive the run and quietly decide
+// the behaviour of the next one. isolateHookStateDir is idempotent — a test
+// that also calls it (via hookDaemonFixture) simply gets a second temp
+// directory, and nothing outside it is touched either way.
 func runHookRaw(t *testing.T, event, stdin string, args ...string) string {
 	t.Helper()
+	isolateHookStateDir(t)
 
 	oldStdin := os.Stdin
 	r, w, err := os.Pipe()
@@ -366,6 +375,43 @@ func TestHookUserPromptSubmit_SecondPromptIsSilent(t *testing.T) {
 	}
 }
 
+// TestHookUserPromptSubmit_NoSessionIDClaimsNoMarker is the permanent-marker
+// bug. The marker path is the HASH of the session id, so an empty id hashed to
+// one fixed name (sha256 of "") shared by every such hook on the machine — and
+// nothing ever cleared it, because session-start and session-end both refuse an
+// empty id too. The first payload that arrived without a session id claimed
+// that file forever: every later one read "not the first prompt" and lost its
+// bootstrap, and the nudge measured "session age" from whenever that stray hook
+// happened to run.
+//
+// A session nobody can name has no state to keep. Each such prompt is its own
+// first (the bootstrap is static text that needs no project), and no file is
+// written — which is what makes the SECOND run below still bootstrap.
+func TestHookUserPromptSubmit_NoSessionIDClaimsNoMarker(t *testing.T) {
+	dbPath, _ := hookDaemonFixture(t)
+	cache := isolateHookStateDir(t)
+	repo := pinnedProjectDir(t, "anonymous-prompt-repo")
+
+	for _, prompt := range []string{"first", "second"} {
+		out := runHook(t, "user-prompt-submit", map[string]any{
+			"cwd": repo, "prompt": prompt, // no session_id at all
+		}, "--db", dbPath)
+		if _, ok := decodeHookJSON(t, out)["hookSpecificOutput"]; !ok {
+			t.Errorf("the %q prompt lost its bootstrap to a marker claimed by an earlier anonymous hook: %s", prompt, out)
+		}
+	}
+
+	// Nothing may be left behind: the shared marker is the whole bug, and the
+	// state directory is where it would be.
+	entries, err := os.ReadDir(filepath.Join(cache, "engram", "hooks"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read the state directory: %v", err)
+	}
+	for _, entry := range entries {
+		t.Errorf("a payload with no session id wrote the state file %q; nothing would ever clear it", entry.Name())
+	}
+}
+
 // TestHookUserPromptSubmit_NudgeAfterStaleSession covers the reminder path with
 // its two clocks wound forward: an old session (the state file's mtime) and a
 // project whose newest memory is older than the staleness bar.
@@ -442,6 +488,11 @@ func TestHookUserPromptSubmit_RecentSaveSuppressesNudge(t *testing.T) {
 // generous (4x the 200ms budget) to survive a loaded CI box while still failing
 // loudly if the hook ever starts waiting on a network timeout.
 func TestHookUserPromptSubmit_NoDaemonStaysWithinBudget(t *testing.T) {
+	// Isolated BEFORE the marker below is written: this test has no daemon
+	// fixture, so nothing else would do it, and the marker would land in the
+	// developer's real cache directory — where it decides the behaviour of the
+	// hook this test then runs.
+	isolateHookStateDir(t)
 	dbPath := filepath.Join(t.TempDir(), "absent.db")
 	sessionID := "hook-budget-" + t.Name()
 	cleanupHookState(t, sessionID)
@@ -816,6 +867,102 @@ func TestHookUserPromptSubmit_NoCwdCapturesNothing(t *testing.T) {
 	}
 }
 
+// TestHookSubagentStop_RelativeCwdSavesNothing is the same refusal for a cwd
+// that is PRESENT and useless. "." is the value a host (or a wrapper script, or
+// a model filling in a field) writes sooner or later, and it is the dangerous
+// one: it passes every "is there a cwd?" check, and the daemon resolves it with
+// filepath.Abs against its OWN working directory — here, the decoy repo. The
+// answer that comes back is a real, existing, confidently-reported project that
+// has nothing to do with the session.
+//
+// On Windows a Git Bash path naming a drive that does not exist is the second
+// spelling of the same mistake, and must be refused the same way: it is not a
+// relative path, it just is not a path on this machine.
+func TestHookSubagentStop_RelativeCwdSavesNothing(t *testing.T) {
+	cases := map[string]string{"dot": "."}
+	if runtime.GOOS == "windows" {
+		// Deliberately a drive letter no Windows machine mounts (A: and B: are
+		// floppies, Q: is unused by convention) so the translation cannot succeed.
+		cases["untranslatable git bash path"] = "/q/nonexistent/repo"
+	}
+
+	for name, cwd := range cases {
+		t.Run(name, func(t *testing.T) {
+			dbPath, components := hookDaemonFixture(t)
+			decoyDaemonCwd(t)
+
+			out := runHook(t, "subagent-stop", map[string]any{
+				"session_id":             "hook-subagent-relative-" + name,
+				"cwd":                    cwd,
+				"last_assistant_message": "Found the deadlock in the writer queue",
+			}, "--db", dbPath)
+
+			if obj := decodeHookJSON(t, out); len(obj) != 0 {
+				t.Errorf("subagent-stop must still print {}; got %v", obj)
+			}
+			count, err := components.store.CountLiveByProject(decoyProject)
+			if err != nil {
+				t.Fatalf("CountLiveByProject: %v", err)
+			}
+			if count != 0 {
+				t.Errorf("cwd=%q filed %d observation(s) under the DAEMON's project %q — that path names no workspace",
+					cwd, count, decoyProject)
+			}
+			results, _, err := components.store.SearchMemoriesFiltered("deadlock", "", 10, localstore.SearchFilter{})
+			if err != nil {
+				t.Fatalf("search: %v", err)
+			}
+			if len(results) != 0 {
+				t.Errorf("the report was saved under project %q; it should not have been saved at all", results[0].Project)
+			}
+		})
+	}
+}
+
+// TestHookSubagentStop_FallsBackToTheSessionsProject covers the other half of
+// "no usable cwd": a session that WAS registered with one. session-start
+// recorded the host's directory for this id, so a later event from the same
+// session that arrives without a cwd is not unplaceable — it is already placed,
+// and the answer is a lookup away (GET /api/v1/sessions/{id}).
+//
+// The daemon's cwd is the decoy throughout, so the only way to the right
+// project is the session row.
+func TestHookSubagentStop_FallsBackToTheSessionsProject(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	decoyDaemonCwd(t)
+	repo := pinnedProjectDir(t, "session-fallback-repo")
+	sessionID := "hook-fallback-" + t.Name()
+
+	// The session is registered WITH a cwd, exactly as a real session-start does.
+	_ = runHook(t, "session-start", map[string]any{
+		"session_id": sessionID, "cwd": repo,
+	}, "--db", dbPath, "--no-autostart")
+
+	// ... and the subagent report arrives without one.
+	_ = runHook(t, "subagent-stop", map[string]any{
+		"session_id":             sessionID,
+		"last_assistant_message": "Found the deadlock in the writer queue",
+	}, "--db", dbPath)
+
+	results, _, err := components.store.SearchMemoriesFiltered("deadlock", "", 10, localstore.SearchFilter{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("saved observations = %d, want 1 — the session's own project was the answer", len(results))
+	}
+	if results[0].Project != "session-fallback-repo" {
+		t.Errorf("project = %q, want %q", results[0].Project, "session-fallback-repo")
+	}
+	count, err := components.store.CountLiveByProject(decoyProject)
+	if err != nil {
+		t.Fatalf("CountLiveByProject: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("%d observation(s) landed under the DAEMON's project %q", count, decoyProject)
+	}
+}
+
 // TestHookSubagentStop_NamesTheProjectExplicitly proves the fix does not simply
 // drop everything: with a cwd in the payload the report is saved, and it is
 // saved under the project that cwd resolves to — not under the daemon's, which
@@ -845,13 +992,31 @@ func TestHookSubagentStop_NamesTheProjectExplicitly(t *testing.T) {
 
 // ─── hook state lives in a per-user cache directory ─────────────────────────
 
+// hookStateIsolationEnv marks a state directory this helper has already
+// isolated. It is read by isolateHookStateDir alone; nothing in the binary
+// knows it exists.
+const hookStateIsolationEnv = "ENGRAM_TEST_HOOK_STATE_DIR"
+
 // isolateHookStateDir points os.UserCacheDir (and, on the platforms that
 // derive it from HOME, the home directory) at a temp directory for the duration
 // of a test, so nothing here writes markers into the developer's real cache.
 // It returns the cache root the markers must appear under.
+//
+// IDEMPOTENT, and that is load-bearing: runHookRaw calls it on every hook
+// invocation so no test can forget, and most hook tests run several hooks whose
+// whole point is the marker the previous one left (a second prompt is silent, a
+// resume re-fires the bootstrap, session-end clears what user-prompt-submit
+// created). Re-isolating mid-test would hand each run a fresh empty directory
+// and make every prompt look like the first. The sentinel env var is how the
+// second call recognises the first: t.Setenv restores all of them when the test
+// ends, so the next test isolates again, into its own directory.
 func isolateHookStateDir(t *testing.T) string {
 	t.Helper()
+	if cache := os.Getenv(hookStateIsolationEnv); cache != "" {
+		return cache
+	}
 	cache := t.TempDir()
+	t.Setenv(hookStateIsolationEnv, cache)
 	t.Setenv("LOCALAPPDATA", cache)   // Windows
 	t.Setenv("XDG_CACHE_HOME", cache) // Unix
 	t.Setenv("HOME", cache)           // macOS ($HOME/Library/Caches) and the XDG fallback
@@ -887,15 +1052,51 @@ func TestHookStateDir_IsPerUserAndPrivate(t *testing.T) {
 
 // TestHookClaimState_IsAtomic covers the O_EXCL claim that replaced an
 // exists-then-create pair: exactly ONE caller may be told it is the first.
+//
+// Run CONCURRENTLY, and under -race in CI, because sequential calls cannot fail
+// the way this code failed: the old exists-then-create pair was perfectly
+// correct one call at a time, and wrong only when two prompts landed close
+// enough together that both read "absent" — which is the case the user hits
+// (two messages in quick succession injecting the bootstrap twice, and the
+// session's age clock reset underneath the nudge). A mutant that drops O_EXCL
+// still passes a sequential test; it does not survive this one.
 func TestHookClaimState_IsAtomic(t *testing.T) {
 	isolateHookStateDir(t)
 	path := hookStateFile("claim-session", hookStateToolsLoaded)
 
-	if !hookClaimState(path) {
-		t.Fatal("the first claim must succeed")
+	const claimants = 16
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		granted int
+	)
+	start := make(chan struct{})
+	wg.Add(claimants)
+	for range claimants {
+		go func() {
+			defer wg.Done()
+			<-start // release them together: a staggered start tests nothing
+			if hookClaimState(path) {
+				mu.Lock()
+				granted++
+				mu.Unlock()
+			}
+		}()
 	}
+	close(start)
+	wg.Wait()
+
+	if granted != 1 {
+		t.Errorf("%d of %d concurrent claims reported themselves as the first prompt of the session; want exactly 1",
+			granted, claimants)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("no marker was left behind after %d claims: %v", claimants, err)
+	}
+	// And the session stays claimed afterwards, which is what every later prompt
+	// reads.
 	if hookClaimState(path) {
-		t.Error("a second claim reported itself as the first prompt of the session")
+		t.Error("a claim after the race reported itself as the first prompt of the session")
 	}
 }
 
@@ -969,6 +1170,13 @@ func TestHookSessionEnd_ClearsSessionState(t *testing.T) {
 // to give up — precisely the case the margin exists to prevent, and for the
 // JSON events a kill mid-write is a parse error on the host's side.
 //
+// What it asserts is hookStdinDeadline + budget < timeout, not budget alone.
+// The budget covers stdin today (one clock, started in runHookCmd), but the
+// stdin deadline is a SEPARATE constant that a future change could put back in
+// front of the budget — which is exactly how 4 seconds of session-end work
+// became a 6-second process against a 3-second timeout. Asserting the sum keeps
+// the margin true under both arrangements, and costs one second of headroom.
+//
 // The table is generated from engramHookPack, so a pack that lowers a timeout
 // fails here instead of in somebody's terminal.
 func TestHookBudgets_FitInsideEveryPackTimeout(t *testing.T) {
@@ -988,13 +1196,75 @@ func TestHookBudgets_FitInsideEveryPackTimeout(t *testing.T) {
 						continue
 					}
 					timeout := time.Duration(entry.Timeout) * time.Second
-					if budget >= timeout {
-						t.Errorf("%s hook %q: budget %s >= declared timeout %s — the host kills the hook before it can print its fallback",
-							item.Event, entry.Command, budget, timeout)
+					if worst := hookStdinDeadline + budget; worst >= timeout {
+						t.Errorf("%s hook %q: stdin deadline %s + budget %s = %s >= declared timeout %s — "+
+							"the host can kill the hook before it prints its fallback",
+							item.Event, entry.Command, hookStdinDeadline, budget, worst, timeout)
 					}
 				}
 			}
 		})
+	}
+}
+
+// TestHookStdinBound_NeverOutlivesTheBudget covers the min() that keeps the
+// prompt hook honest: its whole budget is 200ms, so the 1-second ceiling would
+// blow it five times over on a host that leaves stdin open.
+func TestHookStdinBound_NeverOutlivesTheBudget(t *testing.T) {
+	cases := []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+	}{
+		{"a long budget gets the ceiling", hookBudgetSessionStart, hookStdinDeadline},
+		{"exactly the ceiling", hookStdinDeadline, hookStdinDeadline},
+		{"the prompt budget wins", hookBudgetPrompt, hookBudgetPrompt},
+		{"nothing left means do not wait", -time.Second, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hookStdinBound(tc.remaining); got != tc.want {
+				t.Errorf("hookStdinBound(%s) = %s, want %s", tc.remaining, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHookSessionEnd_WholeProcessFitsTheBudget is the end-to-end half of the
+// same fix: the clock starts at process entry, so a hook whose stdin never
+// closes must still be done within its budget — not stdin PLUS its budget,
+// which is what the host's timeout was being blown by.
+//
+// The pipe's write end is deliberately left open (no payload, no EOF), and
+// there is no daemon: the hook has to give up on stdin, print its fallback and
+// return, all inside the session-end budget.
+func TestHookSessionEnd_WholeProcessFitsTheBudget(t *testing.T) {
+	isolateHookStateDir(t)
+	dbPath := filepath.Join(t.TempDir(), "no-daemon.db") // no daemon.json beside it
+
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close(); _ = r.Close(); os.Stdin = oldStdin })
+	os.Stdin = r
+
+	start := time.Now()
+	out, _ := captureHookStreams(t, func() {
+		if err := runHookCmd([]string{"session-end", "--db", dbPath}); err != nil {
+			t.Errorf("hook session-end returned an error: %v", err)
+		}
+	})
+	elapsed := time.Since(start)
+
+	if obj := decodeHookJSON(t, out); len(obj) != 0 {
+		t.Errorf("session-end must print {} when it has no payload; got %v", obj)
+	}
+	// The budget itself, with process slack — NOT stdin + budget, which is the
+	// arithmetic that used to exceed the Codex pack's 3-second timeout.
+	if limit := hookBudgetSessionEnd + 500*time.Millisecond; elapsed > limit {
+		t.Errorf("session-end took %v on an unclosed stdin, want at most %v (its whole budget)", elapsed, limit)
 	}
 }
 
@@ -1018,7 +1288,7 @@ func TestReadHookInput_ReturnsOnAnUnclosedStdin(t *testing.T) {
 	}
 
 	start := time.Now()
-	in := readHookInput(r)
+	in := readHookInput(r, hookStdinDeadline)
 	elapsed := time.Since(start)
 
 	if elapsed > 2*hookStdinDeadline {
@@ -1032,7 +1302,7 @@ func TestReadHookInput_ReturnsOnAnUnclosedStdin(t *testing.T) {
 // TestReadHookInput_StillReadsAClosedStdinImmediately — the deadline must not
 // cost the normal path anything.
 func TestReadHookInput_StillReadsAClosedStdinImmediately(t *testing.T) {
-	in := readHookInput(strings.NewReader(`{"session_id":"s","prompt":"p"}`))
+	in := readHookInput(strings.NewReader(`{"session_id":"s","prompt":"p"}`), hookStdinDeadline)
 	if in.SessionID != "s" || in.Prompt != "p" {
 		t.Errorf("readHookInput = %+v, want the payload decoded", in)
 	}

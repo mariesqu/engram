@@ -21,8 +21,16 @@ import (
 const ManualSaveSessionPrefix = "manual-save-"
 
 // DefaultManualSessionID returns the session id a write defaults to for project.
+//
+// The project name is NORMALIZED first, exactly as the memories row will store
+// it (AddObservation, AddPrompt). Without that, a caller who named their
+// project "MyRepo" got a row under project "myrepo" carrying the session id
+// "manual-save-MyRepo" — a default that does not match its own project, which
+// OrphanedSessions then has to report as an unregistered session id somebody
+// invented. Minting the id from the same value the row keeps is what makes that
+// query an exact match instead of a fuzzy prefix.
 func DefaultManualSessionID(project string) string {
-	return ManualSaveSessionPrefix + project
+	return ManualSaveSessionPrefix + normalizeProject(project)
 }
 
 // Session represents a tracked MCP coding session.

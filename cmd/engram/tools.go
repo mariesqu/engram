@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -67,6 +68,13 @@ const (
 	// working directory — so it is neither the caller's directory nor an honest
 	// daemon_cwd answer, and it gets a label of its own.
 	dirSourceRelativePath = "relative_path"
+	// dirSourceTranslatedPosix: the value was a Git Bash/MSYS path ("/c/GitLab/x")
+	// and this is Windows, so it was rewritten to its native form before anything
+	// resolved it. The answer is about the caller's directory — that is why it is
+	// not dirSourceRelativePath — but the path in it is NOT the string they sent,
+	// and a source label that hid that would make the one field that exists to
+	// say "how did we get here?" lie. cwd_input still carries the original.
+	dirSourceTranslatedPosix = "translated_posix_path"
 )
 
 // relativeDirectoryHint is the one sentence every surface uses for a relative
@@ -81,18 +89,26 @@ const relativeDirectoryHint = "a RELATIVE path was resolved against the daemon's
 // dirSourceInvalid.
 type directoryArg struct {
 	Directory string
-	Source    string
-	Err       error
+	// Input is what the caller actually sent, verbatim. It differs from
+	// Directory only when a path was normalized (a Git Bash path translated, an
+	// extended-length prefix stripped), and mem_current_project reports IT as
+	// cwd_input: a caller shown only the rewritten value cannot tell what engram
+	// did with what they typed, which is the question that field answers.
+	Input  string
+	Source string
+	Err    error
 	// Relative is true when Directory is a non-absolute path (Source is then
 	// dirSourceRelativePath). Write tools REFUSE it: filepath.Abs would resolve
 	// it against the daemon's cwd, filing the memory under whatever directory the
 	// autostart or tray happened to launch from.
 	Relative bool
-	// Warning is an advisory mem_current_project turns into a hint. Today it has
-	// exactly one source: a "cwd" alias that was present but not a string. That is
-	// NOT promoted to Err — the alias is a courtesy, and a malformed one falls
-	// back to the same daemon-cwd answer an absent one would — but it is not
-	// silence either, because the caller believes they supplied a directory.
+	// Warning is an advisory mem_current_project turns into a hint. It has two
+	// sources: a "cwd" alias that was present but not a string (NOT promoted to
+	// Err — the alias is a courtesy, and a malformed one falls back to the same
+	// daemon-cwd answer an absent one would — but not silence either, because the
+	// caller believes they supplied a directory), and a Git Bash path that was
+	// translated, where the answer is right but is about a path the caller never
+	// wrote.
 	Warning string
 }
 
@@ -159,13 +175,34 @@ func readDirectoryArg(args map[string]any) directoryArg {
 // newDirectoryArg labels a non-blank directory, downgrading absoluteSource to
 // dirSourceRelativePath when the path is not absolute. The value is kept either
 // way: reads answer from it (leniently, via the daemon-cwd resolution), and
-// mem_current_project reports it verbatim in cwd_input so the caller can see
-// what the daemon did with what they sent.
+// mem_current_project reports the ORIGINAL verbatim in cwd_input so the caller
+// can see what the daemon did with what they sent.
+//
+// "Not absolute" is decided by normalizeHostPath, not by filepath.IsAbs alone,
+// because on Windows IsAbs gets two real shapes wrong (see hostpath.go):
+//
+//   - "/c/GitLab/engram" — a Git Bash path, which IsAbs calls relative. It is
+//     nothing of the sort: it names a specific directory on this machine, and
+//     labelling it relative both refused every write and explained the refusal
+//     with a sentence about the daemon's working directory that had nothing to
+//     do with what went wrong. It is translated when the drive exists, and when
+//     it cannot be it stays refused — with the hint that names the shape.
+//   - "\\?\C:\GitLab\engram" — an extended-length path, which IsAbs correctly
+//     calls absolute and which then travels on in a spelling that compares
+//     unequal to every other reference to the same directory. The prefix is
+//     stripped here, once, at the door.
 func newDirectoryArg(dir, absoluteSource string) directoryArg {
-	if !filepath.IsAbs(dir) {
-		return directoryArg{Directory: dir, Source: dirSourceRelativePath, Relative: true}
+	resolved := normalizeHostPath(dir)
+	if !resolved.Absolute {
+		return directoryArg{Directory: dir, Input: dir, Source: dirSourceRelativePath, Relative: true}
 	}
-	return directoryArg{Directory: dir, Source: absoluteSource}
+	arg := directoryArg{Directory: resolved.Path, Input: dir, Source: absoluteSource}
+	if resolved.Translated {
+		arg.Source = dirSourceTranslatedPosix
+		arg.Warning = fmt.Sprintf("%q is a Git Bash/MSYS path and was translated to %q — "+
+			"this answer is about that directory", dir, resolved.Path)
+	}
+	return arg
 }
 
 // toolError renders a dirSourceInvalid directoryArg as the MCP tool error the
@@ -180,7 +217,25 @@ func (d directoryArg) toolError(tool string) *mcp.CallToolResult {
 // of it); a write would file a memory under a project nobody chose, and the one
 // thing the caller can do about it is spell the path out or name the project.
 func (d directoryArg) relativeError(tool string) *mcp.CallToolResult {
+	if hint, ok := d.gitBashHint(); ok {
+		return mcp.NewToolResultError(fmt.Sprintf("%s: directory %s", tool, hint))
+	}
 	return mcp.NewToolResultError(fmt.Sprintf("%s: directory %q is not absolute — %s", tool, d.Directory, relativeDirectoryHint))
+}
+
+// gitBashHint returns the Git Bash wording when that is what this directory is,
+// and ok=false when the generic relative-path sentence is the right one.
+//
+// The distinction is the whole point: "pass an absolute path" is unactionable
+// advice for someone who just passed what their shell calls an absolute path.
+// Only reachable for a path that could NOT be translated — an unmounted drive,
+// or a leading slash that names no drive at all ("/repos/x") — since a
+// translated one is absolute and never refused.
+func (d directoryArg) gitBashHint() (string, bool) {
+	if runtime.GOOS != "windows" || !looksLikeGitBashPath(d.Directory) {
+		return "", false
+	}
+	return gitBashDirectoryHint(d.Directory), true
 }
 
 // missingDirectoryError is the write-tool refusal for a directory that is not
@@ -971,7 +1026,7 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 		"project_source":     "",
 		"project_path":       "",
 		"cwd":                dir,
-		"cwd_input":          dirArg.Directory,
+		"cwd_input":          dirArg.Input,
 		"directory_source":   dirArg.Source,
 		"directory_exists":   false,
 		"available_projects": []string{},
@@ -1028,8 +1083,14 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 		// caller. Kept out of the explicit-project branch above on purpose — naming
 		// a project skips the directory entirely, so nothing is blocked.
 		env["writes_blocked"] = true
-		hints = append(hints, fmt.Sprintf("the directory you passed (%q) is RELATIVE: %s — "+
-			"every write tool refuses it", dirArg.Directory, relativeDirectoryHint))
+		if hint, ok := dirArg.gitBashHint(); ok {
+			// Same sentence the write tools return, so an agent that has read one
+			// recognises the other.
+			hints = append(hints, hint+" — every write tool refuses it")
+		} else {
+			hints = append(hints, fmt.Sprintf("the directory you passed (%q) is RELATIVE: %s — "+
+				"every write tool refuses it", dirArg.Directory, relativeDirectoryHint))
+		}
 	}
 
 	if !env["directory_exists"].(bool) {
@@ -2319,6 +2380,18 @@ const reviewIDsPerCall = 200
 // by review status; action="mark_reviewed" resets the staleness clock on the
 // given ids (or the row resolved from topic_key). mark_reviewed is a LOCAL-ONLY
 // write — it never enqueues an outbox entry, so no sync trigger is needed.
+//
+// Why it resolves its project the lenient READ way (resolveReadProject) even
+// though mark_reviewed writes. Every other write tool goes through
+// resolveSaveProject, which REFUSES a relative directory, because a wrong
+// project there invents a name and files a new memory under it — a fabrication
+// nobody asked for. mem_review cannot do that: both project uses are LOOKUPS
+// scoped by project (ListForReview filters by it, IDByTopicKey resolves a topic
+// inside it), so a wrong project finds nothing and the call is a no-op with an
+// empty list or a "no live memory for topic_key" error. It cannot mark someone
+// else's memory reviewed, because ids are explicit and topic keys are
+// project-scoped. A refusal here would buy nothing and would block the listing
+// half of the tool for callers whose directory the daemon cannot resolve.
 func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()

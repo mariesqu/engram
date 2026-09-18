@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1299,6 +1300,103 @@ func TestResolveClientDir_EnvOverride(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("resolveClientDir() = %q, want the override %q", got, want)
+	}
+}
+
+// TestResolveClientDir_RelativeOverrideIsMadeAbsolute is the fix for an
+// override that passed every check and helped nobody. A relative value — "." is
+// the one everybody writes, a bare folder name the next — used to be forwarded
+// VERBATIM: the daemon resolved it with filepath.Abs against ITS own working
+// directory, so every write was refused with a message quoting a "directory"
+// the user never typed, and nothing in the chain ever mentioned the value they
+// did set. `engram connect` runs in the client's workspace, which is the whole
+// reason its directory is worth forwarding, so that is the base.
+func TestResolveClientDir_RelativeOverrideIsMadeAbsolute(t *testing.T) {
+	workspace := t.TempDir()
+	child := filepath.Join(workspace, "repo")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	chdirTo(t, workspace)
+	// t.TempDir on Windows can hand back a short-name ("MTL~1.MES") path while
+	// Getwd reports the long one, so the expectation is derived from the cwd the
+	// process actually has rather than from the fixture's string.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+
+	for _, value := range []string{".", "repo", filepath.Join(".", "repo")} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("ENGRAM_CLIENT_DIR", value)
+
+			got, err := resolveClientDir()
+			if err != nil {
+				t.Fatalf("resolveClientDir: %v", err)
+			}
+			want := filepath.Clean(filepath.Join(cwd, value))
+			if got != want {
+				t.Errorf("resolveClientDir() = %q, want %q — a relative override resolves against THIS process's cwd",
+					got, want)
+			}
+			if !filepath.IsAbs(got) {
+				t.Errorf("resolveClientDir() = %q, which is not absolute: the daemon would resolve it against its own directory", got)
+			}
+		})
+	}
+}
+
+// TestResolveClientDir_GitBashPathIsTranslated covers the Windows shape that is
+// neither relative nor usable: "/c/GitLab/repo", which is what `pwd` prints in
+// the shell many people configure their MCP host from. filepath.Abs would turn
+// it into "C:\c\GitLab\repo" — a directory that does not exist, whose basename
+// becomes a brand-new junk project, minted by the very setting that exists to
+// prevent junk projects.
+func TestResolveClientDir_GitBashPathIsTranslated(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("/c/... is an ordinary absolute path off Windows")
+	}
+	repo := pinnedProjectDir(t, "git-bash-client-repo")
+	volume := filepath.VolumeName(repo)
+	if len(volume) != 2 || volume[1] != ':' {
+		t.Skipf("temp directory %q has no drive letter to translate", repo)
+	}
+	posix := "/" + strings.ToLower(volume[:1]) + strings.ReplaceAll(repo[len(volume):], `\`, "/")
+	t.Setenv("ENGRAM_CLIENT_DIR", posix)
+
+	got, err := resolveClientDir()
+	if err != nil {
+		t.Fatalf("resolveClientDir(%q): %v", posix, err)
+	}
+	if got != filepath.Clean(repo) {
+		t.Errorf("resolveClientDir() = %q, want the native form of %q (%q)", got, posix, repo)
+	}
+}
+
+// TestResolveClientDir_UntranslatableGitBashPathIsFatal keeps the fail-closed
+// rule for the case the translation cannot check: a drive letter this machine
+// does not have. The message has to name the SHAPE — "not an existing
+// directory" would send the user looking for a folder, when what is wrong is
+// the syntax.
+func TestResolveClientDir_UntranslatableGitBashPathIsFatal(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("/q/... is an ordinary absolute path off Windows")
+	}
+	const value = "/q/no/such/repo" // Q: is unmounted by convention
+	t.Setenv("ENGRAM_CLIENT_DIR", value)
+
+	got, err := resolveClientDir()
+	if err == nil {
+		t.Fatalf("resolveClientDir() = %q, nil — want a startup error for %q", got, value)
+	}
+	if got != "" {
+		t.Errorf("resolveClientDir() returned %q alongside the error; nothing must be forwarded", got)
+	}
+	msg := err.Error()
+	for _, want := range []string{"ENGRAM_CLIENT_DIR", fmt.Sprintf("%q", value), "Git Bash/MSYS path", clientDirDisabled} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error must mention %q so the user can act on it; got: %s", want, msg)
+		}
 	}
 }
 

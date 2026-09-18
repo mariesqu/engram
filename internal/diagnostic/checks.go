@@ -70,14 +70,11 @@ type OrphanedObservationSessionCheck struct{}
 func (OrphanedObservationSessionCheck) Code() string { return CheckOrphanedObservationSession }
 
 func (c OrphanedObservationSessionCheck) Run(_ context.Context, scope Scope) (CheckResult, error) {
-	refs, err := scope.Store.OrphanedObservationSessions(scope.Project)
+	split, err := scope.Store.OrphanedSessions(scope.Project)
 	if err != nil {
 		return CheckResult{}, err
 	}
-	unregistered, err := scope.Store.UnregisteredSessionSaves(scope.Project)
-	if err != nil {
-		return CheckResult{}, err
-	}
+	refs, unregistered := split.Orphans, split.Unregistered
 
 	findings := make([]Finding, 0, len(refs))
 	for _, ref := range refs {

@@ -114,10 +114,19 @@ func buildSpawnCmd(exe, dbPath string) *exec.Cmd {
 // daemon that refuses to start because its directory could not be resolved.
 func spawnWorkingDir() string {
 	if dir, err := config.DefaultConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+		// Resolved to an ABSOLUTE path before anything acts on it. DefaultConfigDir
+		// already does this for an ENGRAM_CONFIG_DIR override; it is re-checked
+		// here because a relative value would be resolved TWICE, independently:
+		// once by the MkdirAll below (against the cwd right now) and once by
+		// os/exec at spawn time (against the cwd then). Any chdir between the two
+		// — the tray, a test, a future caller — creates one directory and starts
+		// the daemon in another, or fails the spawn outright with a Dir that does
+		// not exist.
+		abs, absErr := filepath.Abs(dir)
 		// exec refuses to start a process whose Dir does not exist, so create it —
 		// 0700 is what config.Save uses for the same directory.
-		if mkErr := os.MkdirAll(dir, 0o700); mkErr == nil {
-			return dir
+		if absErr == nil && filepath.IsAbs(abs) && os.MkdirAll(abs, 0o700) == nil {
+			return abs
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {

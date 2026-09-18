@@ -49,14 +49,18 @@ func (f *fakeStore) DiagnosticSessions(project string) ([]localstore.DiagnosticS
 	return f.sessions, f.sessionsErr
 }
 
-func (f *fakeStore) OrphanedObservationSessions(project string) ([]localstore.OrphanedSessionRef, error) {
+// OrphanedSessions keeps the fake's two fields — the check reports the two
+// classes very differently (a warning and a note), and a test that sets only one
+// of them is saying exactly that.
+func (f *fakeStore) OrphanedSessions(project string) (localstore.OrphanedSessions, error) {
 	f.lastProjectIn = project
-	return f.orphans, f.orphansErr
-}
-
-func (f *fakeStore) UnregisteredSessionSaves(project string) ([]localstore.OrphanedSessionRef, error) {
-	f.lastProjectIn = project
-	return f.unregistered, f.unregErr
+	if f.orphansErr != nil {
+		return localstore.OrphanedSessions{}, f.orphansErr
+	}
+	if f.unregErr != nil {
+		return localstore.OrphanedSessions{}, f.unregErr
+	}
+	return localstore.OrphanedSessions{Orphans: f.orphans, Unregistered: f.unregistered}, nil
 }
 
 func (f *fakeStore) ProjectsWithoutPolicy(project string) ([]string, error) {

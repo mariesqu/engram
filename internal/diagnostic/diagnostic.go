@@ -52,8 +52,11 @@ const (
 // *localstore.Store satisfies it (see internal/localstore/diagnostic.go).
 type Store interface {
 	DiagnosticSessions(project string) ([]localstore.DiagnosticSession, error)
-	OrphanedObservationSessions(project string) ([]localstore.OrphanedSessionRef, error)
-	UnregisteredSessionSaves(project string) ([]localstore.OrphanedSessionRef, error)
+	// OrphanedSessions returns both classes of orphaned session reference —
+	// ids nothing registered, and the store's own manual-save default — from a
+	// single scan. They used to be two calls, which read the memories table twice
+	// to answer one question.
+	OrphanedSessions(project string) (localstore.OrphanedSessions, error)
 	ProjectsWithoutPolicy(project string) ([]string, error)
 	CountByReviewStatus(project string) (localstore.ReviewCounts, error)
 	SyncBacklog() (localstore.SyncBacklog, error)
@@ -302,9 +305,15 @@ func (r Report) IsRunLevelFailure() bool {
 	}
 }
 
-// ErrorReport wraps a run-level failure (an unknown check code, a scope with no
-// store) in the same envelope every other answer uses, so a consumer parses one
-// shape and never a bare error string.
+// ErrorReport wraps a run-level failure — in production, an unknown check id —
+// in the same envelope every other answer uses, so a consumer parses one shape
+// and never a bare error string.
+//
+// It is reached from exactly one place: RunOne, when the registry cannot look
+// up the code the caller asked for. Nothing else builds one, so the comment no
+// longer claims a second source ("a scope with no store") that no code path
+// produces — a doc that lists failures the package cannot emit sends the next
+// reader looking for a branch that is not there.
 func ErrorReport(project string, err error) Report {
 	code := CodeDiagnosticError
 	next := "Run mem_doctor without a check argument to see every registered diagnostic."

@@ -299,7 +299,7 @@ The resident daemon persists its configuration to a `config.json` file in a plat
 | macOS    | `~/Library/Application Support/engram/config.json`        |
 | Windows  | `%APPDATA%\engram\config.json`                            |
 
-Override the directory with `ENGRAM_CONFIG_DIR`.
+Override the directory with `ENGRAM_CONFIG_DIR`. A relative value is resolved against the working directory of whichever process reads it, so it is made **absolute** up front: the directory is *created* (by `config.Save`, and by a daemon spawn, which uses it as the detached daemon's working directory), and a relative override would otherwise create it inside whatever repo happened to be current — a different file per repo, under one setting.
 
 The file is written atomically (temp file + rename) so a crash during a write never produces a partial read. Absent file is not an error — the daemon uses defaults.
 
@@ -329,6 +329,7 @@ All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-
 | `GET`    | `/api/v1/memories`                         | List/search memories (`q`, `project`, `type`, `scope`, `from`, `to`, `offset`, `limit` params — `from`/`to` are `YYYY-MM-DD` dates bounding `created_at`, inclusive) |
 | `PUT`    | `/api/v1/memories/{id}`                    | Edit a memory in place (`title`, `content`, `type`)   |
 | `DELETE` | `/api/v1/memories/{id}`                    | Soft-delete a memory by numeric ID                     |
+| `GET`    | `/api/v1/sessions/{id}`                    | The project (and directory) a session was registered under — the fallback a lifecycle hook uses when its payload carries no `cwd` |
 | `POST`   | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
 | `POST`   | `/api/v1/central/disconnect`               | Disconnect from central (clears credentials)           |
 | `POST`   | `/api/v1/sync/trigger`                     | Trigger an immediate sync cycle (202; 409 if offline)  |
@@ -474,6 +475,8 @@ If your MCP host spawns its servers somewhere other than the workspace (some lau
   }
 }
 ```
+
+`ENGRAM_CLIENT_DIR` is made **absolute** first, against `engram connect`'s own working directory — which is the client's workspace, the very thing being forwarded. A relative value (`.` is the one everybody tries) used to travel to the daemon verbatim and be resolved against *its* directory, so every write was refused with a message about a path nobody typed. On Windows a Git Bash path (`/c/GitLab/repo`, `/mnt/c/GitLab/repo`) is translated to its native form when that drive exists, and refused with a message naming the shape when it does not — `filepath.Abs` would otherwise turn it into `C:\c\GitLab\repo`, a directory that is not there, whose basename becomes a brand-new junk project.
 
 `ENGRAM_CLIENT_DIR` **fails closed**: if it carries a real value other than `none`, that value must name an existing directory, or `engram connect` exits at startup with an error naming the variable, the value, and both remedies. It used to warn on stderr and forward the bad path anyway, which had the daemon detect a project from the basename of a directory that does not exist — minting a *new* junk project instead of curing one. Unset, empty, and whitespace-only all read the same way — as *not set* — so they fall back to forwarding the process's own working directory; the value is trimmed before use, so surrounding whitespace is never part of the forwarded path. The setting is read once, at startup: changing it means restarting the client's `engram connect` process.
 
@@ -905,12 +908,13 @@ The commands call `engram` **from PATH**, so the binary has to be there (`engram
 | `user-prompt-submit` | JSON | Captures the prompt (`mem_save_prompt`) so a later `mem_save` can attach it. On the FIRST prompt of a session it injects the tool bootstrap (call `mem_current_project` first; here are the tool names) — hosts that defer MCP tool loading need a name to load. Afterwards it stays silent unless the session is over 5 minutes old AND the project's newest memory is over 15 minutes old, and then at most once every 15 minutes. |
 | `subagent-stop` | `{}` | Saves the subagent's closing report as an observation titled `subagent-stop: …`. A subagent's context dies with it; this is the only copy. The title names the source because nobody reviewed that text. |
 
-Every hook that WRITES (`session-start`, `user-prompt-submit`, `subagent-stop`) resolves the project through `mem_current_project` first and then names it explicitly. If the answer is not trustworthy — no `cwd` in the payload, a directory that is gone, a `writes_blocked` project, or an answer that describes the *daemon's* own directory — the write is **skipped** with a line on stderr. A memory filed under the daemon's junk project reads exactly like real work, in a project nobody opens; not saving it is the cheaper mistake.
 | `session-end` | `{}` | Closes the session row. It does not invent a summary — that field belongs to `mem_session_summary`, and a hook-written "session ended" would overwrite the one thing the next session reads. |
+
+Every hook that WRITES (`session-start`, `user-prompt-submit`, `subagent-stop`) resolves the project through `mem_current_project` first and then names it explicitly. If the answer is not trustworthy — no `cwd` in the payload, a directory that is gone, a `writes_blocked` project, or an answer that describes the *daemon's* own directory — the hook falls back to the project the SESSION itself was registered under (`GET /api/v1/sessions/{id}` — session-start recorded a real `cwd` for that id), and if that answers nothing either, the write is **skipped** with a line on stderr. A memory filed under the daemon's junk project reads exactly like real work, in a project nobody opens; not saving it is the cheaper mistake.
 
 Per-session state (first-prompt marker, nudge cooldown) lives in `os.UserCacheDir()/engram/hooks` (created `0700`) under `engram-hook-<hash>-*`; the session id is hashed rather than embedded, since it is host-supplied text that ends up in a filesystem path. Not the system temp directory: it is world-writable on Unix, and a marker another user can create is a marker another user can use to silence your reminders. `session-start` and `post-compaction` DELETE both markers for their session (a `--resume` reuses the session id, so the bootstrap must fire again and the age clock must restart) and `session-end` removes them for good.
 
-Stdin is read under a 2-second deadline: `io.ReadAll` waits for EOF, so a host that hands the hook a pipe it never closes would otherwise block it forever — not for its budget, forever, with the user's prompt behind it.
+Each event runs under one clock that starts when the process does — stdin included. `io.ReadAll` waits for EOF, so a host that hands the hook a pipe it never closes would otherwise block it forever (not for its budget, forever, with the user's prompt behind it), and the read is therefore bounded by whichever is smaller: a 1-second ceiling, or what is left of the event's budget. The budgets themselves sit below the timeouts the packs declare, with the stdin ceiling counted in — a test fails the build if they ever cross.
 
 ## Using engram from your agent
 
@@ -1007,7 +1011,7 @@ Read-only checks over the local store, for the moments when something looks wron
 
 | Check | What it catches |
 |-------|-----------------|
-| `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. Saves filed under the store's own `manual-save-{project}` default are **excluded**: that is what a `mem_save` with no `session_id` does, and warning about it made every store that had ever taken a manual save permanently "warning". They are reported instead as an `info` finding, `unregistered_session_saves`, which does not move the check out of `ok`. |
+| `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. Saves filed under the store's own `manual-save-{project}` default are **excluded**: that is what a `mem_save` with no `session_id` does, and warning about it made every store that had ever taken a manual save permanently "warning". They are reported instead as an `info` finding, `unregistered_session_saves`, which does not move the check out of `ok`. The exclusion is an EXACT match against the id this store would mint for that row's project (`manual-save-` + project, case-sensitive): an id naming a *different* project, or one in a casing engram does not produce, is not the store's own default and stays a warning. |
 | `session_project_directory_mismatch` | A session filed under one project whose directory resolves to another today. Only *declared* identities count (config file, git remote, git root) — comparing two basename guesses would report drift that is not there. |
 | `ambiguous_active_sessions` | Two or more sessions still open for the same project + directory, usually an agent host that exited without firing its session-end hook. |
 | `project_policy_unknown` | Projects with memories but no explicit policy row, **only when central is configured** — they are being pushed on a computed default of `synced` that nobody chose. Informational. |

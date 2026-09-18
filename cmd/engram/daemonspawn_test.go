@@ -402,6 +402,39 @@ func TestBuildSpawnCmd_DirIsNotTheSpawnersCwd(t *testing.T) {
 	}
 }
 
+// TestSpawnWorkingDir_RelativeConfigDirResolvesExactlyOnce covers a relative
+// ENGRAM_CONFIG_DIR, which two different pieces of machinery would otherwise
+// resolve independently: the MkdirAll inside spawnWorkingDir (against the cwd
+// NOW) and os/exec (against the cwd at spawn time). A chdir between them — the
+// tray, a test, a future caller — creates one directory and starts the daemon
+// in another, or fails the spawn with a Dir that does not exist.
+//
+// Resolving once, here, is what makes the returned path mean the same directory
+// for the rest of the process's life. The second half of the test says so: the
+// answer still points at the created directory after the cwd moves.
+func TestSpawnWorkingDir_RelativeConfigDirResolvesExactlyOnce(t *testing.T) {
+	repo := t.TempDir()
+	chdirTo(t, repo)
+	t.Setenv("ENGRAM_CONFIG_DIR", ".engram-relative")
+
+	dir := spawnWorkingDir()
+
+	if !filepath.IsAbs(dir) {
+		t.Fatalf("spawnWorkingDir() = %q, which os/exec would resolve again against whatever cwd it finds", dir)
+	}
+	if want := filepath.Join(repo, ".engram-relative"); canonicalDir(t, dir) != canonicalDir(t, want) {
+		t.Fatalf("spawnWorkingDir() = %q, want %q — the override resolves against this process's cwd", dir, want)
+	}
+
+	// Move the cwd and check the answer still names the directory that was
+	// actually created. A relative return value would silently start meaning a
+	// directory that does not exist.
+	chdirTo(t, t.TempDir())
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Errorf("after the cwd moved, %q is not an existing directory (%v)", dir, err)
+	}
+}
+
 // TestSpawnWorkingDir_FallsBackToHome — an unusable config directory must not
 // take the spawn down with it. The home directory is not engram's, but it is
 // not a checkout either, which is the whole point.

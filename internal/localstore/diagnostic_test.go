@@ -83,10 +83,11 @@ func TestOrphanedObservationSessions_FindsUnmatchedIDs(t *testing.T) {
 		}
 	}
 
-	refs, err := s.OrphanedObservationSessions("")
+	split, err := s.OrphanedSessions("")
 	if err != nil {
-		t.Fatalf("OrphanedObservationSessions: %v", err)
+		t.Fatalf("OrphanedSessions: %v", err)
 	}
+	refs := split.Orphans
 	if len(refs) != 2 {
 		t.Fatalf("orphans = %+v, want 2 session ids", refs)
 	}
@@ -97,12 +98,12 @@ func TestOrphanedObservationSessions_FindsUnmatchedIDs(t *testing.T) {
 		t.Errorf("projects = %v, want the owning project", refs[0].Projects)
 	}
 
-	scoped, err := s.OrphanedObservationSessions("engram")
+	scoped, err := s.OrphanedSessions("engram")
 	if err != nil {
-		t.Fatalf("OrphanedObservationSessions(engram): %v", err)
+		t.Fatalf("OrphanedSessions(engram): %v", err)
 	}
-	if len(scoped) != 1 || scoped[0].SessionID != "ghost" {
-		t.Errorf("scoped orphans = %+v, want only ghost", scoped)
+	if len(scoped.Orphans) != 1 || scoped.Orphans[0].SessionID != "ghost" {
+		t.Errorf("scoped orphans = %+v, want only ghost", scoped.Orphans)
 	}
 }
 
@@ -120,10 +121,11 @@ func TestOrphanedObservationSessions_IgnoresDeletedRows(t *testing.T) {
 		t.Fatalf("DeleteMemory: %v", err)
 	}
 
-	refs, err := s.OrphanedObservationSessions("")
+	split, err := s.OrphanedSessions("")
 	if err != nil {
-		t.Fatalf("OrphanedObservationSessions: %v", err)
+		t.Fatalf("OrphanedSessions: %v", err)
 	}
+	refs := split.Orphans
 	if len(refs) != 0 {
 		t.Errorf("orphans = %+v, want none: the only referencing row is deleted", refs)
 	}
@@ -312,18 +314,16 @@ func TestOrphanedObservationSessions_ExcludesTheManualSaveDefault(t *testing.T) 
 		}
 	}
 
-	refs, err := s.OrphanedObservationSessions("")
+	split, err := s.OrphanedSessions("")
 	if err != nil {
-		t.Fatalf("OrphanedObservationSessions: %v", err)
+		t.Fatalf("OrphanedSessions: %v", err)
 	}
+	refs := split.Orphans
 	if len(refs) != 1 || refs[0].SessionID != "ghost" {
 		t.Fatalf("orphans = %+v, want only the genuinely orphaned session", refs)
 	}
 
-	manual, err := s.UnregisteredSessionSaves("")
-	if err != nil {
-		t.Fatalf("UnregisteredSessionSaves: %v", err)
-	}
+	manual := split.Unregistered
 	if len(manual) != 1 {
 		t.Fatalf("unregistered = %+v, want one session id", manual)
 	}
@@ -347,12 +347,80 @@ func TestUnregisteredSessionSaves_IgnoresARegisteredManualSession(t *testing.T) 
 		t.Fatalf("AddObservation: %v", err)
 	}
 
-	manual, err := s.UnregisteredSessionSaves("")
+	split, err := s.OrphanedSessions("")
 	if err != nil {
-		t.Fatalf("UnregisteredSessionSaves: %v", err)
+		t.Fatalf("OrphanedSessions: %v", err)
 	}
+	manual := split.Unregistered
 	if len(manual) != 0 {
 		t.Errorf("unregistered = %+v, want none: that session exists", manual)
+	}
+}
+
+// TestOrphanedSessions_OnlyTheExactDefaultIsExcused is why the split is an
+// exact match and not a prefix LIKE. LIKE 'manual-save-%' is case-insensitive
+// in SQLite and matches any tail, so BOTH of these were quietly reclassified as
+// "the store's own default" and demoted to an informational note: an id naming
+// a DIFFERENT project than the row it sits on, and one in a casing this code
+// cannot produce. Neither is something engram writes — which makes them exactly
+// what the orphan warning is for.
+func TestOrphanedSessions_OnlyTheExactDefaultIsExcused(t *testing.T) {
+	s := openTempStore(t)
+
+	for _, p := range []AddObservationParams{
+		{SessionID: DefaultManualSessionID("engram"), Title: "the real default", Project: "engram"},
+		{SessionID: "manual-save-other", Title: "names another project", Project: "engram"},
+		{SessionID: "MANUAL-SAVE-engram", Title: "not a casing we mint", Project: "engram"},
+	} {
+		if _, err := s.AddObservation(p); err != nil {
+			t.Fatalf("AddObservation(%q): %v", p.Title, err)
+		}
+	}
+
+	split, err := s.OrphanedSessions("")
+	if err != nil {
+		t.Fatalf("OrphanedSessions: %v", err)
+	}
+
+	if len(split.Unregistered) != 1 || split.Unregistered[0].SessionID != DefaultManualSessionID("engram") {
+		t.Fatalf("unregistered = %+v, want ONLY %q", split.Unregistered, DefaultManualSessionID("engram"))
+	}
+	got := map[string]bool{}
+	for _, ref := range split.Orphans {
+		got[ref.SessionID] = true
+	}
+	for _, want := range []string{"manual-save-other", "MANUAL-SAVE-engram"} {
+		if !got[want] {
+			t.Errorf("session %q was excused as the store's own default; it is not one — orphans: %+v",
+				want, split.Orphans)
+		}
+	}
+}
+
+// TestDefaultManualSessionID_UsesTheStoredProjectName pins the other half of
+// the exact match: the id is minted from the NORMALIZED project, because that
+// is what the memories row stores. A caller naming "MyRepo" used to get a row
+// under "myrepo" carrying "manual-save-MyRepo" — a default that did not match
+// its own project, and therefore a permanent orphan warning.
+func TestDefaultManualSessionID_UsesTheStoredProjectName(t *testing.T) {
+	s := openTempStore(t)
+
+	const asTyped = "  MyRepo  "
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: DefaultManualSessionID(asTyped), Title: "a plain mem_save", Project: asTyped,
+	}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	split, err := s.OrphanedSessions("")
+	if err != nil {
+		t.Fatalf("OrphanedSessions: %v", err)
+	}
+	if len(split.Orphans) != 0 {
+		t.Errorf("orphans = %+v, want none: that id IS the store's own default", split.Orphans)
+	}
+	if len(split.Unregistered) != 1 {
+		t.Fatalf("unregistered = %+v, want the manual-save default", split.Unregistered)
 	}
 }
 
@@ -371,10 +439,11 @@ func TestOrphanedObservationSessions_ProjectNamesWithCommasSurvive(t *testing.T)
 		t.Fatalf("AddObservation: %v", err)
 	}
 
-	refs, err := s.OrphanedObservationSessions("")
+	split, err := s.OrphanedSessions("")
 	if err != nil {
-		t.Fatalf("OrphanedObservationSessions: %v", err)
+		t.Fatalf("OrphanedSessions: %v", err)
 	}
+	refs := split.Orphans
 	if len(refs) != 1 {
 		t.Fatalf("orphans = %+v, want 1", refs)
 	}

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mariesqu/engram/internal/controlapi"
@@ -79,15 +80,24 @@ Install the hooks into your agent's settings with:
 // gives up and prints its fallback output BEFORE the host kills it — a hook
 // killed mid-write hands the host a truncated line, which for the JSON events
 // is a parse error.
+//
+// The budget covers the WHOLE process, stdin included: the clock starts in
+// runHookCmd before anything is read (see hookStdinDeadline). The invariant
+// TestHookBudgets_FitInsideEveryPackTimeout pins is one notch stricter still —
+// hookStdinDeadline + budget < the pack's timeout — so the margin survives even
+// if a future change moves the stdin read back outside the event's clock.
 const (
-	hookBudgetSessionStart = 9 * time.Second
+	// 8s, not 9s: both packs declare a 10-second timeout for the SessionStart
+	// family, and 9s left no room for the stdin deadline in front of it.
+	hookBudgetSessionStart = 8 * time.Second
 	hookBudgetPrompt       = 200 * time.Millisecond
-	hookBudgetSubagent     = 9 * time.Second
-	// 2s, not 4s: the Codex pack gives SessionEnd a 3-second timeout, so a 4s
+	hookBudgetSubagent     = 8 * time.Second
+	// 1.5s, not 4s: the Codex pack gives SessionEnd a 3-second timeout, so a 4s
 	// budget meant the host killed the hook a full second before the binary
-	// intended to give up — the one case the margin exists to prevent.
-	// TestHookBudgets_FitInsideEveryPackTimeout keeps the two in step.
-	hookBudgetSessionEnd = 2 * time.Second
+	// intended to give up — the one case the margin exists to prevent. 2s was the
+	// first correction and still did not fit the stdin deadline in front of it.
+	// TestHookBudgets_FitInsideEveryPackTimeout keeps the three in step.
+	hookBudgetSessionEnd = 1500 * time.Millisecond
 )
 
 // hookBudgets maps a hook event (the `engram hook <event>` subcommand) to the
@@ -148,7 +158,15 @@ func (in hookInput) message() string {
 // no-op would hide it forever. Every runtime failure inside a known event is
 // swallowed after a line on stderr, because the hook's job is to never be the
 // reason a prompt does not go through.
+//
+// The event's clock starts HERE, on the first line, and the same start feeds
+// both the stdin read and the event's context. It used to start after stdin:
+// the read had its own 2-second deadline and the event then took its full
+// budget on top, so the wall time a host actually saw was stdin PLUS budget —
+// up to 4 seconds for a session-end the Codex pack kills at 3. One clock, one
+// number, and the number is the budget.
 func runHookCmd(args []string) error {
+	start := time.Now()
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, hookUsage)
 		return errors.New("hook: an event name is required")
@@ -173,22 +191,30 @@ func runHookCmd(args []string) error {
 		return fmt.Errorf("hook %s takes no positional arguments; unexpected: %v", event, fs.Args())
 	}
 
-	in := readHookInput(os.Stdin)
+	budget, known := hookBudgets[event]
+	if !known {
+		// Checked BEFORE stdin is touched: an event nobody serves has no budget to
+		// read a payload under, and there is nothing to do with the payload anyway.
+		fmt.Fprint(os.Stderr, hookUsage)
+		return fmt.Errorf("hook: unknown event %q", event)
+	}
+
+	in := readHookInput(os.Stdin, hookStdinBound(budget-time.Since(start)))
+
+	ctx, cancel := context.WithDeadline(context.Background(), start.Add(budget))
+	defer cancel()
 
 	switch event {
 	case "session-start":
-		hookSessionStart(*db, in, false, !*noAutostart)
+		hookSessionStart(ctx, *db, in, false, !*noAutostart)
 	case "post-compaction":
-		hookSessionStart(*db, in, true, !*noAutostart)
+		hookSessionStart(ctx, *db, in, true, !*noAutostart)
 	case "user-prompt-submit":
-		hookUserPromptSubmit(*db, in)
+		hookUserPromptSubmit(ctx, *db, in)
 	case "subagent-stop":
-		hookSubagentStop(*db, in)
+		hookSubagentStop(ctx, *db, in)
 	case "session-end":
-		hookSessionEnd(*db, in)
-	default:
-		fmt.Fprint(os.Stderr, hookUsage)
-		return fmt.Errorf("hook: unknown event %q", event)
+		hookSessionEnd(ctx, *db, in)
 	}
 	return nil
 }
@@ -197,26 +223,51 @@ func runHookCmd(args []string) error {
 // message, not a file. 1 MiB is far past either and still cheap to hold.
 const hookStdinMaxBytes = 1 << 20
 
-// hookStdinDeadline bounds how long readHookInput waits for the host to finish
-// writing — and, critically, CLOSING — its payload. io.ReadAll returns when it
-// sees EOF, so a host that hands the hook an inherited pipe it never closes
-// (a wrapper script, a shell that keeps the write end open, a terminated parent
-// on Windows) hangs the hook forever: not for its budget, forever, holding up
-// the user's prompt with it. Every event degrades gracefully on empty fields,
-// so continuing without the payload is strictly better than not continuing.
-const hookStdinDeadline = 2 * time.Second
+// hookStdinDeadline is the CEILING on how long readHookInput waits for the host
+// to finish writing — and, critically, CLOSING — its payload. io.ReadAll returns
+// when it sees EOF, so a host that hands the hook an inherited pipe it never
+// closes (a wrapper script, a shell that keeps the write end open, a terminated
+// parent on Windows) hangs the hook forever: not for its budget, forever,
+// holding up the user's prompt with it. Every event degrades gracefully on
+// empty fields, so continuing without the payload is strictly better than not
+// continuing.
+//
+// 1s, not 2s: the wait is for a payload the host has already written (the read
+// returns the instant it sees EOF, so a well-behaved host never spends any of
+// this), and it has to fit INSIDE the tightest pack timeout together with the
+// event's budget — Codex gives UserPromptSubmit 2 seconds in total.
+const hookStdinDeadline = time.Second
 
-// readHookInput decodes the host's hook JSON. Every failure mode — no stdin, an
-// empty body, a truncated object, a JSON array, a stdin that never closes —
-// yields the zero value rather than an error: the events all degrade gracefully
-// on empty fields, and a hook that refused to run because the host sent
-// something unexpected would be worse than one that quietly does nothing.
+// hookStdinBound is how long the stdin read may take for an event with
+// remaining left of its budget: the ceiling, or what is left if that is less.
+//
+// The prompt hook is the case that makes this a min() rather than a constant —
+// its whole budget is 200ms, so a 1-second stdin wait would blow it five times
+// over before the hook did anything. A non-positive remaining (a machine so
+// loaded that flag parsing outlived the budget) yields zero, which readHookInput
+// treats as "do not wait at all" rather than "wait forever".
+func hookStdinBound(remaining time.Duration) time.Duration {
+	if remaining < hookStdinDeadline {
+		if remaining < 0 {
+			return 0
+		}
+		return remaining
+	}
+	return hookStdinDeadline
+}
+
+// readHookInput decodes the host's hook JSON under the deadline its caller
+// computed. Every failure mode — no stdin, an empty body, a truncated object, a
+// JSON array, a stdin that never closes — yields the zero value rather than an
+// error: the events all degrade gracefully on empty fields, and a hook that
+// refused to run because the host sent something unexpected would be worse than
+// one that quietly does nothing.
 //
 // The read happens on its own goroutine so the deadline can be enforced. On
 // timeout that goroutine is LEAKED, deliberately: there is no portable way to
 // interrupt a blocked read on an inherited handle, and this process is about to
 // print one line and exit.
-func readHookInput(r io.Reader) hookInput {
+func readHookInput(r io.Reader, deadline time.Duration) hookInput {
 	if r == nil {
 		return hookInput{}
 	}
@@ -231,7 +282,7 @@ func readHookInput(r io.Reader) hookInput {
 		done <- read{body, err}
 	}()
 
-	timer := time.NewTimer(hookStdinDeadline)
+	timer := time.NewTimer(deadline)
 	defer timer.Stop()
 	select {
 	case res := <-done:
@@ -246,7 +297,7 @@ func readHookInput(r io.Reader) hookInput {
 		return in
 	case <-timer.C:
 		fmt.Fprintf(os.Stderr, "engram hook: stdin was still open after %s; continuing without the hook payload\n",
-			hookStdinDeadline)
+			deadline)
 		return hookInput{}
 	}
 }
@@ -279,8 +330,29 @@ func newToolClient(dir string, timeout time.Duration) (*mcpBridge, error) {
 	}, nil
 }
 
+// hookRemaining is how much of the event's budget is left. It is what the
+// hooks' HTTP clients get as their per-request Timeout: ctx is what actually
+// bounds the hook, and a client handed the WHOLE budget would let a retry (the
+// 401-refresh path in callTool) spend a second helping of time already gone.
+//
+// A context with no deadline yields the longest budget rather than zero — a
+// caller that did not bound the hook did not mean "give up immediately".
+func hookRemaining(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return hookBudgetSessionStart
+	}
+	if remaining := time.Until(deadline); remaining > 0 {
+		return remaining
+	}
+	// Spent. Anything positive keeps http.Client from reading this as "no
+	// timeout"; the context is already done, so the call fails on it regardless.
+	return time.Millisecond
+}
+
 // dialHook resolves the DB path, optionally auto-starts a resident daemon, and
-// returns a client for it.
+// returns a client for it. The client's per-request timeout is whatever is left
+// of the event's budget (see hookRemaining).
 //
 // autostart is deliberately NOT universal. session-start and post-compaction
 // may spawn a daemon (they are the first thing that runs in a session, and they
@@ -288,7 +360,7 @@ func newToolClient(dir string, timeout time.Duration) (*mcpBridge, error) {
 // runs out of budget leaves a daemon behind for the next one). The others never
 // do: spawning a SQLite owner to record the end of a session, or inside a
 // 200ms prompt budget, trades the thing the user is doing for bookkeeping.
-func dialHook(ctx context.Context, dbFlag string, autostart bool, timeout time.Duration) (*mcpBridge, error) {
+func dialHook(ctx context.Context, dbFlag string, autostart bool) (*mcpBridge, error) {
 	dbPath, err := resolveConnectDBPath(dbFlag)
 	if err != nil {
 		return nil, err
@@ -302,7 +374,7 @@ func dialHook(ctx context.Context, dbFlag string, autostart bool, timeout time.D
 			fmt.Fprintf(os.Stderr, "engram hook: auto-start: %v\n", err)
 		}
 	}
-	return newToolClient(dir, timeout)
+	return newToolClient(dir, hookRemaining(ctx))
 }
 
 // callTool performs one MCP tools/call over the daemon's HTTP transport and
@@ -445,6 +517,16 @@ func hookResolveProject(ctx context.Context, client *mcpBridge, cwd string) stri
 		fmt.Fprintf(os.Stderr, "engram hook: mem_current_project returned non-JSON: %v\n", err)
 		return ""
 	}
+	// Deliberately REDUNDANT with the writes_blocked check beside it, and worth
+	// keeping anyway. Today mem_current_project blocks writes for both of these
+	// sources, so neither term can decide the outcome alone — a mutation that
+	// deletes either one leaves every test green. What they buy is independence:
+	// writes_blocked is a POLICY answer that composes several conditions (an
+	// omitted project, a missing directory, a relative path) and could
+	// reasonably stop covering one of them, while this names the two answers a
+	// hook must never act on no matter what policy says — the ones that describe
+	// the DAEMON's directory rather than the session's. A hook files memories
+	// nobody reviews; the cheap belt beside the braces is the right trade.
 	answersAboutTheDaemon := env.DirectorySource == dirSourceDaemonCwd || env.DirectorySource == dirSourceRelativePath
 	if strings.TrimSpace(env.Project) == "" || env.ErrorHint != "" || env.WritesBlocked || !env.DirExists ||
 		answersAboutTheDaemon {
@@ -453,6 +535,77 @@ func hookResolveProject(ctx context.Context, client *mcpBridge, cwd string) stri
 		return ""
 	}
 	return env.Project
+}
+
+// hookProject is the project a hook's work belongs to: the payload's cwd first,
+// and the SESSION's own registration as the fallback.
+//
+// The fallback is not a second guess at the same question — it is the same
+// observation arriving by another road. session-start registered this id WITH
+// the directory the host reported, so the session row holds a cwd that came
+// from the host, for this very session, at a moment when the host did supply
+// one. A later event from the same session that arrives without a cwd (Codex
+// omits it for some subagent shapes, and a wrapper script can drop it for any
+// of them) is not a session we cannot place: it is one we already placed.
+//
+// Everything that made the cwd path refuse still applies to what it refused —
+// a directory that is gone or a daemon-cwd answer never becomes acceptable
+// here. This only asks a different, narrower question when the first one had
+// nothing to work with.
+func hookProject(ctx context.Context, client *mcpBridge, in hookInput) string {
+	if project := hookResolveProject(ctx, client, in.CWD); project != "" {
+		return project
+	}
+	return hookProjectFromSession(ctx, client.dir, in.SessionID)
+}
+
+// hookProjectFromSession asks the daemon which project a session id was
+// registered under (GET /api/v1/sessions/{id}).
+//
+// The control API, not an MCP tool, for the same reason hookLastSaveAge reads
+// it there: no tool answers "which project is session X filed under?" in a
+// machine-readable shape, and the session row is exactly the kind of local
+// bookkeeping the control plane exists for. Every failure — no daemon, an
+// unregistered id, a store with no session support (501), an empty project —
+// returns "", which leaves the caller exactly where it was: not saving.
+func hookProjectFromSession(ctx context.Context, dir, sessionID string) string {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return ""
+	}
+	client, err := NewControlClient(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "engram hook: session lookup: %v\n", err)
+		return ""
+	}
+	// Same bound hookLastSaveAge applies, for the same reason: the client's 5s
+	// default would outlive a 200ms prompt budget many times over, and the
+	// context is what actually enforces the deadline across the 401 retry.
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ""
+		}
+		client.http.Timeout = remaining
+	}
+
+	var session struct {
+		Project string `json:"project"`
+	}
+	// urlQueryEscape over-escapes for a path segment (it percent-encodes "/"),
+	// which is the safe direction: a session id is host-supplied text, and the
+	// worst case of over-escaping is a 404 that leaves the caller where it was.
+	if err := client.GetContext(ctx, "/api/v1/sessions/"+urlQueryEscape(id), &session); err != nil {
+		fmt.Fprintf(os.Stderr, "engram hook: session %q is not registered under a project (%v); "+
+			"nothing to fall back to\n", id, err)
+		return ""
+	}
+	project := strings.TrimSpace(session.Project)
+	if project != "" {
+		fmt.Fprintf(os.Stderr, "engram hook: the payload carried no usable cwd; using project %q "+
+			"from the session's own registration\n", project)
+	}
+	return project
 }
 
 // ── session-start / post-compaction ─────────────────────────────────────────
@@ -480,10 +633,7 @@ func hookResolveProject(ctx context.Context, client *mcpBridge, cwd string) stri
 // is the half of the session bootstrap that does not need a daemon, and an
 // agent that knows the tools exist will call them once the daemon is back —
 // whereas an agent that was told nothing will not.
-func hookSessionStart(dbFlag string, in hookInput, compaction, autostart bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), hookBudgetSessionStart)
-	defer cancel()
-
+func hookSessionStart(ctx context.Context, dbFlag string, in hookInput, compaction, autostart bool) {
 	// A session id is REUSED across a `claude --resume` (and across a compaction,
 	// which fires this same hook): the bootstrap must fire again for the new
 	// context, and the nudge clock must start from now rather than from whenever
@@ -492,7 +642,7 @@ func hookSessionStart(dbFlag string, in hookInput, compaction, autostart bool) {
 	hookClearState(in.SessionID)
 
 	project, memoryContext := "", ""
-	client, err := dialHook(ctx, dbFlag, autostart, hookBudgetSessionStart)
+	client, err := dialHook(ctx, dbFlag, autostart)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook session-start: %v\n", err)
 	} else {
@@ -629,21 +779,32 @@ All 4 steps are MANDATORY. Skipping them means continuing blind on a task you ca
 //  3. Afterwards, at most one save reminder per cooldown, and only for a
 //     session old enough and a project whose newest memory is stale enough to
 //     deserve it.
-func hookUserPromptSubmit(dbFlag string, in hookInput) {
-	start := time.Now()
-	ctx, cancel := context.WithDeadline(context.Background(), start.Add(hookBudgetPrompt))
-	defer cancel()
-
+func hookUserPromptSubmit(ctx context.Context, dbFlag string, in hookInput) {
 	// Claimed BEFORE any network work, and atomically: two prompts submitted in
 	// quick succession must not both count as the first one, and the file's
 	// modification time is what later calls use as the session's age.
-	stateFile := hookStateFile(in.SessionID, hookStateToolsLoaded)
-	firstPrompt := hookClaimState(stateFile)
+	//
+	// A payload with NO session id claims nothing. The marker path is the hash of
+	// the id, so an empty one hashes to a single fixed name shared by every such
+	// hook on the machine — and nothing ever clears it, because hookClearState
+	// (session-start, session-end) refuses an empty id too. The first payload
+	// that arrived without a session id therefore claimed a permanent marker,
+	// after which every later one read "not the first prompt" and lost its
+	// bootstrap, and the nudge started measuring a "session age" from whenever
+	// that stray hook ran. A session we cannot name has no state to keep: treat
+	// each one as a first prompt (the bootstrap is static text that needs no
+	// project) and skip the nudge machinery entirely, since every gate it opens
+	// is read from the file this branch does not write.
+	stateFile, firstPrompt := "", true
+	if strings.TrimSpace(in.SessionID) != "" {
+		stateFile = hookStateFile(in.SessionID, hookStateToolsLoaded)
+		firstPrompt = hookClaimState(stateFile)
+	}
 
 	// No autostart: spawning a SQLite owner is seconds of work inside a 200ms
 	// budget. A session-start hook (or the first tools/call from the agent)
 	// brings the daemon up.
-	client, err := dialHook(ctx, dbFlag, false, hookBudgetPrompt)
+	client, err := dialHook(ctx, dbFlag, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook user-prompt-submit: %v\n", err)
 		hookPrintPromptOutput(firstPrompt, "")
@@ -654,7 +815,7 @@ func hookUserPromptSubmit(dbFlag string, in hookInput) {
 	// need the same answer, and a mem_current_project round trip inside a 200ms
 	// budget is not something to pay for twice — or at all on a prompt that has
 	// nothing to save and nothing to remind about.
-	project := onceProject(ctx, client, in.CWD)
+	project := onceProject(ctx, client, in)
 
 	if prompt := strings.TrimSpace(in.Prompt); prompt != "" && strings.TrimSpace(in.SessionID) != "" {
 		// project, not directory: the daemon is a separate process and a payload
@@ -687,18 +848,18 @@ func hookUserPromptSubmit(dbFlag string, in hookInput) {
 	hookPrintPromptOutput(false, hookSaveNudge(ctx, client, in, stateFile, project))
 }
 
-// onceProject memoizes hookResolveProject for one hook run. The zero answer is
+// onceProject memoizes hookProject for one hook run. The zero answer is
 // memoized too: a workspace that could not be resolved once will not resolve on
 // a second call, and retrying it inside a 200ms budget spends the budget twice
 // to learn the same thing.
-func onceProject(ctx context.Context, client *mcpBridge, cwd string) func() string {
+func onceProject(ctx context.Context, client *mcpBridge, in hookInput) func() string {
 	var (
 		project string
 		done    bool
 	)
 	return func() string {
 		if !done {
-			project = hookResolveProject(ctx, client, cwd)
+			project = hookProject(ctx, client, in)
 			done = true
 		}
 		return project
@@ -873,7 +1034,7 @@ func hookLastSaveAge(ctx context.Context, dir, project string) (time.Duration, b
 // by a process nobody reviewed, not a decision anyone made. capture_prompt is
 // off for the same reason — the user's prompt belongs to the parent session's
 // work, not to a subagent's transcript.
-func hookSubagentStop(dbFlag string, in hookInput) {
+func hookSubagentStop(ctx context.Context, dbFlag string, in hookInput) {
 	defer fmt.Println("{}")
 
 	message := in.message()
@@ -881,10 +1042,7 @@ func hookSubagentStop(dbFlag string, in hookInput) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), hookBudgetSubagent)
-	defer cancel()
-
-	client, err := dialHook(ctx, dbFlag, false, hookBudgetSubagent)
+	client, err := dialHook(ctx, dbFlag, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook subagent-stop: %v\n", err)
 		return
@@ -894,8 +1052,10 @@ func hookSubagentStop(dbFlag string, in hookInput) {
 	// cwd (Codex sends none for some subagent shapes) would otherwise resolve to
 	// the resident daemon's own working directory — and a subagent report filed
 	// under a junk project reads exactly like a real memory, in a project the
-	// user never opens.
-	project := hookResolveProject(ctx, client, in.CWD)
+	// user never opens. When there is no cwd to resolve, the session's own
+	// registration answers instead (hookProject); when nothing answers, the
+	// report is dropped.
+	project := hookProject(ctx, client, in)
 	if project == "" {
 		fmt.Fprintf(os.Stderr, "engram hook subagent-stop: no usable project for %q; the report was not saved\n", in.CWD)
 		return
@@ -944,7 +1104,7 @@ func hookSubagentTitle(message string) string {
 // hookSessionEnd closes the session row. No summary is invented here: the
 // agent writes that with mem_session_summary, and a hook that filled the field
 // with "session ended" would overwrite the one place the next session looks.
-func hookSessionEnd(dbFlag string, in hookInput) {
+func hookSessionEnd(ctx context.Context, dbFlag string, in hookInput) {
 	defer fmt.Println("{}")
 
 	id := strings.TrimSpace(in.SessionID)
@@ -956,10 +1116,7 @@ func hookSessionEnd(dbFlag string, in hookInput) {
 	// accumulating one pair of files per session forever.
 	hookClearState(id)
 
-	ctx, cancel := context.WithTimeout(context.Background(), hookBudgetSessionEnd)
-	defer cancel()
-
-	client, err := dialHook(ctx, dbFlag, false, hookBudgetSessionEnd)
+	client, err := dialHook(ctx, dbFlag, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook session-end: %v\n", err)
 		return
@@ -997,16 +1154,36 @@ const (
 //
 // A failure to resolve or create it falls back to os.TempDir — the old home.
 // Degrading a debounce is acceptable; refusing to run a hook is not.
+//
+// The MkdirAll runs ONCE per directory: a hook run calls this for every marker
+// it touches (claim, age, clear — twice each for the two kinds), and a process
+// that has already created the directory has nothing to learn from doing it
+// again. Keyed on the resolved path rather than a bare sync.Once so the state
+// directory can still move within one process, which is exactly what the tests
+// do when they isolate it per test — and guarded by a mutex because the claim
+// it feeds is the one thing here that races by design.
+var hookStateDirCreated struct {
+	sync.Mutex
+	dir string
+}
+
 func hookStateDir() string {
 	base, err := os.UserCacheDir()
 	if err != nil || strings.TrimSpace(base) == "" {
 		return os.TempDir()
 	}
 	dir := filepath.Join(base, "engram", "hooks")
+
+	hookStateDirCreated.Lock()
+	defer hookStateDirCreated.Unlock()
+	if hookStateDirCreated.dir == dir {
+		return dir
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook: cannot use %s (%v); falling back to the temp directory\n", dir, err)
 		return os.TempDir()
 	}
+	hookStateDirCreated.dir = dir
 	return dir
 }
 
