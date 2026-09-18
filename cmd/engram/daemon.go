@@ -457,10 +457,17 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	// it internally so the window need not thread through registerTools.
 	store.SetReviewWindowDays(cfg.reviewWindowDays)
 
+	// WithInstructions ships the agent protocol in the initialize result.  It is
+	// the channel gentle-ai's slim CLAUDE.md section delegates to once it sees a
+	// parseable version at or above its floor — without it that client injects
+	// the slim reminders and nothing that explains the save format, the lifecycle
+	// states, the search flow, or the after-compaction steps.  See
+	// instructions.go for the text and the full rationale.
 	mcpSrv := mcpserver.NewMCPServer(
 		"engram",
 		version,
 		mcpserver.WithToolCapabilities(true),
+		mcpserver.WithInstructions(serverInstructions),
 	)
 
 	var loop *syncer.Loop
