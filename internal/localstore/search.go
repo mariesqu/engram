@@ -616,15 +616,22 @@ func truncateStr(s string, n int) string {
 // sessions and recent observations, mirroring the legacy predecessor's
 // store.FormatContext.
 //
-// Format (faithful to the legacy predecessor):
+// Format:
 //
 //	## Memory from Previous Sessions
 //
 //	### Recent Sessions
-//	- **project** (started_at)[: summary] [N observations]
+//	- **project** (started_at → last_activity_at)[: summary] [N observations]
 //
 //	### Recent Observations
 //	- [type] **title**: content_preview
+//
+// The session bullet carries BOTH timestamps because the list is ordered by
+// last activity (see RecentSessions): showing only started_at would leave the
+// ordering looking arbitrary — an older-started session correctly ranked first
+// for having been worked in five minutes ago would read as a sorting bug. The
+// arrow is omitted when the two are equal, so an idle session renders exactly
+// as it always did.
 //
 // Returns an empty string when there are no sessions and no observations.
 // project and scope are optional — empty string means "all".
@@ -662,9 +669,17 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 				sess.ID,
 			).Scan(&obsCount)
 
+			// Show the span the session actually covers. When nothing happened
+			// after registration the two stamps coincide and only one is printed.
+			started := sess.StartedAt.UTC().Format("2006-01-02 15:04:05")
+			when := started
+			if last := sess.LastActivityAt.UTC().Format("2006-01-02 15:04:05"); last != started && last != "" {
+				when = started + " → " + last
+			}
+
 			fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n",
 				sess.Project,
-				sess.StartedAt.UTC().Format("2006-01-02 15:04:05"),
+				when,
 				summary,
 				obsCount,
 			)

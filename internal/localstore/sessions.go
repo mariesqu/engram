@@ -25,6 +25,16 @@ type SessionSummary struct {
 	StartedAt time.Time
 	EndedAt   *time.Time
 	Summary   *string
+
+	// LastActivityAt is the DERIVED moment this session was last doing anything:
+	// the latest of started_at, ended_at, and the created_at of its newest live
+	// memory. It is computed in SQL by RecentSessions, not stored — there is no
+	// last_activity column, deliberately (see RecentSessions).
+	//
+	// It is what RecentSessions orders by and what FormatContext shows, because
+	// "most recent session" means the one the user was last working in, not the
+	// one that happened to be registered last.
+	LastActivityAt time.Time
 }
 
 // ErrSessionNotFound is returned by GetSession when the id does not exist.
@@ -176,27 +186,53 @@ func (s *Store) GetSession(id string) (*Session, error) {
 }
 
 // RecentSessions returns the most recent sessions for the given project,
-// ordered by started_at DESC with id DESC as a deterministic tie-breaker.
+// ordered by LAST ACTIVITY DESC with id DESC as a deterministic tie-breaker.
 // If project is empty all projects are included. limit <= 0 defaults to 5.
 //
-// TODO(PR4+): the legacy predecessor orders by
-// MAX(COALESCE(obs.created_at, started_at)) DESC (latest ACTIVITY). This uses
-// started_at DESC as a simplification until the observations table exists —
-// revisit the ORDER BY when it lands.
+// Last activity is derived, not stored: the latest of started_at, ended_at (set
+// together with the summary by EndSession, so it covers "the session was closed
+// out at T"), and the created_at of the session's newest live memory. Ordering
+// by started_at — what this did before — ranked a session registered an hour ago
+// and never used above a session opened yesterday that has been saving memories
+// all morning. The second one is the context the agent actually needs back.
+//
+// Why derived rather than a last_activity column: a stored column would need a
+// schema migration AND a write on every memory insert, and it would be one more
+// value that can drift out of sync with the rows it summarizes. The correlated
+// MAX() below is computed from the memories themselves, so it cannot be wrong.
+// The cost is a per-session scan of memories(session_id) — the same shape
+// FormatContext's per-session observation COUNT already pays, and bounded by
+// `limit` sessions. If a session_id index is ever added for the count, this
+// query benefits from it for free.
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	project = normalizeProject(project)
 	if limit <= 0 {
 		limit = 5
 	}
 
-	query := `SELECT id, project, started_at, ended_at, summary
-	          FROM sessions WHERE 1=1`
+	// MAX() here is SQLite's SCALAR max (3 arguments) over three datetime()
+	// strings; the single-argument MAX inside the correlated subquery is the
+	// AGGREGATE. Keeping the aggregate inside its own subquery — rather than a
+	// LEFT JOIN + GROUP BY — is what keeps the two unambiguous, and it lets the
+	// select list stay a plain projection of the sessions row.
+	const lastActivityExpr = `MAX(
+	            datetime(s.started_at),
+	            datetime(COALESCE(s.ended_at, s.started_at)),
+	            datetime(COALESCE(
+	              (SELECT MAX(m.created_at) FROM memories m
+	               WHERE m.session_id = s.id AND m.deleted_at IS NULL),
+	              s.started_at))
+	          )`
+
+	query := `SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
+	                 ` + lastActivityExpr + ` AS last_activity_at
+	          FROM sessions s WHERE 1=1`
 	args := []any{}
 	if project != "" {
-		query += " AND LOWER(project) = ?"
+		query += " AND LOWER(s.project) = ?"
 		args = append(args, project)
 	}
-	query += " ORDER BY datetime(started_at) DESC, id DESC LIMIT ?"
+	query += " ORDER BY datetime(last_activity_at) DESC, s.id DESC LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := s.db.Query(query, args...)
@@ -208,8 +244,8 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	var results []SessionSummary
 	for rows.Next() {
 		var ss SessionSummary
-		var startedRaw, endedRaw, summaryRaw sql.NullString
-		if err := rows.Scan(&ss.ID, &ss.Project, &startedRaw, &endedRaw, &summaryRaw); err != nil {
+		var startedRaw, endedRaw, summaryRaw, lastActivityRaw sql.NullString
+		if err := rows.Scan(&ss.ID, &ss.Project, &startedRaw, &endedRaw, &summaryRaw, &lastActivityRaw); err != nil {
 			return nil, err
 		}
 		if summaryRaw.Valid {
@@ -221,6 +257,14 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 		if endedRaw.Valid && endedRaw.String != "" {
 			if t, err := parseSessionTime(endedRaw.String); err == nil {
 				ss.EndedAt = &t
+			}
+		}
+		// Fall back to StartedAt when the derived value is unparseable, so a data
+		// anomaly degrades to the OLD behaviour instead of a zero timestamp.
+		ss.LastActivityAt = ss.StartedAt
+		if lastActivityRaw.Valid {
+			if t, err := parseSessionTime(lastActivityRaw.String); err == nil {
+				ss.LastActivityAt = t
 			}
 		}
 		results = append(results, ss)
