@@ -486,9 +486,11 @@ action="list": list memories by review status — status filter is one of:
 
 action="mark_reviewed": reset the staleness clock on memories you have verified.
   Provide ids (a number array) OR a topic_key (resolves to its current observation).
-  Sets review_after = now + window; returns the count updated.
+  The new due date is recomputed from the memory's TYPE — decision +6 months,
+  policy +12, preference +3, anything else + the staleness window. Returns the
+  count updated.
 
-Status is computed at read time: a memory is "needs_review" once it ages past the staleness window, "expired" once past its expires_at, else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
+Status is computed at read time: a memory is "needs_review" once past its review_after (set at save time for decision/policy/preference) or, when it has none, once it ages past the staleness window; "expired" once past its expires_at; else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
 			mcp.WithTitleAnnotation("Review Memory Lifecycle"),
 			mcp.WithReadOnlyHintAnnotation(false),
 			mcp.WithDestructiveHintAnnotation(false),

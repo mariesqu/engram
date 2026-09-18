@@ -185,6 +185,11 @@ type fileConfig struct {
 	// ReviewWindowDays is the memory-lifecycle staleness window in days. A memory
 	// is considered "needs_review" once now > COALESCE(review_after, updated_at +
 	// window). 0/unset → default 30; any value <= 0 is treated as the default.
+	//
+	// It is the FALLBACK, not the universal rule: decision, policy and preference
+	// rows carry an explicit review_after stamped at save time from the per-type
+	// decay map (6 / 12 / 3 months — see localstore.decayReviewAfterMonths), so
+	// this window governs every other type.
 	ReviewWindowDays int `json:"review_window_days,omitempty"`
 }
 

@@ -27,12 +27,24 @@ func newReviewMergeDaemon(t *testing.T) *daemonComponents {
 	return components
 }
 
-// markStale forces a row's updated_at into the past so it computes as needs_review
-// under the default 30-day window.
+// markStale forces a row into the past so it computes as needs_review: updated_at
+// beyond the default 30-day window, AND — for a type that carries an explicit
+// review_after from the per-type decay map — that due date too.
+//
+// Ageing updated_at alone stopped being enough once "decision" rows started
+// being stamped with review_after = now + 6 months at insert: an explicit due
+// date outranks the rolling window in ReviewStatus, so the row stayed active no
+// matter how old its updated_at was. The CASE leaves NULL alone so the helper
+// still exercises the window path for types with no decay entry.
 func markStale(t *testing.T, c *daemonComponents, id int64) {
 	t.Helper()
 	if _, err := c.store.DB().Exec(
-		`UPDATE memories SET updated_at = datetime('now','-40 days') WHERE id = ?`, id,
+		`UPDATE memories
+		 SET updated_at   = datetime('now','-40 days'),
+		     review_after = CASE WHEN review_after IS NULL
+		                        THEN NULL
+		                        ELSE datetime('now','-1 days') END
+		 WHERE id = ?`, id,
 	); err != nil {
 		t.Fatalf("markStale: %v", err)
 	}

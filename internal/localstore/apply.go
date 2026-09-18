@@ -123,16 +123,31 @@ func applyTx(tx *sql.Tx, d domain.Decision, m domain.Mutation) error {
 }
 
 func execInsert(tx *sql.Tx, m domain.Mutation) error {
+	// review_after is stamped HERE, on the one path that creates a row, and
+	// nowhere else. That placement is the whole rule: a topic_key revision takes
+	// ActionUpdate (execUpdate leaves review_after alone) and an idempotent
+	// re-apply takes NoOp, so neither can silently push a memory's review date
+	// forward. Only MarkReviewed may move it afterwards, and only on request.
+	//
+	// It is LOCAL-ONLY metadata: review_after is not in the canonical payload
+	// (see mutation.CanonicalPayload), so it never crosses the sync wire. Each
+	// node therefore dates the window from when the row landed on THAT node —
+	// which is what a per-node "I should re-check this" clock means. For a pulled
+	// row that is its arrival, and created_at agrees (the column defaults to
+	// datetime('now') on this same INSERT).
+	reviewAfter := reviewAfterForType(m.Type, time.Now())
+
 	_, err := tx.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
 		   project, scope, topic_key, parent_sync_id, status,
-		   version, writer_id, last_write_mutation_id, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   version, writer_id, last_write_mutation_id, updated_at, review_after)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		m.SyncID, m.SessionID, string(m.EntityType), m.Type, m.Title, m.Content,
 		m.Project, m.Scope, nullStr(m.TopicKey), nullStr(m.ParentSyncID), nullStr(m.Status),
 		m.Version, m.WriterID, m.MutationID,
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		reviewAfter,
 	)
 	if err != nil {
 		return fmt.Errorf("execInsert: %w", err)

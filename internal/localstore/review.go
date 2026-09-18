@@ -29,6 +29,45 @@ type ReviewRow struct {
 	ReviewAfter *time.Time
 }
 
+// decayReviewAfterMonths maps an observation type to how many months it stays
+// trustworthy before it should be re-checked. A type absent from this map gets
+// review_after = NULL and falls back to the store's rolling
+// updated_at + reviewWindowDays (see ReviewStatus) — the map is an override for
+// the handful of types whose useful life is measured in months, not weeks.
+//
+// The three entries are deliberate, not a sample:
+//   - decision (6mo)   — a decision goes stale when the thing it decided moves.
+//   - policy (12mo)    — policy is meant to outlive the work it governs.
+//   - preference (3mo) — a stated preference is the most volatile of the three.
+//
+// "policy" and "preference" are not in the type list mem_save's description
+// enumerates; type is a free-form column and callers do pass them. A map miss is
+// safe by construction, so listing them costs nothing and catches them when they
+// appear.
+var decayReviewAfterMonths = map[string]int{
+	"decision":   6,
+	"policy":     12,
+	"preference": 3,
+}
+
+// sqliteTimeLayout is the text format SQLite's datetime() produces, and the one
+// every timestamp column in this schema is written in. parseTime accepts it.
+const sqliteTimeLayout = "2006-01-02 15:04:05"
+
+// reviewAfterForType returns the review_after value for a row of the given type,
+// as an `any` ready to bind to a SQL parameter: a formatted timestamp for a type
+// in the decay map, or nil (SQL NULL) for one that is not.
+//
+// Callers pass the reference instant explicitly so the value is testable and so
+// the insert path can date the window from the row's own creation moment.
+func reviewAfterForType(typ string, now time.Time) any {
+	months, ok := decayReviewAfterMonths[typ]
+	if !ok {
+		return nil
+	}
+	return now.UTC().AddDate(0, months, 0).Format(sqliteTimeLayout)
+}
+
 // ReviewStatus computes the lifecycle status of a record at read time using the
 // store's configured staleness window:
 //
@@ -36,9 +75,10 @@ type ReviewRow struct {
 //   - needs_review → now > COALESCE(review_after, updated_at + window)
 //   - active       → otherwise
 //
-// review_after is set ONLY by MarkReviewed; on a normal save it is NULL, so a
-// fresh memory is active until updated_at + window elapses. The window is the
-// store's reviewWindowDays (default 30).
+// review_after is set at INSERT time for types in decayReviewAfterMonths and
+// reset by MarkReviewed; for every other type it stays NULL and the row is
+// active until updated_at + window elapses. The window is the store's
+// reviewWindowDays (default 30).
 func (s *Store) ReviewStatus(rec *domain.Record) string {
 	if rec == nil {
 		return ReviewStatusActive
@@ -188,9 +228,26 @@ func (s *Store) ListForReview(status, project string, limit int) ([]ReviewRow, e
 	return out, nil
 }
 
-// MarkReviewed stamps review_after = now + window on each live row in ids,
-// resetting its staleness clock. Returns the number of rows updated. ids that
-// are unknown or already deleted are silently skipped (not an error).
+// MarkReviewed resets the staleness clock on each live row in ids, recomputing
+// review_after FROM THE ROW'S OWN TYPE using the same decayReviewAfterMonths map
+// the insert path uses — so re-reviewing a decision buys another 6 months and
+// re-reviewing a preference another 3, rather than every type getting the same
+// flat window. Returns the number of rows updated. ids that are unknown or
+// already deleted are silently skipped (not an error).
+//
+// DEVIATION from the upstream implementation this is ported from: upstream sets
+// review_after = NULL for a type that has no decay entry, because upstream reads
+// "needs review" as `review_after IS NOT NULL AND review_after < now` — NULL
+// there means "never due". Under THIS store's read-time derivation NULL means
+// "fall back to updated_at + window" (see ReviewStatus), and MarkReviewed does
+// not touch updated_at, so writing NULL would make marking a bugfix reviewed a
+// silent no-op: the row would come straight back as needs_review. Upstream
+// compensates by bumping updated_at, which is not an option here — updated_at is
+// the LWW ordering field (see writeWins in domain/reconcile.go), and inflating it
+// on a local, un-journaled write would let this node wrongly beat a genuinely
+// newer remote write on the next pull. So a type with no decay entry gets
+// now + reviewWindowDays: the same "clock reset" semantics, expressed in the
+// only field this store is allowed to move.
 //
 // This is a LOCAL-ONLY write: it sets per-node lifecycle metadata and does NOT
 // go through LocalWrite, so it enqueues no outbox entry and never syncs (review
@@ -201,36 +258,54 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 		return 0, nil
 	}
 	window := s.reviewWindow()
+	now := time.Now().UTC()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	placeholders := make([]string, len(ids))
-	args := make([]any, 0, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-
-	// datetime('now','+<N> days') computes the new due date in SQLite UTC, the
-	// same clock used by the created_at/updated_at defaults.
-	q := fmt.Sprintf(
-		`UPDATE memories
-		 SET review_after = datetime('now', ?)
-		 WHERE id IN (%s) AND deleted_at IS NULL`,
-		strings.Join(placeholders, ","),
-	)
-	// Prepend the interval modifier as the first bound arg.
-	allArgs := make([]any, 0, len(args)+1)
-	allArgs = append(allArgs, fmt.Sprintf("+%d days", window))
-	allArgs = append(allArgs, args...)
-
-	res, err := s.db.Exec(q, allArgs...)
+	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("MarkReviewed: %w", err)
+		return 0, fmt.Errorf("MarkReviewed: begin: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// Per-row rather than one bulk UPDATE: the new due date depends on the row's
+	// type, so the rows have to be read before they can be written.
+	updated := 0
+	for _, id := range ids {
+		var typ string
+		err := tx.QueryRow(
+			`SELECT type FROM memories WHERE id = ? AND deleted_at IS NULL`, id,
+		).Scan(&typ)
+		if err == sql.ErrNoRows {
+			continue // unknown or deleted — skipped, not an error
+		}
+		if err != nil {
+			return 0, fmt.Errorf("MarkReviewed: read type of %d: %w", id, err)
+		}
+
+		due := reviewAfterForType(typ, now)
+		if due == nil {
+			// No decay entry — fall back to the store's rolling window. See the
+			// DEVIATION note above for why this is not NULL.
+			due = now.AddDate(0, 0, window).Format(sqliteTimeLayout)
+		}
+
+		res, err := tx.Exec(
+			`UPDATE memories SET review_after = ? WHERE id = ? AND deleted_at IS NULL`,
+			due, id,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("MarkReviewed: update %d: %w", id, err)
+		}
+		n, _ := res.RowsAffected()
+		updated += int(n)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("MarkReviewed: commit: %w", err)
+	}
+	return updated, nil
 }
 
 // IDByTopicKey resolves the integer primary key of the live memory row for the
