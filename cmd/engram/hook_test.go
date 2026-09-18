@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +38,16 @@ import (
 // connect` would find it. Returns the DB path the hook commands take via --db.
 func hookDaemonFixture(t *testing.T) (dbPath string, components *daemonComponents) {
 	t.Helper()
+	return hookDaemonFixtureDelayed(t, 0)
+}
+
+// hookDaemonFixtureDelayed is hookDaemonFixture with the control API's
+// "newest memory" endpoint artificially slowed. It is how the budget tests get
+// a daemon that is UP (so the hook does its full work) but slow (so what bounds
+// the hook is its own deadline and nothing else).
+func hookDaemonFixtureDelayed(t *testing.T, memoriesDelay time.Duration) (dbPath string, components *daemonComponents) {
+	t.Helper()
+	isolateHookStateDir(t)
 
 	dir := t.TempDir()
 	dbPath = filepath.Join(dir, "hooks.db")
@@ -58,6 +70,20 @@ func hookDaemonFixture(t *testing.T) (dbPath string, components *daemonComponent
 	))
 	ctrl := controlapi.New(token, 0, &localStoreAdapter{store: components.store},
 		stubSyncController{}, stubConfigStore{}, version)
+	if memoriesDelay > 0 {
+		// More specific than "/api/", so ServeMux routes the memories listing here
+		// and everything else to the real control API.
+		handler := ctrl.Handler()
+		mux.HandleFunc("/api/v1/memories", func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-time.After(memoriesDelay):
+			case <-r.Context().Done():
+				// The client gave up: stop pretending to work on its behalf.
+				return
+			}
+			handler.ServeHTTP(w, r)
+		})
+	}
 	mux.Handle("/api/", ctrl.Handler())
 
 	ts := httptest.NewServer(mux)
@@ -192,11 +218,21 @@ func TestHookSessionStart_PrintsProtocolAndContext(t *testing.T) {
 		"cwd":        repo,
 	}, "--db", dbPath)
 
-	if !strings.Contains(out, "Engram provides persistent memory") {
-		t.Errorf("session-start did not print the protocol text; got:\n%s", out)
+	if !strings.Contains(out, "ENGRAM MEMORY IS ACTIVE") {
+		t.Errorf("session-start did not print the protocol pointer; got:\n%s", out)
 	}
 	if !strings.Contains(out, "an earlier decision") {
 		t.Errorf("session-start did not print the project's memory context; got:\n%s", out)
+	}
+	// The MCP server already delivers the protocol through its initialize result
+	// (instructions.go). Printing it here too spends several KiB of the model's
+	// context on a second copy of a document it already has — on every session
+	// start, and again on every compaction.
+	if strings.Contains(out, "Engram provides persistent memory") {
+		t.Errorf("session-start re-printed the full server protocol instead of a pointer to it; got:\n%s", out)
+	}
+	if !strings.Contains(out, `"hooked-repo"`) {
+		t.Errorf("the pointer does not name the resolved project; got:\n%s", out)
 	}
 	if strings.Contains(out, "CRITICAL INSTRUCTION POST-COMPACTION") {
 		t.Error("session-start printed the post-compaction steps; those belong to post-compaction only")
@@ -224,8 +260,11 @@ func TestHookPostCompaction_PrintsRecoverySteps(t *testing.T) {
 		"cwd":        repo,
 	}, "--db", dbPath)
 
-	if !strings.Contains(out, "Engram provides persistent memory") {
-		t.Errorf("post-compaction did not print the protocol text; got:\n%s", out)
+	if !strings.Contains(out, "ENGRAM MEMORY IS ACTIVE") {
+		t.Errorf("post-compaction did not print the protocol pointer; got:\n%s", out)
+	}
+	if strings.Contains(out, "Engram provides persistent memory") {
+		t.Errorf("post-compaction re-printed the full server protocol; the MCP initialize result carries it:\n%s", out)
 	}
 	for _, want := range []string{
 		"CRITICAL INSTRUCTION POST-COMPACTION",
@@ -240,12 +279,13 @@ func TestHookPostCompaction_PrintsRecoverySteps(t *testing.T) {
 	}
 }
 
-// TestHookSessionStart_NoDaemon_StillPrintsProtocol is the fail-open contract
-// for the injection half: the protocol text needs no daemon, and an agent told
+// TestHookSessionStart_NoDaemon_StillPrintsThePointer is the fail-open contract
+// for the injection half: the pointer needs no daemon, and an agent told
 // nothing calls nothing. --no-autostart is mandatory here, not incidental — the
 // auto-start path shells out to os.Executable(), which under `go test` is the
 // TEST binary, and spawning that as a daemon is not a thing a test may do.
-func TestHookSessionStart_NoDaemon_StillPrintsProtocol(t *testing.T) {
+func TestHookSessionStart_NoDaemon_StillPrintsThePointer(t *testing.T) {
+	isolateHookStateDir(t)
 	dbPath := filepath.Join(t.TempDir(), "absent.db")
 
 	out := runHook(t, "session-start", map[string]any{
@@ -253,8 +293,11 @@ func TestHookSessionStart_NoDaemon_StillPrintsProtocol(t *testing.T) {
 		"cwd":        t.TempDir(),
 	}, "--db", dbPath, "--no-autostart")
 
-	if !strings.Contains(out, "Engram provides persistent memory") {
-		t.Errorf("session-start must print the protocol even with no daemon; got:\n%s", out)
+	if !strings.Contains(out, "ENGRAM MEMORY IS ACTIVE") {
+		t.Errorf("session-start must print the pointer even with no daemon; got:\n%s", out)
+	}
+	if !strings.Contains(out, "mcp__engram__mem_current_project") {
+		t.Errorf("the pointer must name the first call to make; got:\n%s", out)
 	}
 }
 
@@ -512,8 +555,8 @@ func TestHook_MalformedStdinFailsOpen(t *testing.T) {
 			out := runHookRaw(t, event, stdin, "--db", dbPath)
 			switch event {
 			case "session-start", "post-compaction":
-				if !strings.Contains(out, "Engram provides persistent memory") {
-					t.Errorf("%s with stdin %q printed no protocol text", event, stdin)
+				if !strings.Contains(out, "ENGRAM MEMORY IS ACTIVE") {
+					t.Errorf("%s with stdin %q printed no protocol pointer", event, stdin)
 				}
 			default:
 				decodeHookJSON(t, out) // fails the test if it is not exactly one JSON object
@@ -612,12 +655,15 @@ func TestParseToolResult_SurfacesToolErrors(t *testing.T) {
 // that ends up in a filesystem path. Hashing it makes traversal impossible and
 // the length fixed, while keeping the per-session identity the debounce needs.
 func TestHookStateFile_IsHashedAndStable(t *testing.T) {
-	evil := hookStateFile("../../etc/passwd", "tools-loaded")
+	cache := isolateHookStateDir(t)
+
+	evil := hookStateFile("../../etc/passwd", hookStateToolsLoaded)
 	if strings.Contains(evil, "..") || strings.Contains(evil, "passwd") {
 		t.Errorf("state path %q embeds caller-controlled text", evil)
 	}
-	if filepath.Dir(evil) != filepath.Clean(os.TempDir()) {
-		t.Errorf("state file %q escaped the temp directory", evil)
+	wantDir := filepath.Join(cache, "engram", "hooks")
+	if filepath.Dir(evil) != filepath.Clean(wantDir) {
+		t.Errorf("state file %q is not under the per-user cache directory %q", evil, wantDir)
 	}
 	if again := hookStateFile("../../etc/passwd", "tools-loaded"); again != evil {
 		t.Errorf("state path is not stable: %q vs %q", evil, again)
@@ -794,5 +840,260 @@ func TestHookSubagentStop_NamesTheProjectExplicitly(t *testing.T) {
 	}
 	if results[0].Project != "subagent-explicit-repo" {
 		t.Errorf("project = %q, want %q", results[0].Project, "subagent-explicit-repo")
+	}
+}
+
+// ─── hook state lives in a per-user cache directory ─────────────────────────
+
+// isolateHookStateDir points os.UserCacheDir (and, on the platforms that
+// derive it from HOME, the home directory) at a temp directory for the duration
+// of a test, so nothing here writes markers into the developer's real cache.
+// It returns the cache root the markers must appear under.
+func isolateHookStateDir(t *testing.T) string {
+	t.Helper()
+	cache := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)   // Windows
+	t.Setenv("XDG_CACHE_HOME", cache) // Unix
+	t.Setenv("HOME", cache)           // macOS ($HOME/Library/Caches) and the XDG fallback
+	return cache
+}
+
+// TestHookStateDir_IsPerUserAndPrivate pins the move off os.TempDir. The system
+// temp directory is world-writable on Unix and swept by tools that do not know
+// what they are deleting; a marker another user can create is a marker another
+// user can use to silence someone else's reminders.
+func TestHookStateDir_IsPerUserAndPrivate(t *testing.T) {
+	cache := isolateHookStateDir(t)
+
+	dir := hookStateDir()
+
+	want := filepath.Join(cache, "engram", "hooks")
+	if dir != want {
+		t.Fatalf("hookStateDir() = %q, want %q", dir, want)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("the state directory was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%q is not a directory", dir)
+	}
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("state directory mode = %04o, want 0700", perm)
+		}
+	}
+}
+
+// TestHookClaimState_IsAtomic covers the O_EXCL claim that replaced an
+// exists-then-create pair: exactly ONE caller may be told it is the first.
+func TestHookClaimState_IsAtomic(t *testing.T) {
+	isolateHookStateDir(t)
+	path := hookStateFile("claim-session", hookStateToolsLoaded)
+
+	if !hookClaimState(path) {
+		t.Fatal("the first claim must succeed")
+	}
+	if hookClaimState(path) {
+		t.Error("a second claim reported itself as the first prompt of the session")
+	}
+}
+
+// TestHookSessionStart_ResumeReFiresTheBootstrap is the reason session-start
+// clears the markers. `claude --resume` REUSES the session id: the model's
+// context is brand new, so the first-prompt bootstrap has to fire again — and
+// the nudge's age clock has to start from the resume, not from whenever this id
+// first spoke, which may have been days ago on a machine since rebooted.
+func TestHookSessionStart_ResumeReFiresTheBootstrap(t *testing.T) {
+	dbPath, _ := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "resumed-repo")
+	sessionID := "hook-resume-" + t.Name()
+
+	// First prompt of the original session: bootstrap fires.
+	first := runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "one",
+	}, "--db", dbPath)
+	if _, ok := decodeHookJSON(t, first)["hookSpecificOutput"]; !ok {
+		t.Fatalf("the first prompt did not bootstrap: %s", first)
+	}
+	// Second prompt: silent, as designed.
+	second := runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "two",
+	}, "--db", dbPath)
+	if obj := decodeHookJSON(t, second); len(obj) != 0 {
+		t.Fatalf("the second prompt should be silent: %v", obj)
+	}
+
+	// The resume: same session id, new context.
+	_ = runHook(t, "session-start", map[string]any{
+		"session_id": sessionID, "cwd": repo,
+	}, "--db", dbPath, "--no-autostart")
+
+	resumed := runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "three",
+	}, "--db", dbPath)
+	if _, ok := decodeHookJSON(t, resumed)["hookSpecificOutput"]; !ok {
+		t.Errorf("after a resume the bootstrap did not fire again; the model has no idea the tools exist: %s", resumed)
+	}
+}
+
+// TestHookSessionEnd_ClearsSessionState — without it the state directory grows
+// one pair of files per session, forever, and nothing ever removes them.
+func TestHookSessionEnd_ClearsSessionState(t *testing.T) {
+	dbPath, _ := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "ending-state-repo")
+	sessionID := "hook-end-state-" + t.Name()
+
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "one",
+	}, "--db", dbPath)
+	marker := hookStateFile(sessionID, hookStateToolsLoaded)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the first prompt left no marker: %v", err)
+	}
+
+	_ = runHook(t, "session-end", map[string]any{
+		"session_id": sessionID, "cwd": repo,
+	}, "--db", dbPath)
+
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("session-end left %q behind (%v)", marker, err)
+	}
+}
+
+// ─── budgets ────────────────────────────────────────────────────────────────
+
+// TestHookBudgets_FitInsideEveryPackTimeout is the guard the Codex session-end
+// budget needed: it was 4 seconds against a pack that declares a 3-second
+// timeout, so the host killed the hook a full second BEFORE the binary intended
+// to give up — precisely the case the margin exists to prevent, and for the
+// JSON events a kill mid-write is a parse error on the host's side.
+//
+// The table is generated from engramHookPack, so a pack that lowers a timeout
+// fails here instead of in somebody's terminal.
+func TestHookBudgets_FitInsideEveryPackTimeout(t *testing.T) {
+	for _, agent := range []string{"claude-code", "codex"} {
+		t.Run(agent, func(t *testing.T) {
+			for _, item := range engramHookPack(agent).Events {
+				for _, entry := range item.Group.Hooks {
+					event := strings.TrimPrefix(entry.Command, "engram hook ")
+					budget, ok := hookBudgets[event]
+					if !ok {
+						t.Errorf("pack command %q has no entry in hookBudgets — the binary would run it with no budget at all",
+							entry.Command)
+						continue
+					}
+					if entry.Timeout <= 0 {
+						t.Errorf("%s hook %q declares no timeout", item.Event, entry.Command)
+						continue
+					}
+					timeout := time.Duration(entry.Timeout) * time.Second
+					if budget >= timeout {
+						t.Errorf("%s hook %q: budget %s >= declared timeout %s — the host kills the hook before it can print its fallback",
+							item.Event, entry.Command, budget, timeout)
+					}
+				}
+			}
+		})
+	}
+}
+
+// ─── stdin and prompt bounds ────────────────────────────────────────────────
+
+// TestReadHookInput_ReturnsOnAnUnclosedStdin covers the hang nobody sees until
+// it happens: io.ReadAll waits for EOF, so a host that hands the hook a pipe it
+// never closes (a wrapper script, a shell holding the write end, a parent that
+// died on Windows) blocks the hook forever — not for its budget, forever, with
+// the user's prompt behind it.
+func TestReadHookInput_ReturnsOnAnUnclosedStdin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close(); _ = r.Close() })
+
+	// Write a complete payload and DO NOT close the write end.
+	if _, err := w.WriteString(`{"session_id":"never-closed"}`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	start := time.Now()
+	in := readHookInput(r)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*hookStdinDeadline {
+		t.Errorf("readHookInput took %v on an unclosed stdin, want ~%v", elapsed, hookStdinDeadline)
+	}
+	// The payload is not required to survive — the deadline fires before EOF, so
+	// the zero value is the documented outcome. What matters is that it returns.
+	_ = in
+}
+
+// TestReadHookInput_StillReadsAClosedStdinImmediately — the deadline must not
+// cost the normal path anything.
+func TestReadHookInput_StillReadsAClosedStdinImmediately(t *testing.T) {
+	in := readHookInput(strings.NewReader(`{"session_id":"s","prompt":"p"}`))
+	if in.SessionID != "s" || in.Prompt != "p" {
+		t.Errorf("readHookInput = %+v, want the payload decoded", in)
+	}
+}
+
+// TestHookUserPromptSubmit_TruncatesAHugePrompt — a prompt can carry a pasted
+// file. Saved whole it becomes a memory nobody can read, and mem_save then
+// attaches it to an observation, spending the model's context on it twice.
+func TestHookUserPromptSubmit_TruncatesAHugePrompt(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "huge-prompt-repo")
+	sessionID := "hook-huge-" + t.Name()
+
+	huge := strings.Repeat("x", hookContextLimit*2)
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": huge,
+	}, "--db", dbPath)
+
+	// Read the row directly: the store exposes no list-by-session helper, and
+	// what is under test is the exact bytes that reached the table.
+	var content string
+	if err := components.store.DB().QueryRow(
+		`SELECT content FROM user_prompts WHERE session_id = ?`, sessionID).Scan(&content); err != nil {
+		t.Fatalf("read the stored prompt: %v", err)
+	}
+	if len(content) > hookContextLimit {
+		t.Errorf("stored prompt is %d bytes, want at most %d", len(content), hookContextLimit)
+	}
+	if !strings.Contains(content, "[context truncated") {
+		t.Error("the truncation is not disclosed in the stored prompt")
+	}
+}
+
+// ─── the prompt budget bounds the control call too ──────────────────────────
+
+// TestHookUserPromptSubmit_SlowControlAPIStaysWithinBudget puts a live but SLOW
+// daemon behind the nudge's one control-API call. The hook runs between the
+// user pressing Enter and their message being sent: whatever the daemon is
+// doing, the hook's own deadline is what decides when it stops waiting.
+func TestHookUserPromptSubmit_SlowControlAPIStaysWithinBudget(t *testing.T) {
+	dbPath, _ := hookDaemonFixtureDelayed(t, 2*time.Second)
+	repo := pinnedProjectDir(t, "slow-control-repo")
+	sessionID := "hook-slow-" + t.Name()
+
+	// Not the first prompt, and old enough to reach the nudge — which is the
+	// only thing that calls the control API.
+	hookTouchState(hookStateFile(sessionID, hookStateToolsLoaded))
+	ageHookState(t, hookStateFile(sessionID, hookStateToolsLoaded), 30*time.Minute)
+
+	start := time.Now()
+	out := runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "hello",
+	}, "--db", dbPath)
+	elapsed := time.Since(start)
+
+	if obj := decodeHookJSON(t, out); len(obj) != 0 {
+		t.Errorf("with an unusable control API the hook must print {}; got %v", obj)
+	}
+	// Process slack, not budget slack: the assertion that matters is that this
+	// is nowhere near the server's 2s sleep.
+	if limit := time.Second; elapsed > limit {
+		t.Errorf("hook took %v against a daemon that sleeps 2s, want well under %v", elapsed, limit)
 	}
 }

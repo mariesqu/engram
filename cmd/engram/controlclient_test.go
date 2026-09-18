@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mariesqu/engram/internal/controlapi"
 )
@@ -222,5 +225,86 @@ func TestCLI_Status_PrintsOutput(t *testing.T) {
 	err := runStatusCmd([]string{"--db", dbPath})
 	if err != nil {
 		t.Fatalf("runStatusCmd: %v", err)
+	}
+}
+
+// TestControlClientGetContext_HonoursTheContextDeadline covers what the
+// http.Client's own Timeout cannot express: a deadline that spans BOTH attempts
+// of the 401-refresh-and-retry.
+//
+// Timeout is per request. A caller with 200 ms left — the user-prompt-submit
+// hook, which runs between someone pressing Enter and their message being sent
+// — used to hand that figure to the client and could still wait twice as long,
+// because a daemon that is restarting answers 401 and the retry gets a fresh
+// helping. A context expires once, for the whole call.
+func TestControlClientGetContext_HonoursTheContextDeadline(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		select {
+		case <-time.After(2 * time.Second):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	if err := controlapi.WriteDaemonJSON(dir, "token", mustParsePort(t, server.URL), os.Getpid()); err != nil {
+		t.Fatalf("WriteDaemonJSON: %v", err)
+	}
+	client, err := NewControlClient(dir)
+	if err != nil {
+		t.Fatalf("NewControlClient: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	var out []struct{}
+	err = client.GetContext(ctx, "/api/v1/memories?limit=1", &out)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("GetContext returned nil against a server that never answered in time")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if limit := time.Second; elapsed > limit {
+		t.Errorf("GetContext took %v against a 200ms deadline, want under %v", elapsed, limit)
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Errorf("server saw %d request(s); an expired context must not be retried", n)
+	}
+}
+
+// TestControlClientGet_StillWorksWithoutAContext — Get is GetContext with a
+// background context, and every CLI caller still uses it.
+func TestControlClientGet_StillWorksWithoutAContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	if err := controlapi.WriteDaemonJSON(dir, "token", mustParsePort(t, server.URL), os.Getpid()); err != nil {
+		t.Fatalf("WriteDaemonJSON: %v", err)
+	}
+	client, err := NewControlClient(dir)
+	if err != nil {
+		t.Fatalf("NewControlClient: %v", err)
+	}
+
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := client.Get("/api/v1/status", &out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !out.OK {
+		t.Error("Get did not decode the response body")
 	}
 }

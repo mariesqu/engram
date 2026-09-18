@@ -22,6 +22,13 @@ import (
 // every level except the one being touched, every unknown key is carried
 // through byte-for-byte, and an entry whose command is already present is left
 // exactly as it is (timeout edits, matcher edits and all).
+//
+// Two things the merge does NOT preserve, both of them stated on stdout when it
+// writes: the ORDER of top-level keys (Go marshals a map sorted by key) and the
+// original indentation (the output is re-indented with two spaces, which is
+// what every agent host writes). The write itself goes through
+// writeHookSettings — temp file, rename, one .bak — because a settings file is
+// not a thing to truncate in place and hope.
 const setupUsage = `Usage: engram setup hooks --agent <claude-code|codex> [--dry-run]
 
 Install engram's lifecycle hooks into an agent host's settings.
@@ -104,13 +111,100 @@ func runSetupHooksCmd(args []string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("setup hooks: create %s: %w", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, merged, 0o644); err != nil {
+	backup, err := writeHookSettings(path, merged, existing)
+	if err != nil {
 		return fmt.Errorf("setup hooks: write %s: %w", path, err)
 	}
 	fmt.Printf("installed %d engram hook(s) into %s\n", added, path)
+	if backup != "" {
+		fmt.Printf("Your previous settings were copied to %s.\n", backup)
+	}
+	fmt.Println("Note: the file was re-serialized, so top-level key ORDER may differ from before; " +
+		"every key and value is preserved.")
 	fmt.Printf("Note: %s.\n", setupHookBinaryHint())
 	fmt.Println("Restart the agent for the hooks to take effect.")
 	return nil
+}
+
+// hookSettingsFailAfterTemp is a TEST seam. When non-nil it is called after the
+// temp file has been written and before the rename, and a non-nil return aborts
+// the write. It exists because the whole point of the temp-and-rename dance is
+// what happens when the write fails halfway — a full disk, a killed process, an
+// antivirus scanner holding the file — and that is otherwise the one path no
+// test can reach. Production leaves it nil.
+var hookSettingsFailAfterTemp func() error
+
+// writeHookSettings replaces path's contents with merged, atomically, and
+// returns the path of the backup it wrote (empty when it wrote none).
+//
+// Atomic because this file belongs to the USER. os.WriteFile truncates first
+// and writes second: a crash, a full disk or a killed process between the two
+// leaves an agent host's settings.json empty or half-written, which for Claude
+// Code means every permission, every model preference and every OTHER hook the
+// user had is gone — to install a memory hook. A temp file in the SAME
+// directory (so the rename stays on one filesystem, where it is atomic) and
+// os.Rename over the original cannot produce that state: either the old file is
+// there or the new one is.
+//
+// The file's mode is preserved when it already exists; a file created here is
+// 0600, because an agent's settings routinely carry API keys and nothing else
+// on the machine needs to read them.
+//
+// A <file>.bak copy of the ORIGINAL bytes is written on the FIRST modification
+// only. Re-running the command must not overwrite the one pristine copy with a
+// version engram has already edited — a backup that tracks the current file is
+// not a backup.
+func writeHookSettings(path string, merged, existing []byte) (string, error) {
+	dir := filepath.Dir(path)
+
+	perm := os.FileMode(0o600)
+	if info, err := os.Stat(path); err == nil {
+		perm = info.Mode().Perm()
+	}
+
+	backup := ""
+	if len(existing) > 0 {
+		candidate := path + ".bak"
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			if err := os.WriteFile(candidate, existing, perm); err != nil {
+				// Not fatal: a backup that could not be written is a reason to warn,
+				// not a reason to leave the hooks uninstalled.
+				fmt.Fprintf(os.Stderr, "engram setup hooks: could not write %s: %v\n", candidate, err)
+			} else {
+				backup = candidate
+			}
+		}
+	}
+
+	tmp, err := os.CreateTemp(dir, ".engram-settings-*.json.tmp")
+	if err != nil {
+		return backup, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(merged); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return backup, fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return backup, fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		_ = os.Remove(tmpPath)
+		return backup, fmt.Errorf("chmod temp file: %w", err)
+	}
+	if hookSettingsFailAfterTemp != nil {
+		if err := hookSettingsFailAfterTemp(); err != nil {
+			_ = os.Remove(tmpPath)
+			return backup, err
+		}
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return backup, fmt.Errorf("replace %s: %w", path, err)
+	}
+	return backup, nil
 }
 
 // hookSettingsPath returns the file to merge into for the named agent.

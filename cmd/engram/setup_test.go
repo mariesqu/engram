@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -343,5 +345,169 @@ func TestSetupCmd_UnknownTarget(t *testing.T) {
 	}
 	if err := runSetupCmd([]string{"hooks"}); err == nil {
 		t.Error("setup hooks without --agent must be reported")
+	}
+}
+
+// ─── the settings file survives a failed write ──────────────────────────────
+
+// TestSetupHooks_FailedWriteLeavesTheOriginalIntact is the reason the write is
+// a temp-file-and-rename instead of an os.WriteFile.
+//
+// os.WriteFile truncates first and writes second. A crash, a full disk, an
+// antivirus scanner or a killed process between those two steps leaves the
+// user's settings.json empty or half-written — and for Claude Code that file
+// carries every permission, every model preference and every OTHER hook they
+// have. Losing all of it to install a memory hook is not a trade anybody
+// agreed to.
+//
+// The failure is injected where it actually happens: after the temp file is
+// written, before the rename.
+func TestSetupHooks_FailedWriteLeavesTheOriginalIntact(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "settings.json")
+
+	original := []byte(`{"permissions":{"allow":["Bash(git status)"]},"model":"opus"}` + "\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	hookSettingsFailAfterTemp = func() error { return errors.New("simulated disk failure") }
+	t.Cleanup(func() { hookSettingsFailAfterTemp = nil })
+
+	err := runSetupCmd([]string{"hooks", "--agent", "claude-code"})
+	if err == nil {
+		t.Fatal("a failed write must be reported, not swallowed")
+	}
+	if !strings.Contains(err.Error(), "simulated disk failure") {
+		t.Errorf("error = %v, want it to carry the underlying failure", err)
+	}
+
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("the settings file is gone after a failed write: %v", readErr)
+	}
+	if string(after) != string(original) {
+		t.Errorf("the settings file changed despite the failed write:\n got: %s\nwant: %s", after, original)
+	}
+
+	// And no debris: a temp file left behind in the user's config directory is
+	// litter they have to recognise before they dare delete it.
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("ReadDir: %v", readErr)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Errorf("a failed write left %q behind", entry.Name())
+		}
+	}
+}
+
+// TestSetupHooks_BacksUpTheOriginalOnce covers the .bak contract. The backup is
+// the user's undo, so it is written on the FIRST modification and never again:
+// a backup that tracks the current file is not a backup, it is a second copy of
+// whatever engram last wrote.
+func TestSetupHooks_BacksUpTheOriginalOnce(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "settings.json")
+	backup := path + ".bak"
+
+	original := []byte(`{"model":"opus"}` + "\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runSetupCmd([]string{"hooks", "--agent", "claude-code"}); err != nil {
+			t.Fatalf("install: %v", err)
+		}
+	})
+	if !strings.Contains(out, "copied to") {
+		t.Errorf("the command did not mention the backup it wrote:\n%s", out)
+	}
+	if !strings.Contains(out, "re-serialized") {
+		t.Errorf("the command did not disclose that top-level key order may change:\n%s", out)
+	}
+
+	saved, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("no backup was written: %v", err)
+	}
+	if string(saved) != string(original) {
+		t.Errorf("backup = %s, want the ORIGINAL bytes %s", saved, original)
+	}
+
+	// A later run that changes the file again must not overwrite that copy.
+	// (Remove one hook so there is something to add, and therefore a write.)
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	trimmed := strings.Replace(string(current), `"engram hook session-end"`, `"somebody elses hook"`, 1)
+	if err := os.WriteFile(path, []byte(trimmed), 0o600); err != nil {
+		t.Fatalf("rewrite settings: %v", err)
+	}
+	if err := runSetupCmd([]string{"hooks", "--agent", "claude-code"}); err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+	saved2, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(saved2) != string(original) {
+		t.Errorf("the second run overwrote the pristine backup:\n got: %s\nwant: %s", saved2, original)
+	}
+}
+
+// TestSetupHooks_NewFileIsPrivate — an agent's settings routinely carry API
+// keys, and a file engram CREATES has no prior mode to inherit. 0600 is the
+// only defensible default; 0644 would publish it to every account on the box.
+// (Skipped on Windows, where the Unix permission bits are not the ACL.)
+func TestSetupHooks_NewFileIsPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not the access control on Windows")
+	}
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+
+	if err := runSetupCmd([]string{"hooks", "--agent", "claude-code"}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatalf("settings were not written: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("new settings file mode = %04o, want 0600", perm)
+	}
+}
+
+// TestSetupHooks_PreservesAnExistingFileMode — the other half: a file the user
+// already owns keeps the mode they chose. Tightening it silently is still
+// changing their configuration.
+func TestSetupHooks_PreservesAnExistingFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not the access control on Windows")
+	}
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, []byte(`{"model":"opus"}`), 0o644); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	if err := runSetupCmd([]string{"hooks", "--agent", "claude-code"}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("settings file mode = %04o, want the original 0644", perm)
 	}
 }

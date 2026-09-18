@@ -864,7 +864,7 @@ MCP tools are *pull*: the agent calls them when it decides to. Hooks are *push* 
 Every hook is the engram binary itself:
 
 ```bash
-engram hook session-start        # register the session, inject the protocol + recent context
+engram hook session-start        # register the session, inject recent context + a protocol pointer
 engram hook post-compaction      # the same, plus the mandatory recovery steps
 engram hook user-prompt-submit   # capture the prompt; bootstrap the tools on the first one
 engram hook subagent-stop        # save a subagent's closing report before its context dies
@@ -877,7 +877,7 @@ Each reads the host's hook JSON on stdin and talks to the resident daemon over t
 
 ### Installing
 
-Into your agent's settings (append-only merge — your other hooks and every unknown key are preserved, and re-running it is a no-op):
+Into your agent's settings (append-only merge — your other hooks and every unknown key are preserved, and re-running it is a no-op). The file is written through a temp file and a rename, never truncated in place, and the first modification leaves a `<file>.bak` copy of your original beside it. Two things the merge does not preserve, both stated on stdout: the ORDER of top-level keys and the original indentation.
 
 ```bash
 engram setup hooks --agent claude-code   # ~/.claude/settings.json  (honours CLAUDE_CONFIG_DIR)
@@ -900,7 +900,7 @@ The commands call `engram` **from PATH**, so the binary has to be there (`engram
 
 | Event | Output | Behaviour |
 |-------|--------|-----------|
-| `session-start` | plain text (injected as context) | Resolves the project through `mem_current_project`, registers the session, then prints the memory protocol followed by the project's recent context (capped at 16 KiB). Auto-starts a resident daemon if none is running; `--no-autostart` disables that. The protocol is printed even when the daemon is unreachable — an agent that was told nothing calls nothing. |
+| `session-start` | plain text (injected as context) | Resolves the project through `mem_current_project`, registers the session, then prints a three-line protocol POINTER followed by the project's recent context (capped at 16 KiB). It does **not** re-print the protocol: the MCP server already delivers it through the `initialize` result, and a second copy costs several KiB of the model's context on every session start. Auto-starts a resident daemon if none is running; `--no-autostart` disables that. The pointer is printed even when the daemon is unreachable — an agent that was told nothing calls nothing. |
 | `post-compaction` | plain text | Everything `session-start` does, plus four numbered, unconditional steps: save the compacted summary with `mem_session_summary`, recover with `mem_context`, fill gaps with `mem_search`, then continue. After a compaction the model has lost the context that would have told it to do any of this. |
 | `user-prompt-submit` | JSON | Captures the prompt (`mem_save_prompt`) so a later `mem_save` can attach it. On the FIRST prompt of a session it injects the tool bootstrap (call `mem_current_project` first; here are the tool names) — hosts that defer MCP tool loading need a name to load. Afterwards it stays silent unless the session is over 5 minutes old AND the project's newest memory is over 15 minutes old, and then at most once every 15 minutes. |
 | `subagent-stop` | `{}` | Saves the subagent's closing report as an observation titled `subagent-stop: …`. A subagent's context dies with it; this is the only copy. The title names the source because nobody reviewed that text. |
@@ -908,7 +908,9 @@ The commands call `engram` **from PATH**, so the binary has to be there (`engram
 Every hook that WRITES (`session-start`, `user-prompt-submit`, `subagent-stop`) resolves the project through `mem_current_project` first and then names it explicitly. If the answer is not trustworthy — no `cwd` in the payload, a directory that is gone, a `writes_blocked` project, or an answer that describes the *daemon's* own directory — the write is **skipped** with a line on stderr. A memory filed under the daemon's junk project reads exactly like real work, in a project nobody opens; not saving it is the cheaper mistake.
 | `session-end` | `{}` | Closes the session row. It does not invent a summary — that field belongs to `mem_session_summary`, and a hook-written "session ended" would overwrite the one thing the next session reads. |
 
-Per-session state (first-prompt marker, nudge cooldown) lives in `os.TempDir()` under `engram-hook-<hash>-*`; the session id is hashed rather than embedded, since it is host-supplied text that ends up in a filesystem path.
+Per-session state (first-prompt marker, nudge cooldown) lives in `os.UserCacheDir()/engram/hooks` (created `0700`) under `engram-hook-<hash>-*`; the session id is hashed rather than embedded, since it is host-supplied text that ends up in a filesystem path. Not the system temp directory: it is world-writable on Unix, and a marker another user can create is a marker another user can use to silence your reminders. `session-start` and `post-compaction` DELETE both markers for their session (a `--resume` reuses the session id, so the bootstrap must fire again and the age clock must restart) and `session-end` removes them for good.
+
+Stdin is read under a 2-second deadline: `io.ReadAll` waits for EOF, so a host that hands the hook a pipe it never closes would otherwise block it forever — not for its budget, forever, with the user's prompt behind it.
 
 ## Using engram from your agent
 
