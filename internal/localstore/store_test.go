@@ -1197,6 +1197,82 @@ func TestMigration_V0ToV1_IndexesRebuiltOnNewTable(t *testing.T) {
 	}
 }
 
+// memoriesIndexNames returns every index sqlite_master reports on the memories
+// table of db, sorted. Auto-indexes (sqlite_autoindex_*, created for UNIQUE
+// constraints) are excluded: they come from the table DDL, not from a
+// CREATE INDEX the rebuild has to replay.
+func memoriesIndexNames(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(
+		`SELECT name FROM sqlite_master
+		 WHERE type='index' AND tbl_name='memories' AND sql IS NOT NULL
+		 ORDER BY name`)
+	if err != nil {
+		t.Fatalf("list memories indexes: %v", err)
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan index name: %v", err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("index rows: %v", err)
+	}
+	return names
+}
+
+// TestMigration_V0ToV1_KeepsEveryApplySchemaIndex is the regression test for the
+// half of Bug A that the four-name test above could not see.
+//
+// ApplySchema runs BEFORE runMigrations on every Open, so when the v0→v1 rebuild
+// renames memories → memories_old, EVERY index ApplySchema just created keeps
+// its name attached to the old table. rebuildMemoriesTable dropped four of those
+// names; idx_mem_project (and later idx_mem_session) were not on the list, so
+// their CREATE INDEX IF NOT EXISTS silently no-opped against the still-existing
+// name and DROP TABLE memories_old took the index with it. A legacy DB came out
+// of migration missing an index a fresh one has — and nothing said so, because
+// SQLite answers the same queries either way, just by scanning.
+//
+// The expected set is DERIVED, not hand-written: a fresh store is exactly what
+// the DDL constants produce, so adding an index to ApplySchema and forgetting
+// rebuildMemoriesTable fails here without anyone remembering to edit a list.
+func TestMigration_V0ToV1_KeepsEveryApplySchemaIndex(t *testing.T) {
+	// Reference: a store created today, i.e. ApplySchema's own output.
+	fresh, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("Open fresh DB: %v", err)
+	}
+	defer fresh.Close()
+	want := memoriesIndexNames(t, fresh.db)
+	if len(want) == 0 {
+		t.Fatal("a fresh DB reports no indexes on memories — the reference set is broken")
+	}
+
+	// Subject: a legacy v0 DB taken through the rebuild.
+	migrated, err := Open(createLegacyDB(t))
+	if err != nil {
+		t.Fatalf("Open legacy DB: %v", err)
+	}
+	defer migrated.Close()
+	got := memoriesIndexNames(t, migrated.db)
+
+	present := make(map[string]bool, len(got))
+	for _, n := range got {
+		present[n] = true
+	}
+	for _, n := range want {
+		if !present[n] {
+			t.Errorf("index %q exists on a fresh DB but is MISSING after the v0→v1 rebuild "+
+				"(fresh: %v, migrated: %v)", n, want, got)
+		}
+	}
+}
+
 // TestMigration_V0ToV1_RelationsFKsDropped is the RED proof test for Bug B.
 // A legacy DB whose memory_relations table carries REFERENCES FKs must have
 // those FKs removed by migrateV0ToV1 so out-of-order relation inserts succeed

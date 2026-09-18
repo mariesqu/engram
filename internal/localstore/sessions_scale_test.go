@@ -3,6 +3,7 @@ package localstore
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -81,25 +82,91 @@ func seedSessionScaleFixture(tb testing.TB, s *Store, project string, sessionCou
 	}
 }
 
+// explainRecentSessions returns SQLite's query plan for the EXACT statement
+// RecentSessions ships, one detail line per plan row.
+func explainRecentSessions(tb testing.TB, s *Store, project string, limit int) []string {
+	tb.Helper()
+
+	query, args := recentSessionsQuery(project, limit)
+	rows, err := s.DB().Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		tb.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			tb.Fatalf("scan plan row: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatalf("plan rows: %v", err)
+	}
+	return plan
+}
+
 // TestRecentSessions_ScalesToThreeHundredSessions is the regression test for the
-// correlated-subquery ordering this commit replaces. The old query evaluated a
-// MAX(created_at) subquery over memories(session_id) once PER SESSION ROW — an
+// correlated-subquery ordering the derived-table rewrite replaced. The old query
+// evaluated a MAX(created_at) subquery over memories once PER SESSION ROW — an
 // O(sessions × memories) scan that measured 1.39s on this fixture shape and
 // dragged every mem_context call down with it (FormatContext calls RecentSessions
-// first). The derived-table join computes the same value in one grouped pass.
+// first, then counts observations per returned session).
+//
+// The assertion that actually guards the fix is the QUERY PLAN, not the clock: a
+// correlated subquery is a SHAPE, and SQLite names it in the plan
+// ("CORRELATED SCALAR SUBQUERY"). Asserting on the shape fails for the right
+// reason on any machine, where a wall-clock threshold tight enough to separate
+// the two shapes is also tight enough to flake on a loaded CI runner. The 1s
+// budget below is a deliberately generous BACKSTOP — six times the worst number
+// the broken shape produced here is 1.58s, so a regression that somehow keeps
+// the plan clean still cannot hide — not a performance target.
 //
 // The fixture is the one the slowdown was measured on (300 sessions, 20k
-// memories) rather than the benchmark's 5k, because at 5k the two query shapes
-// are only ~100× apart in absolute terms and a budget that separates them would
-// be tight enough to flake on a loaded runner. The 200ms budget here is two
-// orders of magnitude above what the fixed query needs and an order of magnitude
-// below what the correlated form costs: it fails on a REGRESSION of query shape,
-// not on a slow CI runner.
+// memories) rather than the benchmark's 5k, and both halves of the hot path are
+// timed: RecentSessions alone and FormatContext, which is what mem_context
+// actually calls.
 func TestRecentSessions_ScalesToThreeHundredSessions(t *testing.T) {
 	s := openTempStore(t)
 	const project = "scale"
 
 	seedSessionScaleFixture(t, s, project, 300, 20000)
+
+	// 1. Shape: no per-row correlated subquery, and the grouped derived table
+	//    (aliased lm) is materialized once.
+	plan := explainRecentSessions(t, s, project, 5)
+	joined := strings.Join(plan, "\n")
+	t.Logf("RecentSessions query plan:\n%s", joined)
+
+	if strings.Contains(strings.ToUpper(joined), "CORRELATED") {
+		t.Errorf("RecentSessions plan contains a correlated subquery — the per-session "+
+			"MAX(created_at) is back:\n%s", joined)
+	}
+	derived := false
+	for _, line := range plan {
+		up := strings.ToUpper(line)
+		// SQLite renders the grouped subquery as MATERIALIZE / CO-ROUTINE lm
+		// depending on version; either is the one-pass shape this test wants.
+		if strings.Contains(up, "MATERIALIZE") || strings.Contains(up, "CO-ROUTINE") {
+			derived = true
+			break
+		}
+		if strings.Contains(up, "SUBQUERY") {
+			derived = true
+			break
+		}
+	}
+	if !derived {
+		t.Errorf("RecentSessions plan shows no materialized derived table — the grouped "+
+			"newest-memory-per-session pass is gone:\n%s", joined)
+	}
+
+	// 2. Backstop: the whole mem_context read path stays far away from the
+	//    seconds the correlated form cost.
+	const budget = time.Second
 
 	start := time.Now()
 	sessions, err := s.RecentSessions(project, 5)
@@ -111,10 +178,24 @@ func TestRecentSessions_ScalesToThreeHundredSessions(t *testing.T) {
 		t.Fatalf("RecentSessions returned %d sessions, want 5", len(sessions))
 	}
 	t.Logf("RecentSessions over 300 sessions / 20000 memories took %s", elapsed)
+	if elapsed > budget {
+		t.Errorf("RecentSessions took %s over 300 sessions / 20000 memories, want < %s",
+			elapsed, budget)
+	}
 
-	if budget := 200 * time.Millisecond; elapsed > budget {
-		t.Errorf("RecentSessions took %s over 300 sessions / 20000 memories, want < %s — "+
-			"the per-session correlated subquery is back", elapsed, budget)
+	start = time.Now()
+	blob, err := s.FormatContext(project, "")
+	ctxElapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if blob == "" {
+		t.Fatal("FormatContext returned an empty blob over a seeded fixture")
+	}
+	t.Logf("FormatContext over 300 sessions / 20000 memories took %s", ctxElapsed)
+	if ctxElapsed > budget {
+		t.Errorf("FormatContext took %s over 300 sessions / 20000 memories, want < %s — "+
+			"the per-session work RecentSessions feeds is unbounded again", ctxElapsed, budget)
 	}
 }
 

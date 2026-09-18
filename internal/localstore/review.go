@@ -271,10 +271,11 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
 	// The new due date depends on each row's TYPE, so the types have to be read
-	// before anything can be written — but that is ONE read and one write per
-	// distinct type, not per id. Marking a 200-id page reviewed used to cost 400
-	// round-trips through the SQLite driver; grouped it costs one SELECT plus at
-	// most a handful of UPDATEs, since a realistic batch spans two or three types.
+	// before anything can be written — but that is one read and one write per
+	// distinct type (times the id chunking below), not per id. Marking a 200-id
+	// page reviewed used to cost 400 round-trips through the SQLite driver;
+	// grouped it costs one SELECT plus at most a handful of UPDATEs, since a
+	// realistic batch spans two or three types.
 	idsByType, err := liveTypesOf(tx, ids)
 	if err != nil {
 		return 0, err
@@ -299,22 +300,24 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 		}
 
 		group := idsByType[typ]
-		args := make([]any, 0, len(group)+1)
-		args = append(args, due)
-		for _, id := range group {
-			args = append(args, id)
-		}
+		for _, chunk := range chunkIDs(group, markReviewedIDChunk) {
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, due)
+			for _, id := range chunk {
+				args = append(args, id)
+			}
 
-		res, err := tx.Exec(
-			`UPDATE memories SET review_after = ?
-			 WHERE id IN (`+sqlPlaceholders(len(group))+`) AND deleted_at IS NULL`,
-			args...,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("MarkReviewed: update %d %s row(s): %w", len(group), typ, err)
+			res, err := tx.Exec(
+				`UPDATE memories SET review_after = ?
+				 WHERE id IN (`+sqlPlaceholders(len(chunk))+`) AND deleted_at IS NULL`,
+				args...,
+			)
+			if err != nil {
+				return 0, fmt.Errorf("MarkReviewed: update %d %s row(s): %w", len(chunk), typ, err)
+			}
+			n, _ := res.RowsAffected()
+			updated += int(n)
 		}
-		n, _ := res.RowsAffected()
-		updated += int(n)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -329,6 +332,43 @@ func sqlPlaceholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
+// markReviewedIDChunk bounds how many ids go into ONE IN (...) list.
+//
+// SQLite refuses a statement with more bound parameters than
+// SQLITE_MAX_VARIABLE_NUMBER, and that ceiling is a build-time property of
+// whatever SQLite the driver was compiled with — 999 on the classic default,
+// 32766 on a modern one. A store method that builds an unbounded IN list is
+// therefore correct only by accident of the build.
+//
+// The guard lives HERE, next to the SQL that would fail, rather than only at the
+// MCP layer's 200-id cap: mem_review is one caller of MarkReviewed, the cap is
+// theirs to change, and a store method must not depend on a ceiling enforced two
+// packages away. 500 is comfortably under the pessimistic limit and a handful of
+// statements even for the largest batch anyone passes.
+const markReviewedIDChunk = 500
+
+// chunkIDs splits ids into consecutive slices of at most size, preserving order.
+// An empty input yields NO chunks — never one empty chunk, which would build an
+// `IN ()` with zero placeholders. A size <= 0 yields one chunk (the caller passes
+// a constant; this only keeps a mistake from looping forever).
+func chunkIDs(ids []int64, size int) [][]int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	if size <= 0 || len(ids) <= size {
+		return [][]int64{ids}
+	}
+	chunks := make([][]int64, 0, (len(ids)+size-1)/size)
+	for start := 0; start < len(ids); start += size {
+		end := start + size
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunks = append(chunks, ids[start:end])
+	}
+	return chunks
+}
+
 // liveTypesOf reads the type of every LIVE row named in ids and returns the ids
 // grouped by type, in one round-trip. Ids that name nothing live are simply
 // absent from the result — MarkReviewed's contract is that unknown and
@@ -339,32 +379,48 @@ func sqlPlaceholders(n int) string {
 // updated and a row can only be marked reviewed once. The per-id loop this
 // replaces counted such an id twice in its return value.
 func liveTypesOf(tx *sql.Tx, ids []int64) (map[string][]int64, error) {
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-
-	rows, err := tx.Query(
-		`SELECT id, type FROM memories
-		 WHERE id IN (`+sqlPlaceholders(len(ids))+`) AND deleted_at IS NULL`,
-		args...,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("MarkReviewed: read types: %w", err)
-	}
-	defer rows.Close()
-
 	byType := make(map[string][]int64)
-	for rows.Next() {
-		var id int64
-		var typ string
-		if err := rows.Scan(&id, &typ); err != nil {
-			return nil, fmt.Errorf("MarkReviewed: scan type: %w", err)
+	// The dedup that used to be implicit in ONE IN list has to be explicit now
+	// that the read is chunked: the same id appearing in two chunks would be
+	// recorded twice and counted twice by the UPDATE that follows.
+	seen := make(map[int64]bool, len(ids))
+
+	for _, chunk := range chunkIDs(ids, markReviewedIDChunk) {
+		if err := func() error {
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
+			}
+
+			rows, err := tx.Query(
+				`SELECT id, type FROM memories
+				 WHERE id IN (`+sqlPlaceholders(len(chunk))+`) AND deleted_at IS NULL`,
+				args...,
+			)
+			if err != nil {
+				return fmt.Errorf("MarkReviewed: read types: %w", err)
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var id int64
+				var typ string
+				if err := rows.Scan(&id, &typ); err != nil {
+					return fmt.Errorf("MarkReviewed: scan type: %w", err)
+				}
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				byType[typ] = append(byType[typ], id)
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("MarkReviewed: read types: %w", err)
+			}
+			return nil
+		}(); err != nil {
+			return nil, err
 		}
-		byType[typ] = append(byType[typ], id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("MarkReviewed: read types: %w", err)
 	}
 	return byType, nil
 }

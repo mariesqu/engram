@@ -577,7 +577,7 @@ The suggestion is deterministic — the same title/type/content always yields th
 				mcp.Description(`Only return memories created on or after this instant. RFC3339 ("2024-06-01T09:00:00Z") or a plain date ("2024-06-01", read as UTC midnight).`),
 			),
 			mcp.WithString("created_to",
-				mcp.Description(`Only return memories created on or before this instant. RFC3339 ("2024-06-30T23:59:59Z") or a plain date ("2024-06-30", which covers the WHOLE day).`),
+				mcp.Description(`Only return memories created on or before this instant. RFC3339 ("2024-06-30T23:59:59Z") or a plain date ("2024-06-30", which covers the WHOLE day). Must not be earlier than created_from.`),
 			),
 			mcp.WithString("mode",
 				mcp.Description(`Retrieval mode: "" or "fts" (keyword search, default), "semantic" (cosine only), "hybrid" (FTS + cosine fused via RRF). Semantic modes require an embedding provider to be configured; they degrade gracefully to FTS when unavailable.`),
@@ -1836,11 +1836,17 @@ func toolSearchOffset(args map[string]any) (int, string) {
 	if !ok {
 		return 0, "mem_search: offset must be a number"
 	}
-	// The int64 boundary check parseObservationID makes is not needed here (an
-	// offset that large is meaningless), but the integer and sign checks are: a
-	// fractional or negative offset is a caller bug, not a page.
-	if f != math.Trunc(f) || f < 0 || f > float64(math.MaxInt32) {
+	// A fractional or negative offset is a caller bug, not a page.
+	if f != math.Trunc(f) || f < 0 {
 		return 0, "mem_search: offset must be a non-negative integer"
+	}
+	// The ceiling gets its OWN message. int is 32-bit on some builds, so the
+	// bound is real — but "must be a non-negative integer" told a caller who
+	// passed a well-formed integer to pass an integer, which is advice they
+	// cannot act on. Naming the actual problem is the difference between a caller
+	// that shrinks the offset and one that retries the same value forever.
+	if f > float64(math.MaxInt32) {
+		return 0, fmt.Sprintf("mem_search: offset is too large (max %d)", math.MaxInt32)
 	}
 	return int(f), ""
 }
@@ -1947,6 +1953,14 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		if errMsg != "" {
 			return mcp.NewToolResultError(errMsg), nil
 		}
+		// An inverted window is empty by construction: the store ANDs the two
+		// bounds, so this search can only ever return nothing. Answering "no
+		// memories found" would be true and useless — the caller would go on
+		// believing the corpus is empty for that window instead of seeing that
+		// they swapped their arguments.
+		if !createdFrom.IsZero() && !createdTo.IsZero() && createdFrom.After(createdTo) {
+			return mcp.NewToolResultError("mem_search: created_from is after created_to"), nil
+		}
 
 		project := resolveReadProject(explicitProject, directory)
 		// REQ-391: personal-scope memories are NOT project-scoped. When scope is
@@ -1973,7 +1987,18 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		// Page one renders exactly as it always has. Past it the header names the
+		// row range and the numbering continues from the offset, because "Found 10
+		// memories" over items [1]–[10] describes page one, page three and page
+		// nine identically — and an agent walking pages has no other way to tell
+		// which one it is holding. The count stays the count of THIS page; the
+		// range is what says where the page sits.
+		if offset > 0 {
+			fmt.Fprintf(&b, "Found %d memories (rows %d–%d):\n\n",
+				len(results), offset+1, offset+len(results))
+		} else {
+			fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		}
 		anyTruncated := false
 		for i, r := range results {
 			preview := r.Content
@@ -1983,7 +2008,7 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				preview = string([]rune(r.Content)[:previewLen]) + " [preview]"
 			}
 			fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    project: %s | scope: %s\n",
-				i+1, r.ID, r.Type, r.Title,
+				offset+i+1, r.ID, r.Type, r.Title,
 				preview,
 				r.Project, r.Scope)
 			if r.TopicKey != nil && *r.TopicKey != "" {

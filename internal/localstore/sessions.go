@@ -225,50 +225,26 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // cannot bound a sort key — so it is O(sessions × memories), not "bounded by
 // limit sessions" as this comment used to claim: 300 sessions over 20k memories
 // measured 1.39s, and FormatContext (which calls this first) 1.58s. The grouped
-// join below computes every session's newest memory in ONE pass over
-// memories(session_id) — the idx_mem_session index added in schema v14 — and
-// measures ~20ms on the same fixture (see TestRecentSessions_ScalesToThreeHundredSessions).
+// join below computes every session's newest memory in ONE pass over memories
+// and measures ~20ms on the same fixture (see
+// TestRecentSessions_ScalesToThreeHundredSessions).
+//
+// The SHAPE is the win here, not the index. The grouped pass still visits every
+// live memory; idx_mem_session (schema v14) only lets SQLite walk them already
+// in session order — "SCAN memories USING INDEX idx_mem_session" in the plan —
+// instead of sorting them for the GROUP BY. That saves a sort, not the
+// O(sessions × memories) evaluation: the correlated subquery had to go for that.
+// Where the index measurably pays for itself is the OTHER half of the mem_context
+// path, FormatContext's per-session observation COUNT — one indexed lookup per
+// returned session instead of a scan each, ~26% off FormatContext at this
+// fixture size.
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	project = normalizeProject(project)
 	if limit <= 0 {
 		limit = 5
 	}
 
-	// MAX() here is SQLite's SCALAR max (3 arguments) over three datetime()
-	// strings; the single-argument MAX inside the derived table is the AGGREGATE.
-	// The two forms stay unambiguous because the aggregate lives in its own
-	// subquery — now a GROUPED one that runs once, instead of a correlated one
-	// that runs per session row (see the doc comment for the numbers).
-	//
-	// datetime() wraps the aggregate's argument, not just its result: MAX() over
-	// raw text is a LEXICAL max, and this column holds a mix of SQLite's
-	// 'YYYY-MM-DD HH:MM:SS' (the column default) and RFC3339 with a 'T' and a 'Z'
-	// (anything written by a Go caller). Lexically, '2024-01-02T…' sorts ABOVE
-	// '2024-06-10 …' because 'T' > ' ' — so a January RFC3339 row would win over a
-	// June one. datetime() normalizes both forms to the same comparable text first.
-	const lastActivityExpr = `MAX(
-	            datetime(s.started_at),
-	            datetime(COALESCE(s.ended_at, s.started_at)),
-	            datetime(COALESCE(lm.last_created, s.started_at))
-	          )`
-
-	query := `SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
-	                 ` + lastActivityExpr + ` AS last_activity_at
-	          FROM sessions s
-	          LEFT JOIN (
-	            SELECT session_id, MAX(datetime(created_at)) AS last_created
-	            FROM memories
-	            WHERE deleted_at IS NULL
-	            GROUP BY session_id
-	          ) lm ON lm.session_id = s.id
-	          WHERE 1=1`
-	args := []any{}
-	if project != "" {
-		query += " AND LOWER(s.project) = ?"
-		args = append(args, project)
-	}
-	query += " ORDER BY datetime(last_activity_at) DESC, s.id DESC LIMIT ?"
-	args = append(args, limit)
+	query, args := recentSessionsQuery(project, limit)
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -305,6 +281,53 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 		results = append(results, ss)
 	}
 	return results, rows.Err()
+}
+
+// recentSessionsQuery builds RecentSessions' statement and its args. project is
+// expected ALREADY normalized ("" disables the filter) and limit already
+// defaulted — this is the SQL, not the argument handling.
+//
+// It is a separate function so the scale test can run EXPLAIN QUERY PLAN on the
+// EXACT statement that ships, rather than on a copy that can drift away from it.
+// A plan assertion over a re-typed query proves nothing about production.
+func recentSessionsQuery(project string, limit int) (string, []any) {
+	// MAX() here is SQLite's SCALAR max (3 arguments) over three datetime()
+	// strings; the single-argument MAX inside the derived table is the AGGREGATE.
+	// The two forms stay unambiguous because the aggregate lives in its own
+	// subquery — now a GROUPED one that runs once, instead of a correlated one
+	// that runs per session row (see the doc comment for the numbers).
+	//
+	// datetime() wraps the aggregate's argument, not just its result, and it is
+	// defensive: MAX() over raw text is a LEXICAL max, so a column holding a mix
+	// of SQLite's 'YYYY-MM-DD HH:MM:SS' and RFC3339 with a 'T' and a 'Z' compares
+	// wrong — '2024-01-02T…' sorts ABOVE '2024-06-10 …' because 'T' > ' ', and a
+	// January row would win over a June one. datetime() normalizes both storage
+	// formats to the same comparable text first.
+	const lastActivityExpr = `MAX(
+	            datetime(s.started_at),
+	            datetime(COALESCE(s.ended_at, s.started_at)),
+	            datetime(COALESCE(lm.last_created, s.started_at))
+	          )`
+
+	query := `SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
+	                 ` + lastActivityExpr + ` AS last_activity_at
+	          FROM sessions s
+	          LEFT JOIN (
+	            SELECT session_id, MAX(datetime(created_at)) AS last_created
+	            FROM memories
+	            WHERE deleted_at IS NULL
+	            GROUP BY session_id
+	          ) lm ON lm.session_id = s.id
+	          WHERE 1=1`
+	args := []any{}
+	if project != "" {
+		query += " AND LOWER(s.project) = ?"
+		args = append(args, project)
+	}
+	query += " ORDER BY datetime(last_activity_at) DESC, s.id DESC LIMIT ?"
+	args = append(args, limit)
+
+	return query, args
 }
 
 // nullableStr converts an empty string to a SQL NULL so that summary="" is

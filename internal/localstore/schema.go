@@ -828,10 +828,11 @@ func migrateV3ToV4(db *sql.DB) error {
 //     d. Drop FTS virtual table + triggers (they reference the old rowid mapping).
 //     e. Recreate FTS virtual table + triggers via the shared DDL statements.
 //     f. Rebuild FTS index from the copied rows.
-//     g. DROP INDEX IF EXISTS for all four idx_mem_* names — necessary because
-//     ALTER TABLE RENAME preserves index names on memories_old, so
-//     CREATE INDEX IF NOT EXISTS would silently no-op (name already exists).
-//     Dropping the names first lets the CREATE INDEX run against the new table.
+//     g. DROP INDEX IF EXISTS for EVERY idx_mem_* name ApplySchema installs —
+//     necessary because ALTER TABLE RENAME preserves index names on
+//     memories_old, so CREATE INDEX IF NOT EXISTS would silently no-op (name
+//     already exists). Dropping the names first lets the CREATE INDEX run
+//     against the new table.
 //     h. Recreate indexes on the new memories table.
 //     i. Drop memories_old (this also drops any indexes that survived on it).
 //  3. `PRAGMA foreign_keys = ON`.
@@ -933,11 +934,21 @@ func rebuildMemoriesTable(db *sql.DB) error {
 	// Note: memories_old still exists at this point; its rowid mapping is about
 	// to be destroyed by DROP TABLE memories_old in step (i).  Dropping the
 	// index names here is safe because we no longer need them on memories_old.
+	//
+	// This list must name EVERY index ApplySchema puts on memories — ApplySchema
+	// runs BEFORE runMigrations on every Open, so by the time this rebuild starts
+	// each of those names already exists and is attached to what is about to
+	// become memories_old.  A name missing here is not a missing DROP, it is a
+	// SILENTLY LOST INDEX: its CREATE below no-ops on the existing name and
+	// DROP TABLE memories_old in step (i) takes the index with it.  That is
+	// exactly how idx_mem_project was lost on the v0→v1 path.
 	dropIdxStmts := []string{
 		`DROP INDEX IF EXISTS idx_mem_topic`,
 		`DROP INDEX IF EXISTS idx_mem_parent`,
 		`DROP INDEX IF EXISTS idx_mem_entity_status`,
 		`DROP INDEX IF EXISTS idx_mem_deleted`,
+		`DROP INDEX IF EXISTS idx_mem_project`,
+		`DROP INDEX IF EXISTS idx_mem_session`,
 	}
 	for _, s := range dropIdxStmts {
 		if _, err = tx.Exec(s); err != nil {
@@ -959,6 +970,7 @@ func rebuildMemoriesTable(db *sql.DB) error {
 			ON memories(deleted_at)
 			WHERE deleted_at IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
+		idxMemSessionDDL,
 	}
 	for _, s := range idxStmts {
 		if _, err = tx.Exec(s); err != nil {
@@ -1347,7 +1359,9 @@ func migrateV12ToV13(db *sql.DB) error {
 
 // idxMemSessionDDL creates the memories(session_id) index. Shared between
 // ApplySchema, rebuildMemoriesTable and migrateV13ToV14 so all three paths
-// install the identical index.
+// install the identical index — and, just as important, so rebuildMemoriesTable
+// cannot forget it: an index ApplySchema installs but the rebuild does not
+// recreate is dropped with memories_old (see step (g) there).
 const idxMemSessionDDL = `CREATE INDEX IF NOT EXISTS idx_mem_session ON memories(session_id)`
 
 // migrateV13ToV14 adds idx_mem_session and backfills review_after for the decay

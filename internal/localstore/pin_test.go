@@ -221,6 +221,11 @@ func TestCountPinned_ScopesLikePinnedObservations(t *testing.T) {
 		{"alpha", "", 3},
 		{"beta", "project", 1},
 		{"", "", 4},
+		// A whitespace-only scope is "no scope", on BOTH sides. CountPinned
+		// trimmed before testing for empty and the list query did not, so this
+		// argument counted every pin and listed none of them — the overflow line
+		// claiming rows above an empty section.
+		{"alpha", "   ", 3},
 	} {
 		got, err := s.CountPinned(tc.project, tc.scope)
 		if err != nil {

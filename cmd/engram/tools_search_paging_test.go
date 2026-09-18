@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -231,5 +232,99 @@ func TestMemSearch_AbsentPagingArgsChangeNothing(t *testing.T) {
 	}
 	if !strings.Contains(base, "Found 3 memories") {
 		t.Errorf("baseline search did not return all three rows:\n%s", base)
+	}
+}
+// TestMemSearch_RejectsInvertedDateWindow covers the one malformed window the
+// parser cannot see: both bounds are valid dates, and the pair is nonsense. The
+// store ANDs them, so the search can only return nothing — and "No memories
+// found" is a true answer that hides the caller's swapped arguments behind a
+// statement about the corpus.
+func TestMemSearch_RejectsInvertedDateWindow(t *testing.T) {
+	c, _ := searchPagingDaemon(t, 3)
+
+	result, text := runSearch(t, c, map[string]any{
+		"query": "haystack", "project": "paging",
+		"created_from": "2024-06-05", "created_to": "2024-06-02",
+	})
+	if !result.IsError {
+		t.Fatalf("an inverted window must be a tool error, got:\n%s", text)
+	}
+	if !strings.Contains(text, "created_from is after created_to") {
+		t.Errorf("error text %q does not name the inverted window", text)
+	}
+
+	// The bound is AFTER, not "different": an instant-wide window is a legitimate
+	// question, and a check that refused it would reject a correct call.
+	result, text = runSearch(t, c, map[string]any{
+		"query": "haystack", "project": "paging",
+		"created_from": "2024-06-02T12:00:00Z", "created_to": "2024-06-02T12:00:00Z",
+	})
+	if result.IsError {
+		t.Errorf("created_from == created_to must be allowed, got a tool error: %s", text)
+	}
+}
+
+// TestMemSearch_RejectsOffsetPastTheCeiling pins that the ceiling says what it
+// is. The value below is a well-formed non-negative integer, so the generic
+// "must be a non-negative integer" answer described a problem the caller did not
+// have and gave them nothing they could act on.
+func TestMemSearch_RejectsOffsetPastTheCeiling(t *testing.T) {
+	c, _ := searchPagingDaemon(t, 2)
+
+	result, text := runSearch(t, c, map[string]any{
+		"query": "haystack", "project": "paging",
+		"offset": float64(math.MaxInt32) + 1,
+	})
+	if !result.IsError {
+		t.Fatalf("an offset past the ceiling must be a tool error, got:\n%s", text)
+	}
+	if !strings.Contains(text, "offset is too large") {
+		t.Errorf("error text %q does not say the offset is too large", text)
+	}
+}
+
+// TestMemSearch_OffsetPageIsNumberedFromTheOffset covers what a paged RESULT
+// says about itself. Page one renders exactly as it always has; every page past
+// it names its row range and numbers its items from the offset, because
+// "Found 2 memories" over [1] and [2] renders page one and page three
+// identically and an agent walking pages cannot tell which one it is holding.
+func TestMemSearch_OffsetPageIsNumberedFromTheOffset(t *testing.T) {
+	c, _ := searchPagingDaemon(t, 5)
+
+	_, page1 := runSearch(t, c, map[string]any{
+		"query": "haystack", "project": "paging", "limit": float64(2),
+	})
+	if !strings.Contains(page1, "Found 2 memories:") {
+		t.Errorf("page one header changed:\n%s", page1)
+	}
+	if !strings.Contains(page1, "[1] #") || !strings.Contains(page1, "[2] #") {
+		t.Errorf("page one is not numbered [1],[2]:\n%s", page1)
+	}
+
+	result, page2 := runSearch(t, c, map[string]any{
+		"query": "haystack", "project": "paging",
+		"limit": float64(2), "offset": float64(2),
+	})
+	if result.IsError {
+		t.Fatalf("tool error: %s", page2)
+	}
+	if !strings.Contains(page2, "Found 2 memories (rows 3–4):") {
+		t.Errorf("page two does not name its row range:\n%s", page2)
+	}
+	if !strings.Contains(page2, "[3] #") || !strings.Contains(page2, "[4] #") {
+		t.Errorf("page two is not numbered [3],[4]:\n%s", page2)
+	}
+	if strings.Contains(page2, "[1] #") {
+		t.Errorf("page two restarts its numbering at [1]:\n%s", page2)
+	}
+
+	// A short final page reports the rows it actually holds, not the rows it
+	// asked for: offset 4 over five rows is row 5 alone.
+	_, lastPage := runSearch(t, c, map[string]any{
+		"query": "haystack", "project": "paging",
+		"limit": float64(2), "offset": float64(4),
+	})
+	if !strings.Contains(lastPage, "Found 1 memories (rows 5–5):") {
+		t.Errorf("short final page does not report a 5–5 range:\n%s", lastPage)
 	}
 }

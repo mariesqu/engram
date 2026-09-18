@@ -289,13 +289,29 @@ func TestMigration_V13ToV14_ExistingDB(t *testing.T) {
 		t.Errorf("v13-deleted: review_after = %q, want NULL — a soft-deleted row is not backfilled", got)
 	}
 
-	// Re-running migrations on the migrated DB must be a no-op — including the
-	// backfill, which is guarded by review_after IS NULL.
+	// Replaying the migration must be a no-op — including the backfill, which is
+	// guarded by review_after IS NULL.
+	//
+	// runMigrations alone cannot prove that: the DB now reports user_version 14,
+	// so runMigrations returns before reaching the v13→v14 step and the assertion
+	// below would pass over a migration body that rewrites every row. So run the
+	// version guard (it must not error) AND then call migrateV13ToV14 directly,
+	// which is the statement sequence whose replay-safety is actually in question.
 	if err := runMigrations(db); err != nil {
 		t.Errorf("re-running migrations on a current-version DB: %v", err)
 	}
+	if err := migrateV13ToV14(db); err != nil {
+		t.Errorf("replaying migrateV13ToV14 on an already-migrated DB: %v", err)
+	}
 	if got, _ := rawReviewAfter(t, db, "v13-decision"); got != created.AddDate(0, 6, 0).Format(sqliteTimeLayout) {
 		t.Errorf("v13-decision: review_after moved to %q on a no-op re-run", got)
+	}
+	if got, ok := rawReviewAfter(t, db, "v13-bugfix"); ok {
+		t.Errorf("v13-bugfix: review_after = %q after the replay, want still NULL", got)
+	}
+	if got, ok := rawReviewAfter(t, db, "v13-already-marked"); !ok || got != prevMarked {
+		t.Errorf("v13-already-marked: review_after = %q (set=%v) after the replay, want the pre-existing %q",
+			got, ok, prevMarked)
 	}
 
 	if err := db.Close(); err != nil {

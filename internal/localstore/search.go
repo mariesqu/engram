@@ -98,14 +98,16 @@ const ftsRankExpr = "fts.rank * (CASE WHEN m.pinned = 1 THEN 1.10 ELSE 1.0 END)"
 // the page being asked for (see SearchMemoriesFiltered's doc block). "Full" is
 // literal for the cosine half — SelectVectors already scanned those rows — but an
 // unbounded FTS half would let a one-word query pull every matching row in the
-// store into memory to answer a ten-row page. 2000 is far past what any real
-// paging session walks (200 pages of 10) while keeping the worst case a few
-// megabytes, and a query that reaches beyond it fuses the rows it has rather
-// than erroring.
+// store into the fusion to answer a ten-row page. 2000 is far past what any real
+// paging session walks (200 pages of 10), and a query that reaches beyond it
+// fuses the rows it has rather than erroring.
 //
 // The cost is real and deliberate: page one of a hybrid search now ranks up to
-// 2000 FTS rows instead of 2×limit. That is what a stable ranking costs, and it
-// is paid on the half of the query that was already scanning every vector row.
+// 2000 FTS candidates instead of 2×limit. That is what a stable ranking costs,
+// and it is paid on the half of the query that was already scanning every vector
+// row. What the cap does NOT have to cover is content: the candidate pass selects
+// sync_ids only and the page is hydrated after fusion, so 2000 candidates is 2000
+// identifiers, not 2000 memory bodies.
 const hybridFullFusionFTSCap = 2000
 
 // dateRangeSQL appends CreatedFrom/CreatedTo predicates (if set) to a WHERE
@@ -350,16 +352,21 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	ftsPool := hybridFullFusionFTSCap
 
 	// Run FTS for the candidate pool sized above.
-	ftsCandidates, ftsErr := func() ([]*domain.Record, error) {
+	//
+	// The candidate pass reads IDENTIFIERS ONLY. Fusion ranks sync_ids — content
+	// is no part of that decision — so selecting the full row here materialized up
+	// to hybridFullFusionFTSCap (2000) memory BODIES to answer a ten-row page and
+	// discarded all but `limit` of them after the slice. The page is hydrated
+	// from the fused ids instead (one fetchBySyncIDs of at most `limit` rows),
+	// which also makes the hybrid path read its records through the same query
+	// the semantic path already used.
+	ftsRanks, ftsErr := func() ([]string, error) {
 		ftsQ := sanitizeFTS(query)
 		if ftsQ == "" {
 			return nil, nil
 		}
 		q := `
-			SELECT m.id, m.sync_id, m.session_id, m.entity_type, m.type, m.title, m.content,
-			       m.project, m.scope, m.version, m.writer_id, m.last_write_mutation_id,
-			       m.topic_key, m.status, m.parent_sync_id,
-			       m.created_at, m.updated_at, m.deleted_at
+			SELECT m.sync_id
 			FROM memories_fts fts
 			JOIN memories m ON m.id = fts.rowid
 			WHERE memories_fts MATCH ?
@@ -389,13 +396,13 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			return nil, fmt.Errorf("hybrid FTS: %w", err)
 		}
 		defer rows.Close()
-		var res []*domain.Record
+		var res []string
 		for rows.Next() {
-			r, e := scanRecordWithIDFromRows(rows)
-			if e != nil {
+			var syncID string
+			if e := rows.Scan(&syncID); e != nil {
 				return nil, fmt.Errorf("hybrid FTS scan: %w", e)
 			}
-			res = append(res, r)
+			res = append(res, syncID)
 		}
 		return res, rows.Err()
 	}()
@@ -409,14 +416,6 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	if svErr != nil {
 		results, err := runFTS()
 		return results, SearchDegradation{Reason: "semantic search unavailable: vector scan error; showing keyword results"}, err
-	}
-
-	// Build rank lists (sync_id).
-	ftsRanks := make([]string, len(ftsCandidates))
-	ftsRecordsByID := make(map[string]*domain.Record, len(ftsCandidates))
-	for i, r := range ftsCandidates {
-		ftsRanks[i] = r.SyncID
-		ftsRecordsByID[r.SyncID] = r
 	}
 
 	// The cosine half mirrors the FTS half: every scanned vector row, on every
@@ -449,47 +448,12 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	}
 	fusedIDs = fusedIDs[offset:]
 
-	// Build the result set from fused IDs. Records may come from FTS cache or
-	// need a fresh fetch for cosine-only entries.
-	result := make([]*domain.Record, 0, len(fusedIDs))
-	var missingIDs []string
-	for _, id := range fusedIDs {
-		if r, ok := ftsRecordsByID[id]; ok {
-			result = append(result, r)
-		} else {
-			missingIDs = append(missingIDs, id)
-		}
-	}
-	if len(missingIDs) > 0 {
-		extra, err := s.fetchBySyncIDs(missingIDs)
-		if err != nil {
-			return result, SearchDegradation{}, err
-		}
-		// Insert extras in fused order.
-		extraMap := make(map[string]*domain.Record, len(extra))
-		for _, r := range extra {
-			extraMap[r.SyncID] = r
-		}
-		// Rebuild in exact fused order.
-		ordered := make([]*domain.Record, 0, len(fusedIDs))
-		for _, id := range fusedIDs {
-			if r, ok := ftsRecordsByID[id]; ok {
-				ordered = append(ordered, r)
-			} else if r, ok := extraMap[id]; ok {
-				ordered = append(ordered, r)
-			}
-		}
-		return ordered, SearchDegradation{}, nil
-	}
-
-	// Reorder result to match fused order (FTS map hits may not be in fused order).
-	ordered := make([]*domain.Record, 0, len(fusedIDs))
-	for _, id := range fusedIDs {
-		if r, ok := ftsRecordsByID[id]; ok {
-			ordered = append(ordered, r)
-		}
-	}
-	return ordered, SearchDegradation{}, nil
+	// Hydrate exactly the page being returned — at most `limit` rows, in fused
+	// order (fetchBySyncIDs preserves the order it is given). Both halves of the
+	// fusion contributed bare sync_ids, so there is no half-populated cache to
+	// reconcile: one query reads the page, whichever half each row came from.
+	ordered, err := s.fetchBySyncIDs(fusedIDs)
+	return ordered, SearchDegradation{}, err
 }
 
 // fetchBySyncIDs retrieves records by sync_id, preserving the given order.
@@ -611,9 +575,15 @@ func (s *Store) recentObservations(project, scope string, limit int, pin pinFilt
 		q += "\n  AND LOWER(project) = ?"
 		args = append(args, project)
 	}
-	if scope != "" {
+	// Normalize BEFORE the emptiness test, not inside the predicate: testing the
+	// raw string and filtering on the trimmed one makes a whitespace-only scope
+	// filter on `scope = ''`, which matches nothing — while CountPinned, which
+	// trims first, reads the same argument as "no scope filter" and counts
+	// everything. Two answers to one question is exactly what CountPinned exists
+	// to prevent (see its doc comment).
+	if scope = strings.ToLower(strings.TrimSpace(scope)); scope != "" {
 		q += "\n  AND scope = ?"
-		args = append(args, strings.ToLower(strings.TrimSpace(scope)))
+		args = append(args, scope)
 	}
 
 	q += "\nORDER BY datetime(created_at) DESC, id DESC\nLIMIT ?"
