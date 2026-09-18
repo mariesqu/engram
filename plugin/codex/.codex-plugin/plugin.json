@@ -1,0 +1,14 @@
+{
+  "name": "engram",
+  "displayName": "Engram Persistent Memory",
+  "version": "0.1.0",
+  "description": "Persistent memory for AI coding agents. Survives across sessions and compactions.",
+  "shortDescription": "Persistent memory with session tracking, compaction recovery, and the memory protocol.",
+  "homepage": "https://github.com/mariesqu/engram",
+  "repository": "https://github.com/mariesqu/engram",
+  "license": "MIT",
+  "category": "Productivity",
+  "keywords": ["memory", "persistence", "sessions", "context"],
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

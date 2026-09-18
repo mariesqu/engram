@@ -2,6 +2,8 @@
 
 Copy this block into your agent's instruction file (CLAUDE.md for Claude Code, AGENTS.md, .cursorrules for Cursor, or whichever file your MCP client reads as system-level instructions).
 
+> You may not have to. The daemon already ships a condensed version of this protocol through the MCP `instructions` channel, which clients that honour it prepend to the model's system prompt. And `engram setup hooks --agent claude-code|codex` (see [Lifecycle hooks](../README.md#lifecycle-hooks)) installs a `session-start` hook that injects the same protocol **plus the project's recent memory** at the start of every session — including after a compaction, which is exactly when a file the model can no longer see stops helping. Copy this block when you want the long form, or when your client supports neither.
+
 ---
 
 ## Engram Persistent Memory — Protocol

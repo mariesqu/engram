@@ -67,6 +67,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 - [Windows tray](#windows-tray)
 - [CLI reference](#cli-reference)
 - [Wiring into an MCP client](#wiring-into-an-mcp-client)
+- [Lifecycle hooks](#lifecycle-hooks)
 - [Using engram from your agent](#using-engram-from-your-agent)
 - [MCP tools](#mcp-tools)
 - [Managing your memories](#managing-your-memories)
@@ -726,6 +727,8 @@ engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
 engram import   [--from <old-db>] [--db <dest-db>] [--dry-run] [--writer-id <id>]
+engram hook     <session-start|post-compaction|user-prompt-submit|subagent-stop|session-end> [--db <path>] [--no-autostart]
+engram setup    hooks --agent <claude-code|codex> [--dry-run]
 engram version [--verbose]
 ```
 
@@ -853,6 +856,57 @@ If project auto-detection picks the wrong name (e.g. in a monorepo), create `.en
 ```
 
 Auto-detection runs against the directory the tool call carries — the client's working directory when you bridge through `engram connect` (see [Working-directory forwarding](#http-mcp-transport)), otherwise the daemon's own. If your memories are landing under a name that matches neither your repo nor this file, that is the directory to check first.
+
+## Lifecycle hooks
+
+MCP tools are *pull*: the agent calls them when it decides to. Hooks are *push* — the agent host runs them at fixed moments in a session, whether or not the model thought of it. That is what makes memory survive the two moments it is most often lost: the start of a session (when the model does not yet know there is anything to recall) and a context compaction (when it no longer knows there was).
+
+Every hook is the engram binary itself:
+
+```bash
+engram hook session-start        # register the session, inject the protocol + recent context
+engram hook post-compaction      # the same, plus the mandatory recovery steps
+engram hook user-prompt-submit   # capture the prompt; bootstrap the tools on the first one
+engram hook subagent-stop        # save a subagent's closing report before its context dies
+engram hook session-end          # close the session
+```
+
+Each reads the host's hook JSON on stdin and talks to the resident daemon over the same loopback MCP endpoint `engram connect` uses — same discovery, same bearer token, same rotation handling. There is no shell, no `jq`, and no PowerShell twin: one implementation, identical on every platform.
+
+**They never fail closed.** Every event exits 0 no matter what happened, each has a time budget (200 ms for `user-prompt-submit`, which sits between the user pressing Enter and the message being sent), and errors go to stderr only. An unreachable daemon costs you the context injection, never the prompt.
+
+### Installing
+
+Into your agent's settings (append-only merge — your other hooks and every unknown key are preserved, and re-running it is a no-op):
+
+```bash
+engram setup hooks --agent claude-code   # ~/.claude/settings.json  (honours CLAUDE_CONFIG_DIR)
+engram setup hooks --agent codex         # ~/.codex/hooks.json      (honours CODEX_HOME)
+engram setup hooks --agent claude-code --dry-run   # print the merged file, write nothing
+```
+
+Or, for a host that installs plugins, use the packs in this repo:
+
+```bash
+claude plugin marketplace add https://github.com/mariesqu/engram
+claude plugin install engram@engram
+```
+
+Both paths install the same hooks — `TestEngramHookPack_MatchesShippedPack` fails the build if they ever drift apart.
+
+The commands call `engram` **from PATH**, so the binary has to be there (`engram` / `engram.exe`), and the daemon needs a database: set `ENGRAM_DB` or put `db_path` in the [config file](#config-file).
+
+### What each hook does
+
+| Event | Output | Behaviour |
+|-------|--------|-----------|
+| `session-start` | plain text (injected as context) | Resolves the project through `mem_current_project`, registers the session, then prints the memory protocol followed by the project's recent context (capped at 16 KiB). Auto-starts a resident daemon if none is running; `--no-autostart` disables that. The protocol is printed even when the daemon is unreachable — an agent that was told nothing calls nothing. |
+| `post-compaction` | plain text | Everything `session-start` does, plus four numbered, unconditional steps: save the compacted summary with `mem_session_summary`, recover with `mem_context`, fill gaps with `mem_search`, then continue. After a compaction the model has lost the context that would have told it to do any of this. |
+| `user-prompt-submit` | JSON | Captures the prompt (`mem_save_prompt`) so a later `mem_save` can attach it. On the FIRST prompt of a session it injects the tool bootstrap (call `mem_current_project` first; here are the tool names) — hosts that defer MCP tool loading need a name to load. Afterwards it stays silent unless the session is over 5 minutes old AND the project's newest memory is over 15 minutes old, and then at most once every 15 minutes. |
+| `subagent-stop` | `{}` | Saves the subagent's closing report as an observation titled `subagent-stop: …`. A subagent's context dies with it; this is the only copy. The title names the source because nobody reviewed that text. |
+| `session-end` | `{}` | Closes the session row. It does not invent a summary — that field belongs to `mem_session_summary`, and a hook-written "session ended" would overwrite the one thing the next session reads. |
+
+Per-session state (first-prompt marker, nudge cooldown) lives in `os.TempDir()` under `engram-hook-<hash>-*`; the session id is hashed rather than embedded, since it is host-supplied text that ends up in a filesystem path.
 
 ## Using engram from your agent
 
