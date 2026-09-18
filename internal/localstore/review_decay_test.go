@@ -74,12 +74,16 @@ func TestDecay_NewInsertStampsReviewAfterByType(t *testing.T) {
 	}
 }
 
-// TestDecay_TopicKeyRevisionKeepsPriorReviewAfter is the reason the stamp lives
-// in execInsert and not in the save handler. A topic_key re-save is an UPDATE of
-// the same row; if it recomputed review_after, a memory could be kept
-// permanently "fresh" by rewriting it, which is precisely the stale context the
-// lifecycle feature exists to surface.
-func TestDecay_TopicKeyRevisionKeepsPriorReviewAfter(t *testing.T) {
+// TestDecay_TopicKeyRevisionRefreshesReviewAfter covers the revision half of the
+// rule. A topic_key re-save is an UPDATE of the same row, and rewriting a
+// memory's content is an assertion that it still says what it should — the same
+// assertion mark_reviewed makes, so it buys the same fresh window. The stamp
+// therefore lives in execUpdate as well as execInsert.
+//
+// The failure mode of the opposite choice is what decides it: a decision revised
+// today would keep reading as needs_review because its FIRST version is six
+// months old, and the agent would be told to re-verify text it just wrote.
+func TestDecay_TopicKeyRevisionRefreshesReviewAfter(t *testing.T) {
 	s := openTempStore(t)
 
 	first, err := s.AddObservation(AddObservationParams{
@@ -117,15 +121,15 @@ func TestDecay_TopicKeyRevisionKeepsPriorReviewAfter(t *testing.T) {
 	if !ok {
 		t.Fatal("review_after was cleared by a topic_key revision")
 	}
-	if !after.Equal(parseTime(backdated)) {
-		t.Errorf("topic_key revision moved review_after from %s to %s — a revision must not reset the clock",
-			backdated, after.Format(time.RFC3339))
+	if after.Equal(parseTime(backdated)) {
+		t.Fatalf("topic_key revision left review_after at %s — a revision restarts the clock", backdated)
 	}
+	assertMonthsFromNow(t, "decision after topic_key revision", after, 6)
 }
 
-// TestDecay_UpdateMemoryDoesNotRecompute is the same guarantee through the
-// mem_update surface: editing a row's text is not a review of its contents.
-func TestDecay_UpdateMemoryDoesNotRecompute(t *testing.T) {
+// TestDecay_UpdateMemoryRecomputes is the same guarantee through the mem_update
+// surface: an edit is a revision, and a revision restarts the clock.
+func TestDecay_UpdateMemoryRecomputes(t *testing.T) {
 	s := openTempStore(t)
 
 	res, err := s.AddObservation(AddObservationParams{
@@ -134,11 +138,11 @@ func TestDecay_UpdateMemoryDoesNotRecompute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddObservation: %v", err)
 	}
-	pinned := time.Now().UTC().AddDate(0, 0, 2).Format(sqliteTimeLayout)
+	stale := time.Now().UTC().AddDate(0, 0, 2).Format(sqliteTimeLayout)
 	if _, err := s.DB().Exec(
-		`UPDATE memories SET review_after = ? WHERE id = ?`, pinned, res.ID,
+		`UPDATE memories SET review_after = ? WHERE id = ?`, stale, res.ID,
 	); err != nil {
-		t.Fatalf("pin review_after: %v", err)
+		t.Fatalf("backdate review_after: %v", err)
 	}
 
 	if _, err := s.UpdateMemory(res.ID, "keep pg", "v2", "", "w1"); err != nil {
@@ -149,8 +153,42 @@ func TestDecay_UpdateMemoryDoesNotRecompute(t *testing.T) {
 	if !ok {
 		t.Fatal("UpdateMemory cleared review_after")
 	}
-	if !got.Equal(parseTime(pinned)) {
-		t.Errorf("UpdateMemory moved review_after from %s to %s", pinned, got.Format(time.RFC3339))
+	assertMonthsFromNow(t, "decision after UpdateMemory", got, 6)
+}
+
+// TestDecay_UpdateOfUndecayedTypeKeepsReviewAfter pins the COALESCE in
+// execUpdate. A type with no decay entry has no window to recompute, so the edit
+// must leave review_after alone — writing NULL would silently undo a
+// MarkReviewed reset (which, for these types, is the ONLY thing that ever put a
+// value there) and send the row straight back to needs_review.
+func TestDecay_UpdateOfUndecayedTypeKeepsReviewAfter(t *testing.T) {
+	s := openTempStore(t)
+
+	res, err := s.AddObservation(AddObservationParams{
+		Title: "fix N+1", Content: "v1", Project: "decay", Type: "bugfix",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := s.MarkReviewed([]int64{res.ID}); err != nil {
+		t.Fatalf("MarkReviewed: %v", err)
+	}
+	marked, ok := reviewAfterOf(t, s, res.ID)
+	if !ok {
+		t.Fatal("pre-condition: MarkReviewed must set review_after on a bugfix")
+	}
+
+	if _, err := s.UpdateMemory(res.ID, "fix N+1", "v2", "", "w1"); err != nil {
+		t.Fatalf("UpdateMemory: %v", err)
+	}
+
+	got, ok := reviewAfterOf(t, s, res.ID)
+	if !ok {
+		t.Fatal("UpdateMemory cleared the review_after a MarkReviewed had set")
+	}
+	if !got.Equal(marked) {
+		t.Errorf("UpdateMemory moved review_after from %s to %s on a type with no decay entry",
+			marked.Format(time.RFC3339), got.Format(time.RFC3339))
 	}
 }
 
@@ -278,5 +316,71 @@ func TestMarkReviewed_SkipsUnknownAndDeletedRows(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("MarkReviewed updated %d rows, want 1 (deleted and unknown ids are skipped)", n)
+	}
+}
+
+// TestMarkReviewed_GroupsMixedTypesInOneBatch covers the grouped bulk UPDATE: one
+// call spanning three types has to give each row the window ITS type earns, not
+// the window of whichever row happened to be read first. A duplicated id counts
+// once — the row, not the request, is what gets marked.
+func TestMarkReviewed_GroupsMixedTypesInOneBatch(t *testing.T) {
+	s := openTempStore(t)
+	s.SetReviewWindowDays(30)
+
+	add := func(title, typ string) int64 {
+		t.Helper()
+		res, err := s.AddObservation(AddObservationParams{
+			Title: title, Content: "c", Project: "decay", Type: typ,
+		})
+		if err != nil {
+			t.Fatalf("AddObservation(%s): %v", typ, err)
+		}
+		return res.ID
+	}
+
+	decision := add("pg", "decision")
+	policy := add("retention", "policy")
+	bugfix := add("n+1", "bugfix")
+
+	stale := time.Now().UTC().AddDate(0, 0, -400).Format(sqliteTimeLayout)
+	if _, err := s.DB().Exec(
+		`UPDATE memories SET review_after = ? WHERE id IN (?, ?, ?)`,
+		stale, decision, policy, bugfix,
+	); err != nil {
+		t.Fatalf("backdate review_after: %v", err)
+	}
+
+	// decision is listed twice: the same row, asked for twice.
+	n, err := s.MarkReviewed([]int64{decision, policy, bugfix, decision})
+	if err != nil {
+		t.Fatalf("MarkReviewed: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("MarkReviewed updated %d rows, want 3 (a duplicated id names one row)", n)
+	}
+
+	for _, tc := range []struct {
+		label  string
+		id     int64
+		months int
+	}{
+		{"decision", decision, 6},
+		{"policy", policy, 12},
+	} {
+		got, ok := reviewAfterOf(t, s, tc.id)
+		if !ok {
+			t.Errorf("%s: review_after is NULL after MarkReviewed", tc.label)
+			continue
+		}
+		assertMonthsFromNow(t, tc.label+" in a mixed batch", got, tc.months)
+	}
+
+	got, ok := reviewAfterOf(t, s, bugfix)
+	if !ok {
+		t.Fatal("bugfix: review_after is NULL after MarkReviewed")
+	}
+	if want := time.Now().UTC().AddDate(0, 0, 30); got.Sub(want) > 24*time.Hour || got.Sub(want) < -24*time.Hour {
+		t.Errorf("bugfix in a mixed batch: review_after = %s, want ≈ %s (now + 30d window)",
+			got.Format(time.RFC3339), want.Format(time.RFC3339))
 	}
 }

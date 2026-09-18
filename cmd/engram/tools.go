@@ -638,12 +638,12 @@ action="list": list memories by review status — status filter is one of:
   Returns id, title, type, project, status, review_after.
 
 action="mark_reviewed": reset the staleness clock on memories you have verified.
-  Provide ids (a number array) OR a topic_key (resolves to its current observation).
-  The new due date is recomputed from the memory's TYPE — decision +6 months,
-  policy +12, preference +3, anything else + the staleness window. Returns the
-  count updated.
+  Provide ids (a number array, max 200 per call) OR a topic_key (resolves to its
+  current observation). The new due date is recomputed from the memory's TYPE —
+  decision +6 months, policy +12, preference +3, anything else + the staleness
+  window. Returns the count updated.
 
-Status is computed at read time: a memory is "needs_review" once past its review_after (set at save time for decision/policy/preference) or, when it has none, once it ages past the staleness window; "expired" once past its expires_at; else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
+Status is computed at read time: a memory is "needs_review" once past its review_after (set for decision/policy/preference, and the clock runs from the LAST SAVE OR REVISION — rewriting a memory restarts it, exactly as marking it reviewed does) or, when it has none, once it ages past the staleness window; "expired" once past its expires_at; else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
 			mcp.WithTitleAnnotation("Review Memory Lifecycle"),
 			mcp.WithReadOnlyHintAnnotation(false),
 			mcp.WithDestructiveHintAnnotation(false),
@@ -657,7 +657,7 @@ Status is computed at read time: a memory is "needs_review" once past its review
 				mcp.Description("list filter: needs_review (default) | active | expired | all"),
 			),
 			mcp.WithArray("ids",
-				mcp.Description("mark_reviewed: observation IDs (numbers) to mark as reviewed"),
+				mcp.Description("mark_reviewed: observation IDs (numbers) to mark as reviewed — at most 200 per call"),
 				mcp.Items(map[string]any{"type": "number"}),
 			),
 			mcp.WithString("topic_key",
@@ -1393,24 +1393,25 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 	}
 }
 
-// toolObservationID decodes a required numeric "id" argument into an int64,
-// returning a caller-facing error string when it is missing or not a usable
-// positive integer. The MCP SDK delivers every JSON number as a float64, which
-// cannot represent every int64 above 2^53 — and float64(math.MaxInt64) rounds UP
-// to 2^63, so the exact boundary must be rejected or int64() overflows negative.
+// toolObservationID decodes a REQUIRED numeric "id" argument into an int64,
+// returning a caller-facing error string prefixed with the tool name.
+//
+// The numeric validation itself is parseObservationID's — this wrapper adds only
+// the two things that are specific to "id is a required argument of THIS tool":
+// the missing-key check and the tool prefix. Duplicating the float64 rules here
+// (which is what this used to do) means two copies of a subtle boundary check —
+// float64(math.MaxInt64) rounds UP to 2^63, so the exact boundary must be
+// rejected or int64() overflows negative — that can drift apart silently.
 func toolObservationID(args map[string]any, tool string) (int64, string) {
 	raw, ok := args["id"]
 	if !ok {
 		return 0, tool + ": id is required"
 	}
-	f, ok := raw.(float64)
-	if !ok {
-		return 0, tool + ": id must be a number"
+	id, err := parseObservationID(raw)
+	if err != nil {
+		return 0, tool + ": id " + err.Error()
 	}
-	if f != math.Trunc(f) || f <= 0 || f >= float64(math.MaxInt64) {
-		return 0, tool + ": id must be a positive integer"
-	}
-	return int64(f), ""
+	return id, ""
 }
 
 // handlePin returns the handler for mem_pin (pinned=true) and mem_unpin
@@ -2024,6 +2025,10 @@ func parseObservationID(raw any) (int64, error) {
 	return int64(f), nil
 }
 
+// reviewIDsPerCall caps mark_reviewed's ids[] array, mirroring the 200-row
+// ceiling ListForReview puts on its own limit.
+const reviewIDsPerCall = 200
+
 // handleReview returns the handler for mem_review. action="list" lists memories
 // by review status; action="mark_reviewed" resets the staleness clock on the
 // given ids (or the row resolved from topic_key). mark_reviewed is a LOCAL-ONLY
@@ -2077,6 +2082,17 @@ func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			var ids []int64
 
 			if rawIDs, ok := args["ids"].([]any); ok && len(rawIDs) > 0 {
+				// Same 200 ceiling ListForReview caps `limit` at, for the same
+				// reason: mark_reviewed is the action you take on a list you just
+				// read, so a batch can never legitimately exceed a page of it. It
+				// REFUSES rather than truncating — silently marking the first 200
+				// of 500 ids and reporting success would leave the caller believing
+				// 300 memories were verified that were not.
+				if len(rawIDs) > reviewIDsPerCall {
+					return mcp.NewToolResultError(fmt.Sprintf(
+						"mem_review: mark_reviewed accepts at most %d ids per call (got %d) — split it into pages",
+						reviewIDsPerCall, len(rawIDs))), nil
+				}
 				for i, raw := range rawIDs {
 					id, err := parseObservationID(raw)
 					if err != nil {

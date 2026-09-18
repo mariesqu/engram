@@ -4,6 +4,8 @@ package localstore
 
 import (
 	"database/sql"
+	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -161,7 +163,24 @@ import (
 //	not travel, and no central-store or reconcile invariant changes because of it.
 //	The FTS index is untouched (pinned is not a searchable text column), so the
 //	triggers need no rebuild.
-const currentSchemaVersion = 13
+//
+// v13 → v14: add idx_mem_session ON memories(session_id), and backfill
+//
+//	review_after for the decay types that predate the lifecycle feature.
+//
+//	The index backs the two per-session reads on the mem_context hot path:
+//	RecentSessions' grouped "newest memory per session" join and FormatContext's
+//	per-session observation COUNT. Both previously full-scanned memories — at 300
+//	sessions over 20k rows that measured 1.39s and 1.58s respectively.
+//
+//	The backfill dates review_after from each row's OWN created_at (not from the
+//	migration instant) for the three types in decayReviewAfterMonths, so a
+//	two-year-old decision surfaces as needs_review immediately instead of being
+//	granted a fresh six months by the act of upgrading. Rows that already carry a
+//	review_after are left alone (the column is per-node state a MarkReviewed may
+//	already have set), as are soft-deleted rows and every type with no decay
+//	entry — NULL there still means "fall back to updated_at + window".
+const currentSchemaVersion = 14
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -556,9 +575,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 13
 	}
 
+	if ver < 14 {
+		if err := migrateV13ToV14(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 14
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 13` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 14` migration block.
+	// the final `ver = 14` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 15` migration block.
 	_ = ver
 	return nil
 }
@@ -1318,6 +1345,61 @@ func migrateV12ToV13(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// idxMemSessionDDL creates the memories(session_id) index. Shared between
+// ApplySchema, rebuildMemoriesTable and migrateV13ToV14 so all three paths
+// install the identical index.
+const idxMemSessionDDL = `CREATE INDEX IF NOT EXISTS idx_mem_session ON memories(session_id)`
+
+// migrateV13ToV14 adds idx_mem_session and backfills review_after for the decay
+// types, both described in the currentSchemaVersion note above.
+//
+// The backfill uses datetime(created_at, '+N months') so each row's window is
+// dated from its own creation, not from the upgrade. It is guarded by
+// `review_after IS NULL` — a value already present is either a prior stamp or a
+// MarkReviewed reset, and neither is the migration's to overwrite.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 13.
+func migrateV13ToV14(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(idxMemSessionDDL); err != nil {
+		return err
+	}
+
+	// Iterate the decay map through a sorted key list so the statement order is
+	// deterministic across runs (Go map iteration is not) — a migration that
+	// cannot be replayed identically is a migration you cannot reason about.
+	types := make([]string, 0, len(decayReviewAfterMonths))
+	for typ := range decayReviewAfterMonths {
+		types = append(types, typ)
+	}
+	sort.Strings(types)
+
+	for _, typ := range types {
+		modifier := fmt.Sprintf("+%d months", decayReviewAfterMonths[typ])
+		if _, err := tx.Exec(`
+			UPDATE memories
+			SET review_after = datetime(created_at, ?)
+			WHERE type = ? AND review_after IS NULL AND deleted_at IS NULL`,
+			modifier, typ,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 14`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1451,6 +1533,11 @@ func ApplySchema(db *sql.DB) error {
 		// the table; the index lets SQLite satisfy the distinct via an index scan.
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_tomb_project ON memory_tombstones(project)`,
+
+		// idx_mem_session backs both per-session reads on the mem_context hot path
+		// (v14): RecentSessions' grouped newest-memory-per-session join and
+		// FormatContext's per-session observation COUNT.
+		idxMemSessionDDL,
 
 		// conflict_relations indexes — support FindCandidates and mem_judge access patterns.
 		`CREATE INDEX IF NOT EXISTS idx_confrel_source_status

@@ -168,10 +168,10 @@ func TestSearchFiltered_DateWindowExcludesStrongCosineMatch(t *testing.T) {
 //
 // The fixture makes the FTS and cosine rankings AGREE (term frequency descends
 // A→F at a constant document length; cosine descends on the same axis), which
-// makes the fused ranking prefix-stable and the page boundaries exact. That is
-// deliberate: RRF scores are computed over truncated candidate lists, so a
-// fixture where the two rankings disagree could legitimately reorder rows as
-// the pool widens with the offset, and the test would be asserting noise.
+// makes the fused ranking prefix-stable and the page boundaries exact — the
+// easy case. TestSearchFiltered_HybridOffsetPagesAreDisjoint_AntiCorrelated
+// below covers the hard one, where the two halves rank the corpus in opposite
+// orders and the pool width genuinely decides the answer.
 func TestSearchFiltered_HybridOffsetPagesAreDisjoint(t *testing.T) {
 	s := openTempStore(t)
 	const project = "paging"
@@ -306,4 +306,118 @@ func TestSearchFiltered_SemanticOffsetPagesAreDisjoint(t *testing.T) {
 	if len(past) != 0 {
 		t.Errorf("semantic Offset=50 returned %d rows, want 0", len(past))
 	}
+}
+
+// TestSearchFiltered_HybridOffsetPagesAreDisjoint_AntiCorrelated is the paging
+// test with the training wheels off: the FTS ranking and the cosine ranking are
+// exact REVERSES of each other, which is the fixture that exposes an
+// offset-dependent candidate pool.
+//
+// Why anti-correlation is the discriminating case: an RRF score is a function of
+// a row's rank WITHIN each candidate list. Truncate the lists at 2×(offset+limit)
+// — the old sizing — and every page fuses a different pair of lists, so every
+// page is a slice of a DIFFERENT ranking. When the two halves agree, the
+// disagreement is invisible (both lists put the same rows on top whatever the
+// cut). When they disagree, widening the pool admits rows that outrank what page
+// one already returned, and the pages repeat rows and skip others. Here page 1
+// under the old sizing re-served two rows page 0 had already shown.
+//
+// The assertions are the guarantee itself: pages are disjoint, and concatenated
+// they equal the unpaged top-(pages × pageSize) ranking, row for row.
+func TestSearchFiltered_HybridOffsetPagesAreDisjoint_AntiCorrelated(t *testing.T) {
+	s := openTempStore(t)
+	const project = "paging"
+	const (
+		rows     = 20
+		pageSize = 3
+		pages    = 4
+	)
+
+	at := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	// Row i carries (rows-i) "alpha" tokens padded to a constant length, so bm25
+	// ranks doc 0 first and doc 19 last. Its vector leans on axis 1 by (rows-1-i)
+	// steps away from the query's axis 0, so cosine ranks doc 19 first and doc 0
+	// last: the exact reverse.
+	for i := 0; i < rows; i++ {
+		content := ""
+		for j := 0; j < rows; j++ {
+			if j < rows-i {
+				content += "alpha "
+			} else {
+				content += fmt.Sprintf("pad%d ", j)
+			}
+		}
+		seedVectorRow(t, s, project,
+			fmt.Sprintf("doc %d", i), content, at,
+			map[int]float32{0: 1.0, 1: float32(rows-1-i) * 0.25},
+		)
+	}
+
+	fixedQueryVec(t, s, map[int]float32{0: 1.0})
+
+	// Guard the fixture before trusting anything built on it: if bm25 or the
+	// cosine scan ever stops ordering these rows as designed, the paging
+	// assertions below would be measuring a corpus nobody intended.
+	ftsOrder := searchSyncIDs(t, s, project, rows, SearchFilter{Mode: "fts"})
+	cosineOrder := searchSyncIDs(t, s, project, rows, SearchFilter{Mode: "semantic"})
+	if len(ftsOrder) != rows || len(cosineOrder) != rows {
+		t.Fatalf("fixture: fts returned %d rows and cosine %d, want %d each",
+			len(ftsOrder), len(cosineOrder), rows)
+	}
+	for i, id := range ftsOrder {
+		if mirrored := cosineOrder[rows-1-i]; mirrored != id {
+			t.Fatalf("fixture is not anti-correlated: fts[%d]=%s but cosine[%d]=%s",
+				i, id, rows-1-i, mirrored)
+		}
+	}
+
+	// The reference ranking: one unpaged call wide enough to cover every page.
+	full := searchSyncIDs(t, s, project, pages*pageSize, SearchFilter{Mode: "hybrid"})
+	if len(full) != pages*pageSize {
+		t.Fatalf("unpaged hybrid returned %d rows, want %d", len(full), pages*pageSize)
+	}
+
+	seen := map[string]int{}
+	for page := 0; page < pages; page++ {
+		offset := page * pageSize
+		got := searchSyncIDs(t, s, project, pageSize, SearchFilter{Mode: "hybrid", Offset: offset})
+		if len(got) != pageSize {
+			t.Fatalf("hybrid page %d returned %d rows, want %d", page, len(got), pageSize)
+		}
+		for i, id := range got {
+			if prev, dup := seen[id]; dup {
+				t.Errorf("hybrid page %d row %d (%s) already appeared on page %d — "+
+					"the fused ranking still depends on the offset", page, i, id, prev)
+			}
+			seen[id] = page
+			if want := full[offset+i]; id != want {
+				t.Errorf("hybrid page %d row %d = %s, want %s (position %d of the unpaged ranking)",
+					page, i, id, want, offset+i)
+			}
+		}
+	}
+	if len(seen) != pages*pageSize {
+		t.Errorf("%d pages of %d covered %d distinct rows, want %d",
+			pages, pageSize, len(seen), pages*pageSize)
+	}
+}
+
+// searchSyncIDs runs a search and projects the result to sync_ids, failing the
+// test on an error or an unexpected degradation — the three things every paging
+// assertion in this file wants and none of them want to spell out.
+func searchSyncIDs(t *testing.T, s *Store, project string, limit int, f SearchFilter) []string {
+	t.Helper()
+	records, deg, err := s.SearchMemoriesFiltered("alpha", project, limit, f)
+	if err != nil {
+		t.Fatalf("SearchMemoriesFiltered(mode=%q, offset=%d): %v", f.Mode, f.Offset, err)
+	}
+	if deg.Reason != "" && f.Mode != "fts" {
+		t.Fatalf("SearchMemoriesFiltered(mode=%q, offset=%d) degraded: %s", f.Mode, f.Offset, deg.Reason)
+	}
+	ids := make([]string, len(records))
+	for i, r := range records {
+		ids[i] = r.SyncID
+	}
+	return ids
 }

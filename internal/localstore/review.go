@@ -3,6 +3,7 @@ package localstore
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -269,21 +270,27 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
-	// Per-row rather than one bulk UPDATE: the new due date depends on the row's
-	// type, so the rows have to be read before they can be written.
-	updated := 0
-	for _, id := range ids {
-		var typ string
-		err := tx.QueryRow(
-			`SELECT type FROM memories WHERE id = ? AND deleted_at IS NULL`, id,
-		).Scan(&typ)
-		if err == sql.ErrNoRows {
-			continue // unknown or deleted — skipped, not an error
-		}
-		if err != nil {
-			return 0, fmt.Errorf("MarkReviewed: read type of %d: %w", id, err)
-		}
+	// The new due date depends on each row's TYPE, so the types have to be read
+	// before anything can be written — but that is ONE read and one write per
+	// distinct type, not per id. Marking a 200-id page reviewed used to cost 400
+	// round-trips through the SQLite driver; grouped it costs one SELECT plus at
+	// most a handful of UPDATEs, since a realistic batch spans two or three types.
+	idsByType, err := liveTypesOf(tx, ids)
+	if err != nil {
+		return 0, err
+	}
 
+	// Sort the type keys so the statement order is deterministic — Go map
+	// iteration is not, and a write batch that reorders itself between runs is
+	// needless nondeterminism in a transaction.
+	types := make([]string, 0, len(idsByType))
+	for typ := range idsByType {
+		types = append(types, typ)
+	}
+	sort.Strings(types)
+
+	updated := 0
+	for _, typ := range types {
 		due := reviewAfterForType(typ, now)
 		if due == nil {
 			// No decay entry — fall back to the store's rolling window. See the
@@ -291,12 +298,20 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 			due = now.AddDate(0, 0, window).Format(sqliteTimeLayout)
 		}
 
+		group := idsByType[typ]
+		args := make([]any, 0, len(group)+1)
+		args = append(args, due)
+		for _, id := range group {
+			args = append(args, id)
+		}
+
 		res, err := tx.Exec(
-			`UPDATE memories SET review_after = ? WHERE id = ? AND deleted_at IS NULL`,
-			due, id,
+			`UPDATE memories SET review_after = ?
+			 WHERE id IN (`+sqlPlaceholders(len(group))+`) AND deleted_at IS NULL`,
+			args...,
 		)
 		if err != nil {
-			return 0, fmt.Errorf("MarkReviewed: update %d: %w", id, err)
+			return 0, fmt.Errorf("MarkReviewed: update %d %s row(s): %w", len(group), typ, err)
 		}
 		n, _ := res.RowsAffected()
 		updated += int(n)
@@ -306,6 +321,52 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 		return 0, fmt.Errorf("MarkReviewed: commit: %w", err)
 	}
 	return updated, nil
+}
+
+// sqlPlaceholders returns "?,?,…,?" for an IN clause of n values. n must be > 0;
+// callers reach here only after an empty-ids early return.
+func sqlPlaceholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// liveTypesOf reads the type of every LIVE row named in ids and returns the ids
+// grouped by type, in one round-trip. Ids that name nothing live are simply
+// absent from the result — MarkReviewed's contract is that unknown and
+// soft-deleted ids are skipped, not an error, and "no row came back" says exactly
+// that.
+//
+// A duplicated id collapses to one entry, because the row is what is being
+// updated and a row can only be marked reviewed once. The per-id loop this
+// replaces counted such an id twice in its return value.
+func liveTypesOf(tx *sql.Tx, ids []int64) (map[string][]int64, error) {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+
+	rows, err := tx.Query(
+		`SELECT id, type FROM memories
+		 WHERE id IN (`+sqlPlaceholders(len(ids))+`) AND deleted_at IS NULL`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("MarkReviewed: read types: %w", err)
+	}
+	defer rows.Close()
+
+	byType := make(map[string][]int64)
+	for rows.Next() {
+		var id int64
+		var typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			return nil, fmt.Errorf("MarkReviewed: scan type: %w", err)
+		}
+		byType[typ] = append(byType[typ], id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("MarkReviewed: read types: %w", err)
+	}
+	return byType, nil
 }
 
 // IDByTopicKey resolves the integer primary key of the live memory row for the

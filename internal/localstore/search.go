@@ -60,14 +60,16 @@ type SearchFilter struct {
 	Offset int
 }
 
-// ftsPinnedBoost is the multiplicative boost a pinned row gets in the FTS
-// ORDER BY: 10%, ported from the upstream composite rank.
+// ftsRankExpr is the ORDER BY expression shared by the FTS-only path and the FTS
+// half of hybrid, so the two can never rank the same corpus differently. It
+// requires the memories table to be aliased `m` and the FTS table `fts`.
 //
-// It multiplies rather than adds because bm25() returns a NEGATIVE score (more
-// negative = better match) and the results are ordered ASC — scaling by 1.10
-// moves a pinned row further from zero, i.e. earlier. It is deliberately small:
-// pinning should break a near-tie in the pinned row's favour, not drag an
-// irrelevant memory to the top of an unrelated search.
+// The 1.10 is the pinned boost: 10%, ported from the upstream composite rank. It
+// MULTIPLIES rather than adds because bm25() returns a NEGATIVE score (more
+// negative = better match) and results are ordered ASC — scaling by 1.10 moves a
+// pinned row further from zero, i.e. earlier. It is deliberately small: pinning
+// should break a near-tie in the pinned row's favour, not drag an irrelevant
+// memory to the top of an unrelated search.
 //
 // Only the pinned term of upstream's composite rank is ported. Upstream also
 // multiplies in a recency term (from last_seen_at) and a stability term (from
@@ -76,13 +78,30 @@ type SearchFilter struct {
 // updated_at instead would silently reorder every existing search result, which
 // is not something a pinning feature gets to do — it belongs in its own change
 // with its own before/after evidence.
-const ftsPinnedBoost = 1.10
+//
+// It is a hand-written const, not a Sprintf'd package var: a var built at init is
+// a mutable global holding a string that never changes, and a const cannot be
+// reassigned by anything — including a test.
+//
+// Cost note: `ORDER BY fts.rank * <expr>` gives up FTS5's rank pushdown. A bare
+// `ORDER BY fts.rank` lets FTS5 return rows in rank order directly; multiplying
+// it makes the sort key an expression SQLite must materialize and sort in a temp
+// b-tree. Measured at 20k rows the difference is a wash (the temp sort is over
+// the matched rows only, not the whole table), which is what buys the pinned
+// boost — but it is a real change in query plan, so a future widening of the
+// expression should be measured rather than assumed free.
+const ftsRankExpr = "fts.rank * (CASE WHEN m.pinned = 1 THEN 1.10 ELSE 1.0 END)"
 
-// ftsRankExpr is the ORDER BY expression shared by the FTS-only path and the
-// FTS half of hybrid, so the two can never rank the same corpus differently.
-// It requires the memories table to be aliased `m` and the FTS table `fts`.
-var ftsRankExpr = fmt.Sprintf(
-	"fts.rank * (CASE WHEN m.pinned = 1 THEN %.2f ELSE 1.0 END)", ftsPinnedBoost)
+// hybridFullFusionFTSCap bounds the FTS candidate list on an OFFSET hybrid page.
+//
+// An offset page fuses the full candidate lists so the ranking does not depend on
+// the offset (see SearchMemoriesFiltered's doc block). "Full" is literal for the
+// cosine half — SelectVectors already scanned those rows — but an unbounded FTS
+// half would let a one-word query pull every matching row in the store into
+// memory to answer a ten-row page. 2000 is far past what any real paging session
+// walks (200 pages of 10) while keeping the worst case a few megabytes, and a
+// page that reaches beyond it returns the rows it can rather than erroring.
+const hybridFullFusionFTSCap = 2000
 
 // dateRangeSQL appends CreatedFrom/CreatedTo predicates (if set) to a WHERE
 // clause being built for the given column expression (e.g. "m.created_at" or
@@ -130,9 +149,19 @@ type SearchDegradation struct {
 //   - f.Offset skips the first N rows of the FINAL ranked page. "fts" pushes it
 //     into SQL OFFSET; "semantic" applies it after cosine ranking and "hybrid"
 //     after RRF fusion, because neither has a rank order until scoring has run.
-//     To keep the page well-formed, both widen their candidate pools by Offset
-//     before ranking — an offset page is drawn from a pool that actually
-//     reaches past it, not from a pool sized for page one.
+//     The guarantee the two paths make when Offset > 0 is that the RANKING IS
+//     NOT A FUNCTION OF THE OFFSET: every offset page is cut from the same
+//     ranking page one is cut from, so consecutive pages are disjoint and their
+//     union is the unpaged top-(offset+limit). Widening a truncated pool by the
+//     offset — which is what this used to do — does NOT give that: RRF scores
+//     depend on each row's rank WITHIN the candidate lists, so changing how far
+//     those lists are truncated reorders the fused result, and two pages drawn
+//     from two different rankings can repeat rows and skip others. So an offset
+//     page ranks the FULL candidate lists (every vector row for cosine; FTS up
+//     to hybridFullFusionFTSCap) and slices [offset:offset+limit] out of it.
+//     Offset == 0 keeps the historic narrow pool byte-for-byte — page one was
+//     never wrong, and widening it would silently reorder every existing
+//     first-page hybrid result.
 //   - Paging is stable only for a fixed corpus and a fixed query: a concurrent
 //     write, or an embedding backfill that adds a vector mid-scan, can shift
 //     rows across the page boundary exactly as it can on the FTS path.
@@ -305,12 +334,17 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	}
 
 	// ── Hybrid path: FTS + cosine → RRF ─────────────────────────────────────
-	// Both candidate pools are sized 2× the rows the caller could possibly be
-	// asking for — the requested page PLUS everything it skips. Sizing them at
-	// 2×limit alone would make an offset page fuse from a pool that never
-	// reaches it, and page 2 would come back empty on a corpus that has plenty
-	// of rows left.
-	poolSize := (offset + limit) * 2
+	// Page one keeps the historic pool: 2× the requested rows from each half.
+	// An OFFSET page instead fuses the full candidate lists, because an RRF score
+	// is a property of a row's rank within the lists it was fused from — make the
+	// pool a function of the offset and each page is cut from a DIFFERENT ranking,
+	// which is how pages end up repeating rows and skipping others. Fusing the
+	// same full lists for every offset makes the ranking offset-independent, so
+	// [offset:offset+limit] is a genuine slice of one ordering.
+	ftsPool := limit * 2
+	if offset > 0 {
+		ftsPool = hybridFullFusionFTSCap
+	}
 
 	// Run FTS with 2× candidates.
 	ftsCandidates, ftsErr := func() ([]*domain.Record, error) {
@@ -346,7 +380,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		}
 		q, args = dateRangeSQL(q, args, "m.created_at", f)
 		q += "\nORDER BY " + ftsRankExpr + "\nLIMIT ?"
-		args = append(args, poolSize)
+		args = append(args, ftsPool)
 		rows, err := s.db.Query(q, args...)
 		if err != nil {
 			return nil, fmt.Errorf("hybrid FTS: %w", err)
@@ -382,7 +416,15 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		ftsRecordsByID[r.SyncID] = r
 	}
 
-	cosineCandidates := cosineTopK(queryVec, vrows, poolSize)
+	// The cosine half mirrors the FTS half: 2×limit on page one, every scanned
+	// vector row on an offset page (SelectVectors has already applied the same
+	// project/type/scope/date predicates, so "all of them" is still a bounded,
+	// correctly-scoped list).
+	cosineK := limit * 2
+	if offset > 0 {
+		cosineK = len(vrows)
+	}
+	cosineCandidates := cosineTopK(queryVec, vrows, cosineK)
 	cosineRanks := make([]string, len(cosineCandidates))
 	for i, c := range cosineCandidates {
 		cosineRanks[i] = c.syncID
@@ -398,7 +440,9 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	// Fuse, then cut the requested page out of the fused ranking. Fusing to
 	// offset+limit and slicing is the only order that gives a correct page:
 	// RRF scores are a property of the fused list, so there is nothing to skip
-	// until it exists.
+	// until it exists. rrfFuse sorts first and truncates after, so asking it for
+	// offset+limit returns a genuine PREFIX of the full fused ranking — which is
+	// what makes [offset:] the same rows page one would have skipped.
 	fusedIDs := rrfFuse(ftsRanks, cosineRanks, 60, offset+limit)
 	if offset >= len(fusedIDs) {
 		// Paged past the end of the fused ranking — an empty page, not a

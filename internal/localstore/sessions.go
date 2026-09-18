@@ -197,13 +197,19 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // all morning. The second one is the context the agent actually needs back.
 //
 // Why derived rather than a last_activity column: a stored column would need a
-// schema migration AND a write on every memory insert, and it would be one more
-// value that can drift out of sync with the rows it summarizes. The correlated
-// MAX() below is computed from the memories themselves, so it cannot be wrong.
-// The cost is a per-session scan of memories(session_id) — the same shape
-// FormatContext's per-session observation COUNT already pays, and bounded by
-// `limit` sessions. If a session_id index is ever added for the count, this
-// query benefits from it for free.
+// write on every memory insert, and it would be one more value that can drift out
+// of sync with the rows it summarizes. The MAX() below is computed from the
+// memories themselves, so it cannot be wrong.
+//
+// The derivation is a DERIVED TABLE, not a correlated subquery, and that is the
+// whole cost story. A correlated `(SELECT MAX(created_at) ... WHERE session_id =
+// s.id)` in the ORDER BY is evaluated once per session ROW — before LIMIT, which
+// cannot bound a sort key — so it is O(sessions × memories), not "bounded by
+// limit sessions" as this comment used to claim: 300 sessions over 20k memories
+// measured 1.39s, and FormatContext (which calls this first) 1.58s. The grouped
+// join below computes every session's newest memory in ONE pass over
+// memories(session_id) — the idx_mem_session index added in schema v14 — and
+// measures ~20ms on the same fixture (see TestRecentSessions_ScalesToThreeHundredSessions).
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	project = normalizeProject(project)
 	if limit <= 0 {
@@ -211,22 +217,33 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	}
 
 	// MAX() here is SQLite's SCALAR max (3 arguments) over three datetime()
-	// strings; the single-argument MAX inside the correlated subquery is the
-	// AGGREGATE. Keeping the aggregate inside its own subquery — rather than a
-	// LEFT JOIN + GROUP BY — is what keeps the two unambiguous, and it lets the
-	// select list stay a plain projection of the sessions row.
+	// strings; the single-argument MAX inside the derived table is the AGGREGATE.
+	// The two forms stay unambiguous because the aggregate lives in its own
+	// subquery — now a GROUPED one that runs once, instead of a correlated one
+	// that runs per session row (see the doc comment for the numbers).
+	//
+	// datetime() wraps the aggregate's argument, not just its result: MAX() over
+	// raw text is a LEXICAL max, and this column holds a mix of SQLite's
+	// 'YYYY-MM-DD HH:MM:SS' (the column default) and RFC3339 with a 'T' and a 'Z'
+	// (anything written by a Go caller). Lexically, '2024-01-02T…' sorts ABOVE
+	// '2024-06-10 …' because 'T' > ' ' — so a January RFC3339 row would win over a
+	// June one. datetime() normalizes both forms to the same comparable text first.
 	const lastActivityExpr = `MAX(
 	            datetime(s.started_at),
 	            datetime(COALESCE(s.ended_at, s.started_at)),
-	            datetime(COALESCE(
-	              (SELECT MAX(m.created_at) FROM memories m
-	               WHERE m.session_id = s.id AND m.deleted_at IS NULL),
-	              s.started_at))
+	            datetime(COALESCE(lm.last_created, s.started_at))
 	          )`
 
 	query := `SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
 	                 ` + lastActivityExpr + ` AS last_activity_at
-	          FROM sessions s WHERE 1=1`
+	          FROM sessions s
+	          LEFT JOIN (
+	            SELECT session_id, MAX(datetime(created_at)) AS last_created
+	            FROM memories
+	            WHERE deleted_at IS NULL
+	            GROUP BY session_id
+	          ) lm ON lm.session_id = s.id
+	          WHERE 1=1`
 	args := []any{}
 	if project != "" {
 		query += " AND LOWER(s.project) = ?"

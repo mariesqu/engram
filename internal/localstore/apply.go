@@ -123,11 +123,10 @@ func applyTx(tx *sql.Tx, d domain.Decision, m domain.Mutation) error {
 }
 
 func execInsert(tx *sql.Tx, m domain.Mutation) error {
-	// review_after is stamped HERE, on the one path that creates a row, and
-	// nowhere else. That placement is the whole rule: a topic_key revision takes
-	// ActionUpdate (execUpdate leaves review_after alone) and an idempotent
-	// re-apply takes NoOp, so neither can silently push a memory's review date
-	// forward. Only MarkReviewed may move it afterwards, and only on request.
+	// review_after is stamped HERE for a new row, and re-stamped by execUpdate
+	// for a REVISION of one (see its comment). An idempotent re-apply takes NoOp
+	// and moves nothing, so nothing can push a memory's review date forward
+	// without new content actually landing.
 	//
 	// It is LOCAL-ONLY metadata: review_after is not in the canonical payload
 	// (see mutation.CanonicalPayload), so it never crosses the sync wire. Each
@@ -159,6 +158,23 @@ func execInsert(tx *sql.Tx, m domain.Mutation) error {
 // P1-a fix: targetSyncID is the RESOLVED row's sync_id from Decision.TargetSyncID,
 // which may differ from m.SyncID when resolved via FindByTopic.
 func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
+	// review_after is RE-STAMPED on a revision, for the same reason MarkReviewed
+	// resets it: someone looked at this memory and asserted its content is still
+	// what it should say. A topic_key re-save and a mem_update both land here, and
+	// both are that assertion — a decision rewritten today is not six months stale
+	// just because its first version was written six months ago.
+	//
+	// The COALESCE is what keeps the rule honest for the other direction: a type
+	// with NO decay entry binds nil, and COALESCE(NULL, review_after) leaves the
+	// column exactly as it was. Writing NULL there would silently undo a
+	// MarkReviewed reset on every edit, which is the opposite of what an edit means.
+	//
+	// The window is dated from NOW, not from m.UpdatedAt: review_after is
+	// LOCAL-ONLY per-node metadata (not in mutation.CanonicalPayload), so for a
+	// PULLED revision the meaningful instant is when this node received the new
+	// content, matching execInsert's treatment of a pulled insert.
+	reviewAfter := reviewAfterForType(m.Type, time.Now())
+
 	// embedding columns are RESET on every update: the stored vector was
 	// computed from the OLD title/content — keeping it would leave semantic
 	// search scoring against text that no longer exists, and the backfill
@@ -168,11 +184,13 @@ func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
 		UPDATE memories
 		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
 		    version=?, writer_id=?, last_write_mutation_id=?, updated_at=?,
+		    review_after=COALESCE(?, review_after),
 		    embedding=NULL, embedding_model=NULL, embedding_created_at=NULL
 		WHERE sync_id=?`,
 		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
 		m.Version, m.WriterID, m.MutationID,
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		reviewAfter,
 		targetSyncID,
 	)
 	if err != nil {

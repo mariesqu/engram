@@ -190,6 +190,57 @@ func TestMemReview_BadID(t *testing.T) {
 	}
 }
 
+// TestMemReview_TooManyIDs verifies mark_reviewed refuses an oversized batch
+// instead of silently marking the first 200 of it. A truncating cap would report
+// success for memories it never touched, which is the one answer worse than an
+// error here: the caller walks away believing 500 memories were verified.
+func TestMemReview_TooManyIDs(t *testing.T) {
+	c := newReviewMergeDaemon(t)
+	tool := handleReview(c.store)
+
+	ids := make([]any, reviewIDsPerCall+1)
+	for i := range ids {
+		ids[i] = float64(i + 1)
+	}
+
+	result, err := tool(t.Context(), newToolRequest("mem_review", map[string]any{
+		"action": "mark_reviewed",
+		"ids":    ids,
+	}))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected a tool error for %d ids (cap is %d)", len(ids), reviewIDsPerCall)
+	}
+	if text := result.Content[0].(mcp.TextContent).Text; !strings.Contains(text, "at most 200 ids") {
+		t.Errorf("error text does not name the cap: %s", text)
+	}
+}
+
+// TestMemReview_MaxIDsAccepted pins the boundary from the other side: exactly the
+// cap is a valid call, so the limit reads as "200 per page", not "199".
+func TestMemReview_MaxIDsAccepted(t *testing.T) {
+	c := newReviewMergeDaemon(t)
+	tool := handleReview(c.store)
+
+	ids := make([]any, reviewIDsPerCall)
+	for i := range ids {
+		ids[i] = float64(i + 1)
+	}
+
+	result, err := tool(t.Context(), newToolRequest("mem_review", map[string]any{
+		"action": "mark_reviewed",
+		"ids":    ids,
+	}))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("exactly %d ids must be accepted, got: %s", reviewIDsPerCall, result.Content[0].(mcp.TextContent).Text)
+	}
+}
+
 // TestMemMergeProjects_Moves verifies the merge handler renames source memories.
 func TestMemMergeProjects_Moves(t *testing.T) {
 	c := newReviewMergeDaemon(t)
