@@ -34,23 +34,23 @@ package main
 const serverInstructions = `Engram provides persistent memory that survives across sessions and context compactions. This protocol is ALWAYS ACTIVE — do not wait to be asked.
 
 TOOLS
-  mem_current_project  — which project THIS caller resolves to, and how. Recommended FIRST call of a session; never errors.
-  mem_save             — save a decision, bug fix, discovery, or convention. Call PROACTIVELY.
-  mem_save_prompt      — record the user's prompt so the next mem_save can attach it.
-  mem_search           — full-text, semantic, or hybrid search across observations.
-  mem_similar          — observations semantically nearest a given memory (by sync_id).
-  mem_get_observation  — full untruncated content of one observation by numeric id (search results are truncated).
-  mem_update           — edit one observation in place by id; omitted fields keep their value.
-  mem_suggest_topic_key— a stable topic_key so re-saves UPSERT one chain instead of duplicating.
-  mem_context          — recent sessions and observations. Call at session start and after any compaction.
-  mem_pin / mem_unpin  — keep a memory in front of you: pinned rows lead mem_context and rank higher in search. Local to this machine, never synced.
-  mem_review           — list memories by lifecycle status (active|needs_review|expired), or mark_reviewed to reset the clock.
-  mem_judge            — record a verdict on a conflict candidate surfaced by mem_save.
-  mem_merge_projects   — merge a source project's memories into a target name to fix name drift.
-  mem_doctor           — read-only diagnostics over this node's store (orphaned sessions, project drift, lock contention, sync backlog). Run it when something looks wrong; it never writes.
-  mem_session_start    — register the start of a coding session.
-  mem_session_summary  — save the structured end-of-session summary.
-  mem_session_end      — mark a session completed.
+  mem_current_project   — which project THIS caller resolves to, and how. Recommended FIRST call of a session; never errors.
+  mem_save              — save a decision, bug fix, discovery, or convention. Call PROACTIVELY.
+  mem_save_prompt       — record the user's prompt so the next mem_save can attach it.
+  mem_search            — full-text, semantic, or hybrid search across observations; offset paging and created_from/created_to date bounds.
+  mem_similar           — observations semantically nearest a given memory (by sync_id).
+  mem_get_observation   — full untruncated content of one observation by numeric id (search results are truncated).
+  mem_update            — edit one observation in place by id; omitted fields keep their value.
+  mem_suggest_topic_key — a stable topic_key so re-saves UPSERT one chain instead of duplicating.
+  mem_context           — recent sessions and observations. Call at session start and after any compaction.
+  mem_pin / mem_unpin   — keep a memory in front of you: pinned rows lead mem_context and rank higher in KEYWORD search (the semantic path has no pin boost). Local to this machine, never synced.
+  mem_review            — list memories by lifecycle status (active|needs_review|expired), or mark_reviewed to reset the clock. The clock runs from the last save or revision.
+  mem_judge             — record a verdict on a conflict candidate surfaced by mem_save.
+  mem_merge_projects    — merge a source project's memories into a target name to fix name drift.
+  mem_doctor            — read-only diagnostics over this node's store (orphaned sessions, project drift, lock contention, sync backlog). Run it when something looks wrong; it never writes.
+  mem_session_start     — register the start of a coding session.
+  mem_session_summary   — save the structured end-of-session summary.
+  mem_session_end       — mark a session completed.
 
 CONFIRM THE PROJECT FIRST
 Open with mem_current_project. Three fields decide what you do next:

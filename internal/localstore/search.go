@@ -346,7 +346,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		ftsPool = hybridFullFusionFTSCap
 	}
 
-	// Run FTS with 2× candidates.
+	// Run FTS for the candidate pool sized above.
 	ftsCandidates, ftsErr := func() ([]*domain.Record, error) {
 		ftsQ := sanitizeFTS(query)
 		if ftsQ == "" {
@@ -401,7 +401,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		return results, SearchDegradation{Reason: "semantic search unavailable: FTS error; showing keyword results"}, err
 	}
 
-	// Cosine candidates with 2× candidates.
+	// Scan the vector rows; the pool is cut from them below (see cosineK).
 	vrows, svErr := SelectVectors(s.db, project, f, dims)
 	if svErr != nil {
 		results, err := runFTS()
@@ -720,11 +720,21 @@ func truncateStr(s string, n int) string {
 	return string(runes[:n]) + "..."
 }
 
-// contextPinnedLimit caps the "### Pinned" section of FormatContext. Pinning is
-// a deliberate act, but nothing stops a user from pinning fifty memories, and an
-// unbounded section would push every recent observation out of the caller's
-// context window.
-const contextPinnedLimit = 20
+// contextPinnedLimit and contextRecentLimit are the two halves of FormatContext's
+// observation budget, and they are stated together because what matters is the
+// SUM: 10 + 20 = at most 30 bullets, each up to 300 characters, which is the most
+// of a caller's context window mem_context is willing to spend on observations.
+//
+// Pinned is the smaller half deliberately. It was 20 — equal to recents — which
+// meant a store with 20 pins rendered a context blob that was HALF pins, and
+// pinning enough memories could push recent work down past where an agent
+// actually reads. Ten is a shortlist; twenty is a second feed. The rows past the
+// cap are not hidden: FormatContext prints how many were left out and where to
+// find them (see CountPinned).
+const (
+	contextPinnedLimit = 10
+	contextRecentLimit = 20
+)
 
 // writeObservationBullet renders one observation line. Shared by the "### Pinned"
 // and "### Recent Observations" sections so the two can never drift into
@@ -755,8 +765,11 @@ func writeObservationBullet(b *strings.Builder, obs *domain.Record) {
 // recency order defeats the point — and repeating it below would spend the
 // caller's context window saying the same thing twice. The section is capped
 // (contextPinnedLimit) so an over-enthusiastic pinning session cannot crowd out
-// every recent observation. It is omitted entirely when nothing is pinned, so a
-// store that has never used mem_pin renders exactly as it always did.
+// every recent observation, and when the cap bites it says so — an "…and N more
+// pinned" line, because a silently truncated section leaves the caller believing
+// they are looking at everything they pinned. It is omitted entirely when nothing
+// is pinned, so a store that has never used mem_pin renders exactly as it always
+// did.
 //
 // The session bullet carries BOTH timestamps because the list is ordered by
 // last activity (see RecentSessions): showing only started_at would leave the
@@ -778,7 +791,7 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", fmt.Errorf("FormatContext: PinnedObservations: %w", err)
 	}
 
-	observations, err := s.RecentUnpinnedObservations(project, scope, 20)
+	observations, err := s.RecentUnpinnedObservations(project, scope, contextRecentLimit)
 	if err != nil {
 		return "", fmt.Errorf("FormatContext: RecentUnpinnedObservations: %w", err)
 	}
@@ -828,6 +841,15 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("### Pinned\n")
 		for _, obs := range pinned {
 			writeObservationBullet(&b, obs)
+		}
+		// Only count when the section is full — a short section IS the whole set,
+		// and the extra query would answer a question nobody asked. A count error
+		// is swallowed for the same reason the per-session COUNT above is: an
+		// overflow footnote is not worth failing the whole context blob over.
+		if len(pinned) >= contextPinnedLimit {
+			if total, err := s.CountPinned(project, scope); err == nil && total > len(pinned) {
+				fmt.Fprintf(&b, "- …and %d more pinned (use mem_search)\n", total-len(pinned))
+			}
 		}
 		b.WriteString("\n")
 	}

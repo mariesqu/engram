@@ -3,6 +3,7 @@ package localstore
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // pin.go implements the LOCAL-ONLY pinned flag behind mem_pin / mem_unpin.
@@ -50,6 +51,35 @@ func (s *Store) SetPinned(id int64, pinned bool) (bool, error) {
 		return false, ErrObservationNotFound
 	}
 	return pinned, nil
+}
+
+// CountPinned returns how many live rows are pinned for project/scope, using the
+// same predicates PinnedObservations selects with so the two can never disagree.
+// Empty project or scope disables that filter, matching every other read here.
+//
+// It exists for FormatContext's overflow line: the pinned section is capped, and
+// a cap that silently swallows the rows past it would leave the caller believing
+// they are seeing everything they pinned. Counting is a separate query rather
+// than "ask for cap+1 rows and look at the length" because the exact number is
+// what makes the line worth printing — "and 14 more" is actionable, "and some
+// more" is not.
+func (s *Store) CountPinned(project, scope string) (int, error) {
+	q := `SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL AND pinned = 1`
+	args := []any{}
+	if p := normalizeProject(project); p != "" {
+		q += ` AND LOWER(project) = ?`
+		args = append(args, p)
+	}
+	if scope = strings.ToLower(strings.TrimSpace(scope)); scope != "" {
+		q += ` AND scope = ?`
+		args = append(args, scope)
+	}
+
+	var n int
+	if err := s.db.QueryRow(q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountPinned: %w", err)
+	}
+	return n, nil
 }
 
 // IsPinned reports the pinned state of one live row. Returns

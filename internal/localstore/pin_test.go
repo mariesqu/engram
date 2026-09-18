@@ -2,6 +2,7 @@ package localstore
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -178,5 +179,227 @@ func TestSearch_PinnedRanksAboveEqualUnpinned(t *testing.T) {
 	if got[0].ID != loser {
 		t.Errorf("pinned row #%d did not rank first (got #%d) — the pinned boost is not applied",
 			loser, got[0].ID)
+	}
+}
+
+// ── context budget ───────────────────────────────────────────────────────────
+
+// TestCountPinned_ScopesLikePinnedObservations pins that the count and the list
+// answer from the same set. A count that ignored project or scope would make the
+// overflow line lie in exactly the situation it exists for: a user with pins in
+// three projects would be told about pins that are not in the section above it.
+func TestCountPinned_ScopesLikePinnedObservations(t *testing.T) {
+	s := openTempStore(t)
+
+	seed := func(project, scope string, pinned bool) {
+		t.Helper()
+		res, err := s.AddObservation(AddObservationParams{
+			Title: "p", Content: "c", Project: project, Scope: scope, Type: "decision",
+		})
+		if err != nil {
+			t.Fatalf("AddObservation(%s/%s): %v", project, scope, err)
+		}
+		if pinned {
+			if _, err := s.SetPinned(res.ID, true); err != nil {
+				t.Fatalf("SetPinned: %v", err)
+			}
+		}
+	}
+
+	seed("alpha", "project", true)
+	seed("alpha", "project", true)
+	seed("alpha", "personal", true)
+	seed("beta", "project", true)
+	seed("alpha", "project", false)
+
+	for _, tc := range []struct {
+		project, scope string
+		want           int
+	}{
+		{"alpha", "project", 2},
+		{"alpha", "personal", 1},
+		{"alpha", "", 3},
+		{"beta", "project", 1},
+		{"", "", 4},
+	} {
+		got, err := s.CountPinned(tc.project, tc.scope)
+		if err != nil {
+			t.Fatalf("CountPinned(%q,%q): %v", tc.project, tc.scope, err)
+		}
+		if got != tc.want {
+			t.Errorf("CountPinned(%q,%q) = %d, want %d", tc.project, tc.scope, got, tc.want)
+		}
+		list, err := s.PinnedObservations(tc.project, tc.scope, 100)
+		if err != nil {
+			t.Fatalf("PinnedObservations(%q,%q): %v", tc.project, tc.scope, err)
+		}
+		if len(list) != got {
+			t.Errorf("CountPinned(%q,%q)=%d but PinnedObservations returned %d rows",
+				tc.project, tc.scope, got, len(list))
+		}
+	}
+}
+
+// TestFormatContext_PinnedSectionIsBudgeted covers the whole budget in one pass:
+// the pinned section stops at contextPinnedLimit, says how many it left out, and
+// the two sections together stay inside the 30-bullet ceiling even when every
+// memory in the store is pinned.
+func TestFormatContext_PinnedSectionIsBudgeted(t *testing.T) {
+	s := openTempStore(t)
+	const project = "budget"
+	const pinnedRows = contextPinnedLimit + 14
+
+	for i := 0; i < pinnedRows; i++ {
+		res, err := s.AddObservation(AddObservationParams{
+			Title: fmt.Sprintf("pinned %d", i), Content: "c", Project: project, Type: "decision",
+		})
+		if err != nil {
+			t.Fatalf("AddObservation: %v", err)
+		}
+		if _, err := s.SetPinned(res.ID, true); err != nil {
+			t.Fatalf("SetPinned: %v", err)
+		}
+	}
+	for i := 0; i < contextRecentLimit+5; i++ {
+		if _, err := s.AddObservation(AddObservationParams{
+			Title: fmt.Sprintf("recent %d", i), Content: "c", Project: project, Type: "manual",
+		}); err != nil {
+			t.Fatalf("AddObservation: %v", err)
+		}
+	}
+
+	got, err := s.FormatContext(project, "")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+
+	pinnedBullets := strings.Count(got, "- [decision] **pinned ")
+	if pinnedBullets != contextPinnedLimit {
+		t.Errorf("pinned section rendered %d bullets, want %d (the cap)", pinnedBullets, contextPinnedLimit)
+	}
+	recentBullets := strings.Count(got, "- [manual] **recent ")
+	if recentBullets != contextRecentLimit {
+		t.Errorf("recent section rendered %d bullets, want %d (the cap)", recentBullets, contextRecentLimit)
+	}
+
+	wantOverflow := fmt.Sprintf("- …and %d more pinned (use mem_search)", pinnedRows-contextPinnedLimit)
+	if !strings.Contains(got, wantOverflow) {
+		t.Errorf("missing the overflow line %q; got:\n%s", wantOverflow, got)
+	}
+
+	// The overflow line belongs to the pinned section, not the recents below it.
+	if idx, recents := strings.Index(got, wantOverflow), strings.Index(got, "### Recent Observations"); idx > recents {
+		t.Errorf("overflow line rendered after '### Recent Observations'; got:\n%s", got)
+	}
+}
+
+// TestFormatContext_NoOverflowLineWhenPinsFitTheCap is the other half: the line
+// is a warning about truncation, so a store whose pins all fit must not carry it.
+// A store with EXACTLY the cap pinned is the boundary that decides whether the
+// condition is "> cap" or "≥ cap".
+func TestFormatContext_NoOverflowLineWhenPinsFitTheCap(t *testing.T) {
+	s := openTempStore(t)
+	const project = "budget"
+
+	for i := 0; i < contextPinnedLimit; i++ {
+		res, err := s.AddObservation(AddObservationParams{
+			Title: fmt.Sprintf("pinned %d", i), Content: "c", Project: project, Type: "decision",
+		})
+		if err != nil {
+			t.Fatalf("AddObservation: %v", err)
+		}
+		if _, err := s.SetPinned(res.ID, true); err != nil {
+			t.Fatalf("SetPinned: %v", err)
+		}
+	}
+
+	got, err := s.FormatContext(project, "")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if strings.Contains(got, "more pinned") {
+		t.Errorf("exactly %d pins fit the cap — no overflow line belongs here; got:\n%s",
+			contextPinnedLimit, got)
+	}
+}
+
+// ── the unpinned corpus is untouched ─────────────────────────────────────────
+
+// TestSearchFiltered_UnpinnedOrderMatchesBareFTSRank is the guarantee the pinned
+// boost owes every existing user: on a store where nothing is pinned, the FTS
+// ORDER BY must return exactly what a bare `ORDER BY fts.rank` returns. The boost
+// multiplies by 1.0 for an unpinned row, but it also changes the QUERY PLAN — a
+// bare fts.rank is pushed down into FTS5, while the CASE expression is sorted in
+// a temp b-tree — and "mathematically equivalent" is not the same claim as
+// "produces the same order".
+//
+// 200 rows with strictly descending term frequency at a constant document length
+// give 200 distinct bm25 scores, so the comparison is about ordering and not
+// about how two sorts happen to break a tie.
+func TestSearchFiltered_UnpinnedOrderMatchesBareFTSRank(t *testing.T) {
+	s := openTempStore(t)
+	const project = "rank"
+	const rows = 200
+
+	for i := 0; i < rows; i++ {
+		var content strings.Builder
+		for j := 0; j < rows; j++ {
+			if j < rows-i {
+				content.WriteString("alpha ")
+			} else {
+				fmt.Fprintf(&content, "pad%d ", j)
+			}
+		}
+		if _, err := s.AddObservation(AddObservationParams{
+			Title: fmt.Sprintf("doc %d", i), Content: content.String(),
+			Project: project, Type: "decision",
+		}); err != nil {
+			t.Fatalf("AddObservation(%d): %v", i, err)
+		}
+	}
+
+	got, _, err := s.SearchMemoriesFiltered("alpha", project, rows, SearchFilter{})
+	if err != nil {
+		t.Fatalf("SearchMemoriesFiltered: %v", err)
+	}
+	if len(got) != rows {
+		t.Fatalf("search returned %d rows, want %d", len(got), rows)
+	}
+
+	// The reference: the identical query with the pinned CASE removed.
+	reference, err := s.DB().Query(`
+		SELECT m.id
+		FROM memories_fts fts
+		JOIN memories m ON m.id = fts.rowid
+		WHERE memories_fts MATCH ?
+		  AND m.deleted_at IS NULL
+		  AND LOWER(m.project) = ?
+		ORDER BY fts.rank
+		LIMIT ?`, "\"alpha\"", project, rows)
+	if err != nil {
+		t.Fatalf("reference query: %v", err)
+	}
+	defer reference.Close()
+
+	i := 0
+	for reference.Next() {
+		var id int64
+		if err := reference.Scan(&id); err != nil {
+			t.Fatalf("scan reference row: %v", err)
+		}
+		if i >= len(got) {
+			t.Fatalf("reference has more rows than the search returned (%d)", len(got))
+		}
+		if got[i].ID != id {
+			t.Fatalf("position %d: pinned-boost ORDER BY returned #%d, bare fts.rank returned #%d — "+
+				"the boost reorders a corpus with nothing pinned", i, got[i].ID, id)
+		}
+		i++
+	}
+	if err := reference.Err(); err != nil {
+		t.Fatalf("reference rows: %v", err)
+	}
+	if i != rows {
+		t.Errorf("reference query returned %d rows, want %d", i, rows)
 	}
 }

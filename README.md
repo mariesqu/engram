@@ -970,7 +970,7 @@ The daemon exposes 18 tools to the connected agent.
 | `mem_save_prompt`     | Save the user's prompt text so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID                |
 | `mem_update`          | Edit a specific observation in place by ID (omitted fields keep their value; versioned + re-synced) |
-| `mem_search`          | Search observations; supports `mode` param: `""` (FTS), `"semantic"`, or `"hybrid"` |
+| `mem_search`          | Search observations; `mode` (`""` FTS / `"semantic"` / `"hybrid"`), plus `offset` paging and `created_from` / `created_to` date bounds |
 | `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
 | `mem_review`          | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the staleness clock (local-only) |
 | `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
@@ -1137,6 +1137,18 @@ The web UI also exposes local and purge-all delete from the **Projects** page. `
 | `"fts"` | Explicit keyword search — same as the default. |
 | `"semantic"` | Vector cosine similarity only. Requires a configured embedding provider. |
 | `"hybrid"` | FTS + cosine similarity fused via Reciprocal Rank Fusion (RRF, k=60). Best recall. |
+
+### Paging and date bounds
+
+`mem_search` also takes three optional arguments that narrow or walk the result set. They are **strict**: an unusable value is a tool error, never a silently ignored filter — a dropped bound answers a question about last week with the whole corpus, and the caller cannot tell.
+
+| Argument | Accepts | Meaning |
+|----------|---------|---------|
+| `offset` | non-negative integer | Skip the first N results. Page 2 of `limit=10` is `offset=10`. Paging past the end returns no results rather than page one. |
+| `created_from` | RFC3339 or `YYYY-MM-DD` | Only memories created at or after this instant. A bare date is read as UTC midnight. |
+| `created_to` | RFC3339 or `YYYY-MM-DD` | Only memories created at or before this instant. A bare date covers the **whole** day. |
+
+The bounds are honoured by every mode — on `"hybrid"` they are pushed into both the FTS predicate and the vector candidate scan, so a row outside the window cannot be re-admitted by the semantic half of the fusion. `offset` is applied in SQL on the keyword path and to the final ranked list on the semantic and hybrid paths; an offset page there is cut from the full fused ranking, so consecutive pages are disjoint.
 
 ### Configuring an embedding provider
 

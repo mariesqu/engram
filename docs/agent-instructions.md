@@ -22,7 +22,7 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_save_prompt` | Save the user's prompt so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID |
 | `mem_update` | Edit a specific observation in place by ID (omitted fields keep their value; versioned and re-synced) |
-| `mem_search` | Full-text, semantic, or hybrid search across observations |
+| `mem_search` | Full-text, semantic, or hybrid search across observations (`offset` paging, `created_from` / `created_to` date bounds) |
 | `mem_similar` | Find observations semantically nearest a given memory (by sync_id) |
 | `mem_review` | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the clock (local-only) |
 | `mem_context` | Assemble recent sessions and observations into a context summary |

@@ -14,6 +14,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/mariesqu/engram/internal/controlapi"
 	"github.com/mariesqu/engram/internal/diagnostic"
 	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
@@ -482,6 +483,15 @@ The suggestion is deterministic — the same title/type/content always yields th
 			),
 			mcp.WithNumber("limit",
 				mcp.Description("Max results (default: 10, max: 20)"),
+			),
+			mcp.WithNumber("offset",
+				mcp.Description("Skip the first N results — page 2 of limit=10 is offset=10. Must be a non-negative integer; default 0. Paging past the end returns no results rather than page one."),
+			),
+			mcp.WithString("created_from",
+				mcp.Description(`Only return memories created on or after this instant. RFC3339 ("2024-06-01T09:00:00Z") or a plain date ("2024-06-01", read as UTC midnight).`),
+			),
+			mcp.WithString("created_to",
+				mcp.Description(`Only return memories created on or before this instant. RFC3339 ("2024-06-30T23:59:59Z") or a plain date ("2024-06-30", which covers the WHOLE day).`),
 			),
 			mcp.WithString("mode",
 				mcp.Description(`Retrieval mode: "" or "fts" (keyword search, default), "semantic" (cosine only), "hybrid" (FTS + cosine fused via RRF). Semantic modes require an embedding provider to be configured; they degrade gracefully to FTS when unavailable.`),
@@ -1647,9 +1657,73 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 	}
 }
 
+// toolSearchOffset decodes mem_search's optional "offset" argument. Absent is 0
+// (page one). Present-but-unusable is an ERROR rather than a silent 0: answering
+// "give me rows 50-59" with rows 0-9 is indistinguishable from a correct answer
+// on the caller's side, and an agent paging through results would loop forever
+// on page one without ever being told why.
+func toolSearchOffset(args map[string]any) (int, string) {
+	raw, ok := args["offset"]
+	if !ok {
+		return 0, ""
+	}
+	f, ok := raw.(float64)
+	if !ok {
+		return 0, "mem_search: offset must be a number"
+	}
+	// The int64 boundary check parseObservationID makes is not needed here (an
+	// offset that large is meaningless), but the integer and sign checks are: a
+	// fractional or negative offset is a caller bug, not a page.
+	if f != math.Trunc(f) || f < 0 || f > float64(math.MaxInt32) {
+		return 0, "mem_search: offset must be a non-negative integer"
+	}
+	return int(f), ""
+}
+
+// toolSearchTime decodes one of mem_search's optional date-bound arguments,
+// accepting RFC3339 or a bare "YYYY-MM-DD" date. The zero time.Time means the
+// bound is unset.
+//
+// endOfDay makes a DATE-only value cover the whole day, and it is what the
+// "created_to" bound passes: SearchFilter's bounds are inclusive, so reading
+// "2024-06-30" as UTC midnight would silently exclude everything saved that day
+// — the exact day the caller asked to include. The same helper backs the web UI's
+// filter bar (controlapi.InclusiveDayEnd), so the two surfaces cannot drift into
+// different meanings for the same date string.
+//
+// A malformed value is an error, not an ignored filter. Silently dropping the
+// bound would answer a question about last week with the entire corpus, and the
+// caller has no way to see that it happened.
+func toolSearchTime(args map[string]any, key string, endOfDay bool) (time.Time, string) {
+	raw, ok := args[key]
+	if !ok {
+		return time.Time{}, ""
+	}
+	str, ok := raw.(string)
+	if !ok {
+		return time.Time{}, "mem_search: " + key + " must be a string"
+	}
+	str = strings.TrimSpace(str)
+	if str == "" {
+		return time.Time{}, ""
+	}
+
+	if t, err := time.Parse(time.RFC3339, str); err == nil {
+		return t.UTC(), ""
+	}
+	if t, err := time.Parse("2006-01-02", str); err == nil {
+		if endOfDay {
+			return controlapi.InclusiveDayEnd(t.UTC()), ""
+		}
+		return t.UTC(), ""
+	}
+	return time.Time{}, "mem_search: " + key + ` must be RFC3339 ("2024-06-01T09:00:00Z") or a date ("2024-06-01")`
+}
+
 // handleSearch returns the handler for mem_search. It performs a search with
-// optional type/scope/mode filters, using the LENIENT read-project policy so a
-// search never hard-errors on an ambiguous or misconfigured cwd.
+// optional type/scope/mode filters, date bounds and offset paging, using the
+// LENIENT read-project policy so a search never hard-errors on an ambiguous or
+// misconfigured cwd.
 //
 // Mode values: "" / "fts" → FTS only (default, byte-identical to before);
 // "semantic" → cosine only; "hybrid" → FTS + cosine fused via RRF.
@@ -1690,6 +1764,25 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			}
 		}
 
+		// offset / created_from / created_to are STRICT where limit is lenient, and
+		// the difference is deliberate: a bad limit still answers the caller's
+		// question (with a different number of rows), while a bad offset or date
+		// silently answers a DIFFERENT question — page one instead of page five, or
+		// the whole corpus instead of last week. Those are the answers an agent
+		// cannot tell apart from the right one, so they are refused out loud.
+		offset, errMsg := toolSearchOffset(args)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		createdFrom, errMsg := toolSearchTime(args, "created_from", false)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		createdTo, errMsg := toolSearchTime(args, "created_to", true)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
 		project := resolveReadProject(explicitProject, directory)
 		// REQ-391: personal-scope memories are NOT project-scoped. When scope is
 		// personal and no explicit project was given, search across ALL projects so
@@ -1699,9 +1792,12 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		results, degradation, err := store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{
-			Type:  typ,
-			Scope: scope,
-			Mode:  mode,
+			Type:        typ,
+			Scope:       scope,
+			Mode:        mode,
+			Offset:      offset,
+			CreatedFrom: createdFrom,
+			CreatedTo:   createdTo,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("mem_search: search error: %s. Try simpler keywords.", err)), nil
