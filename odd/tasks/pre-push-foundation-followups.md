@@ -45,7 +45,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-004b — Client: park permanently rejected outbox entries** — Route: delegated writer
 - [x] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
 - [x] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
-- [ ] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
+- [x] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
 - [ ] **FUP-005b — Server: serve original creation times** — Route: delegated writer
 - [ ] **FUP-005c — Client: backfill created_at once per project** — Route: delegated writer
 
@@ -297,6 +297,32 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   packages ok except the three known environmental failures.
   Commit: pending (recorded after commit).
 
+- FUP-005a done (delegated writer). execInsert (internal/localstore/apply.go)
+  now sets created_at from m.OccurredAt (falling back to time.Now() only
+  when OccurredAt is zero — a caller that predates the field), formatted
+  with the existing sqliteTimeLayout constant so it matches every row the
+  SQL DEFAULT already wrote. review_after is now computed from that same
+  createdAt instead of time.Now(), mirroring the migrateV13ToV14 backfill's
+  reasoning. execUpdate already never touched created_at — confirmed
+  unchanged, added the regression test. occurred_at already traveled the
+  wire end-to-end (WireMutation.OccurredAt, central storage, PullSince) —
+  the gap was purely that execInsert never read it; no syncwire/centralstore
+  change was needed for this half. importer.go's doc comment updated (it
+  already set OccurredAt correctly; its rows now automatically get their
+  true creation date with no importer code change).
+  Tests added: `internal/localstore/created_at_test.go` (6 tests: created_at
+  from OccurredAt, zero-OccurredAt now-fallback, review_after dated from
+  createdAt not now for a decay type, execUpdate never changes created_at,
+  RecentObservations orders a scrambled-arrival mix of very-old/old/new rows
+  correctly by created_at DESC, SearchFilter.CreatedFrom/CreatedTo correctly
+  separates an old pulled row from a fresh local one). No existing assertion
+  changed; the whole existing localstore/importer/syncer suite passed
+  unmodified against the new execInsert behavior.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./internal/localstore/... ./internal/importer/... -count=1`
+  (ENGRAM_DSN unset): ok.
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-005a/b/c (created_at on the wire).
+FUP-005b (server: serve original creation times), FUP-005c (client backfill).

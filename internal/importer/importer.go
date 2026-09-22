@@ -36,9 +36,10 @@
 //
 // UpdatedAt on the mutation is set to the source row's updated_at (LWW correctness
 // if the user later syncs multiple imported nodes).  OccurredAt is set to the source
-// row's created_at.  The memories table's created_at column is set by the SQL
-// DEFAULT at INSERT time, but the UpdatedAt / OccurredAt payload ensures LWW
-// tiebreaking reflects the original authorship time.
+// row's created_at, and execInsert (FUP-005) materializes THAT as the new row's
+// created_at — imports therefore keep their original creation date rather than
+// getting the moment this import ran, and UpdatedAt / OccurredAt together still
+// give LWW tiebreaking the original authorship time regardless.
 //
 // # Project normalization
 //
