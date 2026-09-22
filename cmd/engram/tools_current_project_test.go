@@ -401,6 +401,9 @@ func TestCurrentProject_DaemonCwdFallbackIsFlagged(t *testing.T) {
 	if env["fallback"] != true {
 		t.Errorf("fallback = %v, want true", env["fallback"])
 	}
+	if env["writes_blocked"] != true {
+		t.Errorf("writes_blocked = %v, want true: every write tool refuses a daemon_cwd directory without an explicit project", env["writes_blocked"])
+	}
 	if hints := hintsOf(t, env); !strings.Contains(hints, "DAEMON's own working directory") {
 		t.Errorf("hints = %q, want them to disclose that this is the daemon's directory", hints)
 	}
@@ -920,6 +923,12 @@ func TestWriteTools_RefuseEveryWritesBlockedDirectory(t *testing.T) {
 			},
 		},
 		{
+			name: "daemon cwd (no directory sent at all)",
+			setup: func(t *testing.T, _ *daemonComponents) map[string]any {
+				return map[string]any{}
+			},
+		},
+		{
 			name: "relative cwd alias",
 			setup: func(t *testing.T, _ *daemonComponents) map[string]any {
 				// "." — the value a model writes when asked for its workspace. It
@@ -1001,6 +1010,34 @@ func TestWriteTools_AcceptAnExplicitProjectForABlockedDirectory(t *testing.T) {
 			if result.IsError {
 				t.Fatalf("%s refused a call that named its project; the documented remedy does not work: %v",
 					name, result.Content)
+			}
+		})
+	}
+}
+
+// TestWriteTools_DaemonCwdWithExplicitProjectSucceeds is the daemon_cwd half of
+// the remedy above, pinned on its own: NO "directory"/"cwd" argument at all,
+// which is the shape that used to file silently under the daemon's own
+// project (dirSourceDaemonCwd) and must now be refused UNLESS the caller names
+// the project.
+func TestWriteTools_DaemonCwdWithExplicitProjectSucceeds(t *testing.T) {
+	components := currentProjectDaemon(t)
+	chdirToJunkDir(t)
+
+	registered := components.mcpServer.ListTools()
+	for _, name := range directoryAwareWriteTools {
+		t.Run(name, func(t *testing.T) {
+			tool, ok := registered[name]
+			if !ok {
+				t.Fatalf("%s is not registered", name)
+			}
+			args := minimalArgsFor(t, name, map[string]any{"project": "named-by-the-agent"})
+			result, err := tool.Handler(t.Context(), newToolRequest(name, args))
+			if err != nil {
+				t.Fatalf("handler transport error: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("%s refused a daemon_cwd call that named its project: %v", name, result.Content)
 			}
 		})
 	}

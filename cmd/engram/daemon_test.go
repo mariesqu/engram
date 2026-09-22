@@ -622,6 +622,7 @@ func TestDaemonTool_MemSave_CreatesObservation(t *testing.T) {
 		"title":   "test observation",
 		"content": "content body",
 		"type":    "decision",
+		"project": "handler-e2e-project",
 	})
 	result, err := saveTool.Handler(t.Context(), req)
 	if err != nil {
@@ -705,7 +706,10 @@ func TestDaemonTool_MemSave_InvalidConfig(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
 	saveTool := components.mcpServer.ListTools()["mem_save"]
-	req := newToolRequest("mem_save", map[string]any{"title": "bad config test", "content": "body"})
+	// "directory" is passed explicitly (rather than relying on the chdir above)
+	// so the call reaches DetectProjectFull/ErrInvalidConfig under test instead
+	// of being refused earlier as dirSourceDaemonCwd.
+	req := newToolRequest("mem_save", map[string]any{"title": "bad config test", "content": "body", "directory": badDir})
 	result, err := saveTool.Handler(t.Context(), req)
 	if err != nil {
 		t.Fatalf("handler transport error: %v", err)
@@ -786,6 +790,7 @@ func TestDaemonTool_MemSessionSummary_CreatesSessionSummary(t *testing.T) {
 	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
 	req := newToolRequest("mem_session_summary", map[string]any{
 		"content": "## Goal\nTest the session summary tool.",
+		"project": "session-summary-project",
 	})
 	result, err := sumTool.Handler(t.Context(), req)
 	if err != nil {

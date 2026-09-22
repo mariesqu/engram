@@ -485,11 +485,14 @@ func TestDaemonTool_MemSave_ForwardedDirectoryBeatsDaemonCwd(t *testing.T) {
 	}
 }
 
-// TestDaemonTool_MemSave_NoDirectoryStillUsesCwd pins the back-compat path: an
-// older `engram connect`, or a per-client `engram daemon --transport stdio`
-// (whose cwd IS the project), forwards nothing and must behave exactly as
-// before — project detected from os.Getwd().
-func TestDaemonTool_MemSave_NoDirectoryStillUsesCwd(t *testing.T) {
+// TestDaemonTool_MemSave_NoDirectoryIsRefused supersedes the old back-compat
+// path: a call with NEITHER "directory"/"cwd" NOR "project" is dirSourceDaemonCwd
+// (see resolveSaveProject), and the daemon cannot tell an old `engram connect`
+// or a per-client `engram daemon --transport stdio` (whose cwd IS the project)
+// apart from the SHARED resident daemon's own working directory — the incident
+// this whole feature exists to prevent. Writes now refuse it; reads stay
+// lenient (resolveReadProject still answers from os.Getwd()).
+func TestDaemonTool_MemSave_NoDirectoryIsRefused(t *testing.T) {
 	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "cwd_save.db"), syncInterval: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("buildDaemon: %v", err)
@@ -504,16 +507,8 @@ func TestDaemonTool_MemSave_NoDirectoryStillUsesCwd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler transport error: %v", err)
 	}
-	if result.IsError {
-		t.Fatalf("handler returned tool error: %v", result.Content)
-	}
-
-	rec, err := components.store.GetObservation(1)
-	if err != nil {
-		t.Fatalf("GetObservation(1): %v", err)
-	}
-	if rec.Project != "cwd-repo" {
-		t.Errorf("Project = %q, want %q (no forwarded directory → cwd detection)", rec.Project, "cwd-repo")
+	if !result.IsError {
+		t.Fatalf("mem_save accepted a write with no directory and no project; it must refuse dirSourceDaemonCwd: %v", result.Content)
 	}
 }
 
@@ -703,13 +698,12 @@ func TestDaemonTool_MemSessionStart_ExplicitProjectCorrectsStoredRow(t *testing.
 	junkProject := chdirToJunkDir(t)
 	startTool := components.mcpServer.ListTools()["mem_session_start"]
 
-	// First registration: no project, no directory — misfiled under the daemon cwd.
-	if result, err := startTool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
-		"id": "sess-to-correct",
-	})); err != nil {
-		t.Fatalf("first handler transport error: %v", err)
-	} else if result.IsError {
-		t.Fatalf("first call returned tool error: %v", result.Content)
+	// Seed the misfiled row directly: mem_session_start itself now REFUSES a
+	// no-project, no-directory call (dirSourceDaemonCwd), so it can no longer
+	// reproduce the pre-fix misfile it used to. This still exercises the
+	// corrective path for a row that was misfiled before this fix shipped.
+	if err := components.store.CreateSession("sess-to-correct", junkProject, ""); err != nil {
+		t.Fatalf("CreateSession: %v", err)
 	}
 	if sess, err := components.store.GetSession("sess-to-correct"); err != nil {
 		t.Fatalf("GetSession: %v", err)

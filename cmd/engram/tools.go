@@ -238,6 +238,20 @@ func (d directoryArg) gitBashHint() (string, bool) {
 	return gitBashDirectoryHint(d.Directory), true
 }
 
+// daemonCwdError is the write-tool refusal for dirSourceDaemonCwd: no
+// "directory"/"cwd" argument reached the daemon, so the project would be
+// detected from the SHARED daemon's own working directory rather than the
+// caller's — the resident daemon now starts in its config directory
+// (spawnWorkingDir), so this used to file the memory under project "engram"
+// for every caller that forgot to send one. The remedy is the same one
+// missingDirectoryError and relativeError already teach: pass directory (or
+// "cwd") explicitly, or name the project.
+func (d directoryArg) daemonCwdError(tool string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(fmt.Sprintf(
+		"%s: no directory reached the daemon, so this write would be filed under the DAEMON's own working "+
+			"directory rather than yours — pass directory (or \"cwd\") explicitly, or pass project explicitly", tool))
+}
+
 // missingDirectoryError is the write-tool refusal for a directory that is not
 // on this machine. Detection derives a basename from any string, so without it
 // a typo'd path silently CREATES a project — the flag mem_current_project
@@ -250,9 +264,12 @@ func missingDirectoryError(tool, dir string) *mcp.CallToolResult {
 
 // directoryExists reports whether dir is present and is a directory. The empty
 // string (the daemon could not read its own cwd) is NOT treated as missing:
-// DetectProjectFull reads it as ".", which is the historic daemon-cwd answer,
-// and a write tool that refused it would break every caller that never sends a
-// directory at all.
+// DetectProjectFull reads it as ".", which is the historic daemon-cwd answer.
+// In practice this branch is now unreachable from the write-tool callers below
+// — resolveSaveProject and handleSessionStart both refuse dirSourceDaemonCwd
+// (the only source that resolves to "") before calling this — but it stays
+// lenient here too, since a read tool reaching an empty dir must still answer
+// rather than error.
 func directoryExists(dir string) bool {
 	if strings.TrimSpace(dir) == "" {
 		return true
@@ -373,7 +390,7 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 
 Three fields say "do not trust this name blindly":
   fallback=true         — the project name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Pass an explicit project on later calls if that is not the name you want.
-  writes_blocked=true   — mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, missing, relative, or an omitted project) until you pass project explicitly.
+  writes_blocked=true   — mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, missing, relative, no directory at all, or an omitted project) until you pass project explicitly.
   directory_exists=false — the resolved directory does not exist, so any name here is invented from its basename. Pass a real directory or an explicit project.`),
 			mcp.WithTitleAnnotation("Detect Current Project"),
 			mcp.WithReadOnlyHintAnnotation(true),
@@ -1143,7 +1160,8 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 	}
 	switch dirArg.Source {
 	case dirSourceDaemonCwd:
-		hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
+		env["writes_blocked"] = true
+		hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — every write tool refuses it without an explicit project; restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
 	case dirSourceCwdAlias:
 		hints = append(hints, "this directory came from the \"cwd\" alias you supplied, not from 'engram connect' — if it is not the workspace you are actually in, every later call is filed under the wrong project")
 		// dirSourceRelativePath is deliberately absent: its hint is emitted above,
@@ -1212,9 +1230,10 @@ func setHints(env map[string]any, hints []string) {
 //     os.Getwd() — see resolveProjectDir.
 //
 // It is a WRITE tool and refuses everything the other write tools refuse: a
-// relative or missing directory (resolveSaveProject's two guards, reimplemented
-// here because this handler resolves its own project to keep the corrective
-// CreateSessionWithProject path) and an "omitted" project. Registering a
+// relative directory, no directory at all (dirSourceDaemonCwd), a missing one
+// (resolveSaveProject's three guards, reimplemented here because this handler
+// resolves its own project to keep the corrective CreateSessionWithProject
+// path), and an "omitted" project. Registering a
 // session for a project that cannot accept a single memory is a session row
 // whose only effect is to make mem_context report activity that produced
 // nothing.
@@ -1245,11 +1264,15 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		project := explicitProject
 		if project == "" {
-			// The same two refusals resolveSaveProject applies, in the same order and
-			// for the same reason: an explicit project skips both (it is the remedy
-			// every writes_blocked hint offers), everything else must not invent one.
+			// The same three refusals resolveSaveProject applies, in the same order
+			// and for the same reason: an explicit project skips all of them (it is
+			// the remedy every writes_blocked hint offers), everything else must not
+			// invent one.
 			if dirArg.Relative {
 				return dirArg.relativeError("mem_session_start"), nil
+			}
+			if dirArg.Source == dirSourceDaemonCwd {
+				return dirArg.daemonCwdError("mem_session_start"), nil
 			}
 			if !directoryExists(resolvedDir) {
 				return missingDirectoryError("mem_session_start", resolvedDir), nil
@@ -1357,18 +1380,21 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 // fire against the resolved directory, so a forwarded directory is diagnosed
 // exactly like a cwd would be.
 //
-// Before any detection runs it applies the two refusals mem_current_project
+// Before any detection runs it applies the three refusals mem_current_project
 // advertises as writes_blocked and nothing used to enforce:
 //
 //   - a RELATIVE directory (dirSourceRelativePath): filepath.Abs resolves it
 //     against the SHARED daemon's cwd, so the memory would be filed under
 //     whatever folder the autostart or tray happened to launch from;
+//   - no directory at all (dirSourceDaemonCwd): the project would be detected
+//     from the daemon's OWN working directory — %APPDATA%\engram for the
+//     resident daemon, see spawnWorkingDir — not the caller's;
 //   - a directory that is not on this machine: detection derives a basename
 //     from any string, so a typo'd path silently creates a brand-new project.
 //
-// Both are skipped when the caller named a project. An explicit name is the
-// remedy every writes_blocked hint offers, and honouring it here is what makes
-// that advice true.
+// All three are skipped when the caller named a project. An explicit name is
+// the remedy every writes_blocked hint offers, and honouring it here is what
+// makes that advice true.
 //
 // tool is the caller's tool name, used verbatim in the error text: an agent
 // that reads "mem_save: …" after calling mem_session_summary learns the wrong
@@ -1382,6 +1408,9 @@ func resolveSaveProject(store *localstore.Store, tool, explicitProject string, d
 	}
 	if dirArg.Relative {
 		return "", dirArg.relativeError(tool)
+	}
+	if dirArg.Source == dirSourceDaemonCwd {
+		return "", dirArg.daemonCwdError(tool)
 	}
 
 	dir := resolveProjectDir(dirArg.Directory)

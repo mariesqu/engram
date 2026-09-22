@@ -518,15 +518,16 @@ func hookResolveProject(ctx context.Context, client *mcpBridge, cwd string) stri
 		return ""
 	}
 	// Deliberately REDUNDANT with the writes_blocked check beside it, and worth
-	// keeping anyway. Today mem_current_project blocks writes for both of these
+	// keeping anyway. mem_current_project blocks writes for both of these
 	// sources, so neither term can decide the outcome alone — a mutation that
 	// deletes either one leaves every test green. What they buy is independence:
 	// writes_blocked is a POLICY answer that composes several conditions (an
-	// omitted project, a missing directory, a relative path) and could
-	// reasonably stop covering one of them, while this names the two answers a
-	// hook must never act on no matter what policy says — the ones that describe
-	// the DAEMON's directory rather than the session's. A hook files memories
-	// nobody reviews; the cheap belt beside the braces is the right trade.
+	// omitted project, a missing directory, a relative path, no directory at
+	// all) and could reasonably stop covering one of them, while this names the
+	// two answers a hook must never act on no matter what policy says — the
+	// ones that describe the DAEMON's directory rather than the session's. A
+	// hook files memories nobody reviews; the cheap belt beside the braces is
+	// the right trade.
 	answersAboutTheDaemon := env.DirectorySource == dirSourceDaemonCwd || env.DirectorySource == dirSourceRelativePath
 	if strings.TrimSpace(env.Project) == "" || env.ErrorHint != "" || env.WritesBlocked || !env.DirExists ||
 		answersAboutTheDaemon {
