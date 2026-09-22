@@ -172,6 +172,18 @@ const maxPullBatchesPerCall = 100
 // encountered (if any). On error, already-acked mutations stay acked; the rest
 // are retried next cycle (idempotent via mutation_id).
 func Push(ctx context.Context, n *Node, central Central) (int, error) {
+	// FUP-004c: repair any unacked (pending or parked) outbox entry still
+	// carrying a pre-fix U+0000 BEFORE draining — a parked NUL entry stays
+	// parked (and DrainOutbox keeps excluding it) until this runs, so it has
+	// to happen first, every cycle, for a repair to ever have a chance to push.
+	// Best-effort: a repair failure must not block THIS cycle's push of every
+	// other, unaffected entry — whatever failed to repair is retried (as a
+	// repair candidate) next cycle.
+	if _, repairErr := n.Store.RepairUnackedNULMutations(); repairErr != nil {
+		slog.Warn("syncer.Push: NUL repair failed, continuing without it",
+			"node", n.Name, "error", repairErr)
+	}
+
 	entries, err := n.Store.DrainOutbox(0)
 	if err != nil {
 		return 0, fmt.Errorf("push %s: drain outbox: %w", n.Name, err)

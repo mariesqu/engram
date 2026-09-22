@@ -43,7 +43,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-003b — Dedup only near-simultaneous deliveries** — Route: delegated writer
 - [x] **FUP-004a — Server: 422 for permanent Apply errors** — Route: delegated writer
 - [x] **FUP-004b — Client: park permanently rejected outbox entries** — Route: delegated writer
-- [ ] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
+- [x] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
 - [ ] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
 - [ ] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
 - [ ] **FUP-005b — Server: serve original creation times** — Route: delegated writer
@@ -233,7 +233,36 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   proofs unaffected).
   Commit: pending (recorded after commit).
 
+- FUP-004c done (delegated writer). New internal/localstore/nul_repair.go:
+  `Store.RepairUnackedNULMutations()` scans unacked (acked_at IS NULL —
+  pending or parked) sync_mutations rows and repairs each candidate in its
+  own transaction: sanitize via mutation.SanitizeTextFields, re-derive
+  payload+mutation_id, then update sync_mutations (new id/payload, un-park,
+  reset attempts), applied_mutations (re-point the PK), and — ONLY where
+  last_write_mutation_id still equals the OLD id (a newer write must never be
+  clobbered) — memories/memory_tombstones.last_write_mutation_id plus the
+  materialized memories row's own text fields. Wired into syncer.Push,
+  immediately before DrainOutbox, best-effort (a repair failure logs and lets
+  the push cycle continue for every other entry).
+  GOTCHA (saved to memory): a raw-byte scan for NUL in the stored payload
+  never matches — encoding/json escapes U+0000 as the six-character
+  `\u0000` sequence, so the on-disk payload TEXT never contains a literal
+  0x00 byte even when the mutation it encodes does. Fixed by using
+  `mutation.ValidateCanonicalPayloadText` (the same decode-based check
+  centralstore.Apply/cloudserve already use to reject these payloads) as the
+  detector instead of any raw-byte/SQL `instr(...,char(0))` scan.
+  Tests added: `internal/localstore/nul_repair_test.go` (5 tests: repairs a
+  pending entry incl. applied_mutations re-pointing, repairs+un-parks a
+  parked entry so DrainOutbox returns it again, skips clobbering a
+  materialized row a NEWER write already superseded while still repairing
+  the outbox entry itself, ignores acked rows, no-candidates is a clean
+  no-op). No existing assertion changed.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1` (ENGRAM_DSN unset): all
+  packages ok except the three known environmental failures.
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-004c (NUL repair), FUP-004d (doctor + CLI for parked mutations), then
-FUP-005a/b/c (created_at on the wire).
+FUP-004d (doctor + CLI for parked mutations), then FUP-005a/b/c
+(created_at on the wire).
