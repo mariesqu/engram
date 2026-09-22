@@ -897,6 +897,8 @@ claude plugin install engram@engram
 
 Both paths install the same hooks — `TestEngramHookPack_MatchesShippedPack` fails the build if they ever drift apart.
 
+**Use one or the other, not both.** The plugin and `engram setup hooks` register the identical hook commands, so a host with both active fires every event twice. The runtime deduplicates the resulting saves (each prompt/report is claimed once per session before it is saved, so a duplicate delivery is a no-op rather than a duplicate memory), but you still pay for two process launches per event. `engram setup hooks --agent claude-code` prints a warning when it can detect the plugin is also enabled in your `settings.json`.
+
 The commands call `engram` **from PATH**, so the binary has to be there (`engram` / `engram.exe`), and the daemon needs a database: set `ENGRAM_DB` or put `db_path` in the [config file](#config-file).
 
 ### What each hook does

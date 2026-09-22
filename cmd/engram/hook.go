@@ -834,6 +834,11 @@ func hookUserPromptSubmit(ctx context.Context, dbFlag string, in hookInput) {
 		// prompt nobody kept.
 		if p := project(); p == "" {
 			fmt.Fprintf(os.Stderr, "engram hook user-prompt-submit: no usable project for %q; the prompt was not captured\n", in.CWD)
+		} else if !hookClaimOccurrence(in.SessionID, "user-prompt-submit", prompt) {
+			// The plugin and `engram setup hooks` both installed: this exact prompt
+			// was already captured by the other invocation. See FUP-003.
+			fmt.Fprintf(os.Stderr, "engram hook user-prompt-submit: this prompt was already captured for "+
+				"session %q (duplicate hook install?); skipping\n", in.SessionID)
 		} else if _, err := client.callTool(ctx, "mem_save_prompt", map[string]any{
 			// Capped at the same 16 KiB as a subagent report. A prompt can carry a
 			// pasted file, and a memory nobody can read is not worth the write it
@@ -1094,6 +1099,14 @@ func hookSubagentStop(ctx context.Context, dbFlag string, in hookInput) {
 		return
 	}
 
+	if !hookClaimOccurrence(in.SessionID, "subagent-stop", message) {
+		// The plugin and `engram setup hooks` both installed: this exact report
+		// was already saved by the other invocation. See FUP-003.
+		fmt.Fprintf(os.Stderr, "engram hook subagent-stop: this report was already saved for session %q "+
+			"(duplicate hook install?); skipping\n", in.SessionID)
+		return
+	}
+
 	args := map[string]any{
 		"title":          hookSubagentTitle(message),
 		"content":        truncateForHook(message, hookContextLimit),
@@ -1226,11 +1239,20 @@ func hookStateDir() string {
 // with short path limits. The tradeoff — you cannot eyeball which session a
 // file belongs to — costs nothing, since nothing reads these but this binary.
 func hookStateFile(sessionID, kind string) string {
-	sum := sha256.Sum256([]byte(sessionID))
-	return filepath.Join(hookStateDir(), "engram-hook-"+hex.EncodeToString(sum[:8])+"-"+kind)
+	return filepath.Join(hookStateDir(), "engram-hook-"+hookSessionHashHex(sessionID)+"-"+kind)
 }
 
-// hookClearState removes both markers of a session.
+// hookSessionHashHex is the session-id hash hookStateFile keys every marker
+// filename on. Shared (rather than inlined twice) so hookClearOccurrenceMarkers
+// — which has to find a session's markers by NAME, not by a path it already
+// has — can never compute a different prefix than hookStateFile does.
+func hookSessionHashHex(sessionID string) string {
+	sum := sha256.Sum256([]byte(sessionID))
+	return hex.EncodeToString(sum[:8])
+}
+
+// hookClearState removes both fixed markers of a session, plus every
+// per-occurrence dedup marker hookClaimOccurrence left behind for it.
 //
 // It runs at session-start/post-compaction and at session-end, for two
 // different reasons that happen to want the same thing. A `--resume` (and a
@@ -1238,8 +1260,8 @@ func hookStateFile(sessionID, kind string) string {
 // context is new, so the bootstrap has to fire again, and the age clock the
 // nudge reads has to start from now rather than from whenever this id first
 // spoke — days ago, on a machine that has since been rebooted. At session-end
-// it is plain hygiene: without it the directory grows one pair of files per
-// session, forever.
+// it is plain hygiene: without it the directory grows one pair of files, plus
+// one occurrence marker per distinct prompt/report, per session, forever.
 func hookClearState(sessionID string) {
 	if strings.TrimSpace(sessionID) == "" {
 		return
@@ -1247,6 +1269,122 @@ func hookClearState(sessionID string) {
 	for _, kind := range []string{hookStateToolsLoaded, hookStateLastNudge} {
 		if err := os.Remove(hookStateFile(sessionID, kind)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintf(os.Stderr, "engram hook: could not clear session state: %v\n", err)
+		}
+	}
+	hookClearOccurrenceMarkers(sessionID)
+}
+
+// ── duplicate-install dedup (FUP-003) ───────────────────────────────────────
+//
+// Installing BOTH the Claude Code plugin (plugin/claude-code/hooks/hooks.json)
+// and `engram setup hooks` registers the SAME commands twice, so the host fires
+// every event through both — two independent `engram hook <event>` processes,
+// each carrying the identical payload. Without a guard that means a duplicate
+// mem_save_prompt for every prompt and a duplicate mem_save for every subagent
+// report. The functions below make the SECOND of those two processes a no-op
+// for its save, using the exact O_CREATE|O_EXCL claim hookClaimState already
+// makes for the first-prompt bootstrap marker — just keyed on the occurrence
+// (session, event, payload hash) instead of on the session alone.
+
+// hookOccurrenceMarkerFile is hookClaimOccurrence's marker path: the same
+// session hash hookStateFile always uses, plus a short hash of event+payload so
+// two DIFFERENT prompts (or reports) in one session claim different markers —
+// only the SAME occurrence arriving twice must collide.
+func hookOccurrenceMarkerFile(sessionID, event, payload string) string {
+	sum := sha256.Sum256([]byte(event + "\x00" + payload))
+	return hookStateFile(sessionID, "occ-"+hex.EncodeToString(sum[:8]))
+}
+
+// hookClaimOccurrence reports whether THIS call is the first to see event's
+// payload for session id. Call it immediately before the save it guards — not
+// earlier — so a call that never reaches the save (an unresolvable project, a
+// closed budget) never burns the claim for an occurrence nothing actually saved.
+//
+// An empty session id claims unconditionally (no dedup, not a failure): the
+// marker's session component is a hash, so an unnamed session would share ONE
+// marker across every hook on the machine, and an unrelated second occurrence
+// would then find the first one's marker and be wrongly skipped — worse than
+// the duplicate this exists to prevent.
+//
+// Every OTHER failure to create the marker (an unwritable state directory) is
+// fail-open by construction: it is hookClaimState's own contract, reused as-is,
+// and it is the right one here too — a save that is not deduped is strictly
+// better than one silently dropped.
+func hookClaimOccurrence(sessionID, event, payload string) bool {
+	if strings.TrimSpace(sessionID) == "" {
+		return true
+	}
+	hookSweepStaleOccurrenceMarkers()
+	return hookClaimState(hookOccurrenceMarkerFile(sessionID, event, payload))
+}
+
+// hookClearOccurrenceMarkers removes every occurrence marker hookClaimOccurrence
+// left for sessionID. Unlike the two fixed markers hookClearState also removes,
+// an occurrence marker has no fixed name — one is minted per distinct
+// prompt/report — so they are found by LISTING the state directory for the
+// session's hash prefix rather than removed by a path this function already
+// knows.
+func hookClearOccurrenceMarkers(sessionID string) {
+	prefix := "engram-hook-" + hookSessionHashHex(sessionID) + "-occ-"
+
+	entries, err := os.ReadDir(hookStateDir())
+	if err != nil {
+		return // best-effort — the TTL sweep below is the backstop
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(hookStateDir(), entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "engram hook: could not clear occurrence marker: %v\n", err)
+		}
+	}
+}
+
+// hookOccurrenceMarkerTTL bounds how long an occurrence marker survives a
+// session that never reaches session-end (a crashed agent, a host that skips
+// the event) — hookClearOccurrenceMarkers' own cleanup then never runs.
+const hookOccurrenceMarkerTTL = 24 * time.Hour
+
+// hookOccurrenceSweepCooldown bounds how often hookSweepStaleOccurrenceMarkers
+// actually walks the state directory, so the common case (nothing due) costs
+// one Stat on the cooldown marker, not a ReadDir on every hook run.
+const hookOccurrenceSweepCooldown = time.Hour
+
+// hookOccurrenceSweepMarkerFile is the machine-wide (not per-session) cooldown
+// clock for the sweep — there is exactly one sweep for the whole machine, so it
+// reuses hookStateFile with an empty session id rather than inventing a second
+// naming scheme.
+func hookOccurrenceSweepMarkerFile() string {
+	return hookStateFile("", "occurrence-sweep")
+}
+
+// hookSweepStaleOccurrenceMarkers removes occurrence markers older than
+// hookOccurrenceMarkerTTL — the backstop for a session whose hookClearState
+// cleanup never runs. Best-effort throughout: a failed sweep just retries at
+// the next cooldown, and it must never be the reason a hook fails to save.
+func hookSweepStaleOccurrenceMarkers() {
+	cooldown := hookOccurrenceSweepMarkerFile()
+	if age, ok := hookStateAge(cooldown); ok && age < hookOccurrenceSweepCooldown {
+		return
+	}
+	hookTouchState(cooldown)
+
+	entries, err := os.ReadDir(hookStateDir())
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.Contains(entry.Name(), "-occ-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) >= hookOccurrenceMarkerTTL {
+			_ = os.Remove(filepath.Join(hookStateDir(), entry.Name()))
 		}
 	}
 }

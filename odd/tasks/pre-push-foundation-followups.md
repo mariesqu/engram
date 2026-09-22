@@ -39,7 +39,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 
 - [x] **FUP-001 — Index LOWER(project)** — Route: delegated writer
 - [x] **FUP-002 — Hook session fallback only for empty cwd** — Route: delegated writer
-- [ ] **FUP-003 — Duplicate-install hook protection** — Route: delegated writer
+- [x] **FUP-003 — Duplicate-install hook protection** — Route: delegated writer
 - [ ] **FUP-004 — Outbox permanent-rejection handling** — Route: pending design (explorer mapping sync)
 - [ ] **FUP-005 — created_at on the wire** — Route: pending design (explorer mapping sync)
 
@@ -83,9 +83,57 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   Verification: `go build ./...`: ok. `go vet ./...`: ok.
   `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
   known environmental failures.
+  Commit: af20172.
+
+- FUP-003 done (delegated writer), both layers.
+  (a) Runtime dedup (cmd/engram/hook.go): a new `hookClaimOccurrence(sessionID,
+  event, payload)` claims an exclusive-create marker keyed on (session id hash,
+  event, hash of the occurrence payload — the prompt text or the subagent
+  closing message), reusing the existing `hookClaimState` O_CREATE|O_EXCL
+  primitive the first-prompt bootstrap already uses. Wired into
+  `hookUserPromptSubmit` and `hookSubagentStop`, immediately before their
+  respective `mem_save_prompt`/`mem_save` calls, so a claim that never reaches
+  the save (unresolved project) never burns the marker. Empty session id always
+  claims (no dedup possible without a session to key on — matches the existing
+  bootstrap-marker carve-out) and any non-ErrExist claim failure is fail-open
+  (inherited unchanged from `hookClaimState`). `hookClearState` now also
+  globs-and-removes a session's occurrence markers (`hookClearOccurrenceMarkers`,
+  since they have no fixed name), and a cheap cooldown-gated TTL sweep
+  (`hookSweepStaleOccurrenceMarkers`, 24h TTL, checked at most once per hour)
+  backstops sessions that never reach session-end. Refactored the session-id
+  hash out of `hookStateFile` into shared `hookSessionHashHex` so the two
+  marker-naming paths cannot drift.
+  (b) Setup warning (cmd/engram/setup.go): `warnIfPluginAlsoInstalled` reads the
+  claude-code settings.json's `enabledPlugins` key (conservatively — only a
+  `map[string]bool` or a `[]string` shape naming "engram"; any other shape is
+  silently skipped) and prints a stderr warning before the merge writes.
+  README.md's "Installing" section now states the exclusivity next to the
+  setup-hooks instructions regardless of detection.
+  Tests added: `cmd/engram/hook_test.go`
+  (`TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce`,
+  `TestHookUserPromptSubmit_DifferentPromptsBothSaved`,
+  `TestHookSubagentStop_DuplicateDeliverySavesReportOnce`,
+  `TestHookSubagentStop_DifferentReportsBothSaved`,
+  `TestHookClaimOccurrence_EmptySessionNeverDedupes`,
+  `TestHookClaimState_NonExistErrorFailsOpen`,
+  `TestHookSessionEnd_ClearsOccurrenceMarkers`,
+  `TestHookSweepStaleOccurrenceMarkers_RemovesOnlyStaleOnes`);
+  `cmd/engram/setup_test.go` (`TestPluginEntryMentionsEngram`,
+  `TestWarnIfPluginAlsoInstalled_WarnsOnlyWhenDetectable`,
+  `TestSetupHooks_WarnsWhenPluginAlreadyEnabled`). No existing assertion was
+  changed. The claim-dir-failure test exercises the shared `hookClaimState`
+  primitive directly (a NUL byte in the path — invalid on every OS, rejected by
+  the os package before any syscall) rather than through a real permission
+  failure, which is not portably reproducible on Windows.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
+  known environmental failures.
   Commit: pending (recorded after commit).
 
 ## Next Step
 
-FUP-003, as its own commit; parallel read-only sync mapping for FUP-004/005
-stays out of scope for this writer.
+FUP-001..003 are closed. FUP-004/005 (outbox permanent-rejection handling,
+created_at on the wire) remain pending design/exploration of
+internal/syncer, internal/syncwire, internal/localstore/sync.go, apply.go and
+internal/centralstore — explicitly out of scope for this writer, which was
+read-only-restricted from those files.

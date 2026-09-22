@@ -622,3 +622,95 @@ func TestSetupHooks_WritesThroughASymlinkTarget(t *testing.T) {
 		t.Errorf("backup = %s, want the ORIGINAL bytes %s", saved, original)
 	}
 }
+
+// ─── FUP-003(b): warn when the plugin is also installed ─────────────────────
+
+// TestPluginEntryMentionsEngram covers the two enabledPlugins shapes the
+// detection recognizes (a map keyed by plugin id, and a flat list of ids) plus
+// the shapes it must say nothing about: a disabled entry, an unrelated plugin,
+// and a shape neither reader understands.
+func TestPluginEntryMentionsEngram(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"map, enabled", `{"engram@engram": true}`, true},
+		{"map, disabled", `{"engram@engram": false}`, false},
+		{"map, unrelated plugin only", `{"some-other-plugin@marketplace": true}`, false},
+		{"list, present", `["engram@engram"]`, true},
+		{"list, absent", `["some-other-plugin@marketplace"]`, false},
+		{"unrecognized shape", `"engram@engram"`, false},
+		{"empty map", `{}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pluginEntryMentionsEngram(json.RawMessage(tc.raw)); got != tc.want {
+				t.Errorf("pluginEntryMentionsEngram(%s) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWarnIfPluginAlsoInstalled_WarnsOnlyWhenDetectable covers
+// warnIfPluginAlsoInstalled end to end: a settings.json that names the plugin
+// as enabled warns, and every case it cannot speak to (no enabledPlugins key,
+// the plugin absent, or the codex agent, which has no plugin concept here)
+// stays silent.
+func TestWarnIfPluginAlsoInstalled_WarnsOnlyWhenDetectable(t *testing.T) {
+	pluginEnabled := []byte(`{"enabledPlugins": {"engram@engram": true}, "model": "opus"}`)
+
+	cases := []struct {
+		name     string
+		agent    string
+		existing []byte
+		wantWarn bool
+	}{
+		{"claude-code, plugin enabled", "claude-code", pluginEnabled, true},
+		{"claude-code, no enabledPlugins key", "claude-code", []byte(`{"model": "opus"}`), false},
+		{"claude-code, plugin disabled", "claude-code", []byte(`{"enabledPlugins": {"engram@engram": false}}`), false},
+		{"claude-code, empty file", "claude-code", nil, false},
+		{"codex, plugin concept not recognized here", "codex", pluginEnabled, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureStderr(t, func() {
+				warnIfPluginAlsoInstalled(tc.agent, tc.existing)
+			})
+			gotWarn := strings.Contains(out, "also appears to be installed")
+			if gotWarn != tc.wantWarn {
+				t.Errorf("warned = %v, want %v; stderr:\n%s", gotWarn, tc.wantWarn, out)
+			}
+		})
+	}
+}
+
+// TestSetupHooks_WarnsWhenPluginAlreadyEnabled is the end-to-end path: running
+// `engram setup hooks` against a settings.json that already names the plugin as
+// enabled must print the warning BEFORE it writes the merged file.
+func TestSetupHooks_WarnsWhenPluginAlreadyEnabled(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	settings := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(settings, []byte(`{"enabledPlugins": {"engram@engram": true}}`), 0o600); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	errOut := captureStderr(t, func() {
+		if err := runSetupCmd([]string{"hooks", "--agent", "claude-code"}); err != nil {
+			t.Fatalf("install: %v", err)
+		}
+	})
+	if !strings.Contains(errOut, "also appears to be installed") {
+		t.Errorf("no plugin-conflict warning was printed:\n%s", errOut)
+	}
+
+	// The warning does not block the install — the hooks still get merged in.
+	written, err := os.ReadFile(settings)
+	if err != nil {
+		t.Fatalf("settings were not written: %v", err)
+	}
+	if !strings.Contains(string(written), "engram hook session-start") {
+		t.Errorf("the warning suppressed the install:\n%s", written)
+	}
+}

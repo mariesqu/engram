@@ -1224,6 +1224,206 @@ func TestHookSessionEnd_ClearsSessionState(t *testing.T) {
 	}
 }
 
+// ─── FUP-003: plugin + settings.json both installed run every hook twice ────
+//
+// The Claude Code plugin (plugin/claude-code/hooks/hooks.json) and
+// `engram setup hooks` (settings.json) can both be registered at once, and the
+// host then fires every event through BOTH — two independent
+// `engram hook <event>` processes, each carrying the identical payload. These
+// tests simulate that by calling runHook twice with the same input, exactly as
+// two separate process launches would receive it.
+
+// TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce is the regression
+// test for a duplicate prompt save: the SAME prompt, in the SAME session,
+// delivered twice, must be captured exactly once.
+func TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "dup-prompt-repo")
+	sessionID := "hook-dup-prompt-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	input := map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "add the missing index",
+	}
+	_ = runHook(t, "user-prompt-submit", input, "--db", dbPath)
+	// Second "delivery" of the identical occurrence — the other install firing
+	// the same event with the same stdin payload.
+	_ = runHook(t, "user-prompt-submit", input, "--db", dbPath)
+
+	count, err := components.store.CountPromptsForSession(sessionID, "dup-prompt-repo", "add the missing index")
+	if err != nil {
+		t.Fatalf("CountPromptsForSession: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("prompt saved %d time(s) across two identical deliveries, want exactly 1", count)
+	}
+}
+
+// TestHookUserPromptSubmit_DifferentPromptsBothSaved proves the dedup is keyed
+// on the occurrence, not just the session: two DIFFERENT prompts in the same
+// session must both be captured.
+func TestHookUserPromptSubmit_DifferentPromptsBothSaved(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "distinct-prompt-repo")
+	sessionID := "hook-distinct-prompt-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "first prompt",
+	}, "--db", dbPath)
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "second prompt",
+	}, "--db", dbPath)
+
+	for _, prompt := range []string{"first prompt", "second prompt"} {
+		count, err := components.store.CountPromptsForSession(sessionID, "distinct-prompt-repo", prompt)
+		if err != nil {
+			t.Fatalf("CountPromptsForSession(%q): %v", prompt, err)
+		}
+		if count != 1 {
+			t.Errorf("prompt %q saved %d time(s), want exactly 1", prompt, count)
+		}
+	}
+}
+
+// TestHookSubagentStop_DuplicateDeliverySavesReportOnce is the regression test
+// for a duplicate subagent report: the SAME closing message, in the SAME
+// session, delivered twice, must be saved exactly once.
+func TestHookSubagentStop_DuplicateDeliverySavesReportOnce(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "dup-subagent-repo")
+
+	input := map[string]any{
+		"session_id":             "hook-dup-subagent-" + t.Name(),
+		"cwd":                    repo,
+		"last_assistant_message": "Found the deadlock in the writer queue",
+	}
+	_ = runHook(t, "subagent-stop", input, "--db", dbPath)
+	_ = runHook(t, "subagent-stop", input, "--db", dbPath)
+
+	results, _, err := components.store.SearchMemoriesFiltered("deadlock", "dup-subagent-repo", 10, localstore.SearchFilter{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("report saved %d time(s) across two identical deliveries, want exactly 1", len(results))
+	}
+}
+
+// TestHookSubagentStop_DifferentReportsBothSaved is the subagent-stop
+// counterpart to TestHookUserPromptSubmit_DifferentPromptsBothSaved: two
+// DIFFERENT reports in the same session must both be saved.
+func TestHookSubagentStop_DifferentReportsBothSaved(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "distinct-subagent-repo")
+	sessionID := "hook-distinct-subagent-" + t.Name()
+
+	_ = runHook(t, "subagent-stop", map[string]any{
+		"session_id": sessionID, "cwd": repo, "last_assistant_message": "Found the deadlock",
+	}, "--db", dbPath)
+	_ = runHook(t, "subagent-stop", map[string]any{
+		"session_id": sessionID, "cwd": repo, "last_assistant_message": "Fixed the race condition",
+	}, "--db", dbPath)
+
+	count, err := components.store.CountLiveByProject("distinct-subagent-repo")
+	if err != nil {
+		t.Fatalf("CountLiveByProject: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("saved %d report(s) for two distinct messages, want exactly 2", count)
+	}
+}
+
+// TestHookClaimOccurrence_EmptySessionNeverDedupes mirrors hookClaimState's own
+// empty-id carve-out: the marker's session component is a hash, so an unnamed
+// session would share ONE marker across every hook on the machine, and an
+// unrelated later occurrence would wrongly read "already claimed".
+func TestHookClaimOccurrence_EmptySessionNeverDedupes(t *testing.T) {
+	isolateHookStateDir(t)
+
+	if !hookClaimOccurrence("", "user-prompt-submit", "same text") {
+		t.Error("first call with an empty session id must claim")
+	}
+	if !hookClaimOccurrence("", "user-prompt-submit", "same text") {
+		t.Error("a second call with an empty session id must ALSO claim — no dedup without a session to key on")
+	}
+}
+
+// TestHookClaimState_NonExistErrorFailsOpen is the claim-dir-failure case
+// hookClaimOccurrence inherits from hookClaimState unchanged: a creation
+// failure that is NOT os.ErrExist must report true (proceed with the save), not
+// false (silently skip it). A NUL byte is invalid in a path on every OS Go
+// supports and is rejected by the os package itself before any syscall — a
+// portable stand-in for a permission error or a hostile antivirus lock, which
+// this test cannot reliably provoke by name.
+func TestHookClaimState_NonExistErrorFailsOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad\x00path")
+
+	if !hookClaimState(path) {
+		t.Errorf("hookClaimState(%q) = false, want true — a non-ErrExist failure must fail OPEN "+
+			"(duplicates are better than a lost save)", path)
+	}
+}
+
+// TestHookSessionEnd_ClearsOccurrenceMarkers proves hookClearState's cleanup
+// covers occurrence markers too: without it, the state directory would grow one
+// file per distinct prompt/report per session, forever, exactly as the comment
+// on hookClearState warns.
+func TestHookSessionEnd_ClearsOccurrenceMarkers(t *testing.T) {
+	dbPath, _ := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "occ-cleanup-repo")
+	sessionID := "hook-occ-cleanup-" + t.Name()
+
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "clean me up",
+	}, "--db", dbPath)
+
+	marker := hookOccurrenceMarkerFile(sessionID, "user-prompt-submit", "clean me up")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the prompt left no occurrence marker: %v", err)
+	}
+
+	_ = runHook(t, "session-end", map[string]any{
+		"session_id": sessionID, "cwd": repo,
+	}, "--db", dbPath)
+
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("session-end left the occurrence marker %q behind (%v)", marker, err)
+	}
+}
+
+// TestHookSweepStaleOccurrenceMarkers_RemovesOnlyStaleOnes is the TTL backstop
+// for a session that never reaches session-end (a crashed agent). It must
+// remove a marker older than hookOccurrenceMarkerTTL and leave a fresh one
+// alone — the sweep runs on every occurrence claim, so a sweep that deleted
+// everything would make the dedup it backs up worthless.
+func TestHookSweepStaleOccurrenceMarkers_RemovesOnlyStaleOnes(t *testing.T) {
+	isolateHookStateDir(t)
+
+	stale := hookOccurrenceMarkerFile("stale-session", "user-prompt-submit", "old")
+	fresh := hookOccurrenceMarkerFile("fresh-session", "user-prompt-submit", "new")
+	if !hookClaimState(stale) {
+		t.Fatal("could not create the stale marker fixture")
+	}
+	if !hookClaimState(fresh) {
+		t.Fatal("could not create the fresh marker fixture")
+	}
+	ageHookState(t, stale, hookOccurrenceMarkerTTL+time.Hour)
+
+	// Force the sweep to run now regardless of its own cooldown.
+	if err := os.Remove(hookOccurrenceSweepMarkerFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("could not reset the sweep cooldown: %v", err)
+	}
+	hookSweepStaleOccurrenceMarkers()
+
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the sweep left the stale marker behind (%v)", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("the sweep removed a marker well inside its TTL: %v", err)
+	}
+}
+
 // ─── budgets ────────────────────────────────────────────────────────────────
 
 // TestHookBudgets_FitInsideEveryPackTimeout is the guard the Codex session-end

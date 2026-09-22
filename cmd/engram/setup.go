@@ -94,6 +94,12 @@ func runSetupHooksCmd(args []string) error {
 		return fmt.Errorf("setup hooks: read %s: %w", path, err)
 	}
 
+	// Before merging: the plugin pack and this merge both install identical
+	// hook commands, so a host with both active fires every event twice. The
+	// runtime survives that (see hookClaimOccurrence in hook.go), but the
+	// heads-up belongs here, ahead of the write that is about to make it worse.
+	warnIfPluginAlsoInstalled(*agent, existing)
+
 	merged, added, err := mergeHookSettings(existing, engramHookPack(*agent))
 	if err != nil {
 		return fmt.Errorf("setup hooks: %s: %w", path, err)
@@ -268,6 +274,72 @@ func hookSettingsPath(agent string) (string, error) {
 	default:
 		return "", fmt.Errorf("setup hooks: unknown agent %q (want claude-code or codex)", agent)
 	}
+}
+
+// hookPluginWarningAgent restricts the duplicate-install detection below to the
+// one host it is calibrated against: Claude Code's own settings.json. Codex has
+// no plugin-marketplace concept as of this writing, so there is nothing there
+// for `engram setup hooks` to conflict with.
+const hookPluginWarningAgent = "claude-code"
+
+// warnIfPluginAlsoInstalled prints a one-line, best-effort warning when
+// existing — the agent's settings.json, read BEFORE this run's merge — shows
+// the engram Claude Code plugin as installed/enabled. Both install paths
+// register the identical hook commands (engramHookPack / plugin/claude-code),
+// so a host with both active fires every event twice.
+//
+// Detection is DELIBERATELY conservative: Claude Code's enabledPlugins shape
+// is not something this binary can rely on staying stable, so
+// pluginEntryMentionsEngram only recognizes the two shapes below and says
+// nothing for anything else — silence on an undetectable shape costs one
+// stderr line; a false positive costs trust in every other line this command
+// prints. That is also why this only fires for claude-code and only when the
+// key is present and non-empty: no file, no opinion.
+func warnIfPluginAlsoInstalled(agent string, existing []byte) {
+	if !strings.EqualFold(strings.TrimSpace(agent), hookPluginWarningAgent) || len(bytes.TrimSpace(existing)) == 0 {
+		return
+	}
+	var doc struct {
+		EnabledPlugins json.RawMessage `json:"enabledPlugins"`
+	}
+	if err := json.Unmarshal(existing, &doc); err != nil || len(doc.EnabledPlugins) == 0 {
+		return
+	}
+	if !pluginEntryMentionsEngram(doc.EnabledPlugins) {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "Warning: the engram Claude Code plugin also appears to be installed/enabled "+
+		"in this settings.json. The plugin and `engram setup hooks` register the SAME hooks — with both "+
+		"active, every event runs twice (engram deduplicates the resulting saves at runtime, but you still "+
+		"pay for two process launches per event). Use one or the other: either "+
+		"`claude plugin uninstall engram@engram`, or remove the hooks this command is about to (re)install.")
+}
+
+// pluginEntryMentionsEngram reports whether raw — Claude Code's enabledPlugins
+// value, whose exact schema is unverified — names the engram plugin under
+// either of the two shapes this binary knows how to read: a map keyed by
+// plugin id ("engram@engram": true, the same id `claude plugin install` takes)
+// or a flat list of enabled plugin ids. Any other shape is left alone rather
+// than guessed at.
+func pluginEntryMentionsEngram(raw json.RawMessage) bool {
+	var asMap map[string]bool
+	if err := json.Unmarshal(raw, &asMap); err == nil {
+		for key, enabled := range asMap {
+			if enabled && strings.Contains(strings.ToLower(key), "engram") {
+				return true
+			}
+		}
+		return false
+	}
+	var asList []string
+	if err := json.Unmarshal(raw, &asList); err == nil {
+		for _, id := range asList {
+			if strings.Contains(strings.ToLower(id), "engram") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hookEntry is one command hook inside a matcher group.
