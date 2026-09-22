@@ -19,6 +19,7 @@ package localstore
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -215,18 +216,26 @@ func enqueueOutboxTx(tx *sql.Tx, m domain.Mutation) error {
 	return nil
 }
 
-// DrainOutbox returns the pending (acked_at IS NULL) outbox entries in local
-// push order (local_seq ASC), up to limit. limit <= 0 returns all pending rows.
+// DrainOutbox returns the pending (acked_at IS NULL AND parked_at IS NULL)
+// outbox entries in local push order (local_seq ASC), up to limit. limit <= 0
+// returns all pending rows.
 //
 // Each entry's Mutation is reconstructed from the stored canonical Payload via
 // mutation.FromCanonicalPayload, then the identity/ordering fields that live in
 // the row but not in the payload (MutationID, OccurredAt, Payload) are filled in.
 // The entry is ready to push to central exactly as-is.
+//
+// parked_at IS NULL excludes entries Push has already given up on (see
+// ParkMutation): central permanently rejected one, or — the case handled right
+// here — this node could never decode its own stored payload (a pre-fix
+// NUL-byte row). A row that fails to decode is PARKED with the decode error as
+// last_error and skipped, rather than failing the whole call: one bad row must
+// not wedge every other project's push behind it forever.
 func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 	q := `
 		SELECT local_seq, mutation_id, payload, occurred_at
 		FROM sync_mutations
-		WHERE acked_at IS NULL
+		WHERE acked_at IS NULL AND parked_at IS NULL
 		ORDER BY local_seq ASC`
 	args := []any{}
 	if limit > 0 {
@@ -238,9 +247,18 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("DrainOutbox: query: %w", err)
 	}
-	defer rows.Close()
 
+	// undecodable collects rows to park AFTER rows is closed below — the local
+	// store's single connection (SetMaxOpenConns(1)) means an UPDATE issued
+	// while this SELECT's rows are still open would deadlock waiting for the
+	// very connection they are holding.
+	type undecodableRow struct {
+		localSeq int64
+		reason   string
+	}
 	var out []OutboxEntry
+	var undecodable []undecodableRow
+
 	for rows.Next() {
 		var (
 			localSeq      int64
@@ -249,25 +267,43 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 			occurredAtStr string
 		)
 		if err := rows.Scan(&localSeq, &mutationID, &payload, &occurredAtStr); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("DrainOutbox: scan: %w", err)
 		}
 
-		m, err := mutation.FromCanonicalPayload([]byte(payload))
-		if err != nil {
-			return nil, fmt.Errorf("DrainOutbox: decode payload (mutation_id=%s): %w", mutationID, err)
+		m, decErr := mutation.FromCanonicalPayload([]byte(payload))
+		if decErr != nil {
+			undecodable = append(undecodable, undecodableRow{
+				localSeq: localSeq,
+				reason:   fmt.Sprintf("DrainOutbox: decode payload (mutation_id=%s): %v", mutationID, decErr),
+			})
+			continue
 		}
 		m.MutationID = mutationID
 		m.Payload = []byte(payload)
 		t := parseTime(occurredAtStr)
 		if t.IsZero() {
-			return nil, fmt.Errorf("DrainOutbox: mutation_id=%s: occurred_at %q is not a valid timestamp", mutationID, occurredAtStr)
+			undecodable = append(undecodable, undecodableRow{
+				localSeq: localSeq,
+				reason: fmt.Sprintf("DrainOutbox: mutation_id=%s: occurred_at %q is not a valid timestamp",
+					mutationID, occurredAtStr),
+			})
+			continue
 		}
 		m.OccurredAt = t
 
 		out = append(out, OutboxEntry{LocalSeq: localSeq, Mutation: m})
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("DrainOutbox: rows: %w", err)
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return nil, fmt.Errorf("DrainOutbox: rows: %w", rowsErr)
+	}
+
+	for _, b := range undecodable {
+		if err := s.ParkMutation(b.localSeq, b.reason); err != nil {
+			return nil, fmt.Errorf("DrainOutbox: park undecodable row (local_seq=%d): %w", b.localSeq, err)
+		}
 	}
 	return out, nil
 }
@@ -329,6 +365,188 @@ func (s *Store) AckMutation(localSeq int64) error {
 		return fmt.Errorf("AckMutation: commit: %w", err)
 	}
 	return nil
+}
+
+// ── outbox failure tracking / parking (FUP-004) ─────────────────────────────
+//
+// central can reject a pushed mutation PERMANENTLY (HTTP 400/413/422 —
+// malformed, too large, or a deterministic data problem transport.ErrPermanent
+// classifies) instead of transiently (5xx, network trouble). Resending a
+// permanent rejection every push cycle forever accomplishes nothing but noise
+// and wasted round-trips, so the syncer parks that single outbox entry instead:
+// DrainOutbox stops returning it, but it stays UNACKED (never silently
+// discarded) so an operator can inspect, retry, or explicitly discard it.
+
+// ErrMutationNotParked is returned by UnparkMutation and DiscardMutation when
+// localSeq does not name a currently-parked, unacked row — either it was never
+// parked, it was already un-parked/discarded, or it does not exist.
+var ErrMutationNotParked = errors.New("localstore: local_seq is not a parked outbox entry")
+
+// RecordPushFailure stamps a RETRYABLE push failure (a 5xx, a network error,
+// or anything the syncer did not classify as permanent): attempts is
+// incremented and last_error/last_attempt_at are updated. parked_at is left
+// untouched — the entry remains fully pending, and DrainOutbox will return it
+// again on the next push cycle. A no-op (not an error) if localSeq is already
+// acked or does not exist: this is best-effort visibility, not a correctness
+// guard, and must never be the reason a push cycle fails.
+func (s *Store) RecordPushFailure(localSeq int64, errMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`UPDATE sync_mutations
+		   SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
+		 WHERE local_seq = ? AND acked_at IS NULL`,
+		errMsg, now, localSeq,
+	); err != nil {
+		return fmt.Errorf("RecordPushFailure(%d): %w", localSeq, err)
+	}
+	return nil
+}
+
+// ParkMutation marks a single outbox entry as permanently rejected: central
+// will never accept it as pushed, so the entry must stop being resent, but it
+// stays UNACKED (parked, not silently dropped) so `engram sync retry` can
+// un-park it later. attempts/last_error/last_attempt_at are stamped the same
+// as RecordPushFailure — a park IS a failure, just one the syncer has stopped
+// retrying on its own. A no-op (not an error) if localSeq is already acked or
+// does not exist, for the same reason as RecordPushFailure.
+func (s *Store) ParkMutation(localSeq int64, errMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`UPDATE sync_mutations
+		   SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?, parked_at = ?
+		 WHERE local_seq = ? AND acked_at IS NULL`,
+		errMsg, now, now, localSeq,
+	); err != nil {
+		return fmt.Errorf("ParkMutation(%d): %w", localSeq, err)
+	}
+	return nil
+}
+
+// UnparkMutation clears parked_at and resets attempts to 0, making the entry
+// eligible for DrainOutbox again on the next push cycle — the `engram sync
+// retry` primitive. last_error/last_attempt_at are left as a historical
+// record of why it was parked; the next real attempt overwrites them.
+// Returns ErrMutationNotParked if localSeq does not currently name a parked,
+// unacked row.
+func (s *Store) UnparkMutation(localSeq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(
+		`UPDATE sync_mutations SET parked_at = NULL, attempts = 0
+		 WHERE local_seq = ? AND acked_at IS NULL AND parked_at IS NOT NULL`,
+		localSeq,
+	)
+	if err != nil {
+		return fmt.Errorf("UnparkMutation(%d): %w", localSeq, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("UnparkMutation(%d): rows affected: %w", localSeq, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("UnparkMutation(%d): %w", localSeq, ErrMutationNotParked)
+	}
+	return nil
+}
+
+// DiscardMutation marks a parked entry as acked WITHOUT ever pushing it — the
+// operator has decided this mutation's effect is not worth reconciling
+// centrally. It sets acked_at, the SAME field a successful push sets, so
+// DrainOutbox never returns it again; parked_at (and attempts/last_error) are
+// left in place so the row still reads as "discarded, not pushed" in any later
+// audit rather than looking like an ordinary successful push.
+//
+// A hard DELETE was considered and rejected: sync_mutations is this node's
+// only durable record that the mutation was ever attempted, and deleting it
+// buys nothing central doesn't already guarantee on its own (mutation_id is
+// UNIQUE there, so a resurrected local copy could never silently re-apply
+// either way) — keeping the row is strictly safer than discarding evidence.
+// Returns ErrMutationNotParked if localSeq does not currently name a parked,
+// unacked row.
+func (s *Store) DiscardMutation(localSeq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(
+		`UPDATE sync_mutations SET acked_at = ?
+		 WHERE local_seq = ? AND acked_at IS NULL AND parked_at IS NOT NULL`,
+		now, localSeq,
+	)
+	if err != nil {
+		return fmt.Errorf("DiscardMutation(%d): %w", localSeq, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("DiscardMutation(%d): rows affected: %w", localSeq, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("DiscardMutation(%d): %w", localSeq, ErrMutationNotParked)
+	}
+	return nil
+}
+
+// ParkedEntry is one parked outbox row — visibility-only, for mem_doctor and
+// `engram sync parked`.
+type ParkedEntry struct {
+	LocalSeq   int64
+	MutationID string
+	Entity     string
+	// Project is decoded from the stored payload on a best-effort basis: a row
+	// parked because ITS OWN payload could not be decoded (see DrainOutbox)
+	// reports "" here rather than failing the whole listing — local_seq and
+	// LastError are the useful fields for that case, and both are retry/
+	// discard by local_seq, which needs no successful decode.
+	Project       string
+	Attempts      int
+	LastError     string
+	LastAttemptAt time.Time
+	ParkedAt      time.Time
+}
+
+// ListParked returns every parked (never-to-be-resent) outbox entry, oldest
+// (lowest local_seq) first.
+func (s *Store) ListParked() ([]ParkedEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT local_seq, mutation_id, entity, payload,
+		       attempts, COALESCE(last_error, ''), COALESCE(last_attempt_at, ''), COALESCE(parked_at, '')
+		FROM sync_mutations
+		WHERE parked_at IS NOT NULL AND acked_at IS NULL
+		ORDER BY local_seq ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("ListParked: query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ParkedEntry
+	for rows.Next() {
+		var (
+			e                         ParkedEntry
+			payload                   string
+			lastAttemptRaw, parkedRaw string
+		)
+		if err := rows.Scan(&e.LocalSeq, &e.MutationID, &e.Entity, &payload,
+			&e.Attempts, &e.LastError, &lastAttemptRaw, &parkedRaw); err != nil {
+			return nil, fmt.Errorf("ListParked: scan: %w", err)
+		}
+		if m, decErr := mutation.FromCanonicalPayload([]byte(payload)); decErr == nil {
+			e.Project = m.Project
+		}
+		e.LastAttemptAt = parseTime(lastAttemptRaw)
+		e.ParkedAt = parseTime(parkedRaw)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListParked: rows: %w", err)
+	}
+	return out, nil
 }
 
 // PendingCount returns the number of unacked rows currently in the outbox.

@@ -42,7 +42,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-003 — Duplicate-install hook protection** — Route: delegated writer
 - [x] **FUP-003b — Dedup only near-simultaneous deliveries** — Route: delegated writer
 - [x] **FUP-004a — Server: 422 for permanent Apply errors** — Route: delegated writer
-- [ ] **FUP-004b — Client: park permanently rejected outbox entries** — Route: delegated writer
+- [x] **FUP-004b — Client: park permanently rejected outbox entries** — Route: delegated writer
 - [ ] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
 - [ ] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
 - [ ] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
@@ -186,9 +186,54 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   needed); acceptance-tagged Postgres tests were not run (see report).
   Commit: pending (recorded after commit).
 
+- FUP-004b done (delegated writer). Schema v16 adds sync_mutations
+  attempts/last_error/last_attempt_at/parked_at (ALTER, guarded by
+  columnExists like v2→v3) plus idx_sync_mutations_drain ON
+  (acked_at, parked_at, local_seq). Gotcha: ApplySchema runs on every Open,
+  BEFORE runMigrations, and CREATE TABLE IF NOT EXISTS no-ops against an
+  EXISTING legacy sync_mutations table — an unconditional CREATE INDEX
+  naming parked_at in ApplySchema's stmts list therefore failed
+  ("no such column: parked_at") against the v0/v4 legacy-DB test fixtures the
+  instant this binary opened them, since the column does not exist until
+  migrateV15ToV16 runs afterward. Fixed by moving the index creation out of
+  the unconditional stmts list into a columnExists-guarded call after the
+  loop (skips on a legacy DB; migrateV15ToV16 creates the identical
+  idxSyncMutationsDrainDDL once the column exists).
+  localstore/sync.go: new Store.ParkMutation/RecordPushFailure/
+  UnparkMutation/DiscardMutation/ListParked + ParkedEntry +
+  ErrMutationNotParked. DrainOutbox now filters `parked_at IS NULL` and, on a
+  decode failure, parks that one row (AFTER closing the SELECT's rows —
+  SetMaxOpenConns(1) would deadlock an UPDATE issued while rows are still
+  open) instead of failing the whole call.
+  syncer/syncer.go: Push classifies each Apply failure via isParkableRejection
+  (400/413/422 → ParkMutation, stop only that sync_id's group, do not cancel
+  siblings) vs. everything else (RecordPushFailure, propagate — cancels
+  siblings as before). SyncAllProjects now classifies a non-nil push error via
+  isFatalPushError (401/403): fatal skips pull entirely (unchanged from
+  before); every other push failure (parked or retryable) is folded into the
+  existing errs aggregate and pull proceeds regardless — the literal "push
+  failure must no longer skip pull" requirement.
+  Tests added: `internal/localstore/outbox_park_test.go` (8 tests: park
+  excludes from DrainOutbox, ListParked visibility incl. decoded project,
+  unpark restores + resets attempts, unpark/discard error on a non-parked
+  seq, discard excludes permanently, RecordPushFailure without parking,
+  DrainOutbox parks an undecodable row and keeps draining the rest).
+  `internal/syncer/park_test.go` (6 tests: park on 422, group-stop-only
+  (two versions of one sync_id, second never reaches Apply; a different
+  group unaffected), retryable failure records+propagates+not-parked,
+  401/403 skips pull entirely incl. zero PullSince calls, 422 still pulls,
+  network-error-with-no-status still pulls). No existing assertion changed;
+  every pre-existing syncer test (including
+  TestSyncAllProjects_PartialFailure, which predates FUP-004 and exercises
+  the old early-return shape) still passes unmodified.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1` (ENGRAM_DSN unset): all
+  packages ok except the three known environmental failures.
+  `go test ./internal/spike/... -tags acceptance -count=1`: ok (convergence
+  proofs unaffected).
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-004b (client: park permanently rejected outbox entries — schema v16 +
-sync_mutations attempts/last_error/parked_at + Push/DrainOutbox changes),
-then FUP-004c (NUL repair), FUP-004d (doctor + CLI), then FUP-005a/b/c
-(created_at on the wire).
+FUP-004c (NUL repair), FUP-004d (doctor + CLI for parked mutations), then
+FUP-005a/b/c (created_at on the wire).

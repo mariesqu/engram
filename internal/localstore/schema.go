@@ -192,7 +192,24 @@ import (
 //	queries fell back to a full table scan. Both indexes are additive expression
 //	indexes (CREATE INDEX IF NOT EXISTS), so a fresh DB where ApplySchema already
 //	created them is a no-op here.
-const currentSchemaVersion = 15
+//
+// v15 → v16: add sync_mutations.attempts/last_error/last_attempt_at/parked_at
+//
+//	(FUP-004). Central can now reject a push permanently (HTTP 422, or a 400/413
+//	the mutation itself can never outlive) instead of every failure being a
+//	transient 5xx to retry forever. attempts/last_error/last_attempt_at record
+//	EVERY push failure for an entry (retried or parked) for operator visibility
+//	(mem_doctor, `engram sync parked`); parked_at IS NOT NULL marks an entry
+//	DrainOutbox must skip — it stopped pushing on its own but was never acked,
+//	so the plain "acked_at IS NULL" pending definition would otherwise resend it
+//	forever. idx_sync_mutations_drain ON (acked_at, parked_at, local_seq) backs
+//	DrainOutbox's WHERE acked_at IS NULL AND parked_at IS NULL ORDER BY
+//	local_seq — an index a fresh, small outbox table does not need YET, but a
+//	node with a long-parked backlog does. All four columns are additive
+//	(ALTER TABLE ADD COLUMN, guarded by PRAGMA table_info like v2→v3's
+//	last_write_mutation_id), and the index is CREATE INDEX IF NOT EXISTS, so a
+//	fresh DB where ApplySchema already created them is a no-op here.
+const currentSchemaVersion = 16
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -603,9 +620,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 15
 	}
 
+	if ver < 16 {
+		if err := migrateV15ToV16(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 16
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 15` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 16` migration block.
+	// the final `ver = 16` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 17` migration block.
 	_ = ver
 	return nil
 }
@@ -1482,6 +1507,57 @@ func migrateV14ToV15(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// idxSyncMutationsDrainDDL backs DrainOutbox's actual predicate (acked_at IS
+// NULL AND parked_at IS NULL, ordered by local_seq) — shared between
+// ApplySchema and migrateV15ToV16 so both install the identical index.
+const idxSyncMutationsDrainDDL = `CREATE INDEX IF NOT EXISTS idx_sync_mutations_drain
+	ON sync_mutations(acked_at, parked_at, local_seq)`
+
+// migrateV15ToV16 adds sync_mutations.attempts/last_error/last_attempt_at/
+// parked_at and idx_sync_mutations_drain — see the currentSchemaVersion v15→v16
+// note above for the FUP-004 rationale. Each ADD COLUMN is guarded by
+// PRAGMA table_info (the v2→v3 pattern) so a fresh DB — where ApplySchema
+// already created every column from sync_mutations' current DDL — is a no-op.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 15.
+func migrateV15ToV16(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	for _, col := range []struct{ name, ddl string }{
+		{"attempts", `ALTER TABLE sync_mutations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`},
+		{"last_error", `ALTER TABLE sync_mutations ADD COLUMN last_error TEXT`},
+		{"last_attempt_at", `ALTER TABLE sync_mutations ADD COLUMN last_attempt_at TEXT`},
+		{"parked_at", `ALTER TABLE sync_mutations ADD COLUMN parked_at TEXT`},
+	} {
+		exists, err := columnExists(tx, "sync_mutations", col.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue // fresh DB — ApplySchema already added the column
+		}
+		if _, err := tx.Exec(col.ddl); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(idxSyncMutationsDrainDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 16`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1524,16 +1600,25 @@ func ApplySchema(db *sql.DB) error {
 		memoryRelationsTableDDL,
 
 		// ── sync_mutations — outbound push journal ───────────────────────────
+		// attempts/last_error/last_attempt_at/parked_at (v16, FUP-004): every push
+		// failure for an entry is recorded here for operator visibility; parked_at
+		// marks an entry central has permanently rejected (or whose payload this
+		// node could not even decode) — DrainOutbox excludes it so it is never
+		// resent, but it stays UNACKED so `engram sync retry` can un-park it.
 		`CREATE TABLE IF NOT EXISTS sync_mutations (
-			local_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
-			mutation_id  TEXT    NOT NULL UNIQUE,
-			entity       TEXT    NOT NULL DEFAULT '',
-			entity_key   TEXT    NOT NULL DEFAULT '',
-			op           TEXT    NOT NULL CHECK(op IN ('upsert','delete')),
-			payload      TEXT    NOT NULL DEFAULT '',
-			writer_id    TEXT    NOT NULL DEFAULT '',
-			occurred_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-			acked_at     TEXT
+			local_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+			mutation_id     TEXT    NOT NULL UNIQUE,
+			entity          TEXT    NOT NULL DEFAULT '',
+			entity_key      TEXT    NOT NULL DEFAULT '',
+			op              TEXT    NOT NULL CHECK(op IN ('upsert','delete')),
+			payload         TEXT    NOT NULL DEFAULT '',
+			writer_id       TEXT    NOT NULL DEFAULT '',
+			occurred_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+			acked_at        TEXT,
+			attempts        INTEGER NOT NULL DEFAULT 0,
+			last_error      TEXT,
+			last_attempt_at TEXT,
+			parked_at       TEXT
 		)`,
 
 		// ── sync_state — tracks last push-ack and last pull seq ──────────────
@@ -1648,6 +1733,10 @@ func ApplySchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_prompt_tomb_project
 			ON prompt_tombstones(project)`,
 
+		// idx_sync_mutations_drain (v16) is installed separately below, AFTER this
+		// loop — see the comment there for why it cannot be a plain entry in this
+		// list.
+
 		// ── FTS5 virtual table over memories ────────────────────────────────
 		// content=memories with content_rowid=id means FTS is a shadow/external
 		// index: we manage it manually via triggers.
@@ -1669,6 +1758,24 @@ func ApplySchema(db *sql.DB) error {
 
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
+			return err
+		}
+	}
+
+	// idx_sync_mutations_drain names parked_at, a column that exists on a FRESH
+	// DB (the CREATE TABLE above already declares it) but NOT on a pre-v16
+	// database — ApplySchema runs on EVERY Open, before runMigrations, and
+	// CREATE TABLE IF NOT EXISTS above is a no-op against an existing legacy
+	// sync_mutations table, so an unconditional CREATE INDEX here would fail
+	// with "no such column: parked_at" the instant a pre-v16 DB is opened by
+	// this binary. Skipping it here for that case is safe: migrateV15ToV16 adds
+	// the column AND creates this same index (idxSyncMutationsDrainDDL, the
+	// identical statement) immediately afterward, inside runMigrations, once
+	// the column genuinely exists.
+	if exists, err := columnExists(db, "sync_mutations", "parked_at"); err != nil {
+		return err
+	} else if exists {
+		if _, err := db.Exec(idxSyncMutationsDrainDDL); err != nil {
 			return err
 		}
 	}

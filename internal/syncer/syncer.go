@@ -221,7 +221,8 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 	// sync_id (entries applied in local_seq = version order within one goroutine)
 	// preserves each identity's apply order, while DISTINCT identities — the
 	// overwhelming majority of a backlog — still run in parallel. SetLimit throttles
-	// to pushConcurrency() groups; the first error cancels gctx so the rest stop.
+	// to pushConcurrency() groups; the first NON-PARK error cancels gctx so the
+	// rest stop (see below — a park does NOT cancel).
 	var pushed atomic.Int64
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(pushConcurrency())
@@ -235,14 +236,39 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 				if gctx.Err() != nil {
 					return gctx.Err() // a sibling failed or ctx cancelled — stop this identity
 				}
-				if err := central.Apply(gctx, j.mutation); err != nil {
-					return fmt.Errorf("push %s: central.Apply(local_seq=%d, mutation_id=%s): %w",
-						n.Name, j.localSeq, j.mutation.MutationID, err)
+				applyErr := central.Apply(gctx, j.mutation)
+				if applyErr == nil {
+					if err := n.Store.AckMutation(j.localSeq); err != nil {
+						return fmt.Errorf("push %s: ack(local_seq=%d): %w", n.Name, j.localSeq, err)
+					}
+					pushed.Add(1)
+					continue
 				}
-				if err := n.Store.AckMutation(j.localSeq); err != nil {
-					return fmt.Errorf("push %s: ack(local_seq=%d): %w", n.Name, j.localSeq, err)
+
+				wrapped := fmt.Errorf("push %s: central.Apply(local_seq=%d, mutation_id=%s): %w",
+					n.Name, j.localSeq, j.mutation.MutationID, applyErr)
+
+				if isParkableRejection(applyErr) {
+					// Central rejected THIS mutation permanently (400/413/422) — no
+					// retry will ever succeed. Park it and STOP this group here: order
+					// matters within one sync_id's version chain, so a later entry in
+					// the SAME group must not apply out of turn while an earlier one
+					// sits rejected. Returning nil (not the error) is deliberate: other
+					// groups are unaffected and must keep going — gctx is not cancelled.
+					if err := n.Store.ParkMutation(j.localSeq, wrapped.Error()); err != nil {
+						return fmt.Errorf("push %s: park(local_seq=%d): %w", n.Name, j.localSeq, err)
+					}
+					return nil
 				}
-				pushed.Add(1)
+
+				// Retryable (5xx, network) or fatal (401/403) — recorded either way for
+				// operator visibility (mem_doctor / `engram sync parked` reads
+				// last_error even on a never-parked, still-pending row), then
+				// propagated so the caller can classify retryable-vs-fatal.
+				if err := n.Store.RecordPushFailure(j.localSeq, wrapped.Error()); err != nil {
+					return fmt.Errorf("push %s: record failure(local_seq=%d): %w", n.Name, j.localSeq, err)
+				}
+				return wrapped
 			}
 			return nil
 		})
@@ -504,27 +530,39 @@ func Sync(ctx context.Context, n *Node, central Central, project string) (pushed
 // unchanged, so a future flip to synced resumes pulling from where it left off
 // (pull is idempotent via per-project cursors + INV5).
 //
-// Error policy: Push errors short-circuit immediately (outbox integrity matters).
-// For Pull, every project is attempted even if earlier ones fail; all errors are
-// collected into a single joined error so the Loop can classify retryability.
-// The Loop backs off if ANY underlying error is retryable (any project's pull
-// failure is transient until proven otherwise). A project pull failure does NOT
-// rewind that project's cursor — per-project cursors + INV5 (applied_mutations)
-// make re-pulls idempotent.
+// Error policy (FUP-004): a permanently-rejected outbox entry is PARKED by
+// Push itself and never surfaces as an error here — see Push's doc comment.
+// What Push CAN still return is a retryable failure (5xx, network) or a fatal
+// one (401/403, an authentication problem). Only the fatal case short-circuits
+// pull: the SAME broken credential would fail pull identically, so there is
+// nothing pull could add this round. Every other push failure is recorded into
+// errs and pull proceeds anyway — pull is independent of the outbox, and
+// central may still have mutations worth applying even while this node's own
+// push is stuck. For Pull, every project is attempted even if earlier ones
+// fail; all errors (the push failure included) are collected into a single
+// joined error so the Loop can classify retryability. The Loop backs off if
+// ANY underlying error is retryable (any project's pull failure, or the push
+// failure itself, is transient until proven otherwise). A project pull failure
+// does NOT rewind that project's cursor — per-project cursors + INV5
+// (applied_mutations) make re-pulls idempotent.
 //
 // Returns (pushed, totalPulled, error).
 func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pulled int, err error) {
-	pushed, err = Push(ctx, n, central)
-	if err != nil {
-		return pushed, 0, fmt.Errorf("SyncAllProjects %s: push: %w", n.Name, err)
+	var errs []error
+
+	pushed, pushErr := Push(ctx, n, central)
+	if pushErr != nil {
+		wrapped := fmt.Errorf("SyncAllProjects %s: push: %w", n.Name, pushErr)
+		if isFatalPushError(pushErr) {
+			return pushed, 0, wrapped
+		}
+		errs = append(errs, wrapped)
 	}
 
 	projects, err := n.Store.ListProjects()
 	if err != nil {
 		return pushed, 0, fmt.Errorf("SyncAllProjects %s: list projects: %w", n.Name, err)
 	}
-
-	var errs []error
 
 	// New-project pull discovery: ListProjects above reads only the LOCAL store,
 	// so a node would never pull a project it has not written to itself. To honor
@@ -633,6 +671,59 @@ func isDiscoveryUnsupported(err error) bool {
 		return code == httpStatusNotFound || code == httpStatusNotImplemented
 	}
 	return false
+}
+
+// HTTP statuses Push classifies from a central.Apply failure (FUP-004),
+// mirrored here without importing net/http, the same discipline as the
+// discovery statuses above:
+//   - 400/413: the request itself is rejected before Apply even runs — malformed
+//     or too large. Neither will ever succeed unmodified.
+//   - 422: cloudserve's mapping of transport.ErrPermanent — a DETERMINISTIC data
+//     problem (our own validation, or a Postgres data exception / constraint
+//     violation) central's Apply detected. Also never succeeds unmodified.
+//   - 401/403: authentication/authorization failure. Not this mutation's fault —
+//     every OTHER push and the pull that would follow would fail identically —
+//     so this is FATAL to the whole sync cycle, not a single-entry park.
+const (
+	httpStatusBadRequest          = 400
+	httpStatusUnauthorized        = 401
+	httpStatusForbidden           = 403
+	httpStatusRequestTooLarge     = 413
+	httpStatusUnprocessableEntity = 422
+)
+
+// isParkableRejection reports whether err is a central rejection so specific
+// to THIS mutation that retrying it unmodified can never succeed (400, 413, or
+// 422 — see the status table above). Push parks the single outbox entry on a
+// true result rather than retrying it forever.
+func isParkableRejection(err error) bool {
+	var sc statusCoder
+	if !errors.As(err, &sc) {
+		return false // no status at all — a network error, not a rejection
+	}
+	switch sc.StatusCode() {
+	case httpStatusBadRequest, httpStatusRequestTooLarge, httpStatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+// isFatalPushError reports whether err is an authentication/authorization
+// failure (401/403) — the one push failure that must stop the WHOLE sync round
+// (including pull; see SyncAllProjects) rather than letting it continue
+// degraded, because the SAME broken credential would fail pull identically.
+func isFatalPushError(err error) bool {
+	var sc statusCoder
+	if !errors.As(err, &sc) {
+		return false
+	}
+	switch sc.StatusCode() {
+	case httpStatusUnauthorized, httpStatusForbidden:
+		return true
+	default:
+		return false
+	}
 }
 
 // unionProjects merges two project-name slices into a sorted, de-duplicated set,
