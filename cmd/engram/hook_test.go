@@ -305,8 +305,15 @@ func TestHookSessionStart_NoDaemon_StillPrintsThePointer(t *testing.T) {
 	if !strings.Contains(out, "ENGRAM MEMORY IS ACTIVE") {
 		t.Errorf("session-start must print the pointer even with no daemon; got:\n%s", out)
 	}
-	if !strings.Contains(out, "mcp__engram__mem_current_project") {
+	if !strings.Contains(out, "mem_current_project") {
 		t.Errorf("the pointer must name the first call to make; got:\n%s", out)
+	}
+	// The pointer must work whether the host exposes engram via the global MCP
+	// registration (mcp__engram__X) or the Claude Code plugin install
+	// (mcp__plugin_engram_engram__X) — it must not hardcode either prefix.
+	if strings.Contains(out, hookToolPrefixGlobal+"mem_current_project") {
+		t.Errorf("the pointer must not hardcode %q, which a plugin install does not expose; got:\n%s",
+			hookToolPrefixGlobal+"mem_current_project", out)
 	}
 }
 
@@ -334,11 +341,18 @@ func TestHookUserPromptSubmit_FirstPromptBootstraps(t *testing.T) {
 		t.Errorf("hookEventName = %v, want UserPromptSubmit", specific["hookEventName"])
 	}
 	text, _ := specific["additionalContext"].(string)
-	if !strings.Contains(text, "mcp__engram__mem_current_project") {
+	if !strings.Contains(text, "call mem_current_project") {
 		t.Errorf("bootstrap does not tell the agent to call mem_current_project first: %q", text)
 	}
-	if !strings.Contains(text, "mcp__engram__mem_save") {
-		t.Errorf("bootstrap does not list the tool names: %q", text)
+	// The "Available tools" list is the one place this bootstrap intentionally
+	// carries fully-qualified names (for a host that defers tool loading), and
+	// it must work whichever install registered the server: both the global
+	// (mcp__engram__X) and the Claude Code plugin (mcp__plugin_engram_engram__X)
+	// forms must be present.
+	for _, want := range []string{hookToolPrefixGlobal + "mem_save", hookToolPrefixPlugin + "mem_save"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("bootstrap does not list %q: %q", want, text)
+		}
 	}
 	if _, ok := obj["systemMessage"]; ok {
 		t.Error("bootstrap used systemMessage, which is rendered in the terminal and never reaches the model")

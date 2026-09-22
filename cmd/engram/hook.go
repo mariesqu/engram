@@ -687,10 +687,10 @@ func hookProtocolPointer(project string) string {
 	b.WriteString("ENGRAM MEMORY IS ACTIVE. The full protocol (save format, lifecycle, search flow, " +
 		"after-compaction steps) is delivered by the Engram MCP server's own instructions — follow it " +
 		"without being asked.\n")
-	b.WriteString("Open with mcp__engram__mem_current_project to confirm which project this session is filed " +
-		"under, then mcp__engram__mem_context for prior history.\n")
-	b.WriteString("Save proactively with mcp__engram__mem_save after any decision, bug fix, convention or " +
-		"non-obvious discovery — and close with mcp__engram__mem_session_summary.\n")
+	b.WriteString("Open with mem_current_project (provided by the engram MCP server) to confirm which project " +
+		"this session is filed under, then mem_context for prior history.\n")
+	b.WriteString("Save proactively with mem_save after any decision, bug fix, convention or " +
+		"non-obvious discovery — and close with mem_session_summary.\n")
 	if project != "" {
 		fmt.Fprintf(&b, "This session is registered under project %q.\n", project)
 	}
@@ -893,10 +893,24 @@ func hookPrintPromptOutput(firstPrompt bool, nudge string) {
 	fmt.Println(string(out))
 }
 
-// hookMCPToolNames are engram's MCP tool names as the host exposes them
-// (mcp__<server>__<tool> for a server registered as "engram"). The bootstrap
-// lists them because a host that defers tool loading will not surface a tool
-// until something names it.
+// hookToolPrefixGlobal and hookToolPrefixPlugin are the two fully-qualified
+// forms a host may register engram's tools under: mcp__<server>__<tool> for a
+// direct/global MCP registration (server name "engram"), and
+// mcp__plugin_<plugin>_<server>__<tool> for the Claude Code plugin install
+// (plugin/claude-code/.claude-plugin/plugin.json names the plugin "engram",
+// plugin/claude-code/.mcp.json names the server "engram" too, giving
+// "plugin_engram_engram"). Nothing at hook-execution time says which one a
+// given host used, so hookBootstrapContext lists both — see its own doc.
+const (
+	hookToolPrefixGlobal = "mcp__engram__"
+	hookToolPrefixPlugin = "mcp__plugin_engram_engram__"
+)
+
+// hookMCPToolNames are engram's MCP tool names, UNPREFIXED — the form every
+// narrative sentence in this file uses (see hookProtocolPointer,
+// hookSaveNudge): a bare name is valid regardless of which prefix the host
+// actually exposes, where a hardcoded prefix would name a tool that does not
+// exist under the other install.
 //
 // TestHookToolNames_MatchRegisteredTools pins this list against the tools the
 // daemon actually registers — a name here that the server does not serve is a
@@ -924,15 +938,25 @@ var hookMCPToolNames = []string{
 
 // hookBootstrapContext is the first-prompt injection: what to call first, and
 // what exists to be called.
+//
+// The "call X first" sentence uses BARE names (valid under any install), but
+// the "Available tools" list is the one place in this file that lists the
+// FULLY-QUALIFIED forms: a host that defers tool loading surfaces a tool only
+// once something names it as the host itself registered it, and nothing at
+// hook-execution time says whether that host used the global registration or
+// the plugin install. Listing both prefixes costs one longer line and
+// guarantees the real name is in there either way; a model that tries the
+// other form and gets "tool not found" still has its own tool list to fall
+// back to.
 func hookBootstrapContext() string {
-	prefixed := make([]string, 0, len(hookMCPToolNames))
+	prefixed := make([]string, 0, len(hookMCPToolNames)*2)
 	for _, name := range hookMCPToolNames {
-		prefixed = append(prefixed, "mcp__engram__"+name)
+		prefixed = append(prefixed, hookToolPrefixGlobal+name, hookToolPrefixPlugin+name)
 	}
-	return "ENGRAM MEMORY IS ACTIVE. Before answering, call mcp__engram__mem_current_project to confirm " +
-		"which project this session is filed under (it never errors; read fallback, writes_blocked and " +
-		"directory_exists), then mcp__engram__mem_context for prior session history.\n\n" +
-		"Available tools: " + strings.Join(prefixed, ", ")
+	return "ENGRAM MEMORY IS ACTIVE. Before answering, call mem_current_project (provided by the engram MCP " +
+		"server) to confirm which project this session is filed under (it never errors; read fallback, " +
+		"writes_blocked and directory_exists), then mem_context for prior session history.\n\n" +
+		"Available tools (exact name depends on how your host registered the \"engram\" MCP server): " + strings.Join(prefixed, ", ")
 }
 
 // hookSaveNudge returns the reminder text for this prompt, or "" for silence.
@@ -980,7 +1004,7 @@ func hookSaveNudge(ctx context.Context, client *mcpBridge, in hookInput, stateFi
 
 	return fmt.Sprintf("MEMORY REMINDER: nothing has been saved to project %q in over %d minutes. "+
 		"If decisions were made, a bug was fixed, or something non-obvious was learned since then, call "+
-		"mcp__engram__mem_save now — then answer the user.",
+		"mem_save now — then answer the user.",
 		project, int(hookNudgeMinSaveAge.Minutes()))
 }
 

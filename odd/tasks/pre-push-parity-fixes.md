@@ -35,9 +35,10 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
 
 - [x] **FIX-001 — Block daemon_cwd writes**
   - Route: delegated (writer; tools.go + hook.go + tests)
-  - Commit: recorded in the FIX-002 commit below (hash unknown until after commit)
-- [ ] **FIX-002 — Prefix-agnostic tool references in hooks**
+  - Commit: ef436fc
+- [x] **FIX-002 — Prefix-agnostic tool references in hooks**
   - Route: delegated (same writer)
+  - Commit: recorded in the FIX-003 commit below (hash unknown until after commit)
 - [ ] **FIX-003 — Non-escaping, symlink-safe settings writes**
   - Route: delegated (same writer)
 
@@ -73,6 +74,37 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
     environmental failures (TestRun_DaemonMissingDB,
     TestRun_DaemonCentralURLMissingWriterID, TestRun_DaemonCentralURLMissingWriterKey).
 
+- FIX-002 done. `cmd/engram/hook.go` hardcoded the `mcp__engram__` prefix in
+  three narrative places (hookProtocolPointer, hookBootstrapContext's "call X
+  first" sentence, hookSaveNudge) and in the "Available tools" list. Narrative
+  sentences now use BARE tool names + "provided by the engram MCP server" /
+  "(from the engram MCP server)" wording — a bare name is valid regardless of
+  which prefix the host actually exposes, so nothing there can name a
+  nonexistent tool. The "Available tools" list (hookBootstrapContext) is the
+  one place fully-qualified names matter: it exists specifically so a host
+  that defers MCP tool loading surfaces engram's tools once something names
+  them the way the host itself registered them, and the hook process cannot
+  tell at execution time whether the host used the global MCP registration
+  (`mcp__engram__X`) or the Claude Code plugin install
+  (`mcp__plugin_engram_engram__X`, from plugin.json naming the plugin
+  "engram" and .mcp.json naming the server "engram" too). Chose to list BOTH
+  prefixed forms there rather than guess one, per the task's documented
+  fallback — the cost is one longer comma-joined line; the alternative (bare
+  names in that list) risks the exact defect this fix targets if the host's
+  loader genuinely keys off the fully-qualified string. Added
+  hookToolPrefixGlobal/hookToolPrefixPlugin constants so both forms are
+  defined once. Checked plugin/**/hooks, docs/agent-instructions.md and
+  instructions.go for the same hardcoding — none found, no changes needed
+  there.
+  - Tests changed: `TestHookSessionStart_NoDaemon_StillPrintsThePointer` now
+    asserts the bare name and that the global-only prefix is absent (plugin
+    naming works); `TestHookUserPromptSubmit_FirstPromptBootstraps` now checks
+    the "call X first" sentence for the bare name and the "Available tools"
+    list for BOTH prefixed forms of mem_save (hook_test.go).
+  - Verification: `go build ./...` clean; `go vet ./...` clean;
+    `go test ./cmd/... ./internal/... -count=1` → only the 3 known
+    environmental failures.
+
 ## Next Step
 
-FIX-002.
+FIX-003.
