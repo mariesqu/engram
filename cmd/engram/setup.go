@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -154,8 +155,26 @@ var hookSettingsFailAfterTemp func() error
 // only. Re-running the command must not overwrite the one pristine copy with a
 // version engram has already edited — a backup that tracks the current file is
 // not a backup.
+//
+// A path that is itself a SYMLINK (dotfiles managed by stow/chezmoi and
+// similar) is resolved to its real target first, and both the atomic write and
+// the .bak live there instead: os.Rename over a symlink path replaces the
+// DIRENT — it deletes the link and puts a plain file where it pointed, which
+// for a settings.json managed elsewhere is silent data loss of the link the
+// user set up on purpose. Writing through to the target leaves the link itself
+// untouched and pointing at freshly-written content, same as any other editor
+// that opens a symlinked file.
 func writeHookSettings(path string, merged, existing []byte) (string, error) {
-	dir := filepath.Dir(path)
+	writeTo := path
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != "" {
+			writeTo = resolved
+		}
+		// EvalSymlinks failing (a dangling link) falls back to writing "path"
+		// directly — replacing a dangling link with a real file is no worse
+		// than the pre-fix behaviour for every symlink.
+	}
+	dir := filepath.Dir(writeTo)
 
 	perm := os.FileMode(0o600)
 	if info, err := os.Stat(path); err == nil {
@@ -164,7 +183,7 @@ func writeHookSettings(path string, merged, existing []byte) (string, error) {
 
 	backup := ""
 	if len(existing) > 0 {
-		candidate := path + ".bak"
+		candidate := writeTo + ".bak"
 		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
 			if err := os.WriteFile(candidate, existing, perm); err != nil {
 				// Not fatal: a backup that could not be written is a reason to warn,
@@ -212,9 +231,9 @@ func writeHookSettings(path string, merged, existing []byte) (string, error) {
 			return backup, err
 		}
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := os.Rename(tmpPath, writeTo); err != nil {
 		_ = os.Remove(tmpPath)
-		return backup, fmt.Errorf("replace %s: %w", path, err)
+		return backup, fmt.Errorf("replace %s: %w", writeTo, err)
 	}
 	return backup, nil
 }
@@ -276,10 +295,11 @@ type hookPack struct {
 }
 
 // engramHookPack returns the hooks engram installs for the named agent. It is
-// the same content as the shipped packs under plugin/<agent>/hooks/hooks.json,
-// with one difference that matters: the shipped packs invoke the plugin's own
-// copy of the binary path the host provides, while a settings merge has no
-// plugin root and calls "engram" from PATH.
+// the same content, command strings included, as the shipped packs under
+// plugin/<agent>/hooks/hooks.json: both invoke bare "engram hook <event>" from
+// PATH. Neither uses a plugin-provided binary path — a plugin install still
+// needs "engram" (or "engram.exe" on Windows) resolvable on PATH, same as a
+// settings merge.
 //
 // TestEngramHookPack_MatchesShippedPack keeps the two in step.
 func engramHookPack(agent string) hookPack {
@@ -394,7 +414,7 @@ func mergeHookSettings(existing []byte, pack hookPack) ([]byte, int, error) {
 		if command == "" || installed[command] {
 			continue
 		}
-		encoded, err := json.Marshal(item.Group)
+		encoded, err := marshalJSON(item.Group, "")
 		if err != nil {
 			return nil, 0, fmt.Errorf("encode %s hook: %w", item.Event, err)
 		}
@@ -404,7 +424,7 @@ func mergeHookSettings(existing []byte, pack hookPack) ([]byte, int, error) {
 	}
 
 	if added > 0 {
-		encoded, err := json.Marshal(hooks)
+		encoded, err := marshalJSON(hooks, "")
 		if err != nil {
 			return nil, 0, fmt.Errorf("encode hooks: %w", err)
 		}
@@ -413,11 +433,37 @@ func mergeHookSettings(existing []byte, pack hookPack) ([]byte, int, error) {
 
 	// 2-space indent: what every agent host writes, so a merged file does not
 	// show up as a whole-file diff the next time the host rewrites it.
-	out, err := json.MarshalIndent(doc, "", "  ")
+	out, err := marshalJSON(doc, "  ")
 	if err != nil {
 		return nil, 0, fmt.Errorf("encode settings: %w", err)
 	}
 	return append(out, '\n'), added, nil
+}
+
+// marshalJSON is json.Marshal/MarshalIndent with HTML escaping disabled.
+// encoding/json's escaper rewrites the angle brackets and ampersand in a JSON
+// string into six-character unicode escapes, even INSIDE an already-encoded
+// json.RawMessage being merged through — every value re-encoded here (doc,
+// hooks, a single group) nests the user's other settings and existing hook
+// commands as json.RawMessage, so the default escaping silently turned a
+// shell command like "a && b > c" into unusable (though still technically
+// valid) JSON on every merge. indent is passed to Encoder.SetIndent; ""
+// keeps the compact encoding json.Marshal would have produced for a fragment
+// that a later, outer call re-indents anyway.
+func marshalJSON(v any, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	// Encode always appends a trailing newline that json.Marshal/MarshalIndent
+	// never did; trimmed so callers keep controlling their own trailing
+	// newline exactly as before (see the single append(out, '\n') above).
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // installedHookCommands collects every command string already present anywhere

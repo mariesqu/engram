@@ -38,9 +38,10 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
   - Commit: ef436fc
 - [x] **FIX-002 — Prefix-agnostic tool references in hooks**
   - Route: delegated (same writer)
-  - Commit: recorded in the FIX-003 commit below (hash unknown until after commit)
-- [ ] **FIX-003 — Non-escaping, symlink-safe settings writes**
+  - Commit: a55b1e1
+- [x] **FIX-003 — Non-escaping, symlink-safe settings writes**
   - Route: delegated (same writer)
+  - Commit: recorded in the final docs(odd) commit below (hash unknown until after commit)
 
 ## Progress
 
@@ -105,6 +106,55 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
     `go test ./cmd/... ./internal/... -count=1` → only the 3 known
     environmental failures.
 
+- FIX-003 done, three independent problems in `cmd/engram/setup.go`:
+  (a) `json.Marshal`/`MarshalIndent` HTML-escape JSON strings by default —
+  even INSIDE an already-encoded `json.RawMessage` being merged through — so
+  a user's existing hook command containing `&&`/`<`/`>` came back rewritten
+  as six-character unicode escapes on every merge. Added a `marshalJSON`
+  helper (`json.NewEncoder` + `SetEscapeHTML(false)`, `SetIndent` for the one
+  caller that needs indentation) and routed all three encode call sites
+  through it; the Encoder's trailing newline is trimmed so callers keep
+  controlling their own exactly as before (byte-stable otherwise).
+  (b) `writeHookSettings`'s atomic write (temp file + `os.Rename`) replaced a
+  symlinked settings.json with a regular file, since `os.Rename` over a
+  symlink path replaces the dirent itself. It now `os.Lstat`s the path, and
+  when it is a symlink resolves it with `filepath.EvalSymlinks` and performs
+  both the atomic write and the `.bak` against that resolved target, so the
+  link survives; a dangling link (EvalSymlinks failing) falls back to the
+  pre-fix behavior, no worse than before.
+  (c) The `engramHookPack` doc comment claimed the shipped plugin packs
+  invoke "the plugin's own copy of the binary" — false: `plugin/claude-code/hooks/hooks.json`
+  and `plugin/codex/hooks/hooks.json` both call bare `"engram hook <event>"`
+  from PATH, identically to the settings-merge path, and
+  `TestEngramHookPack_MatchesShippedPack` already pins them byte-equal.
+  Corrected the comment.
+  - Gotcha: writing literal `\uXXXX`-style escape-sequence TEXT (as opposed to
+    an actual escaped character) into a tool-call parameter got silently
+    unescaped by a layer of the tool/transport pipeline before it reached the
+    file (e.g. intended source text `&` landed in the file as `&`) —
+    this corrupted both a doc comment and a test assertion on the first
+    attempt. Fixed by describing escapes in prose in comments, and by
+    building the check strings from `string(rune(0x5C))` + `"u0026"` etc. at
+    Go runtime in the test instead of spelling the escape sequence out as
+    literal source text.
+  - Tests added: `TestSetupHooks_PreservesUserCommandsWithHTMLCharacters`
+    (mergeHookSettings round-trips `"a && b > c"` byte-identical, no unicode
+    escapes present); `TestSetupHooks_WritesThroughASymlinkTarget` (a
+    symlinked settings.json stays a symlink, pointing at the same target,
+    after `engram setup hooks`; the `.bak` lives next to the target). The
+    symlink test SKIPPED on this machine: `os.Symlink` failed with "A
+    required privilege is not held by the client" (Windows, no Developer
+    Mode / SeCreateSymbolicLinkPrivilege) — the graceful-skip path the task
+    asked for, exercised for real, not just written defensively.
+  - Verification: `go build ./...` clean; `go vet ./...` clean;
+    `go test ./cmd/... ./internal/... -count=1` → only the 3 known
+    environmental failures. `gofmt -l` flags every .go file in the repo,
+    touched or not (pre-existing CRLF line endings on this Windows checkout,
+    confirmed with `gofmt -d` showing a whole-file diff of line-ending-only
+    changes) — not a regression, left alone.
+
 ## Next Step
 
-FIX-003.
+None — all three fixes are done and verified. `docs(odd): record pre-push
+fix evidence` is the final commit recording this file's state and the
+FIX-003 commit hash.

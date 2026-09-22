@@ -511,3 +511,114 @@ func TestSetupHooks_PreservesAnExistingFileMode(t *testing.T) {
 		t.Errorf("settings file mode = %04o, want the original 0644", perm)
 	}
 }
+
+// TestSetupHooks_PreservesUserCommandsWithHTMLCharacters pins the escaping
+// fix: encoding/json's default escaper rewrites the angle brackets and
+// ampersand in a JSON string into six-character unicode escapes — including
+// inside an EXISTING hook command that is only being carried through as
+// json.RawMessage, not touched. A shell command must survive the merge
+// byte-identical, not merely semantically equivalent — a human re-reading
+// their settings.json has to see what they actually wrote.
+func TestSetupHooks_PreservesUserCommandsWithHTMLCharacters(t *testing.T) {
+	existing := []byte(`{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "startup", "hooks": [{"type": "command", "command": "a && b > c"}]}
+    ]
+  }
+}`)
+
+	merged, added, err := mergeHookSettings(existing, engramHookPack("claude-code"))
+	if err != nil {
+		t.Fatalf("mergeHookSettings: %v", err)
+	}
+	if added == 0 {
+		t.Fatal("no hooks were added to a file that had none of ours")
+	}
+
+	if !strings.Contains(string(merged), `"a && b > c"`) {
+		t.Errorf("the user's command was rewritten; got:\n%s", merged)
+	}
+	// Built from rune values, not literal escape-sequence text: encoding/json's
+	// unicode escapes for '<', '>' and '&' are six ASCII characters each
+	// (backslash, 'u', four hex digits), and spelling that out as source text
+	// risks a tool/transport layer somewhere along the way silently unescaping
+	// it back into the single character it denotes — the exact bug this test
+	// exists to catch, self-defeating if it happened here too.
+	backslash := string(rune(0x5C))
+	for _, hex := range []string{"u0026", "u003c", "u003e"} {
+		escaped := backslash + hex
+		if strings.Contains(string(merged), escaped) {
+			t.Errorf("merged settings contain %q — HTML escaping must stay disabled:\n%s", escaped, merged)
+		}
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(merged, &doc); err != nil {
+		t.Fatalf("merged settings are not valid JSON: %v\n%s", err, merged)
+	}
+}
+
+// TestSetupHooks_WritesThroughASymlinkTarget pins the symlink fix: a
+// settings.json that is itself a symlink (dotfiles managed by stow/chezmoi and
+// similar) must stay a symlink after the merge, with the merged content
+// landing in its TARGET — os.Rename over the link path would otherwise delete
+// the link and put a plain file where it pointed. Skipped when os.Symlink
+// itself fails, which on Windows means the process lacks
+// SeCreateSymbolicLinkPrivilege (Developer Mode/Administrator) rather than
+// anything this fix controls.
+func TestSetupHooks_WritesThroughASymlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+
+	realDir := filepath.Join(dir, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", realDir, err)
+	}
+	target := filepath.Join(realDir, "settings.json")
+	original := []byte(`{"model":"opus"}` + "\n")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+
+	link := filepath.Join(dir, "settings.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("os.Symlink unavailable (likely missing privilege on this machine): %v", err)
+	}
+
+	if err := runSetupCmd([]string{"hooks", "--agent", "claude-code"}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat %s: %v", link, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s is a %v after the merge, want it to still be a symlink", link, info.Mode())
+	}
+	if got, err := os.Readlink(link); err != nil {
+		t.Fatalf("Readlink: %v", err)
+	} else if got != target {
+		t.Errorf("symlink now points at %q, want the original target %q", got, target)
+	}
+
+	written, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if !strings.Contains(string(written), "engram hook session-start") {
+		t.Errorf("the merged hooks were not written to the symlink's target:\n%s", written)
+	}
+
+	// The .bak also lives next to the TARGET, not the link — that is where the
+	// real, previously-existing content actually is.
+	backup := target + ".bak"
+	saved, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("no backup was written next to the target: %v", err)
+	}
+	if string(saved) != string(original) {
+		t.Errorf("backup = %s, want the ORIGINAL bytes %s", saved, original)
+	}
+}
