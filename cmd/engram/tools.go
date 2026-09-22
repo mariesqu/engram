@@ -379,7 +379,17 @@ func resolveReadProject(explicitProject, directory string) string {
 //
 // activity must be non-nil; it is shared across all write handlers so that
 // mem_save_prompt can record the current prompt and mem_save can auto-capture it.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) {
+//
+// daemonCwdIsWorkspace is true only for a per-client `engram daemon --transport
+// stdio` (README.md's documented setup: the MCP client spawns the daemon IN
+// the project directory, so its cwd genuinely IS that client's workspace) —
+// see buildDaemon, which sets it from cfg.mcpTransport == "stdio". It is false
+// for the SHARED resident daemon (`--transport http`, what `engram connect`
+// bridges to), whose cwd is wherever autostart/tray happened to launch it
+// from and is never trustworthy. Threaded down to resolveSaveProject,
+// handleSessionStart and currentProjectEnvelope, the only places that decide
+// whether a dirSourceDaemonCwd directory is refused.
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity, daemonCwdIsWorkspace bool) {
 	// ── mem_current_project ──────────────────────────────────────────────────
 	// Registered first because it is meant to be CALLED first: agent protocols
 	// (gentle-ai's ODD protocol among them) open a session by asking which
@@ -407,7 +417,7 @@ Three fields say "do not trust this name blindly":
 				mcp.Description(cwdArgDescription),
 			),
 		),
-		handleCurrentProject(store),
+		handleCurrentProject(store, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_session_start ────────────────────────────────────────────────────
@@ -433,7 +443,7 @@ Three fields say "do not trust this name blindly":
 				mcp.Description(cwdArgDescription),
 			),
 		),
-		handleSessionStart(store),
+		handleSessionStart(store, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_session_end ──────────────────────────────────────────────────────
@@ -513,7 +523,7 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
 		),
-		handleSave(store, loop, embedLoop, gated, writerID, activity),
+		handleSave(store, loop, embedLoop, gated, writerID, activity, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_save_prompt ──────────────────────────────────────────────────────
@@ -542,7 +552,7 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 				mcp.Description(cwdArgDescription),
 			),
 		),
-		handleSavePrompt(store, loop, writerID, activity),
+		handleSavePrompt(store, loop, writerID, activity, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_get_observation ──────────────────────────────────────────────────
@@ -949,7 +959,7 @@ FORMAT — use this exact structure in the content field:
 				mcp.Description(cwdArgDescription),
 			),
 		),
-		handleSessionSummary(store, loop, writerID),
+		handleSessionSummary(store, loop, writerID, daemonCwdIsWorkspace),
 	)
 }
 
@@ -997,14 +1007,14 @@ FORMAT — use this exact structure in the content field:
 // caller error — here it is reported in the envelope
 // (directory_source="invalid_directory_argument") so the agent can still see
 // what the daemon would resolve.
-func handleCurrentProject(store *localstore.Store) mcpserver.ToolHandlerFunc {
+func handleCurrentProject(store *localstore.Store, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
 		explicitProject, _ := args["project"].(string)
 		dirArg := readDirectoryArg(args)
 
-		envelope := currentProjectEnvelope(store, explicitProject, dirArg)
+		envelope := currentProjectEnvelope(store, explicitProject, dirArg, daemonCwdIsWorkspace)
 
 		out, err := json.Marshal(envelope)
 		if err != nil {
@@ -1035,7 +1045,7 @@ func handleCurrentProject(store *localstore.Store) mcpserver.ToolHandlerFunc {
 // daemon-cwd answer for a missing directory under an omitted project is three
 // separate problems), and a joined sentence makes an agent parse prose to tell
 // them apart.
-func currentProjectEnvelope(store *localstore.Store, explicitProject string, dirArg directoryArg) map[string]any {
+func currentProjectEnvelope(store *localstore.Store, explicitProject string, dirArg directoryArg, daemonCwdIsWorkspace bool) map[string]any {
 	dir := resolveProjectDir(dirArg.Directory)
 
 	env := map[string]any{
@@ -1160,8 +1170,19 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 	}
 	switch dirArg.Source {
 	case dirSourceDaemonCwd:
-		env["writes_blocked"] = true
-		hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — every write tool refuses it without an explicit project; restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
+		if daemonCwdIsWorkspace {
+			// A per-client `engram daemon --transport stdio` (README.md's documented
+			// setup): the MCP client spawned THIS daemon process in the project
+			// directory, so its cwd genuinely is the caller's workspace — not the
+			// SHARED resident daemon's own directory. Nothing is blocked; the label
+			// still says where the answer came from, softened to say why it is
+			// trusted here.
+			hints = append(hints, "no directory reached the daemon, but this daemon is running in per-client stdio "+
+				"mode (--transport stdio), so its own working directory IS your workspace — writes are not blocked")
+		} else {
+			env["writes_blocked"] = true
+			hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — every write tool refuses it without an explicit project; restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
+		}
 	case dirSourceCwdAlias:
 		hints = append(hints, "this directory came from the \"cwd\" alias you supplied, not from 'engram connect' — if it is not the workspace you are actually in, every later call is filed under the wrong project")
 		// dirSourceRelativePath is deliberately absent: its hint is emitted above,
@@ -1241,7 +1262,7 @@ func setHints(env map[string]any, hints []string) {
 // This tool's optional "directory" argument is the model every other
 // directory-aware tool now follows; `engram connect` fills it with the client's
 // working directory when the caller left both it and "project" empty.
-func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
+func handleSessionStart(store *localstore.Store, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		id, _ := args["id"].(string)
@@ -1271,7 +1292,7 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			if dirArg.Relative {
 				return dirArg.relativeError("mem_session_start"), nil
 			}
-			if dirArg.Source == dirSourceDaemonCwd {
+			if dirArg.Source == dirSourceDaemonCwd && !daemonCwdIsWorkspace {
 				return dirArg.daemonCwdError("mem_session_start"), nil
 			}
 			if !directoryExists(resolvedDir) {
@@ -1388,7 +1409,10 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 //     whatever folder the autostart or tray happened to launch from;
 //   - no directory at all (dirSourceDaemonCwd): the project would be detected
 //     from the daemon's OWN working directory — %APPDATA%\engram for the
-//     resident daemon, see spawnWorkingDir — not the caller's;
+//     resident daemon, see spawnWorkingDir — not the caller's; SKIPPED when
+//     daemonCwdIsWorkspace is true, i.e. this is a per-client `engram daemon
+//     --transport stdio` (README.md's documented setup), whose cwd genuinely
+//     IS the caller's workspace — see registerTools;
 //   - a directory that is not on this machine: detection derives a basename
 //     from any string, so a typo'd path silently creates a brand-new project.
 //
@@ -1402,14 +1426,14 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 //
 // Conflict detection (explicit project vs store's known projects) is DEFERRED
 // to a future PR.
-func resolveSaveProject(store *localstore.Store, tool, explicitProject string, dirArg directoryArg) (string, *mcp.CallToolResult) {
+func resolveSaveProject(store *localstore.Store, tool, explicitProject string, dirArg directoryArg, daemonCwdIsWorkspace bool) (string, *mcp.CallToolResult) {
 	if strings.TrimSpace(explicitProject) != "" {
 		return strings.TrimSpace(explicitProject), nil
 	}
 	if dirArg.Relative {
 		return "", dirArg.relativeError(tool)
 	}
-	if dirArg.Source == dirSourceDaemonCwd {
+	if dirArg.Source == dirSourceDaemonCwd && !daemonCwdIsWorkspace {
 		return "", dirArg.daemonCwdError(tool)
 	}
 
@@ -1447,7 +1471,7 @@ func resolveSaveProject(store *localstore.Store, tool, explicitProject string, d
 // embedLoop (may be nil): after a successful save, embedLoop.Trigger() is called
 // nil-safely so the backfill loop picks up the new row without waiting for the
 // next periodic 60s tick. The Trigger is non-blocking (coalesced, size-1 channel).
-func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -1475,7 +1499,7 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 			capturePrompt = v
 		}
 
-		project, toolErr := resolveSaveProject(store, "mem_save", explicitProject, dirArg)
+		project, toolErr := resolveSaveProject(store, "mem_save", explicitProject, dirArg, daemonCwdIsWorkspace)
 		if toolErr != nil {
 			return toolErr, nil
 		}
@@ -1836,7 +1860,7 @@ func handleSuggestTopicKey() mcpserver.ToolHandlerFunc {
 //     a reliable per-call signal; the session row is.
 //  3. Detection from the resolved directory (forwarded "directory", else the
 //     daemon's cwd).
-func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID string) mcpserver.ToolHandlerFunc {
+func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID string, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -1866,7 +1890,7 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 			var toolErr *mcp.CallToolResult
 			// Returns explicitProject verbatim when set; otherwise detects from the
 			// forwarded directory / daemon cwd and may hard-error.
-			project, toolErr = resolveSaveProject(store, "mem_session_summary", explicitProject, dirArg)
+			project, toolErr = resolveSaveProject(store, "mem_session_summary", explicitProject, dirArg, daemonCwdIsWorkspace)
 			if toolErr != nil {
 				return toolErr, nil
 			}
@@ -2236,7 +2260,7 @@ func handleJudge(store *localstore.Store) mcpserver.ToolHandlerFunc {
 // prompt via AddPrompt (which enqueues an outbox entry for central push) and
 // records it in the in-memory SessionActivity so that a subsequent mem_save
 // with capture_prompt=true can auto-capture it without a re-insert (dedup).
-func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -2254,7 +2278,7 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		if dirArg.Err != nil {
 			return dirArg.toolError("mem_save_prompt"), nil
 		}
-		project, toolErr := resolveSaveProject(store, "mem_save_prompt", explicitProject, dirArg)
+		project, toolErr := resolveSaveProject(store, "mem_save_prompt", explicitProject, dirArg, daemonCwdIsWorkspace)
 		if toolErr != nil {
 			return toolErr, nil
 		}

@@ -42,6 +42,15 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
 - [x] **FIX-003 — Non-escaping, symlink-safe settings writes**
   - Route: delegated (same writer)
   - Commit: 490ea88
+- [x] **FIX-004 — Scope the daemon_cwd write block to the shared HTTP daemon only**
+  - Route: delegated (same writer)
+  - Reason: FIX-001's daemon_cwd refusal was a real regression for the
+    per-client `engram daemon --transport stdio` setup README.md documents
+    (the MCP client spawns that daemon IN the project directory, so its cwd
+    genuinely IS the workspace) — it cannot be told apart from the shared
+    resident daemon's junk cwd without a signal from how the daemon itself
+    was started.
+  - Commit: this commit (doc folded in; hash reported to the coordinator directly since a commit cannot record its own hash)
 
 ## Progress
 
@@ -153,8 +162,49 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
     confirmed with `gofmt -d` showing a whole-file diff of line-ending-only
     changes) — not a regression, left alone.
 
+- FIX-004 done. FIX-001's blanket daemon_cwd refusal broke a real, documented
+  setup (README.md:457): a per-client `engram daemon --transport stdio`,
+  which the MCP client spawns IN the project directory, so its cwd genuinely
+  IS the workspace — that daemon and the SHARED resident daemon (`--transport
+  http`) look identical to a tool handler (both are `dirSourceDaemonCwd`),
+  so the fix needed a signal from how the daemon was actually started.
+  `daemonCwdIsWorkspace bool` (computed in `buildDaemon` as `cfg.mcpTransport
+  == "stdio"`, an explicit parameter — no package-level mutable global) is
+  now threaded through `registerTools` into `handleCurrentProject`,
+  `handleSessionStart`, `handleSave`, `handleSavePrompt`,
+  `handleSessionSummary`, `resolveSaveProject` and `currentProjectEnvelope`.
+  When true, the `dirSourceDaemonCwd` refusal in `resolveSaveProject` and
+  `handleSessionStart` does not fire, and `currentProjectEnvelope` does not
+  set `writes_blocked` for it — `directory_source` still reports
+  `"daemon_cwd"` (unchanged label), with a softer hint explaining the cwd is
+  trusted because this is a per-client stdio daemon. Reads were already
+  unaffected (resolveReadProject never consulted the flag). Left
+  `hook.go:531`'s `answersAboutTheDaemon` alone — hooks always talk to the
+  shared HTTP daemon through `engram connect`, so `daemonCwdIsWorkspace` is
+  always false on that path and nothing there needed to change (confirmed:
+  `TestHook*` all still pass).
+  - No FIX-001 test needed reverting: every existing `buildDaemon(daemonCfg{...})`
+    call in the test suite leaves `mcpTransport` at its Go zero value `""`,
+    which is `!= "stdio"`, so `daemonCwdIsWorkspace` is `false` by default —
+    identical to pre-FIX-004 behaviour. Confirmed by running the full suite
+    unchanged before adding new tests: same 3 known failures, nothing else.
+  - Tests added (tools_current_project_test.go):
+    `TestWriteTools_StdioDaemonCwdIsTrusted` (`mcpTransport: "stdio"`, no
+    directory/no project → `mem_save` succeeds under the chdir'd project,
+    `mem_current_project` reports `writes_blocked=false`,
+    `directory_source="daemon_cwd"`); `TestWriteTools_HttpDaemonCwdStaysBlocked`
+    (`mcpTransport: "http"` explicit → refusal and `writes_blocked=true`,
+    same as the FIX-001 default).
+  - Docs: `README.md`'s `writes_blocked` causes table (~line 999) was missing
+    `daemon_cwd` as a cause entirely (a FIX-001 gap, not just a FIX-004 one) —
+    added it, with the stdio-daemon exception noted. Line ~457 (the
+    coordinator's cited line) already correctly described the daemon's own
+    cwd as "the right answer for a per-client stdio daemon" and needed no
+    change — that was about directory *resolution*, not the write refusal.
+  - Verification: `go build ./...` clean; `go vet ./...` clean;
+    `go test ./cmd/... ./internal/... -count=1` → only the 3 known
+    environmental failures.
+
 ## Next Step
 
-None — all three fixes are done and verified. `docs(odd): record pre-push
-fix evidence` is the final commit recording this file's state and the
-FIX-003 commit hash.
+None — all four fixes are done and verified.

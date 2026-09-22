@@ -1043,6 +1043,79 @@ func TestWriteTools_DaemonCwdWithExplicitProjectSucceeds(t *testing.T) {
 	}
 }
 
+// TestWriteTools_StdioDaemonCwdIsTrusted covers the FIX-004 exception:
+// README.md documents a per-client `engram daemon --transport stdio` as a
+// supported setup, where the MCP client spawns the daemon IN the project
+// directory — its cwd genuinely IS the workspace, so the dirSourceDaemonCwd
+// refusal must not fire and mem_current_project must not report
+// writes_blocked for it.
+func TestWriteTools_StdioDaemonCwdIsTrusted(t *testing.T) {
+	components, err := buildDaemon(daemonCfg{
+		db:           filepath.Join(t.TempDir(), "stdio_trusted.db"),
+		syncInterval: 30 * time.Second,
+		mcpTransport: "stdio",
+	})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+	chdirTo(t, pinnedProjectDir(t, "stdio-client-repo"))
+
+	env := callCurrentProjectOn(t, components, map[string]any{})
+	if env["directory_source"] != dirSourceDaemonCwd {
+		t.Errorf("directory_source = %v, want %q", env["directory_source"], dirSourceDaemonCwd)
+	}
+	if env["writes_blocked"] != false {
+		t.Errorf("writes_blocked = %v, want false: a per-client stdio daemon's cwd IS the workspace", env["writes_blocked"])
+	}
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	result, err := saveTool.Handler(t.Context(), newToolRequest("mem_save", map[string]any{"title": "t", "content": "c"}))
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("mem_save refused a directory-less, project-less write on a stdio daemon: %v", result.Content)
+	}
+	rec, err := components.store.GetObservation(1)
+	if err != nil {
+		t.Fatalf("GetObservation(1): %v", err)
+	}
+	if rec.Project != "stdio-client-repo" {
+		t.Errorf("Project = %q, want %q", rec.Project, "stdio-client-repo")
+	}
+}
+
+// TestWriteTools_HttpDaemonCwdStaysBlocked is the other half: an EXPLICIT
+// --transport http (the shared resident daemon `engram connect` bridges to)
+// keeps refusing dirSourceDaemonCwd exactly like the FIX-001 default.
+func TestWriteTools_HttpDaemonCwdStaysBlocked(t *testing.T) {
+	components, err := buildDaemon(daemonCfg{
+		db:           filepath.Join(t.TempDir(), "http_blocked.db"),
+		syncInterval: 30 * time.Second,
+		mcpTransport: "http",
+	})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+	chdirToJunkDir(t)
+
+	env := callCurrentProjectOn(t, components, map[string]any{})
+	if env["writes_blocked"] != true {
+		t.Errorf("writes_blocked = %v, want true: the shared HTTP daemon's cwd is never the caller's workspace", env["writes_blocked"])
+	}
+
+	saveTool := components.mcpServer.ListTools()["mem_save"]
+	result, err := saveTool.Handler(t.Context(), newToolRequest("mem_save", map[string]any{"title": "t", "content": "c"}))
+	if err != nil {
+		t.Fatalf("handler transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("mem_save accepted a directory-less, project-less write on an http daemon: %v", result.Content)
+	}
+}
+
 // TestSessionStart_RefusesAnOmittedProject pins the check mem_session_start was
 // missing by name. applyPolicyBlock listed it among the tools that refuse an
 // omitted project, and the agent-facing instructions say so too — but the

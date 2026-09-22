@@ -545,7 +545,14 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	}
 
 	activity := NewSessionActivity()
-	registerTools(mcpSrv, store, loop, embedLoop, gated, cfg.writerID, activity)
+	// True only for a per-client `engram daemon --transport stdio` (README.md's
+	// documented setup: the MCP client spawns this daemon process IN the
+	// project directory, so its own cwd genuinely is that client's workspace).
+	// False for the SHARED resident daemon (--transport http, what `engram
+	// connect` bridges to), whose cwd is wherever autostart/tray launched it
+	// from — see registerTools' daemonCwdIsWorkspace doc.
+	daemonCwdIsWorkspace := cfg.mcpTransport == "stdio"
+	registerTools(mcpSrv, store, loop, embedLoop, gated, cfg.writerID, activity, daemonCwdIsWorkspace)
 
 	return &daemonComponents{
 		store:     store,
