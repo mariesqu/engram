@@ -41,7 +41,7 @@ Fix the three pre-push defects found in the review of `feat/upstream-parity` bef
   - Commit: a55b1e1
 - [x] **FIX-003 — Non-escaping, symlink-safe settings writes**
   - Route: delegated (same writer)
-  - Commit: recorded in the final docs(odd) commit below (hash unknown until after commit)
+  - Commit: 490ea88
 
 ## Progress
 
