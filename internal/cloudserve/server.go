@@ -359,7 +359,8 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 //  4. [syncwire.FromWire] — malformed payload / bad occurred_at → 400.
 //  5. Forgery check: if authWriterID != "" && m.WriterID != authWriterID → 403.
 //     (The authWriterID == "" guard means AllowAllVerifier skips this check.)
-//  6. central.Apply — DB/internal error → 500. nil → 200.
+//  6. central.Apply — a permanent (transport.ErrPermanent) error → 422; any
+//     other DB/internal error → 500. nil → 200.
 //
 // On 200 the response body is a [syncwire.PushResponse] with status "ok" and
 // applied=true.
@@ -393,6 +394,18 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.central.Apply(r.Context(), m); err != nil {
+		if errors.Is(err, transport.ErrPermanent) {
+			// A DETERMINISTIC data problem (our own validation, or a Postgres data
+			// exception / constraint violation) — retrying this exact mutation can
+			// never succeed. 422, not 500, so the client PARKS it instead of backing
+			// off forever. err.Error() is safe to return verbatim: transport.ErrPermanent's
+			// contract requires implementations to build it from structured
+			// identifiers only, never the database's raw free-text message.
+			s.logger.WarnContext(r.Context(), "cloudserve: Apply permanently rejected the mutation",
+				"error", err, "mutation_id", m.MutationID)
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
 		s.logger.ErrorContext(r.Context(), "cloudserve: Apply failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return

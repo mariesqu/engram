@@ -10,6 +10,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/mutation"
+	"github.com/mariesqu/engram/internal/transport"
 )
 
 // Apply is the central (push-apply) reconciliation: it takes a single mutation
@@ -70,11 +71,13 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 	// protects direct Store callers and guarantees PostgreSQL never sees U+0000.
 	if len(m.Payload) > 0 {
 		if err := mutation.ValidateCanonicalPayloadText(m.Payload); err != nil {
-			return fmt.Errorf("Apply: invalid canonical payload: %w", err)
+			// Our own validator, not the database's: its text is already safe to
+			// return to the pushing client (see transport.ErrPermanent's contract).
+			return fmt.Errorf("Apply: invalid canonical payload: %w: %w", transport.ErrPermanent, err)
 		}
 	}
 	if err := mutation.ValidateTextFields(m); err != nil {
-		return fmt.Errorf("Apply: invalid mutation: %w", err)
+		return fmt.Errorf("Apply: invalid mutation: %w: %w", transport.ErrPermanent, err)
 	}
 
 	// Normalize TopicKey at store entry: fold &"" → nil so '' never reaches any
@@ -119,6 +122,9 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 			// applied. INV5 holds even under a race.
 			return nil
 		}
+		if permErr := permanentDataError("insert mutation", err); permErr != nil {
+			return permErr
+		}
 		return fmt.Errorf("Apply: insert mutation: %w", err)
 	}
 
@@ -137,6 +143,9 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 	// in this switch.
 	if m.EntityType == domain.EntityPrompt {
 		if err = applyPromptDecisionQ(ctx, tx, m); err != nil {
+			if permErr := permanentDataError("apply prompt", err); permErr != nil {
+				return permErr
+			}
 			return err
 		}
 	} else {
@@ -147,6 +156,9 @@ func (s *Store) Apply(ctx context.Context, m domain.Mutation) error {
 
 		// Step 5 — materialize the Decision atomically on the tx.
 		if err = applyDecision(ctx, tx, d, m); err != nil {
+			if permErr := permanentDataError("apply decision", err); permErr != nil {
+				return permErr
+			}
 			return err
 		}
 	}
@@ -298,4 +310,51 @@ func (r *decideReader) MutationApplied(string) (bool, error) {
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// permanentDataError classifies err as a DETERMINISTIC data problem — a
+// Postgres data exception (SQLSTATE class 22) or integrity-constraint
+// violation (class 23) — and, when it is one, returns a NEW error wrapping
+// transport.ErrPermanent whose message is built ONLY from structured pgconn
+// identifiers (SQLSTATE code, constraint/column/table name). Returns nil for
+// every other error (including a nil err), so the caller's existing "%w"
+// wrapping is used unchanged and the mutation is treated as retryable.
+//
+// 23505 (unique_violation) is deliberately excluded: on the ONLY table Apply
+// inserts into with a UNIQUE constraint (central_mutations.mutation_id) it is
+// already handled as an idempotent no-op by isUniqueViolation before this is
+// ever consulted; classifying it here too would be reachable only by a schema
+// change this function has no way to know about safely.
+//
+// Why not pgErr.Message/.Detail/.Hint: transport.ErrPermanent's returned error
+// reaches the pushing client verbatim in the HTTP response body (see
+// cloudserve's 422 mapping). Postgres routinely fills those free-text fields
+// with the actual offending value (a classic DETAIL clause reads "Key
+// (project)=(secret-project-name) already exists") — exactly the raw DB text
+// this contract promises never to leak. A constraint/column NAME is safe: it
+// identifies which rule was violated without repeating any row's data.
+func permanentDataError(context string, err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
+		return nil
+	}
+	if pgErr.Code == "23505" {
+		return nil // unique_violation — isUniqueViolation's to classify, not this
+	}
+	switch pgErr.Code[:2] {
+	case "22", "23": // data_exception, integrity_constraint_violation
+	default:
+		return nil
+	}
+
+	var detail string
+	switch {
+	case pgErr.ConstraintName != "":
+		detail = fmt.Sprintf("rejected by constraint %q (SQLSTATE %s)", pgErr.ConstraintName, pgErr.Code)
+	case pgErr.ColumnName != "":
+		detail = fmt.Sprintf("rejected on field %q (SQLSTATE %s)", pgErr.ColumnName, pgErr.Code)
+	default:
+		detail = fmt.Sprintf("rejected (SQLSTATE %s)", pgErr.Code)
+	}
+	return fmt.Errorf("Apply: %s: %w: %s", context, transport.ErrPermanent, detail)
 }

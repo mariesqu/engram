@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/transport"
 )
 
 // ── mock transport.Central ────────────────────────────────────────────────────
@@ -171,6 +173,41 @@ func TestHandlePush_ApplyError_Returns500(t *testing.T) {
 
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+}
+
+// ── push 422 — Apply returns a permanent (transport.ErrPermanent) error ──────
+
+// TestHandlePush_PermanentApplyError_Returns422 is the FUP-004 regression
+// test: a mutation Apply rejects for a DETERMINISTIC reason (wrapped in
+// transport.ErrPermanent — mirroring what centralstore.Apply actually returns
+// for a Postgres data exception / constraint violation) must come back as 422,
+// not 500, so the client parks the entry instead of retrying it forever. The
+// response body must carry the safe detail text, not a generic "internal
+// error" — the client reads it into last_error for mem_doctor/CLI visibility.
+func TestHandlePush_PermanentApplyError_Returns422(t *testing.T) {
+	central := &mockCentral{applyErr: fmt.Errorf("Apply: insert mutation: %w: rejected by constraint %q (SQLSTATE 23514)",
+		transport.ErrPermanent, "memories_entity_type_check")}
+	ts := newTestServer(t, central)
+
+	body, _ := validPushBody(t)
+	resp, err := http.Post(ts.URL+"/v1/push", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/push: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", resp.StatusCode)
+	}
+	var got struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.Contains(got.Error, "memories_entity_type_check") {
+		t.Errorf("error body = %q, want it to name the constraint", got.Error)
 	}
 }
 

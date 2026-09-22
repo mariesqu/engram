@@ -41,8 +41,13 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-002 — Hook session fallback only for empty cwd** — Route: delegated writer
 - [x] **FUP-003 — Duplicate-install hook protection** — Route: delegated writer
 - [x] **FUP-003b — Dedup only near-simultaneous deliveries** — Route: delegated writer
-- [ ] **FUP-004 — Outbox permanent-rejection handling** — Route: delegated writer
-- [ ] **FUP-005 — created_at on the wire** — Route: delegated writer
+- [x] **FUP-004a — Server: 422 for permanent Apply errors** — Route: delegated writer
+- [ ] **FUP-004b — Client: park permanently rejected outbox entries** — Route: delegated writer
+- [ ] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
+- [ ] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
+- [ ] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
+- [ ] **FUP-005b — Server: serve original creation times** — Route: delegated writer
+- [ ] **FUP-005c — Client: backfill created_at once per project** — Route: delegated writer
 
 ## Progress
 
@@ -149,12 +154,41 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   Verification: `go build ./...`: ok. `go vet ./...`: ok.
   `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
   known environmental failures.
+  Commit: dd8068d.
+
+- FUP-004a done (delegated writer). Added `transport.ErrPermanent` sentinel
+  (internal/transport/errors.go), mirroring ErrResponseTooLarge's pattern:
+  implementations wrap it with %w for a mutation Apply rejects for a
+  DETERMINISTIC reason (our own validation, or a Postgres data exception /
+  constraint violation, SQLSTATE class 22/23), building the message ONLY from
+  structured identifiers (constraint/column name, SQLSTATE) — never
+  pgErr.Message/.Detail/.Hint, which Postgres can fill with the actual
+  offending row value. `centralstore.Apply` (apply.go) now wraps: the two
+  existing Go-side validation errors directly (already-safe text), and any
+  DB error via a new `permanentDataError` helper that classifies SQLSTATE class
+  22/23 (excluding 23505/unique_violation, which isUniqueViolation already
+  treats as an idempotent no-op earlier in the same function).
+  `cloudserve.handlePush` now checks `errors.Is(err, transport.ErrPermanent)`
+  before the generic 500 branch and returns 422 with `err.Error()` verbatim
+  (safe by the sentinel's contract).
+  Tests added: `internal/centralstore/apply_internal_test.go`
+  `TestPermanentDataError` (fake pgconn.PgError, no Postgres — covers class
+  22/23/08, the 23505 carve-out, wrapped-error unwrapping, and asserts the
+  constructed message never contains the fixture's raw Message/Detail/Hint
+  text); `internal/cloudserve/server_test.go`
+  `TestHandlePush_PermanentApplyError_Returns422`. No existing assertion
+  changed; `TestHandlePush_ApplyError_Returns500` (plain error, not wrapped)
+  still asserts 500, confirming the two paths stay distinct.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1` (ENGRAM_DSN unset): all packages
+  ok except the three known environmental failures in cmd/engram.
+  centralstore/cloudserve non-acceptance unit tests ran (no Postgres/DSN
+  needed); acceptance-tagged Postgres tests were not run (see report).
   Commit: pending (recorded after commit).
 
 ## Next Step
 
-FUP-004/005 next: outbox permanent-rejection handling and created_at on the
-wire, now in scope (server changes approved) — touching internal/syncer,
-internal/remote, internal/syncwire, internal/localstore/{sync.go,apply.go,
-schema.go,diagnostic.go}, internal/cloudserve, internal/centralstore,
-internal/importer, internal/diagnostic.
+FUP-004b (client: park permanently rejected outbox entries — schema v16 +
+sync_mutations attempts/last_error/parked_at + Push/DrainOutbox changes),
+then FUP-004c (NUL repair), FUP-004d (doctor + CLI), then FUP-005a/b/c
+(created_at on the wire).

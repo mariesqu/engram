@@ -33,3 +33,27 @@ import "errors"
 // ONE project overflowed, not which, and the remediation has already happened
 // inside Pull. Use it for reporting, never to drive a retry decision.
 var ErrResponseTooLarge = errors.New("transport: response exceeds size cap")
+
+// ErrPermanent is the sentinel a [Central] implementation returns — wrapped
+// with %w — when Apply rejects a mutation for a DETERMINISTIC reason that
+// retrying will never fix: a validation failure this store enforces itself, or
+// a Postgres data exception / integrity-constraint violation (SQLSTATE class
+// 22 / 23). It is the counterpart to the plain (unwrapped) error Apply returns
+// for everything else — a transient outage, a lost connection, a DB restart —
+// which callers must keep retrying.
+//
+// Contract for implementations: wrap ErrPermanent ONLY when the mutation
+// itself is at fault, never for infrastructure trouble, and never include the
+// database's raw error text (e.g. a Postgres DETAIL clause can embed the
+// actual offending row value) — the wrapped error's message reaches the pushing
+// client verbatim over HTTP (see cloudserve's 422 mapping), so it must already
+// be safe to show: derive it from structured identifiers (a constraint name, a
+// SQLSTATE code, a field name), never from the driver's free-text message.
+//
+// Contract for callers: an ErrPermanent from Apply/push means THIS SPECIFIC
+// mutation cannot ever succeed against this central and must not be retried —
+// the caller should PARK it (and, for an ordered group such as one sync_id's
+// version chain, everything queued behind it) rather than back off and resend
+// it forever. cloudserve maps it to HTTP 422; a client's Retryable() must
+// return false for it exactly as it already does for a 4xx StatusError.
+var ErrPermanent = errors.New("transport: mutation permanently rejected")
