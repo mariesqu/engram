@@ -128,7 +128,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   Verification: `go build ./...`: ok. `go vet ./...`: ok.
   `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
   known environmental failures.
-  Commit: pending (recorded after commit).
+  Commit: 597e123.
 
 ## Next Step
 
