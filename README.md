@@ -356,9 +356,21 @@ Mutating endpoints (`PUT`, `POST`, `DELETE`) additionally require an `Origin: ht
 
 # Trigger an immediate sync cycle
 ./engram sync now --db ~/.engram/memories.db
+
+# List outbox entries central has permanently rejected (400/413/422 — see below)
+./engram sync parked --db ~/.engram/memories.db
+
+# Un-park one entry (or every parked entry) so the next sync cycle retries it
+./engram sync retry 42  --db ~/.engram/memories.db
+./engram sync retry all --db ~/.engram/memories.db
+
+# Permanently discard one parked entry — it will never be pushed to central
+./engram sync discard 42 --db ~/.engram/memories.db
 ```
 
-All subcommands read `daemon.json` from the same directory as `--db`. If no daemon is running, they exit non-zero with a clear error message.
+`sync now`, `status`, `ui`, and `config` talk to the running resident daemon and read `daemon.json` from the same directory as `--db`; if no daemon is running, they exit non-zero with a clear error message. `sync parked`/`retry`/`discard` open the local database directly (SQLite's WAL mode makes this safe alongside a running daemon) and work whether or not the daemon is up.
+
+**Parked mutations.** central can reject a pushed mutation *permanently* — malformed content, a request too large, or a deterministic data problem (see `transport.ErrPermanent`) — instead of transiently. Retrying a permanent rejection forever accomplishes nothing, so the syncer parks that single outbox entry: it stops being resent (and stops blocking the rest of its own sync_id's version chain), but stays on disk, unacked, until an operator looks at it. `mem_doctor`'s `parked_mutations` check surfaces the same entries with their `last_error`.
 
 **Config keys**
 

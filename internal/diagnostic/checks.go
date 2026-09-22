@@ -22,6 +22,7 @@ const (
 	CheckSQLiteLockContention            = "sqlite_lock_contention"
 	CheckStaleReviewBacklog              = "stale_review_backlog"
 	CheckSyncBacklog                     = "sync_backlog"
+	CheckParkedMutations                 = "parked_mutations"
 )
 
 // ReasonUnregisteredSessionSaves is a REASON code, not a check code — it names
@@ -497,6 +498,76 @@ func (c SyncBacklogCheck) Run(_ context.Context, scope Scope) (CheckResult, erro
 		SafeNextStep: next,
 	}
 	return resultFromFindings(c.Code(), evidence, []Finding{finding}), nil
+}
+
+// ─── parked_mutations ────────────────────────────────────────────────────────
+
+// mutationIDPrefixLen bounds how much of a mutation_id (a 64-character SHA-256
+// hex digest) a finding's evidence shows — enough to correlate with
+// `engram sync retry`/`discard`'s own output and with sync_mutations directly,
+// without printing the full identifier for what is, after all, an operator-
+// facing report.
+const mutationIDPrefixLen = 12
+
+// ParkedMutationsCheck reports outbox entries the syncer has PARKED (see
+// FUP-004b): central rejected them permanently, so DrainOutbox has stopped
+// resending them — but they are not gone, and a project's writes behind them
+// in the same sync_id's version chain stay stuck until an operator retries or
+// discards each one (`engram sync retry`/`discard`). SyncBacklogCheck
+// deliberately excludes these rows (see SyncBacklog's own doc comment): a
+// parked entry is not "waiting for the next tick" the way a pending one is,
+// and conflating the two would make a real backlog look like it is draining
+// when it is actually stuck.
+type ParkedMutationsCheck struct{}
+
+func (ParkedMutationsCheck) Code() string { return CheckParkedMutations }
+
+func (c ParkedMutationsCheck) Run(_ context.Context, scope Scope) (CheckResult, error) {
+	if !scope.Store.CentralConfigured() {
+		// Local-only: nothing is ever pushed, so nothing can be parked.
+		return okResult(c.Code(), map[string]any{"central_configured": false}), nil
+	}
+
+	parked, err := scope.Store.ListParked()
+	if err != nil {
+		return CheckResult{}, err
+	}
+
+	evidence := map[string]any{"central_configured": true, "parked_count": len(parked)}
+	if len(parked) == 0 {
+		return okResult(c.Code(), evidence), nil
+	}
+
+	findings := make([]Finding, 0, len(parked))
+	for _, p := range parked {
+		idPrefix := p.MutationID
+		if len(idPrefix) > mutationIDPrefixLen {
+			idPrefix = idPrefix[:mutationIDPrefixLen]
+		}
+		findings = append(findings, Finding{
+			CheckID:    c.Code(),
+			Severity:   SeverityWarning,
+			ReasonCode: CheckParkedMutations,
+			Message: fmt.Sprintf("mutation %s… (local_seq=%d, project %q) was permanently rejected and is parked (%d attempt(s)): %s",
+				idPrefix, p.LocalSeq, p.Project, p.Attempts, p.LastError),
+			Why: "Central rejected this exact mutation and will keep rejecting it unmodified — retrying it automatically forever would " +
+				"just repeat the same failed push. It also blocks every LATER write to the same memory queued behind it.",
+			Evidence: mustJSON(map[string]any{
+				"local_seq":       p.LocalSeq,
+				"mutation_id":     idPrefix,
+				"project":         p.Project,
+				"entity":          p.Entity,
+				"attempts":        p.Attempts,
+				"last_error":      p.LastError,
+				"last_attempt_at": p.LastAttemptAt.UTC().Format(time.RFC3339),
+				"parked_at":       p.ParkedAt.UTC().Format(time.RFC3339),
+			}),
+			SafeNextStep: fmt.Sprintf("Read last_error, then `engram sync retry %d` if the underlying problem is fixed, "+
+				"or `engram sync discard %d` if this mutation's effect should never reach central.", p.LocalSeq, p.LocalSeq),
+			RequiresConfirmation: true,
+		})
+	}
+	return resultFromFindings(c.Code(), evidence, findings), nil
 }
 
 // normalizeProject applies the same lowercase/trim rule the store applies to

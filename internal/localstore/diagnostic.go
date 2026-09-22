@@ -292,14 +292,24 @@ func recordForReviewStatus(updatedAt string, reviewAfter, expires sql.NullString
 	return rec
 }
 
-// SyncBacklog describes the unacked outbox: how many mutations are waiting to
-// be pushed to central, and how old the oldest of them is.
+// SyncBacklog describes the unacked, UN-PARKED outbox: how many mutations are
+// genuinely still waiting for the next push cycle to pick them up, and how old
+// the oldest of them is.
+//
+// Parked rows (FUP-004b) are deliberately EXCLUDED: a parked entry is not
+// "waiting for the next tick" — DrainOutbox has stopped returning it, so no
+// amount of waiting drains it. Counting it here would make ParkedMutationsCheck's
+// finding look like it is also silently shrinking the backlog every cycle,
+// when nothing is actually moving. See ParkedMutationsCheck for parked rows'
+// own check.
 type SyncBacklog struct {
 	Pending int       `json:"pending"`
 	Oldest  time.Time `json:"oldest_occurred_at"`
 }
 
-// SyncBacklog reads the outbound push journal (sync_mutations with no acked_at).
+// SyncBacklog reads the outbound push journal (sync_mutations with no
+// acked_at and no parked_at — see SyncBacklog's own doc comment for why
+// parked rows are excluded).
 func (s *Store) SyncBacklog() (SyncBacklog, error) {
 	var (
 		backlog SyncBacklog
@@ -308,7 +318,7 @@ func (s *Store) SyncBacklog() (SyncBacklog, error) {
 	err := s.db.QueryRow(`
 		SELECT COUNT(*), MIN(occurred_at)
 		FROM sync_mutations
-		WHERE acked_at IS NULL`).Scan(&backlog.Pending, &oldest)
+		WHERE acked_at IS NULL AND parked_at IS NULL`).Scan(&backlog.Pending, &oldest)
 	if err != nil {
 		return SyncBacklog{}, fmt.Errorf("SyncBacklog: query: %w", err)
 	}

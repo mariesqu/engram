@@ -60,6 +60,10 @@ type Store interface {
 	ProjectsWithoutPolicy(project string) ([]string, error)
 	CountByReviewStatus(project string) (localstore.ReviewCounts, error)
 	SyncBacklog() (localstore.SyncBacklog, error)
+	// ListParked backs ParkedMutationsCheck (FUP-004d): outbox entries central
+	// has permanently rejected, excluded from SyncBacklog's own count (see its
+	// doc comment) because a parked entry is stuck, not merely waiting.
+	ListParked() ([]localstore.ParkedEntry, error)
 	SQLiteLockSnapshot(ctx context.Context) (localstore.SQLiteLockSnapshot, error)
 	CentralConfigured() bool
 }

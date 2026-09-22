@@ -44,7 +44,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-004a — Server: 422 for permanent Apply errors** — Route: delegated writer
 - [x] **FUP-004b — Client: park permanently rejected outbox entries** — Route: delegated writer
 - [x] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
-- [ ] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
+- [x] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
 - [ ] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
 - [ ] **FUP-005b — Server: serve original creation times** — Route: delegated writer
 - [ ] **FUP-005c — Client: backfill created_at once per project** — Route: delegated writer
@@ -262,7 +262,41 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   packages ok except the three known environmental failures.
   Commit: pending (recorded after commit).
 
+- FUP-004d done (delegated writer), closing FUP-004. New
+  `parked_mutations` diagnostic check (internal/diagnostic/checks.go,
+  registered in registry.go): one Finding per parked entry (local_seq,
+  12-char mutation_id prefix, project, entity, attempts, last_error),
+  safe_next_step naming both `engram sync retry`/`discard`. Store interface
+  gained `ListParked`. `SyncBacklogCheck`'s underlying
+  `localstore.Store.SyncBacklog()` now filters `parked_at IS NULL` too, so a
+  parked entry is reported ONCE (by the new check), not doubled into the
+  "waiting to push" backlog count it no longer represents.
+  New CLI: `engram sync parked` (list), `engram sync retry <seq|all>`
+  (un-park + reset attempts), `engram sync discard <seq>` (acks the entry in
+  place without ever pushing it — see Store.DiscardMutation's doc comment
+  from FUP-004b for why acked-not-deleted is the safer choice; prints what
+  it discarded, reading the entry back before the discard). Unlike `sync
+  now` (talks to the running daemon's control API), these three open the
+  local store directly via `localstore.Open` — the same pattern `engram
+  projects consolidate` already uses — since SQLite's WAL mode makes that
+  safe alongside a running daemon and these subcommands are useful whether
+  or not one is up. retry/discard use the same two-pass flag parse as
+  consolidate so a flag may come before OR after the positional local_seq.
+  Tests added: `internal/diagnostic/diagnostic_test.go`
+  (`TestParkedMutationsCheck`, 3 cases: local-only stays quiet, empty is ok,
+  one entry produces a bounded-prefix finding naming both CLI commands);
+  updated the hardcoded `TestRegistry_IsDeterministicAndComplete` count
+  (7→8, a legitimate change — a new check was actually registered).
+  `cmd/engram/sync_parked_test.go` (10 tests covering list/retry-one/
+  retry-all/discard against a real temp SQLite store, plus missing-db,
+  missing-arg, and not-parked error paths). No other existing assertion
+  changed. README documents the new subcommands and the parked-mutation
+  concept.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1` (ENGRAM_DSN unset): all
+  packages ok except the three known environmental failures.
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-004d (doctor + CLI for parked mutations), then FUP-005a/b/c
-(created_at on the wire).
+FUP-005a/b/c (created_at on the wire).

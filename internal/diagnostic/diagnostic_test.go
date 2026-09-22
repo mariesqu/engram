@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,8 @@ type fakeStore struct {
 	reviewErr     error
 	backlog       localstore.SyncBacklog
 	backlogErr    error
+	parked        []localstore.ParkedEntry
+	parkedErr     error
 	lock          localstore.SQLiteLockSnapshot
 	lockErr       error
 	central       bool
@@ -74,6 +77,8 @@ func (f *fakeStore) CountByReviewStatus(project string) (localstore.ReviewCounts
 }
 
 func (f *fakeStore) SyncBacklog() (localstore.SyncBacklog, error) { return f.backlog, f.backlogErr }
+
+func (f *fakeStore) ListParked() ([]localstore.ParkedEntry, error) { return f.parked, f.parkedErr }
 
 func (f *fakeStore) SQLiteLockSnapshot(context.Context) (localstore.SQLiteLockSnapshot, error) {
 	return f.lock, f.lockErr
@@ -437,6 +442,83 @@ func TestSyncBacklogCheck(t *testing.T) {
 	}
 }
 
+// TestParkedMutationsCheck covers ParkedMutationsCheck (FUP-004d): local-only
+// stores stay quiet even with fixture data present (nothing is ever pushed, so
+// nothing can be parked), an empty parked list is ok, and a non-empty one
+// produces one warning finding per entry with the operator-facing fields —
+// local_seq, a bounded mutation_id prefix, project, entity, attempts,
+// last_error, and both retry/discard commands named in safe_next_step.
+func TestParkedMutationsCheck(t *testing.T) {
+	longID := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
+
+	for name, tc := range map[string]struct {
+		central bool
+		parked  []localstore.ParkedEntry
+		want    string
+	}{
+		"local only": {
+			central: false,
+			parked:  []localstore.ParkedEntry{{LocalSeq: 1, MutationID: longID}},
+			want:    StatusOK,
+		},
+		"nothing parked": {
+			central: true,
+			want:    StatusOK,
+		},
+		"one parked entry": {
+			central: true,
+			parked: []localstore.ParkedEntry{{
+				LocalSeq: 42, MutationID: longID, Entity: "memory", Project: "engram",
+				Attempts: 3, LastError: "rejected by constraint \"x\" (SQLSTATE 23514)",
+			}},
+			want: StatusWarning,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := healthyStore()
+			store.central = tc.central
+			store.parked = tc.parked
+
+			got := runOne(t, ParkedMutationsCheck{}, Scope{Store: store})
+			if got.Result != tc.want {
+				t.Fatalf("result = %q, want %q", got.Result, tc.want)
+			}
+			if tc.want == StatusOK {
+				return
+			}
+			if len(got.Findings) != len(tc.parked) {
+				t.Fatalf("findings = %d, want %d (one per parked entry)", len(got.Findings), len(tc.parked))
+			}
+			f := got.Findings[0]
+			if f.Severity != SeverityWarning {
+				t.Errorf("severity = %q, want %q", f.Severity, SeverityWarning)
+			}
+			var evidence map[string]any
+			if err := json.Unmarshal(f.Evidence, &evidence); err != nil {
+				t.Fatalf("evidence is not valid JSON: %v", err)
+			}
+			if got := evidence["local_seq"]; got != float64(42) {
+				t.Errorf("evidence local_seq = %v, want 42", got)
+			}
+			if got := evidence["project"]; got != "engram" {
+				t.Errorf("evidence project = %v, want %q", got, "engram")
+			}
+			if got := evidence["mutation_id"]; got != longID[:mutationIDPrefixLen] {
+				t.Errorf("evidence mutation_id = %v, want the %d-char prefix %q", got, mutationIDPrefixLen, longID[:mutationIDPrefixLen])
+			}
+			if got := evidence["attempts"]; got != float64(3) {
+				t.Errorf("evidence attempts = %v, want 3", got)
+			}
+			if strings.Contains(fmt.Sprint(evidence["mutation_id"]), longID) {
+				t.Error("evidence leaked the FULL mutation_id, want it bounded to the prefix")
+			}
+			if !strings.Contains(f.SafeNextStep, "engram sync retry 42") || !strings.Contains(f.SafeNextStep, "engram sync discard 42") {
+				t.Errorf("safe_next_step = %q, want both retry and discard commands naming local_seq 42", f.SafeNextStep)
+			}
+		})
+	}
+}
+
 // ─── runner and report shape ─────────────────────────────────────────────────
 
 // TestRunAll_HealthyStore is the shape contract every consumer branches on.
@@ -541,8 +623,8 @@ func TestRunOne_RunsExactlyOneCheck(t *testing.T) {
 // and in every invalid-check error.
 func TestRegistry_IsDeterministicAndComplete(t *testing.T) {
 	codes := RegisteredCodes()
-	if len(codes) != 7 {
-		t.Errorf("registered %d checks %v, want 7", len(codes), codes)
+	if len(codes) != 8 {
+		t.Errorf("registered %d checks %v, want 8", len(codes), codes)
 	}
 	for i := 1; i < len(codes); i++ {
 		if codes[i-1] >= codes[i] {
