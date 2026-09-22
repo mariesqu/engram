@@ -1295,10 +1295,26 @@ func hookOccurrenceMarkerFile(sessionID, event, payload string) string {
 	return hookStateFile(sessionID, "occ-"+hex.EncodeToString(sum[:8]))
 }
 
-// hookClaimOccurrence reports whether THIS call is the first to see event's
-// payload for session id. Call it immediately before the save it guards — not
-// earlier — so a call that never reaches the save (an unresolvable project, a
-// closed budget) never burns the claim for an occurrence nothing actually saved.
+// hookOccurrenceDedupWindow bounds how long an occurrence marker actually
+// dedups its own (session, event, payload) key. A double hook install (the
+// plugin AND `engram setup hooks` both active) fires both processes within
+// milliseconds of each other — that is the delivery this guards against. A
+// user who submits the IDENTICAL text again later in the same session (a
+// retyped "continue", a re-sent report) is a new occurrence that happens to
+// hash the same, and must still be saved; without a window it would stay
+// blocked for the full hookOccurrenceMarkerTTL (24h) or until session-end.
+// 30s comfortably covers the double-install race — both processes launch and
+// finish well under a second — while treating anything a human could
+// plausibly retype as intentional.
+const hookOccurrenceDedupWindow = 30 * time.Second
+
+// hookClaimOccurrence reports whether THIS call should proceed with the save
+// for event's payload in session id — true either because no marker exists yet
+// (a genuinely new occurrence) or because the existing one is older than
+// hookOccurrenceDedupWindow (not a near-simultaneous duplicate; see above).
+// Call it immediately before the save it guards — not earlier — so a call that
+// never reaches the save (an unresolvable project, a closed budget) never
+// burns or refreshes the claim for an occurrence nothing actually saved.
 //
 // An empty session id claims unconditionally (no dedup, not a failure): the
 // marker's session component is a hash, so an unnamed session would share ONE
@@ -1315,7 +1331,21 @@ func hookClaimOccurrence(sessionID, event, payload string) bool {
 		return true
 	}
 	hookSweepStaleOccurrenceMarkers()
-	return hookClaimState(hookOccurrenceMarkerFile(sessionID, event, payload))
+
+	path := hookOccurrenceMarkerFile(sessionID, event, payload)
+	if hookClaimState(path) {
+		return true
+	}
+	// A marker already exists. Outside the dedup window this is not a
+	// near-simultaneous duplicate delivery — refresh it (so the window slides
+	// with each genuine resave, the same way hookTouchState refreshes the nudge
+	// cooldown) and let the save through. !ok (the marker vanished between the
+	// two calls above) is the same "nothing here to collide with" case.
+	if age, ok := hookStateAge(path); !ok || age >= hookOccurrenceDedupWindow {
+		hookTouchState(path)
+		return true
+	}
+	return false
 }
 
 // hookClearOccurrenceMarkers removes every occurrence marker hookClaimOccurrence

@@ -1259,6 +1259,35 @@ func TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce(t *testing.T) {
 	}
 }
 
+// TestHookUserPromptSubmit_DedupWindowExpiryStillSaves is the FUP-003b
+// regression test: the SAME prompt in the SAME session, delivered again after
+// the marker has aged past hookOccurrenceDedupWindow, is a new occurrence (a
+// retyped "continue"), not a duplicate delivery, and must be saved again.
+func TestHookUserPromptSubmit_DedupWindowExpiryStillSaves(t *testing.T) {
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "stale-marker-prompt-repo")
+	sessionID := "hook-stale-marker-prompt-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	input := map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "continue",
+	}
+	_ = runHook(t, "user-prompt-submit", input, "--db", dbPath)
+
+	marker := hookOccurrenceMarkerFile(sessionID, "user-prompt-submit", "continue")
+	ageHookState(t, marker, hookOccurrenceDedupWindow+time.Second)
+
+	_ = runHook(t, "user-prompt-submit", input, "--db", dbPath)
+
+	count, err := components.store.CountPromptsForSession(sessionID, "stale-marker-prompt-repo", "continue")
+	if err != nil {
+		t.Fatalf("CountPromptsForSession: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("prompt saved %d time(s) once its marker aged past the dedup window, want 2", count)
+	}
+}
+
 // TestHookUserPromptSubmit_DifferentPromptsBothSaved proves the dedup is keyed
 // on the occurrence, not just the session: two DIFFERENT prompts in the same
 // session must both be captured.
@@ -1346,6 +1375,32 @@ func TestHookClaimOccurrence_EmptySessionNeverDedupes(t *testing.T) {
 	}
 	if !hookClaimOccurrence("", "user-prompt-submit", "same text") {
 		t.Error("a second call with an empty session id must ALSO claim — no dedup without a session to key on")
+	}
+}
+
+// TestHookClaimOccurrence_DedupWindowBoundary pins hookClaimOccurrence's own
+// window logic directly: a marker still inside hookOccurrenceDedupWindow
+// blocks the repeat, and one just past it does not.
+func TestHookClaimOccurrence_DedupWindowBoundary(t *testing.T) {
+	isolateHookStateDir(t)
+
+	if !hookClaimOccurrence("window-session", "user-prompt-submit", "same text") {
+		t.Fatal("first claim must succeed")
+	}
+	if hookClaimOccurrence("window-session", "user-prompt-submit", "same text") {
+		t.Error("a claim milliseconds later must be treated as the same delivery and blocked")
+	}
+
+	marker := hookOccurrenceMarkerFile("window-session", "user-prompt-submit", "same text")
+	ageHookState(t, marker, hookOccurrenceDedupWindow+time.Second)
+
+	if !hookClaimOccurrence("window-session", "user-prompt-submit", "same text") {
+		t.Error("a claim past the dedup window must be treated as a NEW occurrence and allowed")
+	}
+	// And the window slides: immediately after that refresh, a repeat is a
+	// near-simultaneous duplicate again.
+	if hookClaimOccurrence("window-session", "user-prompt-submit", "same text") {
+		t.Error("the refreshed marker should immediately re-block a near-simultaneous repeat")
 	}
 }
 

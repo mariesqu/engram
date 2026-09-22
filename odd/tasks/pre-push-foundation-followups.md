@@ -40,8 +40,9 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-001 — Index LOWER(project)** — Route: delegated writer
 - [x] **FUP-002 — Hook session fallback only for empty cwd** — Route: delegated writer
 - [x] **FUP-003 — Duplicate-install hook protection** — Route: delegated writer
-- [ ] **FUP-004 — Outbox permanent-rejection handling** — Route: pending design (explorer mapping sync)
-- [ ] **FUP-005 — created_at on the wire** — Route: pending design (explorer mapping sync)
+- [x] **FUP-003b — Dedup only near-simultaneous deliveries** — Route: delegated writer
+- [ ] **FUP-004 — Outbox permanent-rejection handling** — Route: delegated writer
+- [ ] **FUP-005 — created_at on the wire** — Route: delegated writer
 
 ## Progress
 
@@ -130,10 +131,30 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   known environmental failures.
   Commit: 597e123.
 
+- FUP-003b done (delegated writer). The occurrence marker in hookClaimOccurrence
+  blocked a repeat of the identical (session, event, payload) key for its full
+  24h TTL, so a user resending the same text later in a session (a retyped
+  "continue") lost the second save, not just the double-install race it was
+  built for. Added hookOccurrenceDedupWindow (30s): hookClaimOccurrence now
+  checks the existing marker's age via hookStateAge — inside the window it
+  still blocks (near-simultaneous duplicate delivery), past it the marker is
+  refreshed via hookTouchState and the save proceeds (a new occurrence that
+  happens to hash the same).
+  Tests added: `cmd/engram/hook_test.go`
+  `TestHookUserPromptSubmit_DedupWindowExpiryStillSaves` (end-to-end: two
+  identical runHook calls, marker backdated past the window between them, both
+  save), `TestHookClaimOccurrence_DedupWindowBoundary` (unit: blocks
+  immediately, allows past the window, re-blocks immediately after the
+  refresh). No existing assertion changed.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
+  known environmental failures.
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-001..003 are closed. FUP-004/005 (outbox permanent-rejection handling,
-created_at on the wire) remain pending design/exploration of
-internal/syncer, internal/syncwire, internal/localstore/sync.go, apply.go and
-internal/centralstore — explicitly out of scope for this writer, which was
-read-only-restricted from those files.
+FUP-004/005 next: outbox permanent-rejection handling and created_at on the
+wire, now in scope (server changes approved) — touching internal/syncer,
+internal/remote, internal/syncwire, internal/localstore/{sync.go,apply.go,
+schema.go,diagnostic.go}, internal/cloudserve, internal/centralstore,
+internal/importer, internal/diagnostic.
