@@ -38,7 +38,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 ## Tasks
 
 - [x] **FUP-001 — Index LOWER(project)** — Route: delegated writer
-- [ ] **FUP-002 — Hook session fallback only for empty cwd** — Route: delegated writer
+- [x] **FUP-002 — Hook session fallback only for empty cwd** — Route: delegated writer
 - [ ] **FUP-003 — Duplicate-install hook protection** — Route: delegated writer
 - [ ] **FUP-004 — Outbox permanent-rejection handling** — Route: pending design (explorer mapping sync)
 - [ ] **FUP-005 — created_at on the wire** — Route: pending design (explorer mapping sync)
@@ -64,9 +64,28 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
   known environmental failures (TestRun_DaemonMissingDB,
   TestRun_DaemonCentralURLMissingWriterID, TestRun_DaemonCentralURLMissingWriterKey).
+  Commit: 6539c20.
+
+- FUP-002 done (delegated writer). `hookProject` (cmd/engram/hook.go) fell back
+  to the session's registered project whenever `hookResolveProject` returned ""
+  — including a cwd that was PRESENT but REFUSED (relative, missing directory,
+  ambiguous monorepo parent), silently overriding that refusal with a guess.
+  Fixed: the fallback now only fires when `strings.TrimSpace(in.CWD) == ""`;
+  a refused-but-present cwd returns "" (no save) instead of falling through.
+  Doc comment rewritten to state the invariant explicitly.
+  Tests added: `cmd/engram/hook_test.go`
+  `TestHookSubagentStop_RefusedCwdDoesNotFallBackToSessionsProject` (two
+  subtests: relative cwd "." and a missing-directory path, both against a
+  session pre-registered with a real project — asserts zero saves). No
+  existing assertion was changed; the existing
+  `TestHookSubagentStop_FallsBackToTheSessionsProject` already covers the
+  empty-cwd-still-falls-back case and continues to pass unchanged.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1`: all packages ok except the three
+  known environmental failures.
   Commit: pending (recorded after commit).
 
 ## Next Step
 
-FUP-002, then FUP-003, each as its own commit; parallel read-only sync mapping
-for FUP-004/005 stays out of scope for this writer.
+FUP-003, as its own commit; parallel read-only sync mapping for FUP-004/005
+stays out of scope for this writer.

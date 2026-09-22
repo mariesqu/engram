@@ -977,6 +977,54 @@ func TestHookSubagentStop_FallsBackToTheSessionsProject(t *testing.T) {
 	}
 }
 
+// TestHookSubagentStop_RefusedCwdDoesNotFallBackToSessionsProject is the FUP-002
+// regression test: a REFUSED cwd (present but relative/missing/ambiguous) must
+// NOT fall back to the session's registration the way an EMPTY cwd does. The
+// session below is registered with a real project, exactly as
+// TestHookSubagentStop_FallsBackToTheSessionsProject's is — the only difference
+// is that the later event carries a cwd the daemon refuses instead of no cwd at
+// all, and that refusal must stand: nothing gets saved.
+func TestHookSubagentStop_RefusedCwdDoesNotFallBackToSessionsProject(t *testing.T) {
+	cases := map[string]string{
+		"relative":          ".",
+		"missing directory": filepath.Join(t.TempDir(), "no", "such", "repo"),
+	}
+
+	for name, cwd := range cases {
+		t.Run(name, func(t *testing.T) {
+			dbPath, components := hookDaemonFixture(t)
+			decoyDaemonCwd(t)
+			repo := pinnedProjectDir(t, "refused-cwd-repo-"+strings.ReplaceAll(name, " ", "-"))
+			sessionID := "hook-refused-cwd-" + t.Name()
+
+			// The session IS registered with a real project — the exact setup that
+			// makes the (fixed) empty-cwd fallback succeed.
+			_ = runHook(t, "session-start", map[string]any{
+				"session_id": sessionID, "cwd": repo,
+			}, "--db", dbPath, "--no-autostart")
+
+			// ... but this event carries a cwd the daemon refuses, not an absent one.
+			out := runHook(t, "subagent-stop", map[string]any{
+				"session_id":             sessionID,
+				"cwd":                    cwd,
+				"last_assistant_message": "Found the deadlock in the writer queue",
+			}, "--db", dbPath)
+
+			if obj := decodeHookJSON(t, out); len(obj) != 0 {
+				t.Errorf("subagent-stop must still print {}; got %v", obj)
+			}
+			results, _, err := components.store.SearchMemoriesFiltered("deadlock", "", 10, localstore.SearchFilter{})
+			if err != nil {
+				t.Fatalf("search: %v", err)
+			}
+			if len(results) != 0 {
+				t.Errorf("cwd=%q was refused but the report was saved under project %q anyway — "+
+					"the session fallback caught a refusal it must not catch", cwd, results[0].Project)
+			}
+		})
+	}
+}
+
 // TestHookSubagentStop_NamesTheProjectExplicitly proves the fix does not simply
 // drop everything: with a cwd in the payload the report is saved, and it is
 // saved under the project that cwd resolves to — not under the daemon's, which

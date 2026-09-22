@@ -539,23 +539,31 @@ func hookResolveProject(ctx context.Context, client *mcpBridge, cwd string) stri
 }
 
 // hookProject is the project a hook's work belongs to: the payload's cwd first,
-// and the SESSION's own registration as the fallback.
+// and the SESSION's own registration as the fallback — but ONLY when the
+// payload carried NO cwd at all.
 //
 // The fallback is not a second guess at the same question — it is the same
 // observation arriving by another road. session-start registered this id WITH
 // the directory the host reported, so the session row holds a cwd that came
 // from the host, for this very session, at a moment when the host did supply
-// one. A later event from the same session that arrives without a cwd (Codex
-// omits it for some subagent shapes, and a wrapper script can drop it for any
-// of them) is not a session we cannot place: it is one we already placed.
+// one. A later event from the same session that arrives with an EMPTY cwd
+// (Codex omits it for some subagent shapes, and a wrapper script can drop it
+// for any of them) is not a session we cannot place: it is one we already
+// placed.
 //
-// Everything that made the cwd path refuse still applies to what it refused —
-// a directory that is gone or a daemon-cwd answer never becomes acceptable
-// here. This only asks a different, narrower question when the first one had
-// nothing to work with.
+// A cwd that IS present but REFUSED — relative, an ambiguous monorepo parent,
+// a directory that no longer exists — is a different answer, and the fallback
+// must NOT catch it: the host told us exactly where the session is and the
+// daemon said no, so falling back to the session's registration would silently
+// override that refusal with a guess. Only strings.TrimSpace(in.CWD) == ""
+// reaches hookProjectFromSession; hookResolveProject returning "" for a
+// non-empty cwd stops here with no save.
 func hookProject(ctx context.Context, client *mcpBridge, in hookInput) string {
 	if project := hookResolveProject(ctx, client, in.CWD); project != "" {
 		return project
+	}
+	if strings.TrimSpace(in.CWD) != "" {
+		return ""
 	}
 	return hookProjectFromSession(ctx, client.dir, in.SessionID)
 }
