@@ -238,9 +238,11 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // TestRecentSessions_ScalesToThreeHundredSessions).
 //
 // The SHAPE is the win here, not the index. The grouped pass still visits every
-// live memory; idx_mem_session (schema v14) only lets SQLite walk them already
-// in session order — "SCAN memories USING INDEX idx_mem_session" in the plan —
-// instead of sorting them for the GROUP BY. That saves a sort, not the
+// LIVE MEMORY IN THE FILTERED PROJECT — idx_mem_project_lower (schema v15) lets
+// SQLite reach those rows by an index scan on LOWER(project) instead of
+// grouping the whole table; idx_mem_session (schema v14) then lets it walk them
+// already in session order — "SCAN memories USING INDEX idx_mem_session" in the
+// plan — instead of sorting them for the GROUP BY. That saves a sort, not the
 // O(sessions × memories) evaluation: the correlated subquery had to go for that.
 // Where the index measurably pays for itself is the OTHER half of the mem_context
 // path, FormatContext's per-session observation COUNT — one indexed lookup per
@@ -317,17 +319,34 @@ func recentSessionsQuery(project string, limit int) (string, []any) {
 	            datetime(COALESCE(lm.last_created, s.started_at))
 	          )`
 
+	// The derived table's own project filter (not just the outer s.project one)
+	// is what keeps the grouped pass scoped to ONE project. Without it, `lm`
+	// groups every live memory in the whole store by session_id regardless of
+	// which project's sessions the outer query asked for — correct (session_id
+	// still keys the join correctly) but needlessly wide, and unable to use
+	// idx_mem_project_lower since no LOWER(project) predicate is present to match
+	// it against.
+	memoriesFilter := "WHERE deleted_at IS NULL"
+	var innerArgs []any
+	if project != "" {
+		memoriesFilter += "\n              AND LOWER(project) = ?"
+		innerArgs = append(innerArgs, project)
+	}
+
 	query := `SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
 	                 ` + lastActivityExpr + ` AS last_activity_at
 	          FROM sessions s
 	          LEFT JOIN (
 	            SELECT session_id, MAX(datetime(created_at)) AS last_created
 	            FROM memories
-	            WHERE deleted_at IS NULL
+	            ` + memoriesFilter + `
 	            GROUP BY session_id
 	          ) lm ON lm.session_id = s.id
 	          WHERE 1=1`
-	args := []any{}
+	// innerArgs' placeholders appear first in the text above (the derived table
+	// is part of the FROM clause, ahead of the outer WHERE) — args must follow
+	// the same order or the wrong value binds to the wrong "?".
+	args := append([]any{}, innerArgs...)
 	if project != "" {
 		query += " AND LOWER(s.project) = ?"
 		args = append(args, project)

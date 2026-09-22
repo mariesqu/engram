@@ -180,7 +180,19 @@ import (
 //	review_after are left alone (the column is per-node state a MarkReviewed may
 //	already have set), as are soft-deleted rows and every type with no decay
 //	entry — NULL there still means "fall back to updated_at + window".
-const currentSchemaVersion = 14
+//
+// v14 → v15: add idx_mem_project_lower ON memories(LOWER(project)) and
+//
+//	idx_sessions_project_lower ON sessions(LOWER(project)). Every project-scoped
+//	read in this package (SearchMemoriesFiltered, recentObservations, CountPinned,
+//	BrowseMemories, SelectVectors, RecentSessions) filters with
+//	LOWER(project) = ? for case-insensitive matching, and SQLite can only use an
+//	index for the EXACT expression a predicate is written over — a plain index on
+//	the bare column cannot serve a LOWER(column) predicate, so every one of those
+//	queries fell back to a full table scan. Both indexes are additive expression
+//	indexes (CREATE INDEX IF NOT EXISTS), so a fresh DB where ApplySchema already
+//	created them is a no-op here.
+const currentSchemaVersion = 15
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -583,9 +595,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 14
 	}
 
+	if ver < 15 {
+		if err := migrateV14ToV15(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 15
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 14` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 15` migration block.
+	// the final `ver = 15` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 16` migration block.
 	_ = ver
 	return nil
 }
@@ -948,6 +968,7 @@ func rebuildMemoriesTable(db *sql.DB) error {
 		`DROP INDEX IF EXISTS idx_mem_entity_status`,
 		`DROP INDEX IF EXISTS idx_mem_deleted`,
 		`DROP INDEX IF EXISTS idx_mem_project`,
+		`DROP INDEX IF EXISTS idx_mem_project_lower`,
 		`DROP INDEX IF EXISTS idx_mem_session`,
 	}
 	for _, s := range dropIdxStmts {
@@ -970,6 +991,7 @@ func rebuildMemoriesTable(db *sql.DB) error {
 			ON memories(deleted_at)
 			WHERE deleted_at IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
+		idxMemProjectLowerDDL,
 		idxMemSessionDDL,
 	}
 	for _, s := range idxStmts {
@@ -1414,6 +1436,52 @@ func migrateV13ToV14(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// idxMemProjectLowerDDL creates the expression index that lets
+// `WHERE LOWER(project) = ?` use an index scan instead of a full table scan.
+// A plain index on memories(project) cannot serve this predicate — SQLite only
+// uses an index for the EXACT expression a query filters on, and the column
+// wrapped in LOWER() is a different expression than the bare column. Shared
+// between ApplySchema, rebuildMemoriesTable and migrateV14ToV15, like
+// idxMemSessionDDL, so rebuildMemoriesTable cannot forget it and silently drop
+// it with memories_old (see the warning in that function's index-drop step).
+const idxMemProjectLowerDDL = `CREATE INDEX IF NOT EXISTS idx_mem_project_lower ON memories(LOWER(project))`
+
+// idxSessionsProjectLowerDDL is the sessions-table counterpart: RecentSessions
+// filters with LOWER(s.project) = ?, exactly as non-sargable against a plain
+// sessions(project) index as the memories case above. Sessions is never
+// rebuilt/renamed (unlike memories), so this one only needs installing in
+// ApplySchema and migrateV14ToV15.
+const idxSessionsProjectLowerDDL = `CREATE INDEX IF NOT EXISTS idx_sessions_project_lower ON sessions(LOWER(project))`
+
+// migrateV14ToV15 adds idx_mem_project_lower and idx_sessions_project_lower —
+// see the currentSchemaVersion note above for why LOWER(project) needs its own
+// index. Both statements are idempotent (CREATE INDEX IF NOT EXISTS), so a
+// fresh DB where ApplySchema already created them is a no-op here.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 14.
+func migrateV14ToV15(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(idxMemProjectLowerDDL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(idxSessionsProjectLowerDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 15`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1547,6 +1615,13 @@ func ApplySchema(db *sql.DB) error {
 		// the table; the index lets SQLite satisfy the distinct via an index scan.
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_tomb_project ON memory_tombstones(project)`,
+
+		// idx_mem_project_lower / idx_sessions_project_lower (v15) back every
+		// case-insensitive LOWER(project) = ? filter — idx_mem_project above cannot
+		// serve those, since SQLite only indexes the exact expression a predicate is
+		// written over. See the currentSchemaVersion v14→v15 note.
+		idxMemProjectLowerDDL,
+		idxSessionsProjectLowerDDL,
 
 		// idx_mem_session backs both per-session reads on the mem_context hot path
 		// (v14): RecentSessions' grouped newest-memory-per-session join and
