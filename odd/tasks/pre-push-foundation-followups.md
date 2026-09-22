@@ -46,7 +46,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-004c — Client: repair unacked NUL mutations** — Route: delegated writer
 - [x] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
 - [x] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
-- [ ] **FUP-005b — Server: serve original creation times** — Route: delegated writer
+- [x] **FUP-005b — Server: serve original creation times** — Route: delegated writer
 - [ ] **FUP-005c — Client: backfill created_at once per project** — Route: delegated writer
 
 ## Progress
@@ -323,6 +323,46 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   (ENGRAM_DSN unset): ok.
   Commit: pending (recorded after commit).
 
+- FUP-005b done (delegated writer). DEVIATION from the briefing's literal
+  "GET /api/v1/created-at" example: implemented as **POST /v1/created-at**
+  in cloudserve (not controlapi) — every existing cloudserve route
+  (push/pull/projects/unshare/state) is POST with a JSON body under `/v1/`,
+  and the auth middleware HMAC-signs method+path+body, so a bodyless GET
+  would need a different signing scheme than every sibling route. Matched
+  the established convention instead of the example's literal spelling;
+  the capability-gating/compat behavior (501 when unsupported, 404 from an
+  old server) is unaffected by the verb choice.
+  New: `syncwire.CreatedAtRequest/Entry/Response` (keyset-paged by sync_id,
+  `after`=last-seen sync_id, empty Entries=drained — mirrors PullRequest's
+  own paging contract). `centralstore.Store.OriginalCreatedAt` —
+  `MIN(occurred_at) GROUP BY entity_key` on central_mutations (the
+  append-only journal already holding every push's occurred_at across a
+  sync_id's whole version history), clamped to [1,2000]/default 500 like
+  PullSince. New index `idx_cmut_project_entity_key ON central_mutations
+  (project, entity_key)`, additive/idempotent (central schema.go). cloudserve:
+  new optional `createdAtLister` capability (mirrors projectLister/
+  projectDeleter/writerPurgeEpoch) + `handleCreatedAt`, registered at
+  `POST /v1/created-at`, same withAuth wrapping as every other route.
+  Tests added: `internal/cloudserve/server_createdat_test.go` (6 tests:
+  page returned + args forwarded, keyset paging reaches an empty/drained
+  page, missing-project 400, no-capability 501, store-error 500).
+  `internal/centralstore/created_at_acceptance_test.go` (NEW acceptance
+  file, `//go:build acceptance`, 3 tests: earliest-occurred_at-wins across
+  two versions of one sync_id, keyset paging visits every entry exactly
+  once in order, project scoping). Ran against REAL Postgres
+  (embedded-postgres auto-started, ENGRAM_DSN unset — no shared UAT DB
+  touched): all 3 new tests passed, plus the FULL existing
+  `internal/centralstore` (70s) and `internal/cloudserve` (40s)
+  acceptance suites, confirming the new index/query didn't regress
+  anything already covered there.
+  No existing assertion changed.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1` (ENGRAM_DSN unset): all
+  packages ok except the three known environmental failures.
+  `go test ./internal/centralstore/... ./internal/cloudserve/... -tags
+  acceptance -count=1` (ENGRAM_DSN unset, embedded-postgres): ok.
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-005b (server: serve original creation times), FUP-005c (client backfill).
+FUP-005c (client backfill, once per project).

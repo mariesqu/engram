@@ -6,10 +6,11 @@
 //
 // Routes:
 //
-//	POST /v1/push     — apply one mutation to central (see [handlePush])
-//	POST /v1/pull     — fetch mutations since a given seq (see [handlePull])
-//	POST /v1/projects — list the projects central knows (see [handleProjects])
-//	POST /v1/state    — report the authenticated writer's purge_epoch (see [handleState])
+//	POST /v1/push        — apply one mutation to central (see [handlePush])
+//	POST /v1/pull        — fetch mutations since a given seq (see [handlePull])
+//	POST /v1/projects    — list the projects central knows (see [handleProjects])
+//	POST /v1/state       — report the authenticated writer's purge_epoch (see [handleState])
+//	POST /v1/created-at  — page a project's original creation times (see [handleCreatedAt])
 //
 // # Auth
 //
@@ -233,8 +234,9 @@ func New(c transport.Central, verifier Verifier) *Server {
 //
 //	POST /v1/push     → auth middleware → [Server.handlePush]
 //	POST /v1/pull     → auth middleware → [Server.handlePull]
-//	POST /v1/projects → auth middleware → [Server.handleProjects]
-//	POST /v1/state    → auth middleware → [Server.handleState]
+//	POST /v1/projects    → auth middleware → [Server.handleProjects]
+//	POST /v1/state       → auth middleware → [Server.handleState]
+//	POST /v1/created-at  → auth middleware → [Server.handleCreatedAt]
 //
 // Wrong method on a known path → 405. Unknown path → 404 with the JSON
 // {"error":...} shape (via the "/" catch-all, not the text/plain ServeMux default).
@@ -248,6 +250,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/projects", s.methodGuard(http.MethodPost, s.withAuth(s.handleProjects)))
 	mux.HandleFunc("/v1/unshare", s.methodGuard(http.MethodPost, s.withAuth(s.handleUnshare)))
 	mux.HandleFunc("/v1/state", s.methodGuard(http.MethodPost, s.withAuth(s.handleState)))
+	mux.HandleFunc("/v1/created-at", s.methodGuard(http.MethodPost, s.withAuth(s.handleCreatedAt)))
 	// Catch-all: any path not matched by the exact /v1/* routes above gets a JSON
 	// 404 instead of net/http's default text/plain "404 page not found".
 	mux.HandleFunc("/", s.handleNotFound)
@@ -713,6 +716,64 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, syncwire.StateResponse{PurgeEpoch: epoch})
+}
+
+// createdAtLister is the OPTIONAL capability for FUP-005's created_at
+// backfill: the EARLIEST occurred_at central has ever recorded for each
+// sync_id in a project, one keyset-paged page at a time. *centralstore.Store
+// satisfies it; a Central that does not causes /v1/created-at to return 501 —
+// the SAME capability-gating pattern as projectLister/projectDeleter/
+// writerPurgeEpoch above.
+type createdAtLister interface {
+	OriginalCreatedAt(ctx context.Context, project, after string, limit int) ([]syncwire.CreatedAtEntry, error)
+}
+
+// handleCreatedAt processes a POST /v1/created-at request — the client
+// backfill's read side (FUP-005). It exists because created_at was, until
+// this fix, never carried onto a materialized row: execInsert defaulted it to
+// whichever node happened to apply the mutation, so a node that pulled an old
+// memory before the fix landed still shows today's date for it. This endpoint
+// lets that node ask central for the TRUE original date and correct itself,
+// without central needing to re-push anything.
+//
+// Pipeline:
+//  1. Auth middleware (runs before this handler via withAuth) — same as every
+//     other /v1/* route; this endpoint reads no writer-scoped data (like
+//     /v1/pull, it answers for the whole project, not just the caller's own
+//     writes), so any authenticated writer may call it.
+//  2. Decode JSON body into [syncwire.CreatedAtRequest]. Decode error → 400/413.
+//  3. Validate: Project non-empty → else 400.
+//  4. Capability check: the wrapped Central must implement createdAtLister → else 501.
+//  5. OriginalCreatedAt(project, after, limit) → error → 500. Success → 200 with
+//     [syncwire.CreatedAtResponse]. An empty Entries slice is a VALID 200 (not
+//     an error) — it is how the client's page loop learns it has reached the
+//     end of the project, mirroring /v1/pull's empty-batch contract.
+func (s *Server) handleCreatedAt(w http.ResponseWriter, r *http.Request) {
+	var req syncwire.CreatedAtRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	project := strings.TrimSpace(req.Project)
+	if project == "" {
+		writeError(w, http.StatusBadRequest, "project is required")
+		return
+	}
+
+	lister, ok := s.central.(createdAtLister)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "created_at backfill not supported")
+		return
+	}
+
+	entries, err := lister.OriginalCreatedAt(r.Context(), project, req.After, req.Limit)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "cloudserve: OriginalCreatedAt failed",
+			"project", project, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, syncwire.CreatedAtResponse{Entries: entries})
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

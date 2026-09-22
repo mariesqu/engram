@@ -269,3 +269,36 @@ type StateRequest struct{}
 type StateResponse struct {
 	PurgeEpoch int64 `json:"purge_epoch"`
 }
+
+// CreatedAtRequest is the body of a POST /v1/created-at request (FUP-005's
+// backfill endpoint, client → server). It asks central for one PAGE of
+// original-creation-time entries for Project, in a stable keyset order.
+//
+// After is the LAST sync_id returned by the previous page ("" for the first
+// page) — a keyset cursor, not an offset: central orders entries by sync_id
+// and returns rows strictly after it, which stays correct even if rows are
+// inserted between pages (an offset would skip or repeat rows under the same
+// condition). Limit is clamped server-side exactly like PullRequest.Limit.
+type CreatedAtRequest struct {
+	Project string `json:"project"`
+	After   string `json:"after,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+}
+
+// CreatedAtEntry is one sync_id's ORIGINAL creation time: the EARLIEST
+// occurred_at central has ever recorded for it, across every mutation any
+// writer ever pushed for that identity (MIN(occurred_at) GROUP BY entity_key)
+// — the true "when was this memory first written", independent of which
+// node's push happened to land it in central_mutations.
+type CreatedAtEntry struct {
+	SyncID    string `json:"sync_id"`
+	CreatedAt string `json:"created_at"` // RFC3339Nano UTC
+}
+
+// CreatedAtResponse is the body returned by POST /v1/created-at: one page of
+// entries, keyset-ordered by sync_id. An EMPTY Entries slice signals the
+// backfill has reached the end of the project — the client's page loop stops
+// there, mirroring /v1/pull's "empty batch means drained" contract.
+type CreatedAtResponse struct {
+	Entries []CreatedAtEntry `json:"entries"`
+}

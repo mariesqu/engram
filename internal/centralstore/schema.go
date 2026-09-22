@@ -48,6 +48,12 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_cmut_project_seq
 			ON central_mutations(project, seq)`,
 
+		// idx_cmut_project_entity_key backs OriginalCreatedAt's FUP-005 backfill
+		// query: GROUP BY entity_key (sync_id) with a keyset (project, entity_key)
+		// range predicate, once per project rather than on any hot path.
+		`CREATE INDEX IF NOT EXISTS idx_cmut_project_entity_key
+			ON central_mutations(project, entity_key)`,
+
 		// ── central_memories ─────────────────────────────────────────────────────
 		// Canonical materialized read model. sync_id is the portable identity.
 		// embedding is BYTEA reserved for pgvector (not populated in this change).
