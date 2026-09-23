@@ -50,13 +50,16 @@ Usage:
   engram projects consolidate <from> <to> [--yes] [--db <path>]
   engram projects delete <project> [--local] [--remote=purge-all|unshare] [--db <path>] [--dsn <dsn>] [--yes]
   engram config   get | set <key> <value>
-  engram sync     now
+  engram sync     now [--db <path>]
+  engram sync     parked [--db <path>]
+  engram sync     retry <seq|all> [--db <path>]
+  engram sync     discard <seq> [--db <path>]
   engram memories list | search <query>
   engram memories review [--status <status>] [--project <project>] [--limit <n>] [--db <path>]
   engram memories edit <id> --title <t> --content <c> [--type <type>] [--db <path>]
   engram memories delete <id> [--yes] [--db <path>]
   engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
-  engram hook     <session-start|post-compaction|user-prompt-submit|subagent-stop|session-end> [--db <path>]
+  engram hook     <session-start|post-compaction|user-prompt-submit|subagent-stop|session-end> [--db <path>] [--no-autostart]
   engram setup    hooks --agent <claude-code|codex> [--dry-run]
   engram version [--verbose]
 
@@ -83,7 +86,7 @@ Subcommands:
   central   Connect or disconnect the resident daemon from a central sync server (requires daemon --http).
   projects  List, manage policy, consolidate, or delete per-project data (requires daemon --http).
   config    Get or set daemon configuration values (requires daemon --http).
-  sync      Trigger an immediate sync cycle (requires daemon --http).
+  sync      Trigger an immediate sync cycle (now; requires daemon --http), or list, retry, or discard parked outbox entries.
   memories  Browse, review, edit, or delete stored memories (requires daemon --http).
   import    Import memories, prompts, and sessions from an old-generation engram database.
   hook      Run one agent lifecycle hook (reads the host's hook JSON on stdin; always exits 0).

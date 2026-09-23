@@ -107,6 +107,26 @@ func runHook(t *testing.T, event string, input map[string]any, args ...string) s
 	return runHookRaw(t, event, string(body), args...)
 }
 
+// withUnhurriedHookBudget lifts one event's budget for the rest of the test.
+//
+// For tests that assert WHAT a hook stored, not how fast: under the real 200ms
+// prompt budget, a loaded CI box (Windows runners especially) can spend the
+// whole budget before the save goes out, the hook fails open exactly as it
+// should, and the test then reads "sql: no rows" — a flake that says nothing
+// about the behaviour under test. The budget contract has its own tests
+// (TestHookUserPromptSubmit_NoDaemonStaysWithinBudget,
+// TestHookUserPromptSubmit_SlowControlAPIStaysWithinBudget,
+// TestHookBudgets_FitInsideEveryPackTimeout), which never call this.
+func withUnhurriedHookBudget(t *testing.T, event string) {
+	t.Helper()
+	old, ok := hookBudgets[event]
+	if !ok {
+		t.Fatalf("no budget for hook event %q", event)
+	}
+	hookBudgets[event] = time.Minute
+	t.Cleanup(func() { hookBudgets[event] = old })
+}
+
 // runHookRaw is runHook with a verbatim stdin body, for the malformed-input cases.
 //
 // It isolates the hook state directory itself rather than trusting each test to
@@ -321,6 +341,7 @@ func TestHookSessionStart_NoDaemon_StillPrintsThePointer(t *testing.T) {
 // session: the prompt is captured AND the tool bootstrap is injected, in the
 // only field a UserPromptSubmit hook can reach the model through.
 func TestHookUserPromptSubmit_FirstPromptBootstraps(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "prompt-repo")
 	sessionID := "hook-prompt-" + t.Name()
@@ -784,7 +805,7 @@ func (stubConfigStore) Apply(controlapi.ConfigPatch) (bool, error) { return fals
 func cleanupHookState(t *testing.T, sessionID string) {
 	t.Helper()
 	remove := func() {
-		for _, kind := range []string{"tools-loaded", "last-nudge"} {
+		for _, kind := range []string{"tools-loaded", "last-nudge", "project"} {
 			_ = os.Remove(hookStateFile(sessionID, kind))
 		}
 	}
@@ -1237,6 +1258,7 @@ func TestHookSessionEnd_ClearsSessionState(t *testing.T) {
 // test for a duplicate prompt save: the SAME prompt, in the SAME session,
 // delivered twice, must be captured exactly once.
 func TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "dup-prompt-repo")
 	sessionID := "hook-dup-prompt-" + t.Name()
@@ -1264,6 +1286,7 @@ func TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce(t *testing.T) {
 // the marker has aged past hookOccurrenceDedupWindow, is a new occurrence (a
 // retyped "continue"), not a duplicate delivery, and must be saved again.
 func TestHookUserPromptSubmit_DedupWindowExpiryStillSaves(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "stale-marker-prompt-repo")
 	sessionID := "hook-stale-marker-prompt-" + t.Name()
@@ -1292,6 +1315,7 @@ func TestHookUserPromptSubmit_DedupWindowExpiryStillSaves(t *testing.T) {
 // on the occurrence, not just the session: two DIFFERENT prompts in the same
 // session must both be captured.
 func TestHookUserPromptSubmit_DifferentPromptsBothSaved(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "distinct-prompt-repo")
 	sessionID := "hook-distinct-prompt-" + t.Name()
@@ -1628,7 +1652,12 @@ func TestReadHookInput_StillReadsAClosedStdinImmediately(t *testing.T) {
 // TestHookUserPromptSubmit_TruncatesAHugePrompt — a prompt can carry a pasted
 // file. Saved whole it becomes a memory nobody can read, and mem_save then
 // attaches it to an observation, spending the model's context on it twice.
+//
+// It asserts the stored bytes, so it runs without the 200ms budget: under that
+// budget a loaded Windows CI runner timed out the save (fail-open, correctly)
+// and this read "sql: no rows". See withUnhurriedHookBudget.
 func TestHookUserPromptSubmit_TruncatesAHugePrompt(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit")
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "huge-prompt-repo")
 	sessionID := "hook-huge-" + t.Name()
@@ -1682,5 +1711,260 @@ func TestHookUserPromptSubmit_SlowControlAPIStaysWithinBudget(t *testing.T) {
 	// is nowhere near the server's 2s sleep.
 	if limit := time.Second; elapsed > limit {
 		t.Errorf("hook took %v against a daemon that sleeps 2s, want well under %v", elapsed, limit)
+	}
+}
+
+// ─── the per-session project cache ──────────────────────────────────────────
+
+// TestHookSessionStart_CachesProjectForThePromptHook — session-start resolves
+// the workspace inside an 8s budget; the prompt hook must not pay for that
+// again (two git spawns in the daemon) inside its 200ms one.
+func TestHookSessionStart_CachesProjectForThePromptHook(t *testing.T) {
+	dbPath, _ := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "cached-start-repo")
+	sessionID := "hook-cache-start-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	_ = runHook(t, "session-start", map[string]any{"session_id": sessionID, "cwd": repo},
+		"--db", dbPath, "--no-autostart")
+
+	if got, _ := hookCachedProject(sessionID, repo); got != "cached-start-repo" {
+		t.Errorf("cached project after session-start = %q, want %q", got, "cached-start-repo")
+	}
+}
+
+// TestHookUserPromptSubmit_UsesCachedProject proves a cache hit skips the
+// resolution entirely: the cache names a project the workspace would NOT
+// resolve to, so a prompt filed under it can only have come from the cache.
+// A cache written for a different cwd is a different question and must miss.
+func TestHookUserPromptSubmit_UsesCachedProject(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "live-repo")
+
+	hit := "hook-cache-hit-" + t.Name()
+	cleanupHookState(t, hit)
+	hookCacheProject(hit, repo, "cached-repo", mustFingerprint(t, repo))
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": hit, "cwd": repo, "prompt": "from the cache",
+	}, "--db", dbPath)
+
+	miss := "hook-cache-miss-" + t.Name()
+	cleanupHookState(t, miss)
+	other := t.TempDir()
+	hookCacheProject(miss, other, "cached-repo", mustFingerprint(t, other))
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": miss, "cwd": repo, "prompt": "resolved live",
+	}, "--db", dbPath)
+
+	for _, tc := range []struct {
+		session, project, prompt string
+		want                     int
+	}{
+		{hit, "cached-repo", "from the cache", 1},
+		{hit, "live-repo", "from the cache", 0},
+		{miss, "live-repo", "resolved live", 1},
+		{miss, "cached-repo", "resolved live", 0},
+	} {
+		count, err := components.store.CountPromptsForSession(tc.session, tc.project, tc.prompt)
+		if err != nil {
+			t.Fatalf("CountPromptsForSession: %v", err)
+		}
+		if count != tc.want {
+			t.Errorf("prompt %q under project %q: %d, want %d", tc.prompt, tc.project, count, tc.want)
+		}
+	}
+	// The live answer is cached for the session's next prompt.
+	if got, _ := hookCachedProject(miss, repo); got != "live-repo" {
+		t.Errorf("cached project after a live resolution = %q, want %q", got, "live-repo")
+	}
+}
+
+// TestHookUserPromptSubmit_EditedConfigIsNotServedFromCache is the misfiling
+// the cache must never cause: the session's config now names another project,
+// and the prompt must follow it rather than the cached name.
+func TestHookUserPromptSubmit_EditedConfigIsNotServedFromCache(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "before-edit")
+	sessionID := "hook-cache-edit-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	hookCacheProject(sessionID, repo, "before-edit", mustFingerprint(t, repo))
+	rewriteHookInput(t, filepath.Join(repo, ".engram", "config.json"), `{"project_name": "after-edit-longer"}`)
+
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": sessionID, "cwd": repo, "prompt": "which project?",
+	}, "--db", dbPath)
+
+	count, err := components.store.CountPromptsForSession(sessionID, "after-edit-longer", "which project?")
+	if err != nil {
+		t.Fatalf("CountPromptsForSession: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("prompt filed under the edited config's project %d time(s), want 1 — the stale cache won", count)
+	}
+}
+
+// TestHookProjectCache_Revalidation covers every way a cached answer goes
+// stale, each against a workspace detection would now answer differently, plus
+// the unchanged workspace that must still hit.
+func TestHookProjectCache_Revalidation(t *testing.T) {
+	isolateHookStateDir(t)
+
+	// A fake repository: fingerprinting stats files, it never runs git, so a
+	// .git directory holding a config is all detection's inputs need.
+	newRepo := func(t *testing.T) (root, sub string) {
+		t.Helper()
+		root = t.TempDir()
+		sub = filepath.Join(root, "pkg", "inner")
+		for _, dir := range []string{sub, filepath.Join(root, ".git"), filepath.Join(root, ".engram")} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rewriteHookInput(t, filepath.Join(root, ".git", "config"),
+			"[remote \"origin\"]\n\turl = https://example.com/org/first.git\n")
+		rewriteHookInput(t, filepath.Join(root, ".engram", "config.json"), `{"project_name": "root"}`)
+		return root, sub
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, root string)
+		hit    bool
+	}{
+		{"unchanged workspace still hits", func(*testing.T, string) {}, true},
+		{"edited config", func(t *testing.T, root string) {
+			rewriteHookInput(t, filepath.Join(root, ".engram", "config.json"), `{"project_name": "renamed"}`)
+		}, false},
+		{"config created closer to the cwd", func(t *testing.T, root string) {
+			dir := filepath.Join(root, "pkg", ".engram")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			rewriteHookInput(t, filepath.Join(dir, "config.json"), `{"project_name": "closer"}`)
+		}, false},
+		{"git remote changed", func(t *testing.T, root string) {
+			rewriteHookInput(t, filepath.Join(root, ".git", "config"),
+				"[remote \"origin\"]\n\turl = https://example.com/org/second.git\n")
+		}, false},
+		{"TTL expired", func(t *testing.T, _ string) {
+			later := time.Now().Add(hookProjectCacheTTL + time.Second)
+			old := hookNow
+			hookNow = func() time.Time { return later }
+			t.Cleanup(func() { hookNow = old })
+		}, false},
+		{"stat error", func(t *testing.T, _ string) {
+			old := hookDetectionFingerprint
+			hookDetectionFingerprint = func(string) (string, error) {
+				return "", errors.New("injected stat failure")
+			}
+			t.Cleanup(func() { hookDetectionFingerprint = old })
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, sub := newRepo(t)
+			sessionID := "hook-cache-reval-" + t.Name()
+			cleanupHookState(t, sessionID)
+
+			hookCacheProject(sessionID, sub, "root", mustFingerprint(t, sub))
+			if got, _ := hookCachedProject(sessionID, sub); got != "root" {
+				t.Fatalf("fresh cache: hookCachedProject = %q, want %q", got, "root")
+			}
+			tc.mutate(t, root)
+
+			got, _ := hookCachedProject(sessionID, sub)
+			if tc.hit && got != "root" {
+				t.Errorf("hookCachedProject = %q, want a hit on %q", got, "root")
+			}
+			if !tc.hit && got != "" {
+				t.Errorf("hookCachedProject = %q, want a miss — the cached answer is stale", got)
+			}
+		})
+	}
+}
+
+// TestHookProjectCache_RefusalsAreNotCachedAndClearStateRemovesIt — an empty
+// answer is a refused workspace, and caching it would outlive whatever made
+// it; an answer with no fingerprint cannot be revalidated; and a resumed or
+// ended session must resolve afresh.
+func TestHookProjectCache_RefusalsAreNotCachedAndClearStateRemovesIt(t *testing.T) {
+	isolateHookStateDir(t)
+	const sessionID = "hook-cache-clear"
+	cwd := t.TempDir()
+	cacheFile := hookStateFile(sessionID, hookStateProject)
+
+	hookCacheProject(sessionID, cwd, "", mustFingerprint(t, cwd))
+	hookCacheProject(sessionID, cwd, "p", "")
+	if _, err := os.Stat(cacheFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a refused or unfingerprinted answer was cached: stat err = %v", err)
+	}
+
+	hookCacheProject(sessionID, cwd, "p", mustFingerprint(t, cwd))
+	if got, _ := hookCachedProject(sessionID, cwd); got != "p" {
+		t.Fatalf("hookCachedProject = %q, want %q", got, "p")
+	}
+	hookClearState(sessionID)
+	if got, _ := hookCachedProject(sessionID, cwd); got != "" {
+		t.Errorf("hookClearState left the cached project %q behind", got)
+	}
+}
+
+// TestHookProjectCache_HitPathCost pins what the cache is for: a hit — read
+// the file, re-stat every detection input — must be a small fraction of the
+// 200ms prompt budget. Generous on purpose (a loaded CI box), and still far
+// below the git round trip it replaces.
+func TestHookProjectCache_HitPathCost(t *testing.T) {
+	isolateHookStateDir(t)
+	root := t.TempDir()
+	cwd := filepath.Join(root, "a", "b", "c")
+	for _, dir := range []string{cwd, filepath.Join(root, ".git")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const sessionID = "hook-cache-cost"
+	hookCacheProject(sessionID, cwd, "p", mustFingerprint(t, cwd))
+
+	const runs = 50
+	start := time.Now()
+	for range runs {
+		if got, _ := hookCachedProject(sessionID, cwd); got != "p" {
+			t.Fatalf("hookCachedProject = %q, want a hit", got)
+		}
+	}
+	per := time.Since(start) / runs
+	t.Logf("cache hit (read + revalidate): %v per call", per)
+	if limit := hookBudgetPrompt / 4; per > limit {
+		t.Errorf("a cache hit costs %v, want well under %v", per, limit)
+	}
+}
+
+// mustFingerprint is hookProjectFingerprint for a directory the test built,
+// which must fingerprint cleanly.
+func mustFingerprint(t *testing.T, dir string) string {
+	t.Helper()
+	fp := hookProjectFingerprint(dir)
+	if fp == "" {
+		t.Fatalf("could not fingerprint %s", dir)
+	}
+	return fp
+}
+
+// rewriteHookInput writes a detection input and moves its mtime an hour
+// forward, so the change is visible on a filesystem with coarse timestamps
+// even when the new content happens to be the same size.
+func rewriteHookInput(t *testing.T, path, body string) {
+	t.Helper()
+	when := time.Now().Add(time.Hour)
+	if info, err := os.Stat(path); err == nil && !info.ModTime().Before(when) {
+		when = info.ModTime().Add(time.Hour)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatalf("Chtimes %s: %v", path, err)
 	}
 }
