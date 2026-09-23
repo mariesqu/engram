@@ -641,7 +641,7 @@ The suggestion is deterministic — the same title/type/content always yields th
 				mcp.Description("Search query — natural language or keywords"),
 			),
 			mcp.WithString("type",
-				mcp.Description("Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern"),
+				mcp.Description("Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern, config, discovery, learning"),
 			),
 			mcp.WithString("project",
 				mcp.Description("Filter by project name"),
