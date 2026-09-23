@@ -100,9 +100,19 @@ func TestRun_DaemonNegativeSyncInterval(t *testing.T) {
 
 // TestRun_DaemonMissingDB verifies that 'daemon' with no --db and no ENGRAM_DB
 // returns exit code 1 (the "db required" validation error).
+//
+// runDaemonCmd resolves --db as flag > ENGRAM_DB env > the config file's
+// "db_path" key (config.DefaultConfigDir, overridable via ENGRAM_CONFIG_DIR —
+// see daemon.go's "Resolve DB path" chain). Without an explicit
+// ENGRAM_CONFIG_DIR, a real config.json on this machine could supply db_path
+// and make this negative test pass falsely (or, worse, point at a real
+// engram.db). t.TempDir() here is a per-test config dir with no config.json,
+// so the fallback chain is guaranteed empty — on top of the package-wide
+// isolation TestMain (testmain_test.go) already applies.
 func TestRun_DaemonMissingDB(t *testing.T) {
 	t.Setenv("ENGRAM_DB", "")
 	t.Setenv("ENGRAM_CENTRAL_URL", "")
+	t.Setenv("ENGRAM_CONFIG_DIR", t.TempDir())
 	code := run([]string{"daemon"})
 	if code != 1 {
 		t.Errorf("run([daemon]) with no db: got exit code %d, want 1", code)
@@ -111,11 +121,16 @@ func TestRun_DaemonMissingDB(t *testing.T) {
 
 // TestRun_DaemonCentralURLMissingWriterID verifies that providing --central-url
 // without --writer-id returns exit code 1.
+//
+// --writer-id resolves the same flag > env > config-file way as --db (see
+// TestRun_DaemonMissingDB); an isolated ENGRAM_CONFIG_DIR keeps a real
+// config.json's writer_id from ever reaching this assertion.
 func TestRun_DaemonCentralURLMissingWriterID(t *testing.T) {
 	t.Setenv("ENGRAM_DB", t.TempDir()+"/test.db")
 	t.Setenv("ENGRAM_CENTRAL_URL", "http://localhost:8080")
 	t.Setenv("ENGRAM_WRITER_ID", "")
 	t.Setenv("ENGRAM_WRITER_KEY", "")
+	t.Setenv("ENGRAM_CONFIG_DIR", t.TempDir())
 	code := run([]string{"daemon"})
 	if code != 1 {
 		t.Errorf("run([daemon]) central-url without writer-id: got exit code %d, want 1", code)
@@ -124,11 +139,17 @@ func TestRun_DaemonCentralURLMissingWriterID(t *testing.T) {
 
 // TestRun_DaemonCentralURLMissingWriterKey verifies that providing
 // --central-url and --writer-id but no ENGRAM_WRITER_KEY returns exit code 1.
+//
+// ENGRAM_WRITER_KEY always wins over the config file (never resolved from it
+// here), but the config file can still supply an encrypted_writer_key that
+// decrypts successfully via DPAPI and short-circuits this "key required"
+// path; an isolated ENGRAM_CONFIG_DIR keeps a real config.json out of reach.
 func TestRun_DaemonCentralURLMissingWriterKey(t *testing.T) {
 	t.Setenv("ENGRAM_DB", t.TempDir()+"/test.db")
 	t.Setenv("ENGRAM_CENTRAL_URL", "http://localhost:8080")
 	t.Setenv("ENGRAM_WRITER_ID", "writer-x")
 	t.Setenv("ENGRAM_WRITER_KEY", "") // explicitly unset
+	t.Setenv("ENGRAM_CONFIG_DIR", t.TempDir())
 	code := run([]string{"daemon"})
 	if code != 1 {
 		t.Errorf("run([daemon]) central-url without writer-key: got exit code %d, want 1", code)
