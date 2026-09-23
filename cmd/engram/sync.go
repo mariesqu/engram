@@ -83,7 +83,8 @@ func openSyncStore(db string) (*localstore.Store, error) {
 // runSyncParkedCmd implements `engram sync parked`: lists every outbox entry
 // central has permanently rejected (FUP-004b), one line per entry, in the
 // exact fields mem_doctor's parked_mutations check reports — local_seq,
-// project, entity, attempts, and last_error — so an operator can go straight
+// project, entity, attempts, blocked_behind (later writes to the same memory
+// withheld behind it), and last_error — so an operator can go straight
 // from either surface to `engram sync retry`/`discard`.
 func runSyncParkedCmd(args []string) error {
 	fs := flag.NewFlagSet("sync parked", flag.ContinueOnError)
@@ -122,8 +123,8 @@ func runSyncParkedCmd(args []string) error {
 		if len(idPrefix) > mutationIDPrefixLen {
 			idPrefix = idPrefix[:mutationIDPrefixLen]
 		}
-		fmt.Printf("local_seq=%d  mutation_id=%s…  project=%q  entity=%s  attempts=%d\n  last_error: %s\n",
-			p.LocalSeq, idPrefix, p.Project, p.Entity, p.Attempts, p.LastError)
+		fmt.Printf("local_seq=%d  mutation_id=%s…  project=%q  entity=%s  attempts=%d  blocked_behind=%d\n  last_error: %s\n",
+			p.LocalSeq, idPrefix, p.Project, p.Entity, p.Attempts, p.BlockedBehind, p.LastError)
 	}
 	return nil
 }

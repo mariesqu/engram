@@ -265,8 +265,11 @@ func Push(ctx context.Context, n *Node, central Central) (int, error) {
 					// retry will ever succeed. Park it and STOP this group here: order
 					// matters within one sync_id's version chain, so a later entry in
 					// the SAME group must not apply out of turn while an earlier one
-					// sits rejected. Returning nil (not the error) is deliberate: other
-					// groups are unaffected and must keep going — gctx is not cancelled.
+					// sits rejected. The hold outlives this Push: DrainOutbox withholds
+					// every later entry of a sync_id with an unacked parked head until
+					// that head is retried or discarded. Returning nil (not the error)
+					// is deliberate: other groups are unaffected and must keep going —
+					// gctx is not cancelled.
 					if err := n.Store.ParkMutation(j.localSeq, wrapped.Error()); err != nil {
 						return fmt.Errorf("push %s: park(local_seq=%d): %w", n.Name, j.localSeq, err)
 					}

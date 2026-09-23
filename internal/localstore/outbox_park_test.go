@@ -304,3 +304,54 @@ func TestDrainOutbox_ParksUndecodablePayloadAndContinues(t *testing.T) {
 		t.Fatalf("second DrainOutbox returned %d entries, want 1", len(again))
 	}
 }
+
+// TestDrainOutbox_UndecodableHeadBlocksItsChainInTheSameCall: a row DrainOutbox
+// parks itself (undecodable) must hold back the later rows of its own sync_id
+// chain in THAT SAME call, not just from the next one — otherwise version 2
+// would be pushed while version 1 sits parked, out of order.
+func TestDrainOutbox_UndecodableHeadBlocksItsChainInTheSameCall(t *testing.T) {
+	s := openTempStore(t)
+
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_mutations (mutation_id, entity, entity_key, op, payload, writer_id, occurred_at)
+		VALUES ('mut-bad-head', 'memory', 'sync-park-9', 'upsert', 'not valid canonical payload', 'w', ?)`,
+		baseT.Add(1*time.Second).Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("insert undecodable head: %v", err)
+	}
+	if _, err := s.LocalWrite(upsertMut("sync-park-9", "sdd/test/park9", "v2", 2, baseT.Add(2*time.Second))); err != nil {
+		t.Fatalf("LocalWrite (v2 of the same chain): %v", err)
+	}
+
+	for call := 1; call <= 2; call++ {
+		entries, err := s.DrainOutbox(0)
+		if err != nil {
+			t.Fatalf("DrainOutbox call %d: %v", call, err)
+		}
+		for _, e := range entries {
+			if e.Mutation.SyncID == "sync-park-9" {
+				t.Errorf("DrainOutbox call %d returned %q of a chain whose head is parked", call, e.Mutation.Content)
+			}
+		}
+	}
+
+	parked, err := s.ListParked()
+	if err != nil {
+		t.Fatalf("ListParked: %v", err)
+	}
+	if len(parked) != 1 || parked[0].BlockedBehind != 1 {
+		t.Fatalf("ListParked = %+v, want the undecodable head with BlockedBehind=1", parked)
+	}
+
+	// Discarding the head releases the chain.
+	if err := s.DiscardMutation(parked[0].LocalSeq); err != nil {
+		t.Fatalf("DiscardMutation: %v", err)
+	}
+	entries, err := s.DrainOutbox(0)
+	if err != nil {
+		t.Fatalf("DrainOutbox after discard: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Mutation.Content != "v2" {
+		t.Errorf("DrainOutbox after discard = %+v, want exactly the released v2", entries)
+	}
+}

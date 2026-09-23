@@ -1532,6 +1532,17 @@ func migrateV14ToV15(db *sql.DB) error {
 const idxSyncMutationsDrainDDL = `CREATE INDEX IF NOT EXISTS idx_sync_mutations_drain
 	ON sync_mutations(acked_at, parked_at, local_seq)`
 
+// idxSyncMutationsParkedChainDDL backs blockedBehindParkedSQL (sync.go) — the
+// "is there an earlier parked row of this sync_id" probe DrainOutbox runs per
+// candidate row. Partial over exactly the parked, unacked rows, so it stays
+// empty in steady state. Additive and idempotent (IF NOT EXISTS): ApplySchema
+// installs it on every Open of a DB that has parked_at, so an existing v16+ DB
+// gains it without a schema-version bump, and migrateV15ToV16 installs it
+// alongside idx_sync_mutations_drain for an older one.
+const idxSyncMutationsParkedChainDDL = `CREATE INDEX IF NOT EXISTS idx_sync_mutations_parked_chain
+	ON sync_mutations(entity_key, local_seq)
+	WHERE parked_at IS NOT NULL AND acked_at IS NULL`
+
 // migrateV15ToV16 adds sync_mutations.attempts/last_error/last_attempt_at/
 // parked_at and idx_sync_mutations_drain — see the currentSchemaVersion v15→v16
 // note above for the FUP-004 rationale. Each ADD COLUMN is guarded by
@@ -1568,6 +1579,9 @@ func migrateV15ToV16(db *sql.DB) error {
 	}
 
 	if _, err := tx.Exec(idxSyncMutationsDrainDDL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(idxSyncMutationsParkedChainDDL); err != nil {
 		return err
 	}
 
@@ -1832,6 +1846,9 @@ func ApplySchema(db *sql.DB) error {
 		return err
 	} else if exists {
 		if _, err := db.Exec(idxSyncMutationsDrainDDL); err != nil {
+			return err
+		}
+		if _, err := db.Exec(idxSyncMutationsParkedChainDDL); err != nil {
 			return err
 		}
 	}

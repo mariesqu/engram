@@ -512,9 +512,10 @@ const mutationIDPrefixLen = 12
 // ParkedMutationsCheck reports outbox entries the syncer has PARKED (see
 // FUP-004b): central rejected them permanently, so DrainOutbox has stopped
 // resending them — but they are not gone, and a project's writes behind them
-// in the same sync_id's version chain stay stuck until an operator retries or
-// discards each one (`engram sync retry`/`discard`). SyncBacklogCheck
-// deliberately excludes these rows (see SyncBacklog's own doc comment): a
+// in the same sync_id's version chain stay BLOCKED (withheld by DrainOutbox,
+// counted in blocked_behind) until an operator retries or discards the parked
+// head (`engram sync retry`/`discard`). SyncBacklogCheck deliberately excludes
+// both the parked and the blocked rows (see SyncBacklog's own doc comment): a
 // parked entry is not "waiting for the next tick" the way a pending one is,
 // and conflating the two would make a real backlog look like it is draining
 // when it is actually stuck.
@@ -548,16 +549,19 @@ func (c ParkedMutationsCheck) Run(_ context.Context, scope Scope) (CheckResult, 
 			CheckID:    c.Code(),
 			Severity:   SeverityWarning,
 			ReasonCode: CheckParkedMutations,
-			Message: fmt.Sprintf("mutation %s… (local_seq=%d, project %q) was permanently rejected and is parked (%d attempt(s)): %s",
-				idPrefix, p.LocalSeq, p.Project, p.Attempts, p.LastError),
+			Message: fmt.Sprintf("mutation %s… (local_seq=%d, project %q) was permanently rejected and is parked (%d attempt(s)), "+
+				"blocking %d later write(s) to the same memory: %s",
+				idPrefix, p.LocalSeq, p.Project, p.Attempts, p.BlockedBehind, p.LastError),
 			Why: "Central rejected this exact mutation and will keep rejecting it unmodified — retrying it automatically forever would " +
-				"just repeat the same failed push. It also blocks every LATER write to the same memory queued behind it.",
+				"just repeat the same failed push. It also blocks every LATER write to the same memory queued behind it: those are " +
+				"withheld from push (never applied out of order) until this one is retried or discarded.",
 			Evidence: mustJSON(map[string]any{
 				"local_seq":       p.LocalSeq,
 				"mutation_id":     idPrefix,
 				"project":         p.Project,
 				"entity":          p.Entity,
 				"attempts":        p.Attempts,
+				"blocked_behind":  p.BlockedBehind,
 				"last_error":      p.LastError,
 				"last_attempt_at": p.LastAttemptAt.UTC().Format(time.RFC3339),
 				"parked_at":       p.ParkedAt.UTC().Format(time.RFC3339),

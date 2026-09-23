@@ -231,12 +231,21 @@ func enqueueOutboxTx(tx *sql.Tx, m domain.Mutation) error {
 // NUL-byte row). A row that fails to decode is PARKED with the decode error as
 // last_error and skipped, rather than failing the whole call: one bad row must
 // not wedge every other project's push behind it forever.
+//
+// A parked entry also BLOCKS every later unacked entry of the same sync_id
+// (entity_key — the key Push groups its ordered version chains by): those rows
+// are withheld too (see blockedBehindParkedSQL), because pushing version N+1
+// while version N sits rejected would apply the chain out of order. The block is
+// lifted by exactly the two operator actions on the parked head: UnparkMutation
+// makes the head drainable again (it sorts first, so the chain resumes in order),
+// and DiscardMutation acks it (so it no longer counts as an unacked park).
 func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 	q := `
-		SELECT local_seq, mutation_id, payload, occurred_at
-		FROM sync_mutations
-		WHERE acked_at IS NULL AND parked_at IS NULL
-		ORDER BY local_seq ASC`
+		SELECT s.local_seq, s.entity_key, s.mutation_id, s.payload, s.occurred_at
+		FROM sync_mutations s
+		WHERE s.acked_at IS NULL AND s.parked_at IS NULL
+		  AND NOT ` + blockedBehindParkedSQL + `
+		ORDER BY s.local_seq ASC`
 	args := []any{}
 	if limit > 0 {
 		q += " LIMIT ?"
@@ -258,17 +267,26 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 	}
 	var out []OutboxEntry
 	var undecodable []undecodableRow
+	// parkedNow holds the entity_keys of rows parked by THIS call (undecodable):
+	// the SQL block above only sees parks that already existed, so any later row
+	// of the same chain in this same result set is withheld here instead. Rows
+	// arrive in local_seq order, so every later row of the chain follows its head.
+	parkedNow := map[string]bool{}
 
 	for rows.Next() {
 		var (
 			localSeq      int64
+			entityKey     string
 			mutationID    string
 			payload       string
 			occurredAtStr string
 		)
-		if err := rows.Scan(&localSeq, &mutationID, &payload, &occurredAtStr); err != nil {
+		if err := rows.Scan(&localSeq, &entityKey, &mutationID, &payload, &occurredAtStr); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("DrainOutbox: scan: %w", err)
+		}
+		if entityKey != "" && parkedNow[entityKey] {
+			continue // blocked behind a row this call is about to park
 		}
 
 		m, decErr := mutation.FromCanonicalPayload([]byte(payload))
@@ -277,6 +295,7 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 				localSeq: localSeq,
 				reason:   fmt.Sprintf("DrainOutbox: decode payload (mutation_id=%s): %v", mutationID, decErr),
 			})
+			parkedNow[entityKey] = true
 			continue
 		}
 		m.MutationID = mutationID
@@ -288,6 +307,7 @@ func (s *Store) DrainOutbox(limit int) ([]OutboxEntry, error) {
 				reason: fmt.Sprintf("DrainOutbox: mutation_id=%s: occurred_at %q is not a valid timestamp",
 					mutationID, occurredAtStr),
 			})
+			parkedNow[entityKey] = true
 			continue
 		}
 		m.OccurredAt = t
@@ -377,6 +397,20 @@ func (s *Store) AckMutation(localSeq int64) error {
 // DrainOutbox stops returning it, but it stays UNACKED (never silently
 // discarded) so an operator can inspect, retry, or explicitly discard it.
 
+// blockedBehindParkedSQL is the predicate (over sync_mutations aliased s) that
+// is true when s sits BEHIND a parked entry of its own sync_id chain: an
+// unacked, parked row with the same entity_key and a lower local_seq. Such a
+// row is withheld from DrainOutbox and counted as blocked rather than pending
+// (SyncBacklog, ListParked) until the parked head is retried or discarded. An
+// empty entity_key names no chain, so it never blocks anything. Backed by
+// idx_sync_mutations_parked_chain, a partial index over exactly the parked,
+// unacked rows — normally none, so the probe is a near-free index lookup.
+const blockedBehindParkedSQL = `EXISTS (
+		SELECT 1 FROM sync_mutations p
+		WHERE p.entity_key = s.entity_key AND s.entity_key <> ''
+		  AND p.parked_at IS NOT NULL AND p.acked_at IS NULL
+		  AND p.local_seq < s.local_seq)`
+
 // ErrMutationNotParked is returned by UnparkMutation and DiscardMutation when
 // localSeq does not name a currently-parked, unacked row — either it was never
 // parked, it was already un-parked/discarded, or it does not exist.
@@ -431,7 +465,9 @@ func (s *Store) ParkMutation(localSeq int64, errMsg string) error {
 // UnparkMutation clears parked_at and resets attempts to 0, making the entry
 // eligible for DrainOutbox again on the next push cycle — the `engram sync
 // retry` primitive. last_error/last_attempt_at are left as a historical
-// record of why it was parked; the next real attempt overwrites them.
+// record of why it was parked; the next real attempt overwrites them. It also
+// releases the later entries of its sync_id chain blocked behind it: they
+// drain again right after it, in local_seq order.
 // Returns ErrMutationNotParked if localSeq does not currently name a parked,
 // unacked row.
 func (s *Store) UnparkMutation(localSeq int64) error {
@@ -461,7 +497,8 @@ func (s *Store) UnparkMutation(localSeq int64) error {
 // centrally. It sets acked_at, the SAME field a successful push sets, so
 // DrainOutbox never returns it again; parked_at (and attempts/last_error) are
 // left in place so the row still reads as "discarded, not pushed" in any later
-// audit rather than looking like an ordinary successful push.
+// audit rather than looking like an ordinary successful push. Once acked it no
+// longer blocks its sync_id chain, so the later entries behind it drain again.
 //
 // A hard DELETE was considered and rejected: sync_mutations is this node's
 // only durable record that the mutation was ever attempted, and deleting it
@@ -509,17 +546,32 @@ type ParkedEntry struct {
 	LastError     string
 	LastAttemptAt time.Time
 	ParkedAt      time.Time
+	// BlockedBehind counts the later, un-parked, unacked entries of this entry's
+	// own sync_id chain that DrainOutbox withholds because of it (see
+	// blockedBehindParkedSQL) — up to the next parked entry of the chain, if any,
+	// so no blocked row is counted under two heads. They go out, in order, once
+	// this entry is retried or discarded.
+	BlockedBehind int
 }
 
 // ListParked returns every parked (never-to-be-resent) outbox entry, oldest
 // (lowest local_seq) first.
 func (s *Store) ListParked() ([]ParkedEntry, error) {
 	rows, err := s.db.Query(`
-		SELECT local_seq, mutation_id, entity, payload,
-		       attempts, COALESCE(last_error, ''), COALESCE(last_attempt_at, ''), COALESCE(parked_at, '')
-		FROM sync_mutations
-		WHERE parked_at IS NOT NULL AND acked_at IS NULL
-		ORDER BY local_seq ASC`)
+		SELECT p.local_seq, p.mutation_id, p.entity, p.payload,
+		       p.attempts, COALESCE(p.last_error, ''), COALESCE(p.last_attempt_at, ''), COALESCE(p.parked_at, ''),
+		       (SELECT COUNT(*) FROM sync_mutations b
+		         WHERE b.entity_key = p.entity_key AND p.entity_key <> ''
+		           AND b.local_seq > p.local_seq
+		           AND b.acked_at IS NULL AND b.parked_at IS NULL
+		           AND NOT EXISTS (
+		             SELECT 1 FROM sync_mutations q
+		             WHERE q.entity_key = p.entity_key
+		               AND q.parked_at IS NOT NULL AND q.acked_at IS NULL
+		               AND q.local_seq > p.local_seq AND q.local_seq < b.local_seq))
+		FROM sync_mutations p
+		WHERE p.parked_at IS NOT NULL AND p.acked_at IS NULL
+		ORDER BY p.local_seq ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("ListParked: query: %w", err)
 	}
@@ -533,7 +585,7 @@ func (s *Store) ListParked() ([]ParkedEntry, error) {
 			lastAttemptRaw, parkedRaw string
 		)
 		if err := rows.Scan(&e.LocalSeq, &e.MutationID, &e.Entity, &payload,
-			&e.Attempts, &e.LastError, &lastAttemptRaw, &parkedRaw); err != nil {
+			&e.Attempts, &e.LastError, &lastAttemptRaw, &parkedRaw, &e.BlockedBehind); err != nil {
 			return nil, fmt.Errorf("ListParked: scan: %w", err)
 		}
 		if m, decErr := mutation.FromCanonicalPayload([]byte(payload)); decErr == nil {

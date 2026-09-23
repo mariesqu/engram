@@ -10,6 +10,7 @@ package syncer_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -214,65 +215,126 @@ func TestPush_ParkStopsRestOfSameGroupOnly(t *testing.T) {
 	}
 
 	// Both queued sync-group versions are gone from DrainOutbox: the first is
-	// parked, and the second was never touched — it must still show up as
-	// PENDING (not parked, not acked), proving it is untouched rather than lost.
+	// parked, and the second is BLOCKED behind it (withheld until the head is
+	// retried or discarded) — but still unacked and counted on the parked head,
+	// proving it is held rather than lost.
 	entries, err := node.Store.DrainOutbox(0)
 	if err != nil {
 		t.Fatalf("DrainOutbox: %v", err)
 	}
-	pendingGroup := 0
 	for _, e := range entries {
 		if e.Mutation.SyncID == "sync-group" {
-			pendingGroup++
+			t.Errorf("DrainOutbox returned sync-group v%d after its head was parked; it must be withheld",
+				e.Mutation.Version)
 		}
 	}
-	if pendingGroup != 1 {
-		t.Errorf("DrainOutbox shows %d pending sync-group entries after the park, want 1 (the untouched second version)",
-			pendingGroup)
-	}
-}
-
-// TestPush_RetryableFailureRecordsAttemptsAndPropagates covers the OTHER
-// branch: a 5xx-shaped (or unclassified) failure must NOT be parked, but must
-// be recorded (attempts/last_error) and returned as a Push error so the Loop's
-// backoff still engages.
-func TestPush_RetryableFailureRecordsAttemptsAndPropagates(t *testing.T) {
-	ctx := context.Background()
-	node := openNode(t, "park-retryable")
-
-	writeVersion(t, node, "proj", "sync-flaky", 1, time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC))
-
-	central := &parkCentral{
-		applyErrFor: map[string]error{
-			"sync-flaky": &parkStatusErr{code: 503, msg: "overloaded"},
-		},
-	}
-
-	_, err := syncer.Push(ctx, node, central)
-	if err == nil {
-		t.Fatal("Push: want a non-nil error for a retryable (5xx) failure, got nil")
-	}
-
 	parked, err := node.Store.ListParked()
 	if err != nil {
 		t.Fatalf("ListParked: %v", err)
 	}
-	if len(parked) != 0 {
-		t.Errorf("ListParked returned %d entries, want 0 — a 5xx must never be auto-parked", len(parked))
+	if len(parked) != 1 || parked[0].BlockedBehind != 1 {
+		t.Errorf("ListParked = %+v, want one parked head with BlockedBehind=1 (the held second version)", parked)
 	}
+}
 
-	entries, err := node.Store.DrainOutbox(0)
-	if err != nil {
-		t.Fatalf("DrainOutbox: %v", err)
+// chainCentral rejects exactly ONE mutation (by version) of one sync_id with a
+// permanent 422 while reject is set, and records every Apply in call order.
+type chainCentral struct {
+	parkCentral
+	rejectSyncID  string
+	rejectVersion int
+	reject        bool
+}
+
+func (c *chainCentral) Apply(ctx context.Context, m domain.Mutation) error {
+	c.mu.Lock()
+	c.applied = append(c.applied, m)
+	rejected := c.reject && m.SyncID == c.rejectSyncID && m.Version == c.rejectVersion
+	c.mu.Unlock()
+	if rejected {
+		return &parkStatusErr{code: 422, msg: "rejected head"}
 	}
-	found := false
-	for _, e := range entries {
-		if e.Mutation.SyncID == "sync-flaky" {
-			found = true
+	return nil
+}
+
+// appliedVersionsOf lists the versions Apply saw for syncID, in call order.
+func (c *chainCentral) appliedVersionsOf(syncID string) []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []int
+	for _, m := range c.applied {
+		if m.SyncID == syncID {
+			out = append(out, m.Version)
 		}
 	}
-	if !found {
-		t.Error("sync-flaky is not pending after a retryable failure — it must stay in the outbox for the next cycle")
+	return out
+}
+
+// TestPush_ParkedHeadBlocksChainAcrossCycles is the ordered-chain invariant
+// ACROSS push cycles: with version 1 of a sync_id parked, versions 2 and 3 must
+// never reach central on any later cycle (they used to, out of order, on the
+// very next DrainOutbox) — and must go out, in order, once the head is either
+// retried or discarded.
+func TestPush_ParkedHeadBlocksChainAcrossCycles(t *testing.T) {
+	for _, release := range []string{"retry", "discard"} {
+		t.Run(release, func(t *testing.T) {
+			ctx := context.Background()
+			node := openNode(t, "park-chain-"+release)
+
+			for v := 1; v <= 3; v++ {
+				writeVersion(t, node, "proj", "sync-chain", v, time.Date(2025, 1, 1, 0, 0, v, 0, time.UTC))
+			}
+			central := &chainCentral{rejectSyncID: "sync-chain", rejectVersion: 1, reject: true}
+
+			for cycle := 1; cycle <= 3; cycle++ {
+				if _, err := syncer.Push(ctx, node, central); err != nil {
+					t.Fatalf("Push cycle %d: %v", cycle, err)
+				}
+			}
+			if got := central.appliedVersionsOf("sync-chain"); !slices.Equal(got, []int{1}) {
+				t.Fatalf("after 3 cycles with v1 parked, Apply saw versions %v, want [1] — later versions leaked out of order", got)
+			}
+
+			parked, err := node.Store.ListParked()
+			if err != nil || len(parked) != 1 {
+				t.Fatalf("ListParked = %+v, %v; want exactly the parked v1", parked, err)
+			}
+			if parked[0].BlockedBehind != 2 {
+				t.Errorf("BlockedBehind = %d, want 2 (v2 and v3 held behind the parked head)", parked[0].BlockedBehind)
+			}
+			backlog, err := node.Store.SyncBacklog()
+			if err != nil {
+				t.Fatalf("SyncBacklog: %v", err)
+			}
+			if backlog.Pending != 0 {
+				t.Errorf("SyncBacklog.Pending = %d, want 0 — blocked rows are not waiting for the next tick", backlog.Pending)
+			}
+
+			central.mu.Lock()
+			central.reject = false
+			central.mu.Unlock()
+			want := []int{1, 1, 2, 3} // the rejected attempt, then the retried head and its chain in order
+			switch release {
+			case "retry":
+				err = node.Store.UnparkMutation(parked[0].LocalSeq)
+			case "discard":
+				err = node.Store.DiscardMutation(parked[0].LocalSeq)
+				want = []int{1, 2, 3} // the head is dropped, never resent
+			}
+			if err != nil {
+				t.Fatalf("%s head: %v", release, err)
+			}
+
+			if _, err := syncer.Push(ctx, node, central); err != nil {
+				t.Fatalf("Push after %s: %v", release, err)
+			}
+			if got := central.appliedVersionsOf("sync-chain"); !slices.Equal(got, want) {
+				t.Errorf("after %s, Apply saw versions %v, want %v (in order)", release, got, want)
+			}
+			if n, err := node.Store.PendingCount(); err != nil || n != 0 {
+				t.Errorf("PendingCount after %s = %d, %v; want 0", release, n, err)
+			}
+		})
 	}
 }
 

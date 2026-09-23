@@ -301,7 +301,10 @@ func recordForReviewStatus(updatedAt string, reviewAfter, expires sql.NullString
 // amount of waiting drains it. Counting it here would make ParkedMutationsCheck's
 // finding look like it is also silently shrinking the backlog every cycle,
 // when nothing is actually moving. See ParkedMutationsCheck for parked rows'
-// own check.
+// own check. Rows BLOCKED behind a parked entry of their own sync_id chain
+// (blockedBehindParkedSQL) are excluded for the same reason — DrainOutbox
+// withholds them until that head is retried or discarded — and are reported
+// instead as ParkedEntry.BlockedBehind on the head that holds them.
 type SyncBacklog struct {
 	Pending int       `json:"pending"`
 	Oldest  time.Time `json:"oldest_occurred_at"`
@@ -316,9 +319,10 @@ func (s *Store) SyncBacklog() (SyncBacklog, error) {
 		oldest  sql.NullString
 	)
 	err := s.db.QueryRow(`
-		SELECT COUNT(*), MIN(occurred_at)
-		FROM sync_mutations
-		WHERE acked_at IS NULL AND parked_at IS NULL`).Scan(&backlog.Pending, &oldest)
+		SELECT COUNT(*), MIN(s.occurred_at)
+		FROM sync_mutations s
+		WHERE s.acked_at IS NULL AND s.parked_at IS NULL
+		  AND NOT `+blockedBehindParkedSQL).Scan(&backlog.Pending, &oldest)
 	if err != nil {
 		return SyncBacklog{}, fmt.Errorf("SyncBacklog: query: %w", err)
 	}
