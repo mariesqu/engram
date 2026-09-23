@@ -416,7 +416,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   acceptance -count=1` (ENGRAM_DSN unset, embedded-postgres): ok (90s +
   58s, full suites, confirming the domain.CreatedAtEntry refactor and v17
   schema change regressed nothing already covered there).
-  Commit: pending (recorded after commit).
+  Commit: 7ff48b8.
 
 ## Next Step
 
