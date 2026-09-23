@@ -38,9 +38,17 @@ var (
 	pgEP        *embeddedpostgres.EmbeddedPostgres
 )
 
-// TestMain starts embedded-postgres once per package run and stops it when all
-// tests finish. Mirrors the pattern from centralstore/store_acceptance_test.go.
+// TestMain isolates the package from the developer's real user config, cache
+// and home directories (BH-001; see testenv_test.go's isolateUserEnv), then
+// starts embedded-postgres once per package run and stops it when all tests
+// finish. Mirrors the pattern from centralstore/store_acceptance_test.go.
 func TestMain(m *testing.M) {
+	cleanupEnv, err := isolateUserEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cmd/engram acceptance: isolateUserEnv: %v\n", err)
+		os.Exit(1)
+	}
+
 	pgStartOnce.Do(func() {
 		if dsn := os.Getenv("ENGRAM_TEST_PG_DSN"); dsn != "" {
 			pgDSN = dsn
@@ -79,6 +87,7 @@ func TestMain(m *testing.M) {
 		}
 	}
 
+	cleanupEnv()
 	os.Exit(code)
 }
 
