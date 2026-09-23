@@ -4,6 +4,8 @@ package localstore
 
 import (
 	"database/sql"
+	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -146,7 +148,79 @@ import (
 //	reuse it without another migration. The table is idempotent (CREATE TABLE IF
 //	NOT EXISTS in ApplySchema), so a fresh DB where ApplySchema already created it
 //	is a no-op in the migration.
-const currentSchemaVersion = 12
+//
+// v12 → v13: add memories.pinned (BOOLEAN NOT NULL DEFAULT 0), backing mem_pin /
+//
+//	mem_unpin. A plain additive ALTER TABLE ADD COLUMN guarded by PRAGMA
+//	table_info, so a fresh DB (where memoriesTableDDL already declares it) is a
+//	no-op. Existing rows default to 0 — unpinned is the correct state for every
+//	memory saved before the feature existed.
+//
+//	pinned is LOCAL-ONLY by construction: it is absent from the canonical payload
+//	(mutation.CanonicalPayload) and therefore from the sync wire, and no
+//	reconciliation path reads it. "This matters to ME, on THIS machine" is a
+//	per-node judgment — the same posture as review_after — so it deliberately does
+//	not travel, and no central-store or reconcile invariant changes because of it.
+//	The FTS index is untouched (pinned is not a searchable text column), so the
+//	triggers need no rebuild.
+//
+// v13 → v14: add idx_mem_session ON memories(session_id), and backfill
+//
+//	review_after for the decay types that predate the lifecycle feature.
+//
+//	The index backs the two per-session reads on the mem_context hot path:
+//	RecentSessions' grouped "newest memory per session" join and FormatContext's
+//	per-session observation COUNT. Both previously full-scanned memories — at 300
+//	sessions over 20k rows that measured 1.39s and 1.58s respectively.
+//
+//	The backfill dates review_after from each row's OWN created_at (not from the
+//	migration instant) for the three types in decayReviewAfterMonths, so a
+//	two-year-old decision surfaces as needs_review immediately instead of being
+//	granted a fresh six months by the act of upgrading. Rows that already carry a
+//	review_after are left alone (the column is per-node state a MarkReviewed may
+//	already have set), as are soft-deleted rows and every type with no decay
+//	entry — NULL there still means "fall back to updated_at + window".
+//
+// v14 → v15: add idx_mem_project_lower ON memories(LOWER(project)) and
+//
+//	idx_sessions_project_lower ON sessions(LOWER(project)). Every project-scoped
+//	read in this package (SearchMemoriesFiltered, recentObservations, CountPinned,
+//	BrowseMemories, SelectVectors, RecentSessions) filters with
+//	LOWER(project) = ? for case-insensitive matching, and SQLite can only use an
+//	index for the EXACT expression a predicate is written over — a plain index on
+//	the bare column cannot serve a LOWER(column) predicate, so every one of those
+//	queries fell back to a full table scan. Both indexes are additive expression
+//	indexes (CREATE INDEX IF NOT EXISTS), so a fresh DB where ApplySchema already
+//	created them is a no-op here.
+//
+// v15 → v16: add sync_mutations.attempts/last_error/last_attempt_at/parked_at
+//
+//	(FUP-004). Central can now reject a push permanently (HTTP 422, or a 400/413
+//	the mutation itself can never outlive) instead of every failure being a
+//	transient 5xx to retry forever. attempts/last_error/last_attempt_at record
+//	EVERY push failure for an entry (retried or parked) for operator visibility
+//	(mem_doctor, `engram sync parked`); parked_at IS NOT NULL marks an entry
+//	DrainOutbox must skip — it stopped pushing on its own but was never acked,
+//	so the plain "acked_at IS NULL" pending definition would otherwise resend it
+//	forever. idx_sync_mutations_drain ON (acked_at, parked_at, local_seq) backs
+//	DrainOutbox's WHERE acked_at IS NULL AND parked_at IS NULL ORDER BY
+//	local_seq — an index a fresh, small outbox table does not need YET, but a
+//	node with a long-parked backlog does. All four columns are additive
+//	(ALTER TABLE ADD COLUMN, guarded by PRAGMA table_info like v2→v3's
+//	last_write_mutation_id), and the index is CREATE INDEX IF NOT EXISTS, so a
+//	fresh DB where ApplySchema already created them is a no-op here.
+//
+// v16 → v17: add created_at_backfill(project PK, completed_at) (FUP-005c).
+//
+//	Tracks, per project, whether this node has already run the ONE-TIME
+//	created_at backfill against central's new /v1/created-at endpoint (see
+//	syncer's BackfillCreatedAt) — a row present means "done, do not repeat".
+//	A separate table rather than a project_policy column: policy and backfill
+//	completion are unrelated concerns, and a project with no row here simply
+//	has not been backfilled yet (including one that predates this feature
+//	entirely), which is the correct default with no data migration needed.
+//	CREATE TABLE IF NOT EXISTS makes this idempotent for a fresh DB.
+const currentSchemaVersion = 17
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -300,6 +374,9 @@ const memoriesTableDDL = `CREATE TABLE IF NOT EXISTS memories (
 	deleted_at      TEXT,
 	review_after    TEXT,
 	expires_at      TEXT,
+	-- pinned is LOCAL-ONLY: never in the canonical payload, never on the wire,
+	-- never read by reconciliation. See the v12 → v13 note above.
+	pinned          BOOLEAN NOT NULL DEFAULT 0,
 	-- Application-level invariants encoded as CHECK constraints.
 	-- Only 'memory' rows may omit status.
 	CHECK(entity_type = 'memory' OR status IS NOT NULL),
@@ -530,9 +607,49 @@ func runMigrations(db *sql.DB) error {
 		ver = 12
 	}
 
+	if ver < 13 {
+		if err := migrateV12ToV13(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 13
+	}
+
+	if ver < 14 {
+		if err := migrateV13ToV14(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 14
+	}
+
+	if ver < 15 {
+		if err := migrateV14ToV15(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 15
+	}
+
+	if ver < 16 {
+		if err := migrateV15ToV16(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 16
+	}
+
+	if ver < 17 {
+		if err := migrateV16ToV17(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 17
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 12` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 13` migration block.
+	// the final `ver = 17` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 18` migration block.
 	_ = ver
 	return nil
 }
@@ -775,10 +892,11 @@ func migrateV3ToV4(db *sql.DB) error {
 //     d. Drop FTS virtual table + triggers (they reference the old rowid mapping).
 //     e. Recreate FTS virtual table + triggers via the shared DDL statements.
 //     f. Rebuild FTS index from the copied rows.
-//     g. DROP INDEX IF EXISTS for all four idx_mem_* names — necessary because
-//     ALTER TABLE RENAME preserves index names on memories_old, so
-//     CREATE INDEX IF NOT EXISTS would silently no-op (name already exists).
-//     Dropping the names first lets the CREATE INDEX run against the new table.
+//     g. DROP INDEX IF EXISTS for EVERY idx_mem_* name ApplySchema installs —
+//     necessary because ALTER TABLE RENAME preserves index names on
+//     memories_old, so CREATE INDEX IF NOT EXISTS would silently no-op (name
+//     already exists). Dropping the names first lets the CREATE INDEX run
+//     against the new table.
 //     h. Recreate indexes on the new memories table.
 //     i. Drop memories_old (this also drops any indexes that survived on it).
 //  3. `PRAGMA foreign_keys = ON`.
@@ -880,11 +998,22 @@ func rebuildMemoriesTable(db *sql.DB) error {
 	// Note: memories_old still exists at this point; its rowid mapping is about
 	// to be destroyed by DROP TABLE memories_old in step (i).  Dropping the
 	// index names here is safe because we no longer need them on memories_old.
+	//
+	// This list must name EVERY index ApplySchema puts on memories — ApplySchema
+	// runs BEFORE runMigrations on every Open, so by the time this rebuild starts
+	// each of those names already exists and is attached to what is about to
+	// become memories_old.  A name missing here is not a missing DROP, it is a
+	// SILENTLY LOST INDEX: its CREATE below no-ops on the existing name and
+	// DROP TABLE memories_old in step (i) takes the index with it.  That is
+	// exactly how idx_mem_project was lost on the v0→v1 path.
 	dropIdxStmts := []string{
 		`DROP INDEX IF EXISTS idx_mem_topic`,
 		`DROP INDEX IF EXISTS idx_mem_parent`,
 		`DROP INDEX IF EXISTS idx_mem_entity_status`,
 		`DROP INDEX IF EXISTS idx_mem_deleted`,
+		`DROP INDEX IF EXISTS idx_mem_project`,
+		`DROP INDEX IF EXISTS idx_mem_project_lower`,
+		`DROP INDEX IF EXISTS idx_mem_session`,
 	}
 	for _, s := range dropIdxStmts {
 		if _, err = tx.Exec(s); err != nil {
@@ -906,6 +1035,8 @@ func rebuildMemoriesTable(db *sql.DB) error {
 			ON memories(deleted_at)
 			WHERE deleted_at IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
+		idxMemProjectLowerDDL,
+		idxMemSessionDDL,
 	}
 	for _, s := range idxStmts {
 		if _, err = tx.Exec(s); err != nil {
@@ -1262,6 +1393,238 @@ func migrateV11ToV12(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV12ToV13 adds memories.pinned, the local-only flag behind mem_pin /
+// mem_unpin.  Purely additive: existing rows default to 0 (unpinned), which is
+// the correct state for every memory saved before the feature existed.  Guarded
+// by PRAGMA table_info so a fresh DB — where ApplySchema already created the
+// column from memoriesTableDDL — is a no-op.
+func migrateV12ToV13(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	exists, err := columnExists(tx, "memories", "pinned")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := tx.Exec(
+			`ALTER TABLE memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT 0`,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 13`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// idxMemSessionDDL creates the memories(session_id) index. Shared between
+// ApplySchema, rebuildMemoriesTable and migrateV13ToV14 so all three paths
+// install the identical index — and, just as important, so rebuildMemoriesTable
+// cannot forget it: an index ApplySchema installs but the rebuild does not
+// recreate is dropped with memories_old (see step (g) there).
+const idxMemSessionDDL = `CREATE INDEX IF NOT EXISTS idx_mem_session ON memories(session_id)`
+
+// migrateV13ToV14 adds idx_mem_session and backfills review_after for the decay
+// types, both described in the currentSchemaVersion note above.
+//
+// The backfill uses datetime(created_at, '+N months') so each row's window is
+// dated from its own creation, not from the upgrade. It is guarded by
+// `review_after IS NULL` — a value already present is either a prior stamp or a
+// MarkReviewed reset, and neither is the migration's to overwrite.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 13.
+func migrateV13ToV14(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(idxMemSessionDDL); err != nil {
+		return err
+	}
+
+	// Iterate the decay map through a sorted key list so the statement order is
+	// deterministic across runs (Go map iteration is not) — a migration that
+	// cannot be replayed identically is a migration you cannot reason about.
+	types := make([]string, 0, len(decayReviewAfterMonths))
+	for typ := range decayReviewAfterMonths {
+		types = append(types, typ)
+	}
+	sort.Strings(types)
+
+	for _, typ := range types {
+		modifier := fmt.Sprintf("+%d months", decayReviewAfterMonths[typ])
+		if _, err := tx.Exec(`
+			UPDATE memories
+			SET review_after = datetime(created_at, ?)
+			WHERE type = ? AND review_after IS NULL AND deleted_at IS NULL`,
+			modifier, typ,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 14`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// idxMemProjectLowerDDL creates the expression index that lets
+// `WHERE LOWER(project) = ?` use an index scan instead of a full table scan.
+// A plain index on memories(project) cannot serve this predicate — SQLite only
+// uses an index for the EXACT expression a query filters on, and the column
+// wrapped in LOWER() is a different expression than the bare column. Shared
+// between ApplySchema, rebuildMemoriesTable and migrateV14ToV15, like
+// idxMemSessionDDL, so rebuildMemoriesTable cannot forget it and silently drop
+// it with memories_old (see the warning in that function's index-drop step).
+const idxMemProjectLowerDDL = `CREATE INDEX IF NOT EXISTS idx_mem_project_lower ON memories(LOWER(project))`
+
+// idxSessionsProjectLowerDDL is the sessions-table counterpart: RecentSessions
+// filters with LOWER(s.project) = ?, exactly as non-sargable against a plain
+// sessions(project) index as the memories case above. Sessions is never
+// rebuilt/renamed (unlike memories), so this one only needs installing in
+// ApplySchema and migrateV14ToV15.
+const idxSessionsProjectLowerDDL = `CREATE INDEX IF NOT EXISTS idx_sessions_project_lower ON sessions(LOWER(project))`
+
+// migrateV14ToV15 adds idx_mem_project_lower and idx_sessions_project_lower —
+// see the currentSchemaVersion note above for why LOWER(project) needs its own
+// index. Both statements are idempotent (CREATE INDEX IF NOT EXISTS), so a
+// fresh DB where ApplySchema already created them is a no-op here.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 14.
+func migrateV14ToV15(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(idxMemProjectLowerDDL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(idxSessionsProjectLowerDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 15`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// idxSyncMutationsDrainDDL backs DrainOutbox's actual predicate (acked_at IS
+// NULL AND parked_at IS NULL, ordered by local_seq) — shared between
+// ApplySchema and migrateV15ToV16 so both install the identical index.
+const idxSyncMutationsDrainDDL = `CREATE INDEX IF NOT EXISTS idx_sync_mutations_drain
+	ON sync_mutations(acked_at, parked_at, local_seq)`
+
+// idxSyncMutationsParkedChainDDL backs blockedBehindParkedSQL (sync.go) — the
+// "is there an earlier parked row of this sync_id" probe DrainOutbox runs per
+// candidate row. Partial over exactly the parked, unacked rows, so it stays
+// empty in steady state. Additive and idempotent (IF NOT EXISTS): ApplySchema
+// installs it on every Open of a DB that has parked_at, so an existing v16+ DB
+// gains it without a schema-version bump, and migrateV15ToV16 installs it
+// alongside idx_sync_mutations_drain for an older one.
+const idxSyncMutationsParkedChainDDL = `CREATE INDEX IF NOT EXISTS idx_sync_mutations_parked_chain
+	ON sync_mutations(entity_key, local_seq)
+	WHERE parked_at IS NOT NULL AND acked_at IS NULL`
+
+// migrateV15ToV16 adds sync_mutations.attempts/last_error/last_attempt_at/
+// parked_at and idx_sync_mutations_drain — see the currentSchemaVersion v15→v16
+// note above for the FUP-004 rationale. Each ADD COLUMN is guarded by
+// PRAGMA table_info (the v2→v3 pattern) so a fresh DB — where ApplySchema
+// already created every column from sync_mutations' current DDL — is a no-op.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 15.
+func migrateV15ToV16(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	for _, col := range []struct{ name, ddl string }{
+		{"attempts", `ALTER TABLE sync_mutations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`},
+		{"last_error", `ALTER TABLE sync_mutations ADD COLUMN last_error TEXT`},
+		{"last_attempt_at", `ALTER TABLE sync_mutations ADD COLUMN last_attempt_at TEXT`},
+		{"parked_at", `ALTER TABLE sync_mutations ADD COLUMN parked_at TEXT`},
+	} {
+		exists, err := columnExists(tx, "sync_mutations", col.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue // fresh DB — ApplySchema already added the column
+		}
+		if _, err := tx.Exec(col.ddl); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(idxSyncMutationsDrainDDL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(idxSyncMutationsParkedChainDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 16`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createdAtBackfillTableDDL is the authoritative CREATE TABLE statement for
+// created_at_backfill — shared between ApplySchema and migrateV16ToV17 so
+// both install the identical schema. See the currentSchemaVersion v16→v17
+// note for the FUP-005c rationale.
+const createdAtBackfillTableDDL = `CREATE TABLE IF NOT EXISTS created_at_backfill (
+	project      TEXT PRIMARY KEY,
+	completed_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`
+
+// migrateV16ToV17 creates created_at_backfill. A fresh DB created by
+// ApplySchema already has it (CREATE TABLE IF NOT EXISTS), so this migration
+// is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 16.
+func migrateV16ToV17(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(createdAtBackfillTableDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 17`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1304,16 +1667,25 @@ func ApplySchema(db *sql.DB) error {
 		memoryRelationsTableDDL,
 
 		// ── sync_mutations — outbound push journal ───────────────────────────
+		// attempts/last_error/last_attempt_at/parked_at (v16, FUP-004): every push
+		// failure for an entry is recorded here for operator visibility; parked_at
+		// marks an entry central has permanently rejected (or whose payload this
+		// node could not even decode) — DrainOutbox excludes it so it is never
+		// resent, but it stays UNACKED so `engram sync retry` can un-park it.
 		`CREATE TABLE IF NOT EXISTS sync_mutations (
-			local_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
-			mutation_id  TEXT    NOT NULL UNIQUE,
-			entity       TEXT    NOT NULL DEFAULT '',
-			entity_key   TEXT    NOT NULL DEFAULT '',
-			op           TEXT    NOT NULL CHECK(op IN ('upsert','delete')),
-			payload      TEXT    NOT NULL DEFAULT '',
-			writer_id    TEXT    NOT NULL DEFAULT '',
-			occurred_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-			acked_at     TEXT
+			local_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+			mutation_id     TEXT    NOT NULL UNIQUE,
+			entity          TEXT    NOT NULL DEFAULT '',
+			entity_key      TEXT    NOT NULL DEFAULT '',
+			op              TEXT    NOT NULL CHECK(op IN ('upsert','delete')),
+			payload         TEXT    NOT NULL DEFAULT '',
+			writer_id       TEXT    NOT NULL DEFAULT '',
+			occurred_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+			acked_at        TEXT,
+			attempts        INTEGER NOT NULL DEFAULT 0,
+			last_error      TEXT,
+			last_attempt_at TEXT,
+			parked_at       TEXT
 		)`,
 
 		// ── sync_state — tracks last push-ack and last pull seq ──────────────
@@ -1374,6 +1746,9 @@ func ApplySchema(db *sql.DB) error {
 		// First consumer: honored_purge_epoch (remote-purge feature).
 		daemonMetaTableDDL,
 
+		// ── created_at_backfill — FUP-005c one-time-per-project marker (v17) ──
+		createdAtBackfillTableDDL,
+
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic
 			ON memories(topic_key, project, scope, updated_at DESC)
@@ -1396,6 +1771,18 @@ func ApplySchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_tomb_project ON memory_tombstones(project)`,
 
+		// idx_mem_project_lower / idx_sessions_project_lower (v15) back every
+		// case-insensitive LOWER(project) = ? filter — idx_mem_project above cannot
+		// serve those, since SQLite only indexes the exact expression a predicate is
+		// written over. See the currentSchemaVersion v14→v15 note.
+		idxMemProjectLowerDDL,
+		idxSessionsProjectLowerDDL,
+
+		// idx_mem_session backs both per-session reads on the mem_context hot path
+		// (v14): RecentSessions' grouped newest-memory-per-session join and
+		// FormatContext's per-session observation COUNT.
+		idxMemSessionDDL,
+
 		// conflict_relations indexes — support FindCandidates and mem_judge access patterns.
 		`CREATE INDEX IF NOT EXISTS idx_confrel_source_status
 			ON conflict_relations(source_id, judgment_status)`,
@@ -1415,6 +1802,10 @@ func ApplySchema(db *sql.DB) error {
 		// prompt_tombstones index — supports pull-apply project filtering.
 		`CREATE INDEX IF NOT EXISTS idx_prompt_tomb_project
 			ON prompt_tombstones(project)`,
+
+		// idx_sync_mutations_drain (v16) is installed separately below, AFTER this
+		// loop — see the comment there for why it cannot be a plain entry in this
+		// list.
 
 		// ── FTS5 virtual table over memories ────────────────────────────────
 		// content=memories with content_rowid=id means FTS is a shadow/external
@@ -1437,6 +1828,27 @@ func ApplySchema(db *sql.DB) error {
 
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
+			return err
+		}
+	}
+
+	// idx_sync_mutations_drain names parked_at, a column that exists on a FRESH
+	// DB (the CREATE TABLE above already declares it) but NOT on a pre-v16
+	// database — ApplySchema runs on EVERY Open, before runMigrations, and
+	// CREATE TABLE IF NOT EXISTS above is a no-op against an existing legacy
+	// sync_mutations table, so an unconditional CREATE INDEX here would fail
+	// with "no such column: parked_at" the instant a pre-v16 DB is opened by
+	// this binary. Skipping it here for that case is safe: migrateV15ToV16 adds
+	// the column AND creates this same index (idxSyncMutationsDrainDDL, the
+	// identical statement) immediately afterward, inside runMigrations, once
+	// the column genuinely exists.
+	if exists, err := columnExists(db, "sync_mutations", "parked_at"); err != nil {
+		return err
+	} else if exists {
+		if _, err := db.Exec(idxSyncMutationsDrainDDL); err != nil {
+			return err
+		}
+		if _, err := db.Exec(idxSyncMutationsParkedChainDDL); err != nil {
 			return err
 		}
 	}

@@ -56,7 +56,9 @@ Usage:
   engram memories edit <id> --title <t> --content <c> [--type <type>] [--db <path>]
   engram memories delete <id> [--yes] [--db <path>]
   engram import   [--from <old-db>] [--db <dest-db>] [--dry-run]
-  engram version
+  engram hook     <session-start|post-compaction|user-prompt-submit|subagent-stop|session-end> [--db <path>]
+  engram setup    hooks --agent <claude-code|codex> [--dry-run]
+  engram version [--verbose]
 
 Environment:
   ENGRAM_ADDR            default listen address for 'serve' (default ":8080")
@@ -84,7 +86,9 @@ Subcommands:
   sync      Trigger an immediate sync cycle (requires daemon --http).
   memories  Browse, review, edit, or delete stored memories (requires daemon --http).
   import    Import memories, prompts, and sessions from an old-generation engram database.
-  version   Print binary version, GOOS/GOARCH, and Go runtime version.
+  hook      Run one agent lifecycle hook (reads the host's hook JSON on stdin; always exits 0).
+  setup     Install engram's lifecycle hooks into an agent host's settings.
+  version   Print the binary version as one bare line ("engram vX.Y.Z"); --verbose adds GOOS/GOARCH and the Go runtime version.
 
 Run 'engram <subcommand> --help' for per-subcommand flags.
 `
@@ -180,6 +184,18 @@ func run(args []string) int {
 	case "import":
 		if err := runImportCmd(args[1:]); err != nil {
 			log.Printf("engram import: %v", err)
+			return 1
+		}
+		return 0
+	case "hook":
+		if err := runHookCmd(args[1:]); err != nil {
+			log.Printf("engram hook: %v", err)
+			return 1
+		}
+		return 0
+	case "setup":
+		if err := runSetupCmd(args[1:]); err != nil {
+			log.Printf("engram setup: %v", err)
 			return 1
 		}
 		return 0

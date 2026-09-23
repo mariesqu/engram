@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -248,11 +250,11 @@ func TestRun_Version_ExitZero(t *testing.T) {
 	}
 }
 
-// TestRun_Version_Output verifies that 'engram version' prints the version
-// string, the OS/arch, and the Go runtime version to stdout.
-// The version var defaults to "dev" in test builds (no ldflags injection),
-// so we assert non-empty tokens rather than a literal value — this contract
-// remains valid whether the binary is built locally or from a tagged release.
+// TestRun_Version_Output verifies that 'engram version' prints exactly two
+// whitespace-separated tokens — "engram" and the version — on a single line,
+// and NOTHING else. The version var defaults to "dev" in test builds (no
+// ldflags injection), so we assert the shape rather than a literal value; the
+// semver-specific contract is pinned by TestRun_Version_BareSemverLine below.
 func TestRun_Version_Output(t *testing.T) {
 	out := captureStdout(t, func() {
 		if code := run([]string{"version"}); code != 0 {
@@ -264,21 +266,81 @@ func TestRun_Version_Output(t *testing.T) {
 	if !strings.Contains(out, "engram") {
 		t.Errorf("version output missing 'engram': %q", out)
 	}
-	// Must contain a non-empty version token (the first field after "engram ").
+	// Exactly two fields: "engram" and a non-empty version token. Anything more
+	// (the GOOS/GOARCH pair and Go runtime version that used to live here) would
+	// break the anchored version probe — see runVersionCmd.
 	parts := strings.Fields(out)
-	if len(parts) < 4 {
-		t.Fatalf("version output has fewer than 4 fields: %q", out)
+	if len(parts) != 2 {
+		t.Fatalf("version output has %d fields, want exactly 2 (\"engram <version>\"): %q", len(parts), out)
+	}
+	if parts[0] != "engram" {
+		t.Errorf("first field = %q, want %q: %q", parts[0], "engram", out)
 	}
 	if parts[1] == "" {
 		t.Errorf("version token is empty: %q", out)
 	}
-	// Must contain GOOS/GOARCH pair.
-	if !strings.Contains(out, "/") {
-		t.Errorf("version output missing GOOS/GOARCH pair: %q", out)
+	// One line only — a second line fails the probe's end-of-TEXT anchor.
+	if lines := strings.Split(strings.TrimRight(out, "\n"), "\n"); len(lines) != 1 {
+		t.Errorf("version output spans %d lines, want 1: %q", len(lines), out)
 	}
-	// Must contain "go" runtime prefix (e.g. "go1.22.0").
-	if !strings.Contains(out, "go") {
-		t.Errorf("version output missing Go runtime version: %q", out)
+}
+
+// TestRun_Version_BareSemverLine pins the compatibility contract itself: with a
+// release-shaped version injected, the WHOLE trimmed stdout of `engram version`
+// matches the anchored regexp integrators probe it with (gentle-ai's
+// engramVersionPattern in internal/components/engram/protocol.go, applied to
+// the trimmed full output — not just its first line).
+// NOTE: MUTATES the package-level version var; see TestRun_Version_InjectedValue.
+func TestRun_Version_BareSemverLine(t *testing.T) {
+	original := version
+	version = "v1.5.5"
+	t.Cleanup(func() { version = original })
+
+	probe := regexp.MustCompile(`^(?:engram\s+)?v?(\d+)\.(\d+)\.(\d+)$`)
+
+	out := captureStdout(t, func() {
+		if code := run([]string{"version"}); code != 0 {
+			t.Errorf("run([version]): exit code %d, want 0", code)
+		}
+	})
+
+	if got := strings.TrimSpace(out); got != "engram v1.5.5" {
+		t.Errorf("version output = %q, want %q", got, "engram v1.5.5")
+	}
+	if !probe.MatchString(strings.TrimSpace(out)) {
+		t.Errorf("version output %q does not match the integrator probe %s", out, probe)
+	}
+}
+
+// TestRun_Version_Verbose verifies that the build details removed from the bare
+// line are still reachable — on a SECOND line, behind --verbose — so nothing was
+// lost, only moved out of the probe's way.
+func TestRun_Version_Verbose(t *testing.T) {
+	for _, flag := range []string{"--verbose", "-v"} {
+		t.Run(flag, func(t *testing.T) {
+			out := captureStdout(t, func() {
+				if code := run([]string{"version", flag}); code != 0 {
+					t.Errorf("run([version %s]): exit code %d, want 0", flag, code)
+				}
+			})
+
+			lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("verbose output spans %d lines, want 2: %q", len(lines), out)
+			}
+			if fields := strings.Fields(lines[0]); len(fields) != 2 || fields[0] != "engram" {
+				t.Errorf("verbose first line = %q, want the bare \"engram <version>\" line", lines[0])
+			}
+			// Second line: the EXACT build identity a bug report is asked for
+			// (.github/ISSUE_TEMPLATE/bug_report.yml says "engram version
+			// --verbose"). Asserting the literal values rather than "contains a
+			// slash and the letters go" is the difference between a triage line
+			// that identifies the binary and one that merely looks like it does.
+			want := runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()
+			if lines[1] != want {
+				t.Errorf("verbose second line = %q, want %q", lines[1], want)
+			}
+		})
 	}
 }
 

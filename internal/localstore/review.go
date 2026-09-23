@@ -3,6 +3,7 @@ package localstore
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,45 @@ type ReviewRow struct {
 	ReviewAfter *time.Time
 }
 
+// decayReviewAfterMonths maps an observation type to how many months it stays
+// trustworthy before it should be re-checked. A type absent from this map gets
+// review_after = NULL and falls back to the store's rolling
+// updated_at + reviewWindowDays (see ReviewStatus) — the map is an override for
+// the handful of types whose useful life is measured in months, not weeks.
+//
+// The three entries are deliberate, not a sample:
+//   - decision (6mo)   — a decision goes stale when the thing it decided moves.
+//   - policy (12mo)    — policy is meant to outlive the work it governs.
+//   - preference (3mo) — a stated preference is the most volatile of the three.
+//
+// "policy" and "preference" are not in the type list mem_save's description
+// enumerates; type is a free-form column and callers do pass them. A map miss is
+// safe by construction, so listing them costs nothing and catches them when they
+// appear.
+var decayReviewAfterMonths = map[string]int{
+	"decision":   6,
+	"policy":     12,
+	"preference": 3,
+}
+
+// sqliteTimeLayout is the text format SQLite's datetime() produces, and the one
+// every timestamp column in this schema is written in. parseTime accepts it.
+const sqliteTimeLayout = "2006-01-02 15:04:05"
+
+// reviewAfterForType returns the review_after value for a row of the given type,
+// as an `any` ready to bind to a SQL parameter: a formatted timestamp for a type
+// in the decay map, or nil (SQL NULL) for one that is not.
+//
+// Callers pass the reference instant explicitly so the value is testable and so
+// the insert path can date the window from the row's own creation moment.
+func reviewAfterForType(typ string, now time.Time) any {
+	months, ok := decayReviewAfterMonths[typ]
+	if !ok {
+		return nil
+	}
+	return now.UTC().AddDate(0, months, 0).Format(sqliteTimeLayout)
+}
+
 // ReviewStatus computes the lifecycle status of a record at read time using the
 // store's configured staleness window:
 //
@@ -36,9 +76,10 @@ type ReviewRow struct {
 //   - needs_review → now > COALESCE(review_after, updated_at + window)
 //   - active       → otherwise
 //
-// review_after is set ONLY by MarkReviewed; on a normal save it is NULL, so a
-// fresh memory is active until updated_at + window elapses. The window is the
-// store's reviewWindowDays (default 30).
+// review_after is set at INSERT time for types in decayReviewAfterMonths and
+// reset by MarkReviewed; for every other type it stays NULL and the row is
+// active until updated_at + window elapses. The window is the store's
+// reviewWindowDays (default 30).
 func (s *Store) ReviewStatus(rec *domain.Record) string {
 	if rec == nil {
 		return ReviewStatusActive
@@ -188,9 +229,26 @@ func (s *Store) ListForReview(status, project string, limit int) ([]ReviewRow, e
 	return out, nil
 }
 
-// MarkReviewed stamps review_after = now + window on each live row in ids,
-// resetting its staleness clock. Returns the number of rows updated. ids that
-// are unknown or already deleted are silently skipped (not an error).
+// MarkReviewed resets the staleness clock on each live row in ids, recomputing
+// review_after FROM THE ROW'S OWN TYPE using the same decayReviewAfterMonths map
+// the insert path uses — so re-reviewing a decision buys another 6 months and
+// re-reviewing a preference another 3, rather than every type getting the same
+// flat window. Returns the number of rows updated. ids that are unknown or
+// already deleted are silently skipped (not an error).
+//
+// DEVIATION from the upstream implementation this is ported from: upstream sets
+// review_after = NULL for a type that has no decay entry, because upstream reads
+// "needs review" as `review_after IS NOT NULL AND review_after < now` — NULL
+// there means "never due". Under THIS store's read-time derivation NULL means
+// "fall back to updated_at + window" (see ReviewStatus), and MarkReviewed does
+// not touch updated_at, so writing NULL would make marking a bugfix reviewed a
+// silent no-op: the row would come straight back as needs_review. Upstream
+// compensates by bumping updated_at, which is not an option here — updated_at is
+// the LWW ordering field (see writeWins in domain/reconcile.go), and inflating it
+// on a local, un-journaled write would let this node wrongly beat a genuinely
+// newer remote write on the next pull. So a type with no decay entry gets
+// now + reviewWindowDays: the same "clock reset" semantics, expressed in the
+// only field this store is allowed to move.
 //
 // This is a LOCAL-ONLY write: it sets per-node lifecycle metadata and does NOT
 // go through LocalWrite, so it enqueues no outbox entry and never syncs (review
@@ -201,36 +259,170 @@ func (s *Store) MarkReviewed(ids []int64) (int, error) {
 		return 0, nil
 	}
 	window := s.reviewWindow()
+	now := time.Now().UTC()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	placeholders := make([]string, len(ids))
-	args := make([]any, 0, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-
-	// datetime('now','+<N> days') computes the new due date in SQLite UTC, the
-	// same clock used by the created_at/updated_at defaults.
-	q := fmt.Sprintf(
-		`UPDATE memories
-		 SET review_after = datetime('now', ?)
-		 WHERE id IN (%s) AND deleted_at IS NULL`,
-		strings.Join(placeholders, ","),
-	)
-	// Prepend the interval modifier as the first bound arg.
-	allArgs := make([]any, 0, len(args)+1)
-	allArgs = append(allArgs, fmt.Sprintf("+%d days", window))
-	allArgs = append(allArgs, args...)
-
-	res, err := s.db.Exec(q, allArgs...)
+	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("MarkReviewed: %w", err)
+		return 0, fmt.Errorf("MarkReviewed: begin: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// The new due date depends on each row's TYPE, so the types have to be read
+	// before anything can be written — but that is one read and one write per
+	// distinct type (times the id chunking below), not per id. Marking a 200-id
+	// page reviewed used to cost 400 round-trips through the SQLite driver;
+	// grouped it costs one SELECT plus at most a handful of UPDATEs, since a
+	// realistic batch spans two or three types.
+	idsByType, err := liveTypesOf(tx, ids)
+	if err != nil {
+		return 0, err
+	}
+
+	// Sort the type keys so the statement order is deterministic — Go map
+	// iteration is not, and a write batch that reorders itself between runs is
+	// needless nondeterminism in a transaction.
+	types := make([]string, 0, len(idsByType))
+	for typ := range idsByType {
+		types = append(types, typ)
+	}
+	sort.Strings(types)
+
+	updated := 0
+	for _, typ := range types {
+		due := reviewAfterForType(typ, now)
+		if due == nil {
+			// No decay entry — fall back to the store's rolling window. See the
+			// DEVIATION note above for why this is not NULL.
+			due = now.AddDate(0, 0, window).Format(sqliteTimeLayout)
+		}
+
+		group := idsByType[typ]
+		for _, chunk := range chunkIDs(group, markReviewedIDChunk) {
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, due)
+			for _, id := range chunk {
+				args = append(args, id)
+			}
+
+			res, err := tx.Exec(
+				`UPDATE memories SET review_after = ?
+				 WHERE id IN (`+sqlPlaceholders(len(chunk))+`) AND deleted_at IS NULL`,
+				args...,
+			)
+			if err != nil {
+				return 0, fmt.Errorf("MarkReviewed: update %d %s row(s): %w", len(chunk), typ, err)
+			}
+			n, _ := res.RowsAffected()
+			updated += int(n)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("MarkReviewed: commit: %w", err)
+	}
+	return updated, nil
+}
+
+// sqlPlaceholders returns "?,?,…,?" for an IN clause of n values. n must be > 0;
+// callers reach here only after an empty-ids early return.
+func sqlPlaceholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// markReviewedIDChunk bounds how many ids go into ONE IN (...) list.
+//
+// SQLite refuses a statement with more bound parameters than
+// SQLITE_MAX_VARIABLE_NUMBER, and that ceiling is a build-time property of
+// whatever SQLite the driver was compiled with — 999 on the classic default,
+// 32766 on a modern one. A store method that builds an unbounded IN list is
+// therefore correct only by accident of the build.
+//
+// The guard lives HERE, next to the SQL that would fail, rather than only at the
+// MCP layer's 200-id cap: mem_review is one caller of MarkReviewed, the cap is
+// theirs to change, and a store method must not depend on a ceiling enforced two
+// packages away. 500 is comfortably under the pessimistic limit and a handful of
+// statements even for the largest batch anyone passes.
+const markReviewedIDChunk = 500
+
+// chunkIDs splits ids into consecutive slices of at most size, preserving order.
+// An empty input yields NO chunks — never one empty chunk, which would build an
+// `IN ()` with zero placeholders. A size <= 0 yields one chunk (the caller passes
+// a constant; this only keeps a mistake from looping forever).
+func chunkIDs(ids []int64, size int) [][]int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	if size <= 0 || len(ids) <= size {
+		return [][]int64{ids}
+	}
+	chunks := make([][]int64, 0, (len(ids)+size-1)/size)
+	for start := 0; start < len(ids); start += size {
+		end := start + size
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunks = append(chunks, ids[start:end])
+	}
+	return chunks
+}
+
+// liveTypesOf reads the type of every LIVE row named in ids and returns the ids
+// grouped by type, in one round-trip. Ids that name nothing live are simply
+// absent from the result — MarkReviewed's contract is that unknown and
+// soft-deleted ids are skipped, not an error, and "no row came back" says exactly
+// that.
+//
+// A duplicated id collapses to one entry, because the row is what is being
+// updated and a row can only be marked reviewed once. The per-id loop this
+// replaces counted such an id twice in its return value.
+func liveTypesOf(tx *sql.Tx, ids []int64) (map[string][]int64, error) {
+	byType := make(map[string][]int64)
+	// The dedup that used to be implicit in ONE IN list has to be explicit now
+	// that the read is chunked: the same id appearing in two chunks would be
+	// recorded twice and counted twice by the UPDATE that follows.
+	seen := make(map[int64]bool, len(ids))
+
+	for _, chunk := range chunkIDs(ids, markReviewedIDChunk) {
+		if err := func() error {
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
+			}
+
+			rows, err := tx.Query(
+				`SELECT id, type FROM memories
+				 WHERE id IN (`+sqlPlaceholders(len(chunk))+`) AND deleted_at IS NULL`,
+				args...,
+			)
+			if err != nil {
+				return fmt.Errorf("MarkReviewed: read types: %w", err)
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var id int64
+				var typ string
+				if err := rows.Scan(&id, &typ); err != nil {
+					return fmt.Errorf("MarkReviewed: scan type: %w", err)
+				}
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				byType[typ] = append(byType[typ], id)
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("MarkReviewed: read types: %w", err)
+			}
+			return nil
+		}(); err != nil {
+			return nil, err
+		}
+	}
+	return byType, nil
 }
 
 // IDByTopicKey resolves the integer primary key of the live memory row for the

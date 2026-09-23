@@ -32,9 +32,9 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Features
 
-- **14 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, lifecycle review, project merge, and conflict resolution
+- **18 MCP tools** for project resolution, session tracking, memory write, edit, topic-key suggestion, search, similarity, pinning, lifecycle review, project merge, diagnostics, and conflict resolution
 - **Human memory management** — browse, search, edit, and delete memories, and delete whole projects (local / unshare / purge-all), from both the CLI and the web UI
-- **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
+- **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open; case-insensitive project lookups (`mem_search`, `mem_context`) use an expression index on `LOWER(project)` rather than a full table scan
 - **Local-only mode** — no network, no credentials required
 - **Optional central sync** — push/pull over HTTP with HMAC-SHA256 per-writer authentication
 - **Autosync** — configurable interval (default 30 s) plus immediate trigger on every write
@@ -62,11 +62,13 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 - [Build from source](#build-from-source)
 - [Quickstart: local-only mode](#quickstart-local-only-mode)
 - [Quickstart: central sync](#quickstart-central-sync)
+- [Upgrading](#upgrading)
 - [Resident daemon](#resident-daemon)
 - [Web UI](#web-ui)
 - [Windows tray](#windows-tray)
 - [CLI reference](#cli-reference)
 - [Wiring into an MCP client](#wiring-into-an-mcp-client)
+- [Lifecycle hooks](#lifecycle-hooks)
 - [Using engram from your agent](#using-engram-from-your-agent)
 - [MCP tools](#mcp-tools)
 - [Managing your memories](#managing-your-memories)
@@ -110,7 +112,7 @@ Pre-built binaries for Linux, macOS, and Windows are published on the
 
    ```bash
    engram version
-   # engram vX.Y.Z linux/amd64 go1.26.x
+   # engram vX.Y.Z
    ```
 
 ## Build from source
@@ -130,6 +132,15 @@ For a smaller, stripped release binary:
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o engram ./cmd/engram
 ```
+
+**Version stamping.** A plain `go build` leaves the version at its `dev` default. The Makefile stamps it from `git describe`, which on any commit past a tag produces a *describe-shaped* string:
+
+```bash
+make build            # engram v1.5.5-2-gabcd123   ← NOT probeable
+make build VERSION=v1.5.5   # engram v1.5.5        ← probeable
+```
+
+That distinction matters to integrators: gentle-ai (and anything else using the anchored `^(?:engram\s+)?v?(\d+)\.(\d+)\.(\d+)$` probe described under [CLI reference](#cli-reference)) *rejects* `v1.5.5-2-gabcd123`, silently falls back to its conservative default, and the integration degrades with no error anywhere to explain why. Pass an explicit `VERSION=` when you build a binary something else will probe.
 
 ## Quickstart: local-only mode
 
@@ -196,6 +207,10 @@ SELECT tablename FROM pg_tables WHERE schemaname = 'engram' ORDER BY tablename;
 -- central_tombstones, central_user_prompts, cloud_sync_audit, cloud_writer_keys
 ```
 
+**`created_at` semantics.** A memory's `created_at` is the ORIGINAL write time (the mutation's `occurred_at`, carried on the wire and stamped at the point of the mutation itself, not at apply or pull time), not the moment any particular node happened to pull it — the same memory shows the same creation date on every node, in `mem_get_observation`'s "Created:" line, in `created_from`/`created_to` search filters, and in ordering. On first connecting to a NEW central (or after upgrading from a version that predated this), each node automatically backfills `created_at` for its already-synced projects once, correcting any row that had defaulted to a pull's arrival time; nothing to run manually. The backfill runs over `POST /v1/created-at`, an endpoint `engram serve` exposes that pages a project's original creation times, keyset-ordered by `sync_id`; the node records completion per project so a fully-backfilled project is never re-walked.
+
+**Compatibility.** The backfill endpoint is additive: an older central that predates it (or any other Central implementation that does not add the capability) returns `404`/`501`, which the node treats as "nothing to do yet" and retries the next time the backfill is attempted — it never blocks ordinary push/pull. A v1.6.0 **client** against a pre-v1.6.0 **central** degrades the same way: push and pull are unaffected, simply without the backfill or the `422`-driven parking behaviour (an older central has no reason to ever return `422` for a permanent rejection, so nothing to park). The other direction is the one to know about: a pre-v1.6.0 **client** against a v1.6.0 **central** still syncs normally in the common case, but it predates the client-side parking logic — if it ever pushes a mutation central rejects with `422` (the NUL-byte case above is the one this release actually fixes), that old client has no park step, so it keeps re-offering the same rejected mutation at the head of every push cycle, which — on that older client's `Push` implementation — halts the *whole* cycle's outbox (not just that one mutation) and skips pull for the round, repeating on every subsequent cycle until the client itself is upgraded or the offending row is removed at the source. Upgrading the client is the fix; the central-side `422` mapping is what makes the upgrade path visible instead of a silent retry loop.
+
 ### 1. Start the central server
 
 ```bash
@@ -247,6 +262,24 @@ $env:ENGRAM_WRITER_KEY = "<hex key>"
   --writer-id my-laptop
 ```
 
+## Upgrading
+
+Local SQLite schema migrations run automatically, in order, every time the local store opens — a v1.6.0 binary opening a database left by an older version applies whatever migrations are pending in sequence, and each one is additive (`ALTER TABLE ADD COLUMN`, `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), so it is safe to run against a database already partway there. There is nothing to run by hand.
+
+v1.6.0 carries five such migrations (schema v13 → v17):
+
+| Version | Adds |
+|---------|------|
+| v13 | The `pinned` column backing `mem_pin`/`mem_unpin`. |
+| v14 | A one-time `review_after` backfill for existing `decision`/`policy`/`preference` rows (the per-type decay map), plus an index that backs `mem_context`'s per-session lookup. |
+| v15 | Expression indexes on `LOWER(project)` for case-insensitive project lookups. |
+| v16 | The `sync_mutations` `attempts`/`last_error`/`last_attempt_at`/`parked_at` columns and their drain index — parked mutations. |
+| v17 | The `created_at_backfill` tracking table (marks a project done after its one-time `created_at` backfill). |
+
+**Restart both ends.** Migrations run at the moment the store is *opened*, not continuously — a resident daemon (or `engram serve`) that is already running when you replace the binary keeps executing the OLD code against the OLD schema until it is restarted. Deploy the new binary and then restart `engram serve` on the central side and the resident local daemon on every node (quit the tray and relaunch, or stop the daemon process and let the next `engram connect`/`engram tray` auto-start the upgraded one — auto-start only ever ADDS a daemon, never restarts an existing one). Postgres schema changes on central are applied automatically by `engram serve` on every startup, exactly as before — there is no separate `migrate` command to run against the database.
+
+**The `created_at` backfill needs an upgraded server.** `POST /v1/created-at` is a new capability this release adds to `engram serve`; a v1.6.0 client talking to a pre-v1.6.0 central simply skips the backfill and retries automatically once that central is upgraded — nothing else about push/pull is affected. See "Compatibility" under [Quickstart: central sync](#quickstart-central-sync) for the reverse direction (an old client against a v1.6.0 central).
+
 ## Resident daemon
 
 The `--http` flag switches the daemon from stdio MCP mode to a long-running HTTP control plane. In this mode the daemon:
@@ -289,7 +322,7 @@ The resident daemon persists its configuration to a `config.json` file in a plat
 | macOS    | `~/Library/Application Support/engram/config.json`        |
 | Windows  | `%APPDATA%\engram\config.json`                            |
 
-Override the directory with `ENGRAM_CONFIG_DIR`.
+Override the directory with `ENGRAM_CONFIG_DIR`. A relative value is resolved against the working directory of whichever process reads it, so it is made **absolute** up front: the directory is *created* (by `config.Save`, and by a daemon spawn, which uses it as the detached daemon's working directory), and a relative override would otherwise create it inside whatever repo happened to be current — a different file per repo, under one setting.
 
 The file is written atomically (temp file + rename) so a crash during a write never produces a partial read. Absent file is not an error — the daemon uses defaults.
 
@@ -319,6 +352,7 @@ All endpoints require `Authorization: Bearer <token>`. Responses include `Cache-
 | `GET`    | `/api/v1/memories`                         | List/search memories (`q`, `project`, `type`, `scope`, `from`, `to`, `offset`, `limit` params — `from`/`to` are `YYYY-MM-DD` dates bounding `created_at`, inclusive) |
 | `PUT`    | `/api/v1/memories/{id}`                    | Edit a memory in place (`title`, `content`, `type`)   |
 | `DELETE` | `/api/v1/memories/{id}`                    | Soft-delete a memory by numeric ID                     |
+| `GET`    | `/api/v1/sessions/{id}`                    | The project (and directory) a session was registered under — the fallback a lifecycle hook uses when its payload carries no `cwd` |
 | `POST`   | `/api/v1/central/connect`                  | Connect to a central server (seals writer key)         |
 | `POST`   | `/api/v1/central/disconnect`               | Disconnect from central (clears credentials)           |
 | `POST`   | `/api/v1/sync/trigger`                     | Trigger an immediate sync cycle (202; 409 if offline)  |
@@ -345,9 +379,25 @@ Mutating endpoints (`PUT`, `POST`, `DELETE`) additionally require an `Origin: ht
 
 # Trigger an immediate sync cycle
 ./engram sync now --db ~/.engram/memories.db
+
+# List outbox entries central has permanently rejected (400/413/422 — see below)
+./engram sync parked --db ~/.engram/memories.db
+
+# Un-park one entry (or every parked entry) so the next sync cycle retries it
+./engram sync retry 42  --db ~/.engram/memories.db
+./engram sync retry all --db ~/.engram/memories.db
+
+# Permanently discard one parked entry — it will never be pushed to central
+./engram sync discard 42 --db ~/.engram/memories.db
 ```
 
-All subcommands read `daemon.json` from the same directory as `--db`. If no daemon is running, they exit non-zero with a clear error message.
+`sync now`, `status`, `ui`, and `config` talk to the running resident daemon and read `daemon.json` from the same directory as `--db`; if no daemon is running, they exit non-zero with a clear error message. `sync parked`/`retry`/`discard` open the local database directly (SQLite's WAL mode makes this safe alongside a running daemon) and work whether or not the daemon is up.
+
+**Parked mutations.** central rejects a pushed mutation with HTTP `422` when the rejection is *permanent* — malformed content, a request too large (`400`/`413`), or a deterministic data problem (see `transport.ErrPermanent`) — instead of transient (a `5xx` or network error, which the syncer keeps retrying on the normal schedule). Retrying a permanent rejection forever accomplishes nothing, so the syncer parks that single outbox entry: it stops being resent (and stops blocking the rest of its own sync_id's version chain, since entries within one identity's version chain must apply in order), but stays on disk, unacked, until an operator looks at it. Parking one entry does not stop the rest of that push cycle — every other, unaffected outbox entry keeps going. `mem_doctor`'s `parked_mutations` check surfaces the same entries with their `last_error` (see [Diagnostics](#diagnostics-mem_doctor) below).
+
+**A push failure no longer blocks pull.** Before this release, any push error short-circuited the whole sync cycle and skipped pulling entirely — one bad mutation could stop a node from ever applying central's other writes. Now a permanent rejection is parked (see above) rather than propagated as an error, and a *retryable* push failure (a `5xx` or network error) is recorded but does not stop the cycle either: the cycle still lists projects and pulls from central, because a broken outbox does not mean central has nothing worth applying. Only a fatal, non-retryable push failure — `401`/`403`, a credential problem pull would hit identically — still short-circuits the cycle, since nothing pull could do would help.
+
+**Unacked NUL mutations are repaired automatically.** A small number of pre-fix clients could enqueue an outbox entry whose content carried a literal `U+0000` byte, which Postgres' `text` type rejects outright — central would keep bouncing the push forever. Every `Push` cycle now repairs any still-unacked (pending or parked) outbox entry carrying a `U+0000` byte *before* draining the outbox, so a previously stuck or parked entry gets a chance to push again on the very next cycle. The repair is best-effort: a failure to repair one entry is logged and does not block the push of every other, unaffected entry.
 
 **Config keys**
 
@@ -439,7 +489,7 @@ Auto-start only ever ADDS a daemon — it never restarts or kills an existing on
 
 Tool handlers run in the **shared daemon**, not in `engram connect`. Left to itself, the daemon would auto-detect the project from *its own* working directory — whichever directory the autostart, the tray, or your service manager happened to launch it from (on Windows commonly `C:\Windows\system32`), never the repo you are working in. Every client would then file its memories under that single junk project name.
 
-`engram connect` closes that gap: your MCP client spawns it inside the project directory, and it adds that directory as the `directory` argument of every project-resolving tool call it proxies (`mem_session_start`, `mem_session_summary`, `mem_save`, `mem_save_prompt`, `mem_search`, `mem_context`, `mem_review`). The injection is per call, so several `engram connect` clients in different repos can share one daemon without contaminating each other. Precedence, highest first:
+`engram connect` closes that gap: your MCP client spawns it inside the project directory, and it adds that directory as the `directory` argument of every project-resolving tool call it proxies (`mem_current_project`, `mem_session_start`, `mem_session_summary`, `mem_save`, `mem_save_prompt`, `mem_search`, `mem_context`, `mem_review`). The injection is per call, so several `engram connect` clients in different repos can share one daemon without contaminating each other. Precedence, highest first:
 
 1. An explicit `project` argument — always wins, and suppresses the injection entirely. Only a non-empty *string* counts: the daemon reads this argument as a string, so a number or object is empty to it, and the injection proceeds as if the argument were absent.
 2. A `directory` argument you set yourself. Absent, `null`, or blank counts as *unset* and gets the injected value; any other value (including a non-string, which is your error to see) is left alone. Blank therefore cannot be used to mean "fall back to the daemon's cwd" — use `ENGRAM_CLIENT_DIR=none` below for that.
@@ -447,7 +497,7 @@ Tool handlers run in the **shared daemon**, not in `engram connect`. Left to its
 
 The resolution runs in the **resident daemon**, not in `engram connect`, so upgrading the binary is not enough: **restart the resident daemon** after the upgrade (quit it from the tray and relaunch, or kill it and let the next `engram connect` auto-start a fresh one). An old daemon does not reject the injected `directory` — unknown arguments are simply dropped — so it keeps resolving from its own cwd with no error anywhere to tell you why your memories are still landing in the junk project.
 
-Forwarding a real directory also makes one previously silent misconfiguration loud: if your client's working directory is a **multi-repo parent** (an editor opened at `~/work`, which contains several checkouts), no single project can be detected from it. Write tools (`mem_save`, `mem_save_prompt`, `mem_session_start`, `mem_session_summary`) now return an ambiguous-project error naming the candidates, instead of filing under the *daemon's* directory name as they did before forwarding existed. Read tools (`mem_search`, `mem_context`, `mem_review` `action=list`) stay deliberately lenient and never error — from that same directory they silently scope to the parent's basename, so you get "my searches return nothing but my saves fail loudly": one misconfiguration, two faces. Fix it by passing an explicit `project` argument, by pointing `ENGRAM_CLIENT_DIR` at the actual repo, or by dropping an `.engram/config.json` in the parent that pins the project name.
+Forwarding a real directory also makes one previously silent misconfiguration loud: if your client's working directory is a **multi-repo parent** (an editor opened at `~/work`, which contains several checkouts), no single project can be detected from it. Write tools (`mem_save`, `mem_save_prompt`, `mem_session_start`, `mem_session_summary`) now return an ambiguous-project error naming the candidates, instead of filing under the *daemon's* directory name as they did before forwarding existed. Read tools (`mem_search`, `mem_context`, `mem_review` `action=list`) stay deliberately lenient and never error — from that same directory they silently scope to the parent's basename, so you get "my searches return nothing but my saves fail loudly": one misconfiguration, two faces. Fix it by passing an explicit `project` argument, by pointing `ENGRAM_CLIENT_DIR` at the actual repo, or by dropping an `.engram/config.json` in the parent that pins the project name. `mem_current_project` shows both faces at once before either bites: it reports the lenient read resolution, flags `writes_blocked: true` when write tools would refuse the directory, and flags `fallback: true` when the name is only a basename.
 
 An explicit `project` is also the repair tool: re-running `mem_session_start` with the same session id and an explicit `project` **updates** the stored project of a session that was registered under the wrong one, so later calls that resolve through the session row (such as `mem_session_summary`) inherit the corrected name. (A re-*detected* project never overwrites a stored one — only an explicit argument does.) It repairs the **session row only**: observations already written under the wrong project keep it — use `mem_merge_projects` to fold those into the right one.
 
@@ -464,6 +514,8 @@ If your MCP host spawns its servers somewhere other than the workspace (some lau
   }
 }
 ```
+
+`ENGRAM_CLIENT_DIR` is made **absolute** first, against `engram connect`'s own working directory — which is the client's workspace, the very thing being forwarded. A relative value (`.` is the one everybody tries) used to travel to the daemon verbatim and be resolved against *its* directory, so every write was refused with a message about a path nobody typed. On Windows a Git Bash path (`/c/GitLab/repo`, `/mnt/c/GitLab/repo`) is translated to its native form when that drive exists, and refused with a message naming the shape when it does not — `filepath.Abs` would otherwise turn it into `C:\c\GitLab\repo`, a directory that is not there, whose basename becomes a brand-new junk project.
 
 `ENGRAM_CLIENT_DIR` **fails closed**: if it carries a real value other than `none`, that value must name an existing directory, or `engram connect` exits at startup with an error naming the variable, the value, and both remedies. It used to warn on stderr and forward the bad path anyway, which had the daemon detect a project from the basename of a directory that does not exist — minting a *new* junk project instead of curing one. Unset, empty, and whitespace-only all read the same way — as *not set* — so they fall back to forwarding the process's own working directory; the value is trimmed before use, so surrounding whitespace is never part of the forwarded path. The setting is read once, at startup: changing it means restarting the client's `engram connect` process.
 
@@ -717,12 +769,23 @@ engram config   get          [--db <path>]
 engram config   set <key> <value>  [--db <path>]
 engram sync     now          [--db <path>]
 engram import   [--from <old-db>] [--db <dest-db>] [--dry-run] [--writer-id <id>]
-engram version
+engram hook     <session-start|post-compaction|user-prompt-submit|subagent-stop|session-end> [--db <path>] [--no-autostart]
+engram setup    hooks --agent <claude-code|codex> [--dry-run]
+engram version [--verbose]
 ```
 
-`engram version` prints the binary version, GOOS/GOARCH, and Go runtime version.
-Local dev builds print `dev` as the version; release binaries are stamped at
-link time (see [RELEASING.md](RELEASING.md)).
+`engram version` prints ONE bare line — `engram vX.Y.Z` and nothing else.
+Integrators probe it by trimming the whole stdout and matching an anchored
+regexp (`^(?:engram\s+)?v?(\d+)\.(\d+)\.(\d+)$`), so any extra token, or a
+second line, fails the match *silently*. GOOS/GOARCH and the Go runtime version
+moved behind `--verbose` (`-v`), which prints them on a second line.
+A plain `go build` prints `dev`; `make build` stamps the git-describe string
+(`v1.5.5-2-gabcd123`), which **fails** that probe — pass `make build
+VERSION=v1.5.5` for a probeable binary. Release binaries are stamped at link
+time (see [RELEASING.md](RELEASING.md)).
+
+`engram version --verbose` adds a second line with `GOOS/GOARCH` and the Go
+runtime version — that is the line to paste into a bug report.
 
 ### Environment variables
 
@@ -836,9 +899,71 @@ If project auto-detection picks the wrong name (e.g. in a monorepo), create `.en
 
 Auto-detection runs against the directory the tool call carries — the client's working directory when you bridge through `engram connect` (see [Working-directory forwarding](#http-mcp-transport)), otherwise the daemon's own. If your memories are landing under a name that matches neither your repo nor this file, that is the directory to check first.
 
+## Lifecycle hooks
+
+MCP tools are *pull*: the agent calls them when it decides to. Hooks are *push* — the agent host runs them at fixed moments in a session, whether or not the model thought of it. That is what makes memory survive the two moments it is most often lost: the start of a session (when the model does not yet know there is anything to recall) and a context compaction (when it no longer knows there was).
+
+Every hook is the engram binary itself:
+
+```bash
+engram hook session-start        # register the session, inject recent context + a protocol pointer
+engram hook post-compaction      # the same, plus the mandatory recovery steps
+engram hook user-prompt-submit   # capture the prompt; bootstrap the tools on the first one
+engram hook subagent-stop        # save a subagent's closing report before its context dies
+engram hook session-end          # close the session
+```
+
+Each reads the host's hook JSON on stdin and talks to the resident daemon over the same loopback MCP endpoint `engram connect` uses — same discovery, same bearer token, same rotation handling. There is no shell, no `jq`, and no PowerShell twin: one implementation, identical on every platform.
+
+**They never fail closed.** Every event exits 0 no matter what happened, each has a time budget (200 ms for `user-prompt-submit`, which sits between the user pressing Enter and the message being sent), and errors go to stderr only. An unreachable daemon costs you the context injection, never the prompt.
+
+### Installing
+
+Into your agent's settings (append-only merge — your other hooks and every unknown key are preserved, and re-running it is a no-op). The file is written through a temp file and a rename, never truncated in place, and the first modification leaves a `<file>.bak` copy of your original beside it (later re-runs never overwrite that one pristine copy). The merge disables JSON's default HTML-escaping, so a hook command containing `&&`, `<`, or `>` — an ordinary shell command — is written back byte-for-byte instead of being silently rewritten into six-character unicode escapes. A settings file that is itself a symlink (common with `stow`/`chezmoi`-managed dotfiles) is written through to its real target, leaving the link itself untouched, instead of `os.Rename` replacing the link with a plain file. Two things the merge does not preserve, both stated on stdout: the ORDER of top-level keys and the original indentation.
+
+```bash
+engram setup hooks --agent claude-code   # ~/.claude/settings.json  (honours CLAUDE_CONFIG_DIR)
+engram setup hooks --agent codex         # ~/.codex/hooks.json      (honours CODEX_HOME)
+engram setup hooks --agent claude-code --dry-run   # print the merged file, write nothing
+```
+
+Or, for a host that installs plugins, use the packs in this repo:
+
+```bash
+claude plugin marketplace add https://github.com/mariesqu/engram
+claude plugin install engram@engram
+```
+
+Both paths install the same hooks — `TestEngramHookPack_MatchesShippedPack` fails the build if they ever drift apart.
+
+**Use one or the other, not both.** The plugin and `engram setup hooks` register the identical hook commands, so a host with both active fires every event twice. The runtime deduplicates the resulting saves within a 30-second window (each `(session, event, payload)` occurrence is claimed once before it is saved, so a near-simultaneous duplicate delivery from the two install paths firing back-to-back is a no-op rather than a duplicate memory — outside that window it is treated as a new occurrence), but you still pay for two process launches per event. `engram setup hooks --agent claude-code` prints a warning when it can detect the plugin is also enabled in your `settings.json`.
+
+**Tool names in hook text are bare** (`mem_save`, `mem_current_project`, …), never prefixed with `mcp__engram__` or similar, because the fully-qualified name depends on how the host registered the server — a direct MCP registration and the Claude Code plugin install expose the same tools under different prefixes (`mcp__engram__…` vs `mcp__plugin_engram_engram__…`), and a hardcoded prefix would name a tool that does not exist under the other install. The one place that DOES need a concrete, callable name — the first-prompt bootstrap's "Available tools" list, for a host that defers MCP tool loading — lists both fully-qualified forms side by side, since nothing at hook-execution time says which one the host actually used.
+
+The commands call `engram` **from PATH**, so the binary has to be there (`engram` / `engram.exe`), and the daemon needs a database: set `ENGRAM_DB` or put `db_path` in the [config file](#config-file).
+
+### What each hook does
+
+| Event | Output | Behaviour |
+|-------|--------|-----------|
+| `session-start` | plain text (injected as context) | Resolves the project through `mem_current_project`, registers the session, then prints a three-line protocol POINTER followed by the project's recent context (capped at 16 KiB). It does **not** re-print the protocol: the MCP server already delivers it through the `initialize` result, and a second copy costs several KiB of the model's context on every session start. Auto-starts a resident daemon if none is running; `--no-autostart` disables that. The pointer is printed even when the daemon is unreachable — an agent that was told nothing calls nothing. |
+| `post-compaction` | plain text | Everything `session-start` does, plus four numbered, unconditional steps: save the compacted summary with `mem_session_summary`, recover with `mem_context`, fill gaps with `mem_search`, then continue. After a compaction the model has lost the context that would have told it to do any of this. |
+| `user-prompt-submit` | JSON | Captures the prompt (`mem_save_prompt`) so a later `mem_save` can attach it. On the FIRST prompt of a session it injects the tool bootstrap (call `mem_current_project` first; here are the tool names) — hosts that defer MCP tool loading need a name to load. Afterwards it stays silent unless the session is over 5 minutes old AND the project's newest memory is over 15 minutes old, and then at most once every 15 minutes. |
+| `subagent-stop` | `{}` | Saves the subagent's closing report as an observation titled `subagent-stop: …`. A subagent's context dies with it; this is the only copy. The title names the source because nobody reviewed that text. |
+
+| `session-end` | `{}` | Closes the session row. It does not invent a summary — that field belongs to `mem_session_summary`, and a hook-written "session ended" would overwrite the one thing the next session reads. |
+
+Every hook that WRITES (`session-start`, `user-prompt-submit`, `subagent-stop`) resolves the project through `mem_current_project` first and then names it explicitly. If the answer is not trustworthy — no `cwd` in the payload, a directory that is gone, a `writes_blocked` project, or an answer that describes the *daemon's* own directory — the hook falls back to the project the SESSION itself was registered under (`GET /api/v1/sessions/{id}` — session-start recorded a real `cwd` for that id), and if that answers nothing either, the write is **skipped** with a line on stderr. A memory filed under the daemon's junk project reads exactly like real work, in a project nobody opens; not saving it is the cheaper mistake.
+
+Per-session state (first-prompt marker, nudge cooldown) lives in `os.UserCacheDir()/engram/hooks` (created `0700`) under `engram-hook-<hash>-*`; the session id is hashed rather than embedded, since it is host-supplied text that ends up in a filesystem path. Not the system temp directory: it is world-writable on Unix, and a marker another user can create is a marker another user can use to silence your reminders. `session-start` and `post-compaction` DELETE both markers for their session (a `--resume` reuses the session id, so the bootstrap must fire again and the age clock must restart) and `session-end` removes them for good.
+
+Each event runs under one clock that starts when the process does — stdin included. `io.ReadAll` waits for EOF, so a host that hands the hook a pipe it never closes would otherwise block it forever (not for its budget, forever, with the user's prompt behind it), and the read is therefore bounded by whichever is smaller: a 1-second ceiling, or what is left of the event's budget. The budgets themselves sit below the timeouts the packs declare, with the stdin ceiling counted in — a test fails the build if they ever cross.
+
 ## Using engram from your agent
 
 Wiring the daemon as an MCP server makes the tools available — but the agent won't use them proactively unless its instructions say so. This section describes the protocol to add to your agent's instruction file. Copy [docs/agent-instructions.md](docs/agent-instructions.md) into your CLAUDE.md, AGENTS.md, .cursorrules, or whichever file your client reads as system-level instructions.
+
+You may not have to copy anything. The daemon now also ships a condensed version of this protocol over the MCP `instructions` field in its `initialize` response — for a client that honours it (prepends it to the model's system prompt), the tool roster, the proactive-save rule, and the recovery steps arrive automatically, with no file to maintain. `engram setup hooks` (below) layers the same protocol plus the project's actual recent memory on top, at the one moment the instructions channel alone cannot reach: after a context compaction. Copy `docs/agent-instructions.md` when you want the long form, or your client honours neither channel.
 
 The protocol works with any MCP-capable agent (Claude Code, Cursor, OpenCode, or any client that exposes MCP tools to its model).
 
@@ -886,10 +1011,11 @@ If the agent's context is cleared or compacted, the persistent store is unaffect
 
 ## MCP tools
 
-The daemon exposes 14 tools to the connected agent.
+The daemon exposes 18 tools to the connected agent.
 
 | Tool                  | Purpose                                                                              |
 |-----------------------|--------------------------------------------------------------------------------------|
+| `mem_current_project` | Report the project THIS caller resolves to and how (`fallback` / `writes_blocked` / `directory_exists` flag a guess, `hints` say why); never errors — the recommended first call of a session |
 | `mem_session_start`   | Register the start of a coding session; resolves and stores the project name         |
 | `mem_session_end`     | Mark a session as completed with an optional summary                                 |
 | `mem_save`            | Save an observation (decision, bug fix, discovery, …) to persistent memory           |
@@ -897,13 +1023,62 @@ The daemon exposes 14 tools to the connected agent.
 | `mem_save_prompt`     | Save the user's prompt text so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID                |
 | `mem_update`          | Edit a specific observation in place by ID (omitted fields keep their value; versioned + re-synced) |
-| `mem_search`          | Search observations; supports `mode` param: `""` (FTS), `"semantic"`, or `"hybrid"` |
+| `mem_search`          | Search observations; `mode` (`""` FTS / `"semantic"` / `"hybrid"`), plus `offset` paging and `created_from` / `created_to` date bounds |
 | `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
 | `mem_review`          | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the staleness clock (local-only) |
-| `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
+| `mem_context`         | Assemble recent sessions and observations into a context summary for the agent — sessions are ordered by last activity (the latest of start, end, and newest memory), not by when they were registered |
+| `mem_pin`             | Pin a memory so it leads `mem_context` and ranks higher in keyword search (local-only) |
+| `mem_unpin`           | Unpin a memory, returning it to normal recency order (local-only)                    |
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
 | `mem_judge`           | Record a verdict on a conflict candidate surfaced by `mem_save`                      |
 | `mem_merge_projects`  | Merge a source project's memories into a target name to fix project name drift (local-only) |
+| `mem_doctor`          | Run read-only diagnostics over the local store and return a structured report (never modifies your memories) |
+
+### Project probe: `mem_current_project`
+
+Call it first, and read three fields before writing anything:
+
+| Field | Meaning |
+|-------|---------|
+| `fallback: true` | The name is a GUESS — a directory basename, or the lenient fallback after a resolution error. It changes the day the folder is renamed. |
+| `writes_blocked: true` | `mem_save` / `mem_save_prompt` / `mem_session_start` / `mem_session_summary` will REFUSE this directory. Causes: an ambiguous multi-repo parent, a malformed `.engram/config.json`, a directory that does not exist, a **relative** directory, no directory reaching a shared HTTP-transport daemon at all (`daemon_cwd`), or a project whose policy is `omitted`. The `daemon_cwd` cause does not apply to a per-client `--transport stdio` daemon, whose cwd IS the workspace (see "Working-directory forwarding" above) — there it is never blocked. Reads keep answering from the basename. |
+| `directory_exists: false` | The resolved directory is not on this machine (a typo'd `ENGRAM_CLIENT_DIR`, a hallucinated `cwd`). Any project name here was invented from a basename that names nothing. |
+
+Plus `hints`, an **array** of one plain sentence per reason the answer is untrustworthy (they compose — a daemon-cwd answer for a missing directory under an omitted project is three separate problems), `directory_source` (`argument` = injected by `engram connect`; `cwd_alias` = a path the caller supplied; `daemon_cwd` = nobody supplied one, so the answer describes the *daemon's* directory; `relative_path` = the caller's value was relative, so `filepath.Abs` resolved it against the *daemon's* directory; `invalid_directory_argument` = `directory` was present but not a string, and was ignored), `cwd` (absolute and cleaned), `cwd_input` (the caller's value, verbatim) and `project_path` (the project's canonical directory: the repo root, the directory holding `.engram/config.json`, or the resolved cwd).
+
+`cwd` is accepted as an alias of `directory` by **every** project-resolving tool, and is read only when `directory` is absent or blank — the injected client directory must keep outranking a hand-written path. A `directory` that is present but **not a string** is a caller error: every tool except `mem_current_project` refuses the call (that one reports it in the envelope instead, since it never errors). It is never silently downgraded to the `cwd` alias — `engram connect` leaves a non-string `directory` alone on purpose, so the daemon is the only place left that can tell you about it. A non-string `cwd` is one notch softer: the alias is optional, so the call resolves exactly as it would with no alias at all, and the envelope carries a hint saying so.
+
+**Pass absolute paths.** A relative `directory`/`cwd` (`.`, `./repo`) is resolved with `filepath.Abs` — against the **daemon's** working directory, which for a shared resident daemon is wherever autostart or the tray launched it. Reads stay lenient and answer from it; every write tool refuses it (`directory_source: "relative_path"`, `writes_blocked: true`), because the alternative is filing a memory under a project the caller never saw.
+
+### Diagnostics: `mem_doctor`
+
+Read-only checks over the local store, for the moments when something looks wrong and nothing says why. `mem_doctor` returns `{status, project, summary{total,ok,warnings,blocked,errors}, checks[]}`; `status` rolls up worst-first (`error` > `blocked` > `warning` > `ok`), and each check carries a `message`, a `why`, an `evidence` blob and a `safe_next_step`.
+
+| Check | What it catches |
+|-------|-----------------|
+| `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. Saves filed under the store's own `manual-save-{project}` default are **excluded**: that is what a `mem_save` with no `session_id` does, and warning about it made every store that had ever taken a manual save permanently "warning". They are reported instead as an `info` finding, `unregistered_session_saves`, which does not move the check out of `ok`. The exclusion is an EXACT match against the id this store would mint for that row's project (`manual-save-` + project, case-sensitive): an id naming a *different* project, or one in a casing engram does not produce, is not the store's own default and stays a warning. |
+| `session_project_directory_mismatch` | A session filed under one project whose directory resolves to another today. Only *declared* identities count (config file, git remote, git root) — comparing two basename guesses would report drift that is not there. |
+| `ambiguous_active_sessions` | Two or more sessions still open for the same project + directory, usually an agent host that exited without firing its session-end hook. |
+| `parked_mutations` | Outbox entries central has permanently rejected (see "Parked mutations" under [CLI subcommands](#cli-subcommands)) — each finding names the mutation, project, entity, attempt count and `last_error`, mirroring `engram sync parked`'s own output so either surface leads straight to `engram sync retry`/`discard`. Only evaluated when central is configured; reports `ok` with `central_configured: false` otherwise, since a local-only node can never have a parked outbox entry. |
+| `project_policy_unknown` | Projects with memories but no explicit policy row, **only when central is configured** — they are being pushed on a computed default of `synced` that nobody chose. Informational. |
+| `sqlite_lock_contention` | A WAL checkpoint that cannot complete (another process is holding the database), or a `busy_timeout` of 0, which turns ordinary contention into a failed `mem_save`. |
+| `stale_review_backlog` | Most of a project flagged `needs_review` or `expired`, at which point the lifecycle flag has stopped distinguishing anything. |
+| `sync_backlog` | Mutations waiting in the outbound journal. Informational between cycles; a warning once the oldest is hours old or the queue is large — that is a sync that *cannot* complete, and those memories exist on one machine only. |
+
+Scope: the per-project checks follow the same project resolution as `mem_search` and `mem_context` (explicit `project`, else the forwarded directory); pass `check` to run exactly one. `sqlite_lock_contention` and `sync_backlog` are node-wide either way.
+
+**It never modifies your memories.** Every finding ends in a `safe_next_step` for a human to run, and `requires_confirmation: true` marks the ones where the right fix depends on context the store does not have — which of two project names is canonical, which of three open sessions is yours. A repair that guesses at those destroys the evidence on its way. (The wording is deliberate: no row, session or project is ever touched, but `sqlite_lock_contention` probes with `PRAGMA wal_checkpoint(PASSIVE)`, which can move pages out of the WAL. Calling that "never writes" would be a claim the code does not make.)
+
+**Tool errors vs findings.** The call is flagged as an error only when the *request* could not be run — an unknown `check` id. A check that reports `severity: "error"` failed to ANSWER (the lock probe could not read its pragma, say); the other checks still reported, and the call succeeded. A doctor whose calls "fail" is a doctor nobody runs on the store that needs it.
+
+### Lifecycle: review_after decay
+
+A memory's `review_after` is set once, at insert time, and never recomputed except by `mem_review`'s `mark_reviewed`. Two rules decide the value, in this order:
+
+1. **Per-type decay.** Three types carry an explicit staleness window because their useful life is measured in months, not weeks: `decision` (6 months), `policy` (12 months — meant to outlive the work it governs), `preference` (3 months — the most volatile of the three). A row of one of these types gets `review_after = created_at + <window>` at insert time.
+2. **Fallback window.** Every other type (`bugfix`, `architecture`, `pattern`, `discovery`, `learning`, `manual`, …) gets no `review_after` at insert time and instead goes stale at `updated_at + review_window_days` — a `config.json`-only, restart-required setting (default **30 days**; any value ≤ 0 is treated as the default). It has no CLI flag or control-API key; set it directly in [the config file](#config-file).
+
+`needs_review` fires the moment `now` passes whichever due date applies; `expired` (a separate, rarer state — `expires_at`) always takes priority over `needs_review` when both are set. Neither `review_after` nor `expires_at` is part of the sync payload: lifecycle status is a per-node judgment about staleness, not shared truth, so two nodes can legitimately disagree about whether the same memory needs a second look.
 
 ### Conflict detection
 
@@ -1029,6 +1204,20 @@ The web UI also exposes local and purge-all delete from the **Projects** page. `
 | `"fts"` | Explicit keyword search — same as the default. |
 | `"semantic"` | Vector cosine similarity only. Requires a configured embedding provider. |
 | `"hybrid"` | FTS + cosine similarity fused via Reciprocal Rank Fusion (RRF, k=60). Best recall. |
+
+### Paging and date bounds
+
+`mem_search` also takes three optional arguments that narrow or walk the result set. They are **strict**: an unusable value is a tool error, never a silently ignored filter — a dropped bound answers a question about last week with the whole corpus, and the caller cannot tell.
+
+| Argument | Accepts | Meaning |
+|----------|---------|---------|
+| `offset` | non-negative integer | Skip the first N results. Page 2 of `limit=10` is `offset=10`. Paging past the end returns no results rather than page one. |
+| `created_from` | RFC3339 or `YYYY-MM-DD` | Only memories created at or after this instant. A bare date is read as UTC midnight. |
+| `created_to` | RFC3339 or `YYYY-MM-DD` | Only memories created at or before this instant. A bare date covers the **whole** day. |
+
+The bounds are honoured by every mode — on `"hybrid"` they are pushed into both the FTS predicate and the vector candidate scan, so a row outside the window cannot be re-admitted by the semantic half of the fusion. `offset` is applied in SQL on the keyword path and to the final ranked list on the semantic and hybrid paths.
+
+Hybrid fuses the **full** candidate lists on every page, including page one (every vector row for the cosine half; up to 2000 rows for the FTS half). An RRF score depends on a row's rank *within the lists it was fused from*, so a candidate pool that varied by page would cut each page out of a different ranking — pages that repeat some rows and skip others. One ranking, sliced: consecutive pages are disjoint and their union is the unpaged top-(offset+limit).
 
 ### Configuring an embedding provider
 

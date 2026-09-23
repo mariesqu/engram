@@ -110,16 +110,17 @@ type VectorRow = vectorRow
 // does not match dims are silently skipped (they are stale — the backfill loop
 // will re-embed them on the next pass). NaN-producing rows are also excluded.
 //
-// project and filter.Type/Scope predicates mirror the FTS path so the cosine
-// scan is scoped the same way as a keyword search.
+// project and filter.Type/Scope/TopicKey/CreatedFrom/CreatedTo predicates mirror
+// the FTS path so the cosine scan is scoped the same way as a keyword search.
+// The date bounds in particular MUST be pushed down here and not applied after
+// ranking: hybrid RRF fuses this list with the FTS list, so an out-of-range row
+// that survives the cosine scan is re-admitted into the fused page even though
+// the FTS half correctly excluded it.
 //
-// CAVEAT: filter.CreatedFrom, filter.CreatedTo, and filter.Offset are NOT
-// applied here — the semantic/hybrid path scans and ranks ALL matching live
-// vectors before any date bound or paging would be meaningful to apply, and
-// no caller currently needs date/offset-bounded semantic search. A caller
-// that sets those fields on a "semantic" or "hybrid" mode SearchMemoriesFiltered
-// call gets them silently ignored on this path (see the filter-semantics note
-// on SearchMemoriesFiltered).
+// filter.Offset is deliberately NOT applied here. Offset is a property of the
+// FINAL ranked page, not of either candidate source — skipping rows before the
+// cosine scores exist would drop arbitrary rows rather than the top N. The
+// callers in search.go apply it after ranking/fusion instead.
 //
 // dims must match the configured provider's Dimensions(). Passing 0 skips all
 // rows (returns nil, nil) — safe when NoopProvider is active.
@@ -147,6 +148,9 @@ func SelectVectors(db *sql.DB, project string, filter SearchFilter, dims int) ([
 		q += " AND topic_key = ?"
 		args = append(args, filter.TopicKey)
 	}
+	// Unqualified "created_at": this query reads memories directly, with no FTS
+	// join and therefore no table alias (the FTS path uses "m.created_at").
+	q, args = dateRangeSQL(q, args, "created_at", filter)
 
 	rows, err := db.Query(q, args...)
 	if err != nil {

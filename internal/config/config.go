@@ -185,6 +185,11 @@ type fileConfig struct {
 	// ReviewWindowDays is the memory-lifecycle staleness window in days. A memory
 	// is considered "needs_review" once now > COALESCE(review_after, updated_at +
 	// window). 0/unset → default 30; any value <= 0 is treated as the default.
+	//
+	// It is the FALLBACK, not the universal rule: decision, policy and preference
+	// rows carry an explicit review_after stamped at save time from the per-type
+	// decay map (6 / 12 / 3 months — see localstore.decayReviewAfterMonths), so
+	// this window governs every other type.
 	ReviewWindowDays int `json:"review_window_days,omitempty"`
 }
 
@@ -332,13 +337,30 @@ type ConfigPatch struct {
 // DefaultConfigDir returns the directory where config.json is stored:
 // %APPDATA%\engram on Windows, os.UserConfigDir()/engram elsewhere.
 // Returns an error when the OS cannot determine the user config directory.
+//
+// The result is always ABSOLUTE, including for an ENGRAM_CONFIG_DIR override.
 func DefaultConfigDir() (string, error) {
 	// ENGRAM_CONFIG_DIR overrides the default platform location (as documented in
 	// the README's Config file / Environment variables sections). It lets a user
 	// relocate or isolate their config — e.g. for testing, or running multiple
 	// daemons with distinct settings without colliding on a single config.json.
 	if override := strings.TrimSpace(os.Getenv("ENGRAM_CONFIG_DIR")); override != "" {
-		return override, nil
+		// Made ABSOLUTE here, once, against the process's working directory.
+		// Callers create this directory (config.Save, and spawnWorkingDir, which
+		// hands it to a detached daemon as its cwd) — and a RELATIVE override
+		// resolves against whoever happens to be running: `engram connect` starts
+		// in the user's repo, so ENGRAM_CONFIG_DIR=.engram would silently create a
+		// config directory INSIDE their checkout, and a daemon autostarted from a
+		// different repo would then read a different file under the same setting.
+		// A path the user cannot predict is not an override, it is a surprise.
+		abs, err := filepath.Abs(override)
+		if err != nil {
+			// filepath.Abs fails only when the cwd cannot be read; the override is
+			// still the user's instruction, so honour it rather than falling through
+			// to the platform default they explicitly overrode.
+			return override, nil
+		}
+		return abs, nil
 	}
 	base, err := os.UserConfigDir()
 	if err != nil {

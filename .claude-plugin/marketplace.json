@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "engram",
+  "description": "Persistent memory for AI coding agents — single binary, local SQLite, optional central sync",
+  "owner": {
+    "name": "mariesqu"
+  },
+  "plugins": [
+    {
+      "name": "engram",
+      "description": "Persistent memory with session registration, compaction recovery, prompt capture and the memory protocol. Requires the engram binary on PATH.",
+      "version": "1.6.0",
+      "source": "./plugin/claude-code",
+      "category": "productivity",
+      "homepage": "https://github.com/mariesqu/engram"
+    }
+  ]
+}

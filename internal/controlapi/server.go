@@ -272,6 +272,37 @@ type Store interface {
 	CountsByProject() (map[string]int, error)
 }
 
+// SessionRef is the part of a session row the control API exposes: which
+// project it was registered under, and from which directory. Nothing else —
+// summaries and timestamps belong to the memory tools, and this endpoint has
+// exactly one job (see handleSession).
+type SessionRef struct {
+	ID        string `json:"id"`
+	Project   string `json:"project"`
+	Directory string `json:"directory"`
+}
+
+// SessionLookup is an OPTIONAL capability of Store: resolving a session id to
+// the project it was registered under.
+//
+// Optional, rather than a method on Store, because Store is implemented in five
+// places across this tree (the daemon, the web UI, and three test fakes) and
+// only one of them has sessions at all. A capability a caller type-asserts for
+// costs nothing to the stores that do not have it, and handleSession answers
+// 501 for them instead of pretending.
+type SessionLookup interface {
+	// LookupSession returns the session row for id, or an error wrapping
+	// ErrSessionNotFound when there is none.
+	LookupSession(id string) (SessionRef, error)
+}
+
+// ErrSessionNotFound is the sentinel a SessionLookup returns for an id no
+// session row carries. It lives here rather than being matched on its message
+// (as isNotFound does for memories) because this interface is new: the
+// adapter that implements it can translate its store's own sentinel once,
+// which is what that string matching is a workaround for.
+var ErrSessionNotFound = errors.New("session not found")
+
 // SyncController is the autosync control port. PR-① uses Status for the
 // GET /api/v1/status endpoint. PR-③ extends with TriggerNow, Disconnect, Reconnect.
 //
@@ -389,6 +420,7 @@ func (s *Server) WithAuthAndOrigin(next http.HandlerFunc) http.HandlerFunc {
 //	POST   /api/v1/sync/trigger                 → withAuth+Origin → handleSyncTrigger
 //	POST   /api/v1/embedding/key                → withAuth+Origin → handleEmbeddingKeyPost
 //	DELETE /api/v1/embedding/key                → withAuth+Origin → handleEmbeddingKeyDelete
+//	GET    /api/v1/sessions/{id}                → withAuth → handleSession
 //	/                                           → withAuth → 404 JSON catch-all
 //
 // The catch-all is auth-wrapped too: unknown paths return 401 to
@@ -411,6 +443,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyPost))
 	mux.HandleFunc("DELETE /api/v1/embedding/key", s.WithAuthAndOrigin(s.handleEmbeddingKeyDelete))
 	mux.HandleFunc("/api/v1/memories", s.withAuth(s.handleMemories))
+	// Session lookup: which project was this session registered under? Read-only,
+	// and the answer a lifecycle hook falls back to when its payload carries no
+	// workspace (see handleSession).
+	mux.HandleFunc("/api/v1/sessions/{id}", s.withAuth(s.handleSession))
 	// PUT /api/v1/memories/{id} and DELETE /api/v1/memories/{id} — memory mutation routes.
 	// Auth + Origin are both required (same chain as config/policy mutation routes).
 	mux.HandleFunc("/api/v1/memories/{id}", s.WithAuthAndOrigin(s.handleMemoryMutate))
@@ -679,6 +715,50 @@ func (s *Server) handleProjectPolicy(w http.ResponseWriter, r *http.Request) {
 // Any other or missing scope returns 400. The route is registered with
 // WithAuthAndOrigin so both bearer-token auth and Origin validation are
 // enforced before this handler runs.
+// handleSession handles GET /api/v1/sessions/{id}: the project (and directory)
+// a session was registered under.
+//
+// It exists for ONE caller: a lifecycle hook whose payload carried no usable
+// cwd. Codex omits it for some subagent shapes, and a wrapper script can drop
+// it for any of them — and without a directory the hook has nothing to resolve
+// a project from, so it refuses to save rather than file the work under the
+// daemon's own directory. But the session itself was registered WITH a cwd at
+// session-start, which makes the session row the same observation arriving by a
+// different road: not a guess, the directory the host reported for this very
+// session. Asking here is the difference between keeping a subagent's report
+// and dropping it.
+//
+// The lookup is an OPTIONAL capability (SessionLookup): a Store that does not
+// implement it answers 501 rather than failing to compile, so the several test
+// and web-UI stores in this tree stay as they are.
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "session id is required")
+		return
+	}
+	lookup, ok := s.store.(SessionLookup)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "this store cannot look up sessions")
+		return
+	}
+	session, err := lookup.LookupSession(id)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, session)
+}
+
 func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	if project == "" {

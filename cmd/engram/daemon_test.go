@@ -312,10 +312,11 @@ func TestBuildDaemon_WithCentral(t *testing.T) {
 }
 
 // TestBuildDaemon_MCPServerTools verifies that the MCP server built by
-// buildDaemon registers exactly the fourteen tools:
-// mem_session_start, mem_session_end, mem_save, mem_get_observation, mem_update,
-// mem_suggest_topic_key, mem_session_summary, mem_search, mem_context, mem_judge,
-// mem_save_prompt, mem_similar, mem_review, mem_merge_projects.
+// buildDaemon registers exactly the fifteen tools:
+// mem_current_project, mem_session_start, mem_session_end, mem_save,
+// mem_get_observation, mem_update, mem_suggest_topic_key, mem_session_summary,
+// mem_search, mem_context, mem_judge, mem_save_prompt, mem_similar, mem_review,
+// mem_merge_projects.
 //
 // Mechanism: mcpserver.MCPServer.ListTools() returns the registered tool map
 // directly.  Asserting the exact key set ensures no accidental additions and
@@ -340,6 +341,7 @@ func TestBuildDaemon_MCPServerTools(t *testing.T) {
 	tools := components.mcpServer.ListTools()
 
 	wantTools := []string{
+		"mem_current_project",
 		"mem_session_start",
 		"mem_session_end",
 		"mem_save",
@@ -349,11 +351,14 @@ func TestBuildDaemon_MCPServerTools(t *testing.T) {
 		"mem_session_summary",
 		"mem_search",
 		"mem_context",
+		"mem_pin",
+		"mem_unpin",
 		"mem_judge",
 		"mem_save_prompt",
 		"mem_similar",
 		"mem_review",
 		"mem_merge_projects",
+		"mem_doctor",
 	}
 	if len(tools) != len(wantTools) {
 		names := make([]string, 0, len(tools))
@@ -617,6 +622,7 @@ func TestDaemonTool_MemSave_CreatesObservation(t *testing.T) {
 		"title":   "test observation",
 		"content": "content body",
 		"type":    "decision",
+		"project": "handler-e2e-project",
 	})
 	result, err := saveTool.Handler(t.Context(), req)
 	if err != nil {
@@ -700,7 +706,10 @@ func TestDaemonTool_MemSave_InvalidConfig(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
 	saveTool := components.mcpServer.ListTools()["mem_save"]
-	req := newToolRequest("mem_save", map[string]any{"title": "bad config test", "content": "body"})
+	// "directory" is passed explicitly (rather than relying on the chdir above)
+	// so the call reaches DetectProjectFull/ErrInvalidConfig under test instead
+	// of being refused earlier as dirSourceDaemonCwd.
+	req := newToolRequest("mem_save", map[string]any{"title": "bad config test", "content": "body", "directory": badDir})
 	result, err := saveTool.Handler(t.Context(), req)
 	if err != nil {
 		t.Fatalf("handler transport error: %v", err)
@@ -781,6 +790,7 @@ func TestDaemonTool_MemSessionSummary_CreatesSessionSummary(t *testing.T) {
 	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
 	req := newToolRequest("mem_session_summary", map[string]any{
 		"content": "## Goal\nTest the session summary tool.",
+		"project": "session-summary-project",
 	})
 	result, err := sumTool.Handler(t.Context(), req)
 	if err != nil {

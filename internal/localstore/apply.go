@@ -123,16 +123,54 @@ func applyTx(tx *sql.Tx, d domain.Decision, m domain.Mutation) error {
 }
 
 func execInsert(tx *sql.Tx, m domain.Mutation) error {
+	// createdAt is the row's OWN creation instant — FUP-005. m.OccurredAt is the
+	// ORIGINATING node's local write time; it travels on the wire as WireMutation.
+	// OccurredAt (syncwire.go) and central preserves it verbatim through a pull
+	// (see PullSince), so a row materialized on a DIFFERENT node than the one that
+	// wrote it still gets the SAME created_at here as it got on the writer. A zero
+	// OccurredAt means the caller never set it (a Mutation built by hand, or one
+	// that predates this field) — now() is that pre-fix fallback, and the ONLY
+	// case where created_at still means "when THIS node happened to apply it".
+	//
+	// Format: sqliteTimeLayout ("2006-01-02 15:04:05"), matching the column's
+	// existing DEFAULT (datetime('now')) exactly — every row already stored uses
+	// this format, and datetime()-wrapped comparisons/ORDER BY (dateRangeSQL,
+	// RecentObservations, BrowseMemories, …) depend on new rows staying
+	// consistent with it rather than introducing a second timestamp shape.
+	createdAt := m.OccurredAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	createdAt = createdAt.UTC()
+
+	// review_after is stamped HERE for a new row, and re-stamped by execUpdate
+	// for a REVISION of one (see its comment). An idempotent re-apply takes NoOp
+	// and moves nothing, so nothing can push a memory's review date forward
+	// without new content actually landing.
+	//
+	// It is LOCAL-ONLY metadata: review_after is not in the canonical payload
+	// (see mutation.CanonicalPayload), so it never crosses the sync wire. It is
+	// dated from createdAt (the row's OWN creation instant, immediately above),
+	// not time.Now() — mirroring the migrateV13ToV14 backfill's own reasoning:
+	// a two-year-old decision pulled onto a new node today must surface as
+	// needs_review immediately, not be granted a fresh six months by the act of
+	// this node applying it now. For a genuinely brand-new local write createdAt
+	// IS now (normalizeMutation defaults OccurredAt to time.Now() before this is
+	// ever reached), so this changes nothing for that case.
+	reviewAfter := reviewAfterForType(m.Type, createdAt)
+
 	_, err := tx.Exec(`
 		INSERT INTO memories
 		  (sync_id, session_id, entity_type, type, title, content,
 		   project, scope, topic_key, parent_sync_id, status,
-		   version, writer_id, last_write_mutation_id, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   version, writer_id, last_write_mutation_id, created_at, updated_at, review_after)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		m.SyncID, m.SessionID, string(m.EntityType), m.Type, m.Title, m.Content,
 		m.Project, m.Scope, nullStr(m.TopicKey), nullStr(m.ParentSyncID), nullStr(m.Status),
 		m.Version, m.WriterID, m.MutationID,
+		createdAt.Format(sqliteTimeLayout),
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		reviewAfter,
 	)
 	if err != nil {
 		return fmt.Errorf("execInsert: %w", err)
@@ -144,6 +182,23 @@ func execInsert(tx *sql.Tx, m domain.Mutation) error {
 // P1-a fix: targetSyncID is the RESOLVED row's sync_id from Decision.TargetSyncID,
 // which may differ from m.SyncID when resolved via FindByTopic.
 func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
+	// review_after is RE-STAMPED on a revision, for the same reason MarkReviewed
+	// resets it: someone looked at this memory and asserted its content is still
+	// what it should say. A topic_key re-save and a mem_update both land here, and
+	// both are that assertion — a decision rewritten today is not six months stale
+	// just because its first version was written six months ago.
+	//
+	// The COALESCE is what keeps the rule honest for the other direction: a type
+	// with NO decay entry binds nil, and COALESCE(NULL, review_after) leaves the
+	// column exactly as it was. Writing NULL there would silently undo a
+	// MarkReviewed reset on every edit, which is the opposite of what an edit means.
+	//
+	// The window is dated from NOW, not from m.UpdatedAt: review_after is
+	// LOCAL-ONLY per-node metadata (not in mutation.CanonicalPayload), so for a
+	// PULLED revision the meaningful instant is when this node received the new
+	// content, matching execInsert's treatment of a pulled insert.
+	reviewAfter := reviewAfterForType(m.Type, time.Now())
+
 	// embedding columns are RESET on every update: the stored vector was
 	// computed from the OLD title/content — keeping it would leave semantic
 	// search scoring against text that no longer exists, and the backfill
@@ -153,11 +208,13 @@ func execUpdate(tx *sql.Tx, targetSyncID string, m domain.Mutation) error {
 		UPDATE memories
 		SET title=?, content=?, type=?, status=?, topic_key=?, parent_sync_id=?,
 		    version=?, writer_id=?, last_write_mutation_id=?, updated_at=?,
+		    review_after=COALESCE(?, review_after),
 		    embedding=NULL, embedding_model=NULL, embedding_created_at=NULL
 		WHERE sync_id=?`,
 		m.Title, m.Content, m.Type, nullStr(m.Status), nullStr(m.TopicKey), nullStr(m.ParentSyncID),
 		m.Version, m.WriterID, m.MutationID,
 		m.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		reviewAfter,
 		targetSyncID,
 	)
 	if err != nil {

@@ -23,7 +23,7 @@ import (
 // via the Streamable HTTP MCP transport.
 //
 // Proves: the /mcp endpoint is reachable with the bearer token, the tool
-// surface is identical to stdio (same 14 tools), and a saved observation is
+// surface is identical to stdio (same 18 tools), and a saved observation is
 // returned by a subsequent search.
 func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -110,6 +110,7 @@ func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 	}
 
 	wantTools := []string{
+		"mem_current_project",
 		"mem_session_start",
 		"mem_session_end",
 		"mem_save",
@@ -124,6 +125,9 @@ func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 		"mem_similar",
 		"mem_review",
 		"mem_merge_projects",
+		"mem_pin",
+		"mem_unpin",
+		"mem_doctor",
 	}
 	if len(toolsResult.Tools) != len(wantTools) {
 		names := make([]string, len(toolsResult.Tools))

@@ -21,6 +21,7 @@ package centralstore_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mariesqu/engram/internal/domain"
+	"github.com/mariesqu/engram/internal/mutation"
 )
 
 // liveRow holds the subset of a central_memories row the assertions inspect.
@@ -35,6 +37,29 @@ type liveRow struct {
 	syncID  string
 	content string
 	version int
+}
+
+func TestApply_RejectsNULBeforePostgresPersistence(t *testing.T) {
+	store := newIsolatedStore(t)
+	ctx := context.Background()
+	m := testMutation("", "sync-nul-rejected", "proj", domain.OpUpsert)
+	m.Content = "bad\x00content"
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+
+	err := store.Apply(ctx, m)
+	if err == nil || !strings.Contains(err.Error(), "U+0000") || !strings.Contains(err.Error(), "content") {
+		t.Fatalf("Apply error = %v, want actionable content/U+0000 rejection", err)
+	}
+	var count int
+	if err := store.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM central_mutations WHERE mutation_id = $1`, m.MutationID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count central_mutations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("central_mutations count = %d, want 0", count)
+	}
 }
 
 // queryLiveTopicRows returns every live (deleted_at IS NULL) central_memories

@@ -27,12 +27,24 @@ func newReviewMergeDaemon(t *testing.T) *daemonComponents {
 	return components
 }
 
-// markStale forces a row's updated_at into the past so it computes as needs_review
-// under the default 30-day window.
+// markStale forces a row into the past so it computes as needs_review: updated_at
+// beyond the default 30-day window, AND — for a type that carries an explicit
+// review_after from the per-type decay map — that due date too.
+//
+// Ageing updated_at alone stopped being enough once "decision" rows started
+// being stamped with review_after = now + 6 months at insert: an explicit due
+// date outranks the rolling window in ReviewStatus, so the row stayed active no
+// matter how old its updated_at was. The CASE leaves NULL alone so the helper
+// still exercises the window path for types with no decay entry.
 func markStale(t *testing.T, c *daemonComponents, id int64) {
 	t.Helper()
 	if _, err := c.store.DB().Exec(
-		`UPDATE memories SET updated_at = datetime('now','-40 days') WHERE id = ?`, id,
+		`UPDATE memories
+		 SET updated_at   = datetime('now','-40 days'),
+		     review_after = CASE WHEN review_after IS NULL
+		                        THEN NULL
+		                        ELSE datetime('now','-1 days') END
+		 WHERE id = ?`, id,
 	); err != nil {
 		t.Fatalf("markStale: %v", err)
 	}
@@ -175,6 +187,57 @@ func TestMemReview_BadID(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Fatal("expected tool error for non-integer id")
+	}
+}
+
+// TestMemReview_TooManyIDs verifies mark_reviewed refuses an oversized batch
+// instead of silently marking the first 200 of it. A truncating cap would report
+// success for memories it never touched, which is the one answer worse than an
+// error here: the caller walks away believing 500 memories were verified.
+func TestMemReview_TooManyIDs(t *testing.T) {
+	c := newReviewMergeDaemon(t)
+	tool := handleReview(c.store)
+
+	ids := make([]any, reviewIDsPerCall+1)
+	for i := range ids {
+		ids[i] = float64(i + 1)
+	}
+
+	result, err := tool(t.Context(), newToolRequest("mem_review", map[string]any{
+		"action": "mark_reviewed",
+		"ids":    ids,
+	}))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected a tool error for %d ids (cap is %d)", len(ids), reviewIDsPerCall)
+	}
+	if text := result.Content[0].(mcp.TextContent).Text; !strings.Contains(text, "at most 200 ids") {
+		t.Errorf("error text does not name the cap: %s", text)
+	}
+}
+
+// TestMemReview_MaxIDsAccepted pins the boundary from the other side: exactly the
+// cap is a valid call, so the limit reads as "200 per page", not "199".
+func TestMemReview_MaxIDsAccepted(t *testing.T) {
+	c := newReviewMergeDaemon(t)
+	tool := handleReview(c.store)
+
+	ids := make([]any, reviewIDsPerCall)
+	for i := range ids {
+		ids[i] = float64(i + 1)
+	}
+
+	result, err := tool(t.Context(), newToolRequest("mem_review", map[string]any{
+		"action": "mark_reviewed",
+		"ids":    ids,
+	}))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("exactly %d ids must be accepted, got: %s", reviewIDsPerCall, result.Content[0].(mcp.TextContent).Text)
 	}
 }
 

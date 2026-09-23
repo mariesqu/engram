@@ -13,19 +13,19 @@
 //
 // Field split:
 //
-//   IN the canonical payload (reconstructed by mutation.FromCanonicalPayload):
-//     Op, SyncID, SessionID, EntityType, Type, Title, Content, Project, Scope,
-//     TopicKey, Status, ParentSyncID, Version, UpdatedAt, WriterID.
+//	IN the canonical payload (reconstructed by mutation.FromCanonicalPayload):
+//	  Op, SyncID, SessionID, EntityType, Type, Title, Content, Project, Scope,
+//	  TopicKey, Status, ParentSyncID, Version, UpdatedAt, WriterID.
 //
-//   OUTSIDE the payload (siblings on the wire):
-//     mutation_id  — SHA-256 of the payload bytes.
-//     occurred_at  — RFC3339Nano UTC string; the SENDER's local write time
-//                    (set by LocalWrite/normalizeMutation), not part of the
-//                    payload. Required on the wire: ToWire always emits it and
-//                    FromWire rejects an empty value.
-//     seq          — central_mutations BIGSERIAL; 0 / omitted on push,
-//                    positive on pull.
-//     payload      — the raw canonical JSON bytes (embedded as a JSON sub-object).
+//	OUTSIDE the payload (siblings on the wire):
+//	  mutation_id  — SHA-256 of the payload bytes.
+//	  occurred_at  — RFC3339Nano UTC string; the SENDER's local write time
+//	                 (set by LocalWrite/normalizeMutation), not part of the
+//	                 payload. Required on the wire: ToWire always emits it and
+//	                 FromWire rejects an empty value.
+//	  seq          — central_mutations BIGSERIAL; 0 / omitted on push,
+//	                 positive on pull.
+//	  payload      — the raw canonical JSON bytes (embedded as a JSON sub-object).
 package syncwire
 
 import (
@@ -132,6 +132,9 @@ func FromWire(w WireMutation) (domain.Mutation, error) {
 	if err != nil {
 		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: decode payload: %w", err)
 	}
+	if err := mutation.ValidateCanonicalPayloadText(w.Payload); err != nil {
+		return domain.Mutation{}, fmt.Errorf("syncwire.FromWire: invalid canonical payload: %w", err)
+	}
 
 	// Parse occurred_at — it must be a valid RFC3339Nano timestamp in UTC (Z suffix).
 	if w.OccurredAt == "" {
@@ -195,13 +198,13 @@ type PushRequest struct {
 // push (failures are signaled by a non-2xx HTTP status, not this body).
 //
 //   - Status     — always "ok". The server cannot distinguish a fresh apply from an
-//                  idempotent re-push or a version-guard NoOp, because
-//                  centralstore.Apply returns nil for all of them. Surfacing that
-//                  distinction would require an additive ApplyWithOutcome on
-//                  centralstore (the deferred 409; see package cloudserve).
+//     idempotent re-push or a version-guard NoOp, because
+//     centralstore.Apply returns nil for all of them. Surfacing that
+//     distinction would require an additive ApplyWithOutcome on
+//     centralstore (the deferred 409; see package cloudserve).
 //   - MutationID — the mutation_id the server processed (echoes the request's).
 //   - Applied    — always true on success, meaning "the server accepted and
-//                  processed the mutation" — NOT "this write won the LWW merge".
+//     processed the mutation" — NOT "this write won the LWW merge".
 type PushResponse struct {
 	Status     string `json:"status"`
 	MutationID string `json:"mutation_id"`
@@ -265,4 +268,37 @@ type StateRequest struct{}
 // honored (persisted locally) to decide whether a remote purge is due.
 type StateResponse struct {
 	PurgeEpoch int64 `json:"purge_epoch"`
+}
+
+// CreatedAtRequest is the body of a POST /v1/created-at request (FUP-005's
+// backfill endpoint, client → server). It asks central for one PAGE of
+// original-creation-time entries for Project, in a stable keyset order.
+//
+// After is the LAST sync_id returned by the previous page ("" for the first
+// page) — a keyset cursor, not an offset: central orders entries by sync_id
+// and returns rows strictly after it, which stays correct even if rows are
+// inserted between pages (an offset would skip or repeat rows under the same
+// condition). Limit is clamped server-side exactly like PullRequest.Limit.
+type CreatedAtRequest struct {
+	Project string `json:"project"`
+	After   string `json:"after,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+}
+
+// CreatedAtEntry is one sync_id's ORIGINAL creation time: the EARLIEST
+// occurred_at central has ever recorded for it, across every mutation any
+// writer ever pushed for that identity (MIN(occurred_at) GROUP BY entity_key)
+// — the true "when was this memory first written", independent of which
+// node's push happened to land it in central_mutations.
+type CreatedAtEntry struct {
+	SyncID    string `json:"sync_id"`
+	CreatedAt string `json:"created_at"` // RFC3339Nano UTC
+}
+
+// CreatedAtResponse is the body returned by POST /v1/created-at: one page of
+// entries, keyset-ordered by sync_id. An EMPTY Entries slice signals the
+// backfill has reached the end of the project — the client's page loop stops
+// there, mirroring /v1/pull's "empty batch means drained" contract.
+type CreatedAtResponse struct {
+	Entries []CreatedAtEntry `json:"entries"`
 }

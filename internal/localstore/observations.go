@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mariesqu/engram/internal/domain"
+	"github.com/mariesqu/engram/internal/mutation"
 )
 
 // ErrObservationNotFound is returned by GetObservation when no live row exists
@@ -97,6 +98,14 @@ type ObservationResult struct {
 // the write commits) and the sync_id. Returns ErrObservationNotFound if the
 // row cannot be found after write (should not happen in practice).
 func (s *Store) AddObservation(p AddObservationParams) (ObservationResult, error) {
+	p.SessionID = mutation.RemoveNUL(p.SessionID)
+	p.Type = mutation.RemoveNUL(p.Type)
+	p.Title = mutation.RemoveNUL(p.Title)
+	p.Content = mutation.RemoveNUL(p.Content)
+	p.Project = mutation.RemoveNUL(p.Project)
+	p.Scope = mutation.RemoveNUL(p.Scope)
+	p.TopicKey = mutation.RemoveNUL(p.TopicKey)
+	p.WriterID = mutation.RemoveNUL(p.WriterID)
 	if p.Type == "" {
 		p.Type = "manual"
 	}

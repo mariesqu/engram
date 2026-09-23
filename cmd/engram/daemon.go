@@ -457,10 +457,17 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	// it internally so the window need not thread through registerTools.
 	store.SetReviewWindowDays(cfg.reviewWindowDays)
 
+	// WithInstructions ships the agent protocol in the initialize result.  It is
+	// the channel gentle-ai's slim CLAUDE.md section delegates to once it sees a
+	// parseable version at or above its floor — without it that client injects
+	// the slim reminders and nothing that explains the save format, the lifecycle
+	// states, the search flow, or the after-compaction steps.  See
+	// instructions.go for the text and the full rationale.
 	mcpSrv := mcpserver.NewMCPServer(
 		"engram",
 		version,
 		mcpserver.WithToolCapabilities(true),
+		mcpserver.WithInstructions(serverInstructions),
 	)
 
 	var loop *syncer.Loop
@@ -538,7 +545,14 @@ func buildDaemon(cfg daemonCfg) (*daemonComponents, error) {
 	}
 
 	activity := NewSessionActivity()
-	registerTools(mcpSrv, store, loop, embedLoop, gated, cfg.writerID, activity)
+	// True only for a per-client `engram daemon --transport stdio` (README.md's
+	// documented setup: the MCP client spawns this daemon process IN the
+	// project directory, so its own cwd genuinely is that client's workspace).
+	// False for the SHARED resident daemon (--transport http, what `engram
+	// connect` bridges to), whose cwd is wherever autostart/tray launched it
+	// from — see registerTools' daemonCwdIsWorkspace doc.
+	daemonCwdIsWorkspace := cfg.mcpTransport == "stdio"
+	registerTools(mcpSrv, store, loop, embedLoop, gated, cfg.writerID, activity, daemonCwdIsWorkspace)
 
 	return &daemonComponents{
 		store:     store,
@@ -952,6 +966,25 @@ func (a *localStoreAdapter) ListMemoriesFiltered(opts controlapi.MemoryListOptio
 // CountsByProject adapts localstore.Store.CountsByProject to controlapi.Store.
 func (a *localStoreAdapter) CountsByProject() (map[string]int, error) {
 	return a.store.CountsByProject()
+}
+
+// LookupSession implements controlapi.SessionLookup — the optional capability
+// behind GET /api/v1/sessions/{id}. The store's own sentinel is translated
+// once, here, so the HTTP layer can answer 404 without matching on an error
+// message.
+func (a *localStoreAdapter) LookupSession(id string) (controlapi.SessionRef, error) {
+	sess, err := a.store.GetSession(id)
+	if err != nil {
+		if errors.Is(err, localstore.ErrSessionNotFound) {
+			return controlapi.SessionRef{}, controlapi.ErrSessionNotFound
+		}
+		return controlapi.SessionRef{}, err
+	}
+	return controlapi.SessionRef{
+		ID:        sess.ID,
+		Project:   sess.Project,
+		Directory: sess.Directory,
+	}, nil
 }
 
 // recordToSummary converts a domain.Record to a controlapi.MemorySummary.

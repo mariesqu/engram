@@ -5,7 +5,9 @@ package localstore
 // in-process convergence spike wires them to a real central store.
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +74,59 @@ func TestLocalWrite_AppliesAndEnqueues(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("PendingCount=%d, want 1", n)
+	}
+}
+
+func TestLocalWrite_SanitizesNULBeforeMaterializationPayloadAndHash(t *testing.T) {
+	s := openTempStore(t)
+	m := upsertMut("sync-nul-1", "sdd/test/nul", "left\x00right\x01", 1, baseT)
+	m.Title = "title\x00kept\x01"
+	m.MutationID = "caller-supplied-id-without-payload"
+
+	written, err := s.LocalWrite(m)
+	if err != nil {
+		t.Fatalf("LocalWrite: %v", err)
+	}
+	if written.Content != "leftright\x01" || written.Title != "titlekept\x01" {
+		t.Fatalf("written fields = title %q content %q", written.Title, written.Content)
+	}
+	if want := mutation.NewMutationID(written.Payload); written.MutationID != want {
+		t.Fatalf("mutation_id = %q, want payload hash %q", written.MutationID, want)
+	}
+	decoded, err := mutation.FromCanonicalPayload(written.Payload)
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if decoded.Content != written.Content || decoded.Title != written.Title {
+		t.Fatalf("payload fields = title %q content %q; written = title %q content %q",
+			decoded.Title, decoded.Content, written.Title, written.Content)
+	}
+	rec, err := s.FindByTopic("sdd/test/nul", "engram", "project")
+	if err != nil || rec == nil {
+		t.Fatalf("FindByTopic: record=%+v err=%v", rec, err)
+	}
+	if rec.Content != written.Content || rec.Title != written.Title {
+		t.Fatalf("materialized fields = title %q content %q", rec.Title, rec.Content)
+	}
+}
+
+func TestLocalWrite_RejectsSuppliedPayloadContainingNULWithoutRewritingIt(t *testing.T) {
+	s := openTempStore(t)
+	m := upsertMut("sync-external-nul", "sdd/test/external-nul", "bad\x00content", 1, baseT)
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+	originalPayload := append([]byte(nil), m.Payload...)
+	originalID := m.MutationID
+
+	got, err := s.LocalWrite(m)
+	if err == nil || !strings.Contains(err.Error(), "U+0000") {
+		t.Fatalf("LocalWrite error = %v, want actionable U+0000 rejection", err)
+	}
+	if got.MutationID != originalID || !bytes.Equal(got.Payload, originalPayload) {
+		t.Fatal("LocalWrite mutated externally supplied payload/ID pair")
+	}
+	if n, countErr := s.PendingCount(); countErr != nil || n != 0 {
+		t.Fatalf("PendingCount = %d, err=%v; want 0", n, countErr)
 	}
 }
 
@@ -465,7 +520,7 @@ func TestNormalizeTopicKey_MutationID_NilAndEmptyConverge(t *testing.T) {
 }
 
 // TestLocalWrite_EmptyTopicKey_StoresNULL verifies that LocalWrite (upsert) with
-// TopicKey=&"" stores the memories.topic_key column as SQL NULL, not as ''.
+// TopicKey=&"" stores the memories.topic_key column as SQL NULL, not as ”.
 func TestLocalWrite_EmptyTopicKey_StoresNULL(t *testing.T) {
 	s := openTempStore(t)
 	empty := ""
@@ -489,7 +544,7 @@ func TestLocalWrite_EmptyTopicKey_StoresNULL(t *testing.T) {
 
 // TestLocalWrite_EmptyTopicKeyDelete_StoresTombstoneNULL verifies that
 // LocalWrite (delete) with TopicKey=&"" stores memory_tombstones.topic_key as
-// SQL NULL, not as ''.
+// SQL NULL, not as ”.
 func TestLocalWrite_EmptyTopicKeyDelete_StoresTombstoneNULL(t *testing.T) {
 	s := openTempStore(t)
 	at := baseT.Add(1 * time.Second)

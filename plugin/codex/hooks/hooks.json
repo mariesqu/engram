@@ -1,0 +1,63 @@
+{
+  "description": "Engram persistent memory hooks for Codex — session registration, compaction recovery, prompt capture, and passive subagent capture.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-start",
+            "timeout": 10,
+            "statusMessage": "Loading engram memory..."
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook post-compaction",
+            "timeout": 10,
+            "statusMessage": "Recovering engram context after compaction..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook user-prompt-submit",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook subagent-stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-end",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

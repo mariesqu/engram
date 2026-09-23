@@ -1,0 +1,63 @@
+{
+  "description": "Engram persistent memory hooks — session registration, compaction recovery, prompt capture, and passive subagent capture. Every hook is the engram binary itself (engram hook <event>): one implementation, no shell, no jq, identical on every platform.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-start",
+            "timeout": 10,
+            "statusMessage": "Loading engram memory..."
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook post-compaction",
+            "timeout": 10,
+            "statusMessage": "Recovering engram context after compaction..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook user-prompt-submit",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook subagent-stop",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-end",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

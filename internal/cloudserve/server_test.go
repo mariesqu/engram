@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,12 +16,14 @@ import (
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/mutation"
 	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/transport"
 )
 
 // ── mock transport.Central ────────────────────────────────────────────────────
 
 type mockCentral struct {
 	applyErr   error
+	applyCalls int
 	pullResult []domain.Mutation
 	pullErr    error
 
@@ -37,6 +41,7 @@ type mockCentral struct {
 }
 
 func (m *mockCentral) Apply(_ context.Context, _ domain.Mutation) error {
+	m.applyCalls++
 	return m.applyErr
 }
 
@@ -171,6 +176,41 @@ func TestHandlePush_ApplyError_Returns500(t *testing.T) {
 	}
 }
 
+// ── push 422 — Apply returns a permanent (transport.ErrPermanent) error ──────
+
+// TestHandlePush_PermanentApplyError_Returns422 is the FUP-004 regression
+// test: a mutation Apply rejects for a DETERMINISTIC reason (wrapped in
+// transport.ErrPermanent — mirroring what centralstore.Apply actually returns
+// for a Postgres data exception / constraint violation) must come back as 422,
+// not 500, so the client parks the entry instead of retrying it forever. The
+// response body must carry the safe detail text, not a generic "internal
+// error" — the client reads it into last_error for mem_doctor/CLI visibility.
+func TestHandlePush_PermanentApplyError_Returns422(t *testing.T) {
+	central := &mockCentral{applyErr: fmt.Errorf("Apply: insert mutation: %w: rejected by constraint %q (SQLSTATE 23514)",
+		transport.ErrPermanent, "memories_entity_type_check")}
+	ts := newTestServer(t, central)
+
+	body, _ := validPushBody(t)
+	resp, err := http.Post(ts.URL+"/v1/push", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/push: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", resp.StatusCode)
+	}
+	var got struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.Contains(got.Error, "memories_entity_type_check") {
+		t.Errorf("error body = %q, want it to name the constraint", got.Error)
+	}
+}
+
 // ── push 400 — malformed body ─────────────────────────────────────────────────
 
 func TestHandlePush_MalformedBody_Returns400(t *testing.T) {
@@ -233,6 +273,115 @@ func TestHandlePush_TamperedMutationID_Returns400(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for tampered mutation_id", resp.StatusCode)
 	}
+}
+
+func TestHandlePush_NULPayload_ReturnsActionable400BeforeApply(t *testing.T) {
+	central := &mockCentral{}
+	ts := newTestServer(t, central)
+	m := domain.Mutation{
+		Op: domain.OpUpsert, SyncID: "sync-nul", EntityType: domain.EntityMemory,
+		Content: "bad\x00content", Project: "project", Scope: "project",
+		Version: 1, WriterID: "writer", UpdatedAt: time.Now().UTC(), OccurredAt: time.Now().UTC(),
+	}
+	m.Payload = mutation.CanonicalPayload(m)
+	m.MutationID = mutation.NewMutationID(m.Payload)
+	body, err := json.Marshal(syncwire.PushRequest{Mutation: syncwire.ToWire(m)})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	resp, err := http.Post(ts.URL+"/v1/push", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/push: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var got map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if !strings.Contains(got["error"], "U+0000") || !strings.Contains(got["error"], "content") {
+		t.Fatalf("error = %q, want actionable content/U+0000 message", got["error"])
+	}
+	if central.applyCalls != 0 {
+		t.Fatalf("central Apply called %d times, want 0", central.applyCalls)
+	}
+}
+
+func TestHandlePush_NULAnywhereInCanonicalJSON_Returns400BeforeApply(t *testing.T) {
+	base := domain.Mutation{
+		Op: domain.OpUpsert, SyncID: "sync-nul-hidden", EntityType: domain.EntityMemory,
+		Content: "valid content", Project: "project", Scope: "project",
+		Version: 1, WriterID: "writer", UpdatedAt: time.Now().UTC(), OccurredAt: time.Now().UTC(),
+	}
+	basePayload := mutation.CanonicalPayload(base)
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{"unknown field value", appendPushJSONField(t, basePayload, `"unknown":"bad\u0000value"`)},
+		{"object key", appendPushJSONField(t, basePayload, `"bad\u0000key":"value"`)},
+		{"shadowed earlier duplicate field", prependPushJSONField(t, basePayload, `"content":"bad\u0000shadow"`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			central := &mockCentral{}
+			ts := newTestServer(t, central)
+			request := syncwire.PushRequest{Mutation: syncwire.WireMutation{
+				MutationID: mutation.NewMutationID(tt.payload),
+				OccurredAt: base.OccurredAt.UTC().Format(time.RFC3339Nano),
+				Payload:    tt.payload,
+			}}
+			body, err := json.Marshal(request)
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+
+			resp, err := http.Post(ts.URL+"/v1/push", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("POST /v1/push: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			var got map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if !strings.Contains(got["error"], "U+0000") {
+				t.Fatalf("error = %q, want actionable U+0000 message", got["error"])
+			}
+			if central.applyCalls != 0 {
+				t.Fatalf("central Apply called %d times, want 0", central.applyCalls)
+			}
+		})
+	}
+}
+
+func appendPushJSONField(t *testing.T, payload []byte, field string) []byte {
+	t.Helper()
+	if len(payload) == 0 || payload[len(payload)-1] != '}' {
+		t.Fatalf("test payload is not a JSON object: %q", payload)
+	}
+	result := append([]byte(nil), payload[:len(payload)-1]...)
+	result = append(result, ',')
+	result = append(result, field...)
+	return append(result, '}')
+}
+
+func prependPushJSONField(t *testing.T, payload []byte, field string) []byte {
+	t.Helper()
+	if len(payload) == 0 || payload[0] != '{' {
+		t.Fatalf("test payload is not a JSON object: %q", payload)
+	}
+	result := []byte{'{'}
+	result = append(result, field...)
+	result = append(result, ',')
+	return append(result, payload[1:]...)
 }
 
 // ── push 400 — FromWire fails (non-UTC occurred_at) ──────────────────────────

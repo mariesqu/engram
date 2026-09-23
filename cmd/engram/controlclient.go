@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,8 +57,23 @@ func (c *ControlClient) url(path string) string {
 // Get issues an authenticated GET request to the control API and decodes the
 // JSON response body into dst. On 401 it re-reads daemon.json once and retries
 // before returning ErrDaemonNotRunning.
+//
+// It is GetContext with a background context: the client's own Timeout still
+// bounds each request, which is the right default for a CLI command.
 func (c *ControlClient) Get(path string, dst any) error {
-	resp, err := c.do(http.MethodGet, path, nil)
+	return c.GetContext(context.Background(), path, dst)
+}
+
+// GetContext is Get bounded by a caller-supplied context.
+//
+// The distinction matters wherever a deadline covers MORE than one request. The
+// http.Client's Timeout applies per request, so the 401-refresh-and-retry path
+// gets a FRESH one — a caller with 200ms left (the user-prompt-submit hook,
+// which sits between someone pressing Enter and their message being sent) can
+// wait 400ms on a daemon that is restarting, and has no way to say otherwise.
+// A context is shared by both attempts and expires once.
+func (c *ControlClient) GetContext(ctx context.Context, path string, dst any) error {
+	resp, err := c.doContext(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -68,7 +84,7 @@ func (c *ControlClient) Get(path string, dst any) error {
 		if refreshErr := c.refresh(); refreshErr != nil {
 			return fmt.Errorf("%w (stale token; %v)", ErrDaemonNotRunning, refreshErr)
 		}
-		resp2, err2 := c.do(http.MethodGet, path, nil)
+		resp2, err2 := c.doContext(ctx, http.MethodGet, path, nil)
 		if err2 != nil {
 			return err2
 		}
@@ -144,8 +160,14 @@ func (c *ControlClient) mutate(method, path string, body any, dst any) error {
 	return decodeResponse(resp, dst)
 }
 
-// do executes a single HTTP request with the current token.
+// do executes a single HTTP request with the current token, bounded only by the
+// client's own Timeout.
 func (c *ControlClient) do(method, path string, body any) (*http.Response, error) {
+	return c.doContext(context.Background(), method, path, body)
+}
+
+// doContext executes a single HTTP request with the current token, under ctx.
+func (c *ControlClient) doContext(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -154,7 +176,7 @@ func (c *ControlClient) do(method, path string, body any) (*http.Response, error
 		}
 		bodyReader = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.url(path), bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.url(path), bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("new request: %w", err)
 	}

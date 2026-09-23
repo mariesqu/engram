@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mariesqu/engram/internal/config"
 	"github.com/mariesqu/engram/internal/controlapi"
 )
 
@@ -83,12 +84,55 @@ func buildSpawnCmd(exe, dbPath string) *exec.Cmd {
 	cmd := exec.Command(exe, "daemon", "--db", dbPath, "--http", "--transport", "http")
 	cmd.SysProcAttr = detachedSysProcAttr()
 	cmd.Stdin = nil
+	cmd.Dir = spawnWorkingDir()
 
 	if logFile, err := openSpawnLog(dbPath, cmd.Args); err == nil {
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
 	}
 	return cmd
+}
+
+// spawnWorkingDir returns the working directory a spawned daemon runs in.
+//
+// It is deliberately NOT the spawner's cwd, which is what a child inherits by
+// default. Everything that spawns a daemon is standing in somebody's repo: a
+// lifecycle hook runs in the agent's workspace, `engram connect` runs wherever
+// the MCP client launched it, the tray runs wherever it was double-clicked.
+// That directory then becomes the daemon's, and the daemon's cwd is the answer
+// mem_current_project gives EVERY client that sends no directory of its own
+// (directory_source="daemon_cwd") — so the first repo to autostart a daemon
+// quietly names the project for every session after it. On Windows there is a
+// second cost: a process's working directory is an open handle on that folder,
+// so a resident daemon LOCKS the checkout it was spawned from — no rename, no
+// delete, no branch switch that replaces the directory — for its whole life.
+//
+// engram's own config directory is the answer: it belongs to engram, it is not
+// anybody's checkout, and its basename ("engram") is at least an honest name
+// for a daemon-cwd fallback. The home directory is the backstop, and "" (inherit,
+// the old behaviour) the last resort — an awkward cwd is worth less than a
+// daemon that refuses to start because its directory could not be resolved.
+func spawnWorkingDir() string {
+	if dir, err := config.DefaultConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+		// Resolved to an ABSOLUTE path before anything acts on it. DefaultConfigDir
+		// already does this for an ENGRAM_CONFIG_DIR override; it is re-checked
+		// here because a relative value would be resolved TWICE, independently:
+		// once by the MkdirAll below (against the cwd right now) and once by
+		// os/exec at spawn time (against the cwd then). Any chdir between the two
+		// — the tray, a test, a future caller — creates one directory and starts
+		// the daemon in another, or fails the spawn outright with a Dir that does
+		// not exist.
+		abs, absErr := filepath.Abs(dir)
+		// exec refuses to start a process whose Dir does not exist, so create it —
+		// 0700 is what config.Save uses for the same directory.
+		if absErr == nil && filepath.IsAbs(abs) && os.MkdirAll(abs, 0o700) == nil {
+			return abs
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return home
+	}
+	return ""
 }
 
 // spawnLogNeedsRotation reports whether a spawn log of the given size should

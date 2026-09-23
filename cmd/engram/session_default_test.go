@@ -145,8 +145,8 @@ func TestDaemonTool_MemSavePrompt_SessionIDExplicit(t *testing.T) {
 
 // TestDaemonTool_MemSessionSummary_SessionIDDefault verifies that an omitted
 // session_id is stored as "manual-save-{project}" using the FINAL resolved
-// project name (cwd-detected, since this call passes no explicit project and no
-// prior session row exists for an empty session_id).
+// project name. The project is passed explicitly: no directory and no prior
+// session row means dirSourceDaemonCwd, which a write tool now refuses.
 func TestDaemonTool_MemSessionSummary_SessionIDDefault(t *testing.T) {
 	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "engram.db"), syncInterval: 30 * time.Second})
 	if err != nil {
@@ -157,6 +157,7 @@ func TestDaemonTool_MemSessionSummary_SessionIDDefault(t *testing.T) {
 	sumTool := components.mcpServer.ListTools()["mem_session_summary"]
 	req := newToolRequest("mem_session_summary", map[string]any{
 		"content": "## Goal\nverify session_id default",
+		"project": "cwd-default-project",
 	})
 	result, err := sumTool.Handler(t.Context(), req)
 	if err != nil {

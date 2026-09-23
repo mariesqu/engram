@@ -35,16 +35,15 @@ type SearchFilter struct {
 	// identical FTS results they received before this field was added.
 	Mode string
 
-	// CreatedFrom/CreatedTo optionally bound m.created_at (inclusive on both
+	// CreatedFrom/CreatedTo optionally bound created_at (inclusive on both
 	// ends). The zero time.Time disables the corresponding bound. Both fields
 	// are additive — existing callers that leave them zero see byte-identical
 	// results to before these fields were added.
 	//
-	// CAVEAT: honored by the FTS path (mode "" / "fts", including the FTS
-	// half of "hybrid") but NOT by the semantic vector scan (SelectVectors) —
-	// a "semantic" search, or the cosine half of a "hybrid" search, ignores
-	// these bounds entirely. See SearchMemoriesFiltered's filter-semantics
-	// doc block for the full breakdown.
+	// Honored by EVERY mode: the FTS predicate bounds m.created_at and
+	// SelectVectors bounds created_at on the cosine candidate scan, so a row
+	// outside the window can reach no page through either half of a hybrid
+	// fusion.
 	CreatedFrom time.Time
 	CreatedTo   time.Time
 
@@ -53,10 +52,63 @@ type SearchFilter struct {
 	// changes nothing versus before this field was added. Negative values are
 	// treated as zero by callers that construct SQL from this filter.
 	//
-	// CAVEAT: only honored by the FTS path (mode "" / "fts"). "semantic" and
-	// "hybrid" modes ignore Offset entirely — neither paginates.
+	// Honored by every mode, but at different layers: "fts" pushes it into SQL
+	// OFFSET, while "semantic" and "hybrid" apply it to the FINAL ranked list
+	// (after cosine ranking / after RRF fusion) because rank order does not
+	// exist until scoring has run. See SearchMemoriesFiltered's filter-semantics
+	// doc block.
 	Offset int
 }
+
+// ftsRankExpr is the ORDER BY expression shared by the FTS-only path and the FTS
+// half of hybrid, so the two can never rank the same corpus differently. It
+// requires the memories table to be aliased `m` and the FTS table `fts`.
+//
+// The 1.10 is the pinned boost: 10%, ported from the upstream composite rank. It
+// MULTIPLIES rather than adds because bm25() returns a NEGATIVE score (more
+// negative = better match) and results are ordered ASC — scaling by 1.10 moves a
+// pinned row further from zero, i.e. earlier. It is deliberately small: pinning
+// should break a near-tie in the pinned row's favour, not drag an irrelevant
+// memory to the top of an unrelated search.
+//
+// Only the pinned term of upstream's composite rank is ported. Upstream also
+// multiplies in a recency term (from last_seen_at) and a stability term (from
+// revision_count + duplicate_count); this schema has none of those three
+// columns, so there is nothing to compute them from. Adding a recency term off
+// updated_at instead would silently reorder every existing search result, which
+// is not something a pinning feature gets to do — it belongs in its own change
+// with its own before/after evidence.
+//
+// It is a hand-written const, not a Sprintf'd package var: a var built at init is
+// a mutable global holding a string that never changes, and a const cannot be
+// reassigned by anything — including a test.
+//
+// Cost note: `ORDER BY fts.rank * <expr>` gives up FTS5's rank pushdown. A bare
+// `ORDER BY fts.rank` lets FTS5 return rows in rank order directly; multiplying
+// it makes the sort key an expression SQLite must materialize and sort in a temp
+// b-tree. Measured at 20k rows the difference is a wash (the temp sort is over
+// the matched rows only, not the whole table), which is what buys the pinned
+// boost — but it is a real change in query plan, so a future widening of the
+// expression should be measured rather than assumed free.
+const ftsRankExpr = "fts.rank * (CASE WHEN m.pinned = 1 THEN 1.10 ELSE 1.0 END)"
+
+// hybridFullFusionFTSCap bounds the FTS candidate list of EVERY hybrid query.
+//
+// Hybrid always fuses the full candidate lists so the ranking does not depend on
+// the page being asked for (see SearchMemoriesFiltered's doc block). "Full" is
+// literal for the cosine half — SelectVectors already scanned those rows — but an
+// unbounded FTS half would let a one-word query pull every matching row in the
+// store into the fusion to answer a ten-row page. 2000 is far past what any real
+// paging session walks (200 pages of 10), and a query that reaches beyond it
+// fuses the rows it has rather than erroring.
+//
+// The cost is real and deliberate: page one of a hybrid search now ranks up to
+// 2000 FTS candidates instead of 2×limit. That is what a stable ranking costs,
+// and it is paid on the half of the query that was already scanning every vector
+// row. What the cap does NOT have to cover is content: the candidate pass selects
+// sync_ids only and the page is hydrated after fusion, so 2000 candidates is 2000
+// identifiers, not 2000 memory bodies.
+const hybridFullFusionFTSCap = 2000
 
 // dateRangeSQL appends CreatedFrom/CreatedTo predicates (if set) to a WHERE
 // clause being built for the given column expression (e.g. "m.created_at" or
@@ -94,15 +146,36 @@ type SearchDegradation struct {
 //   - mode:    "" or "fts" → FTS only (byte-identical to before); "semantic" →
 //     cosine only; "hybrid" → FTS + cosine → RRF(k=60); unknown → fts
 //
-// CAVEAT — mode="semantic"/"hybrid" and f.CreatedFrom/CreatedTo/f.Offset:
-// the cosine candidate set (SelectVectors) does NOT apply CreatedFrom,
-// CreatedTo, or Offset at all — those bounds are silently ignored on the
-// semantic side. In "hybrid" mode the FTS half of the RRF fusion DOES honor
-// CreatedFrom/CreatedTo, but the cosine half does not, so a hybrid result can
-// still include rows outside the requested date range via the cosine path.
-// f.Offset is entirely unused by both "semantic" and "hybrid" — there is no
-// paging on either path; only mode="" / "fts" (runFTS) applies Offset. Only
-// mode="" and "fts" honor all three fields exactly as documented above.
+// Date bounds and paging across modes:
+//   - f.CreatedFrom / f.CreatedTo are pushed into SQL on BOTH halves — the FTS
+//     predicate and SelectVectors' cosine candidate scan — so no mode can
+//     surface a row outside the window. Pushing them down (rather than
+//     post-filtering the ranked page) is load-bearing for "hybrid": RRF fuses
+//     the two candidate lists, so an out-of-range row surviving the cosine half
+//     would be re-admitted into the fused page the FTS half had excluded.
+//   - f.Offset skips the first N rows of the FINAL ranked page. "fts" pushes it
+//     into SQL OFFSET; "semantic" applies it after cosine ranking and "hybrid"
+//     after RRF fusion, because neither has a rank order until scoring has run.
+//     The guarantee both paths make is that the RANKING IS NOT A FUNCTION OF
+//     THE PAGE: every page is cut from the same ranking, so consecutive pages
+//     are disjoint and their union is the unpaged top-(offset+limit). An RRF
+//     score depends on each row's rank WITHIN the candidate lists, so changing
+//     how far those lists are truncated reorders the fused result — which means
+//     hybrid ranks the FULL candidate lists (every vector row for cosine, FTS up
+//     to hybridFullFusionFTSCap) for EVERY offset, including zero, and slices
+//     [offset:offset+limit] out of it.
+//     Page one used to keep a narrower pool (2×limit per half) for byte-identity
+//     with the pre-paging release. That made page 0 and page 1 slices of two
+//     DIFFERENT rankings, which is the one thing paging may not do: with the two
+//     halves ranking a corpus differently, a row admitted by the wider pool
+//     outranks rows page one already returned, so the pages repeat some and skip
+//     others. Byte-identity with an unpaged ranking is not worth an incoherent
+//     paged one.
+//   - Paging is stable only for a fixed corpus and a fixed query: a concurrent
+//     write, or an embedding backfill that adds a vector mid-scan, can shift
+//     rows across the page boundary exactly as it can on the FTS path.
+//   - When a semantic/hybrid search DEGRADES to FTS (see below), the fallback
+//     is runFTS, which applies Offset in SQL — so paging survives degradation.
 //
 // FTS injection prevention: the query string is passed through sanitizeFTS
 // (wraps each token in double-quotes) before reaching the FTS5 engine.
@@ -166,7 +239,7 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		if offset < 0 {
 			offset = 0
 		}
-		q += "\nORDER BY fts.rank\nLIMIT ? OFFSET ?"
+		q += "\nORDER BY " + ftsRankExpr + "\nLIMIT ? OFFSET ?"
 		args = append(args, limit, offset)
 
 		rows, err := s.db.Query(q, args...)
@@ -227,6 +300,13 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 
 	queryVec := l2Normalize(vecs[0])
 
+	// Offset is applied to the ranked page below, never to the candidate scans.
+	// Negative values mean "page one" (same normalization runFTS applies).
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
 	// ── Cosine-only ("semantic") path ────────────────────────────────────────
 	if mode == "semantic" {
 		vrows, svErr := SelectVectors(s.db, project, f, dims)
@@ -239,11 +319,20 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			return results, SearchDegradation{Reason: "semantic results not ready; showing keyword results"}, err
 		}
 
-		topK := cosineTopK(queryVec, vrows, limit)
+		// Rank offset+limit candidates, then drop the first `offset` — the page
+		// boundary only exists once the cosine scores have ordered the rows.
+		topK := cosineTopK(queryVec, vrows, offset+limit)
 		if len(topK) == 0 {
 			results, err := runFTS()
 			return results, SearchDegradation{Reason: "semantic results not ready; showing keyword results"}, err
 		}
+		if offset >= len(topK) {
+			// Paged past the end of the ranked list. This is an EMPTY page, not a
+			// degradation — falling back to FTS here would answer a "give me rows
+			// 50-59" request with rows 0-9 of a different ranking.
+			return nil, SearchDegradation{}, nil
+		}
+		topK = topK[offset:]
 
 		syncIDs := make([]string, len(topK))
 		for i, c := range topK {
@@ -254,17 +343,30 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 	}
 
 	// ── Hybrid path: FTS + cosine → RRF ─────────────────────────────────────
-	// Run FTS with 2× candidates.
-	ftsCandidates, ftsErr := func() ([]*domain.Record, error) {
+	// EVERY hybrid query fuses the full candidate lists, page one included. An RRF
+	// score is a property of a row's rank within the lists it was fused from, so a
+	// pool that varies by page cuts each page out of a DIFFERENT ranking — which is
+	// how pages end up repeating rows and skipping others. Fusing the same lists
+	// for every offset makes the ranking page-independent, so [offset:offset+limit]
+	// is a genuine slice of one ordering.
+	ftsPool := hybridFullFusionFTSCap
+
+	// Run FTS for the candidate pool sized above.
+	//
+	// The candidate pass reads IDENTIFIERS ONLY. Fusion ranks sync_ids — content
+	// is no part of that decision — so selecting the full row here materialized up
+	// to hybridFullFusionFTSCap (2000) memory BODIES to answer a ten-row page and
+	// discarded all but `limit` of them after the slice. The page is hydrated
+	// from the fused ids instead (one fetchBySyncIDs of at most `limit` rows),
+	// which also makes the hybrid path read its records through the same query
+	// the semantic path already used.
+	ftsRanks, ftsErr := func() ([]string, error) {
 		ftsQ := sanitizeFTS(query)
 		if ftsQ == "" {
 			return nil, nil
 		}
 		q := `
-			SELECT m.id, m.sync_id, m.session_id, m.entity_type, m.type, m.title, m.content,
-			       m.project, m.scope, m.version, m.writer_id, m.last_write_mutation_id,
-			       m.topic_key, m.status, m.parent_sync_id,
-			       m.created_at, m.updated_at, m.deleted_at
+			SELECT m.sync_id
 			FROM memories_fts fts
 			JOIN memories m ON m.id = fts.rowid
 			WHERE memories_fts MATCH ?
@@ -287,20 +389,20 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 			args = append(args, f.TopicKey)
 		}
 		q, args = dateRangeSQL(q, args, "m.created_at", f)
-		q += "\nORDER BY fts.rank\nLIMIT ?"
-		args = append(args, limit*2)
+		q += "\nORDER BY " + ftsRankExpr + "\nLIMIT ?"
+		args = append(args, ftsPool)
 		rows, err := s.db.Query(q, args...)
 		if err != nil {
 			return nil, fmt.Errorf("hybrid FTS: %w", err)
 		}
 		defer rows.Close()
-		var res []*domain.Record
+		var res []string
 		for rows.Next() {
-			r, e := scanRecordWithIDFromRows(rows)
-			if e != nil {
+			var syncID string
+			if e := rows.Scan(&syncID); e != nil {
 				return nil, fmt.Errorf("hybrid FTS scan: %w", e)
 			}
-			res = append(res, r)
+			res = append(res, syncID)
 		}
 		return res, rows.Err()
 	}()
@@ -309,22 +411,17 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		return results, SearchDegradation{Reason: "semantic search unavailable: FTS error; showing keyword results"}, err
 	}
 
-	// Cosine candidates with 2× candidates.
+	// Scan the vector rows; the pool is cut from them below (see cosineK).
 	vrows, svErr := SelectVectors(s.db, project, f, dims)
 	if svErr != nil {
 		results, err := runFTS()
 		return results, SearchDegradation{Reason: "semantic search unavailable: vector scan error; showing keyword results"}, err
 	}
 
-	// Build rank lists (sync_id).
-	ftsRanks := make([]string, len(ftsCandidates))
-	ftsRecordsByID := make(map[string]*domain.Record, len(ftsCandidates))
-	for i, r := range ftsCandidates {
-		ftsRanks[i] = r.SyncID
-		ftsRecordsByID[r.SyncID] = r
-	}
-
-	cosineCandidates := cosineTopK(queryVec, vrows, limit*2)
+	// The cosine half mirrors the FTS half: every scanned vector row, on every
+	// page (SelectVectors has already applied the same project/type/scope/date
+	// predicates, so "all of them" is still a bounded, correctly-scoped list).
+	cosineCandidates := cosineTopK(queryVec, vrows, len(vrows))
 	cosineRanks := make([]string, len(cosineCandidates))
 	for i, c := range cosineCandidates {
 		cosineRanks[i] = c.syncID
@@ -337,50 +434,26 @@ func (s *Store) SearchMemoriesFiltered(query, project string, limit int, f Searc
 		return results, SearchDegradation{Reason: reason}, err
 	}
 
-	// Fuse and return top-limit results.
-	fusedIDs := rrfFuse(ftsRanks, cosineRanks, 60, limit)
+	// Fuse, then cut the requested page out of the fused ranking. Fusing to
+	// offset+limit and slicing is the only order that gives a correct page:
+	// RRF scores are a property of the fused list, so there is nothing to skip
+	// until it exists. rrfFuse sorts first and truncates after, so asking it for
+	// offset+limit returns a genuine PREFIX of the full fused ranking — which is
+	// what makes [offset:] the same rows page one would have skipped.
+	fusedIDs := rrfFuse(ftsRanks, cosineRanks, 60, offset+limit)
+	if offset >= len(fusedIDs) {
+		// Paged past the end of the fused ranking — an empty page, not a
+		// degradation (see the semantic path for why the distinction matters).
+		return nil, SearchDegradation{}, nil
+	}
+	fusedIDs = fusedIDs[offset:]
 
-	// Build the result set from fused IDs. Records may come from FTS cache or
-	// need a fresh fetch for cosine-only entries.
-	result := make([]*domain.Record, 0, len(fusedIDs))
-	var missingIDs []string
-	for _, id := range fusedIDs {
-		if r, ok := ftsRecordsByID[id]; ok {
-			result = append(result, r)
-		} else {
-			missingIDs = append(missingIDs, id)
-		}
-	}
-	if len(missingIDs) > 0 {
-		extra, err := s.fetchBySyncIDs(missingIDs)
-		if err != nil {
-			return result, SearchDegradation{}, err
-		}
-		// Insert extras in fused order.
-		extraMap := make(map[string]*domain.Record, len(extra))
-		for _, r := range extra {
-			extraMap[r.SyncID] = r
-		}
-		// Rebuild in exact fused order.
-		ordered := make([]*domain.Record, 0, len(fusedIDs))
-		for _, id := range fusedIDs {
-			if r, ok := ftsRecordsByID[id]; ok {
-				ordered = append(ordered, r)
-			} else if r, ok := extraMap[id]; ok {
-				ordered = append(ordered, r)
-			}
-		}
-		return ordered, SearchDegradation{}, nil
-	}
-
-	// Reorder result to match fused order (FTS map hits may not be in fused order).
-	ordered := make([]*domain.Record, 0, len(fusedIDs))
-	for _, id := range fusedIDs {
-		if r, ok := ftsRecordsByID[id]; ok {
-			ordered = append(ordered, r)
-		}
-	}
-	return ordered, SearchDegradation{}, nil
+	// Hydrate exactly the page being returned — at most `limit` rows, in fused
+	// order (fetchBySyncIDs preserves the order it is given). Both halves of the
+	// fusion contributed bare sync_ids, so there is no half-populated cache to
+	// reconcile: one query reads the page, whichever half each row came from.
+	ordered, err := s.fetchBySyncIDs(fusedIDs)
+	return ordered, SearchDegradation{}, err
 }
 
 // fetchBySyncIDs retrieves records by sync_id, preserving the given order.
@@ -437,13 +510,45 @@ func (s *Store) countNullEmbeddings() int {
 	return n
 }
 
+// pinFilter selects which side of the pinned flag a recent-observations query
+// covers. It exists so the three variants share one query body instead of three
+// near-identical copies that can drift.
+type pinFilter int
+
+const (
+	pinAny      pinFilter = iota // no pinned predicate — every live row
+	pinOnly                      // pinned = 1
+	pinExcluded                  // pinned = 0
+)
+
 // RecentObservations returns the most recent live (non-deleted) memories ordered
 // by created_at DESC, id DESC. project and scope are optional filters; an empty
 // string disables the filter for that dimension. limit <= 0 defaults to 20.
 //
-// Mirrors the legacy predecessor's store.RecentObservations (project+scope
-// variant).
+// It ignores the pinned flag entirely — pinning changes where a memory is
+// SURFACED, not whether it exists. Callers that want the split use
+// PinnedObservations / RecentUnpinnedObservations.
 func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.Record, error) {
+	return s.recentObservations(project, scope, limit, pinAny)
+}
+
+// PinnedObservations returns the live PINNED memories for project/scope, newest
+// first. Pinning is an explicit, hand-bounded act, but the caller still caps it
+// (FormatContext at 20) so one over-enthusiastic pinning session cannot crowd
+// every recent observation out of the context blob.
+func (s *Store) PinnedObservations(project, scope string, limit int) ([]*domain.Record, error) {
+	return s.recentObservations(project, scope, limit, pinOnly)
+}
+
+// RecentUnpinnedObservations is RecentObservations minus the pinned rows. It is
+// the second half of the context split: pinned memories are rendered in their
+// own section, so repeating them under "Recent Observations" would spend the
+// caller's context window saying the same thing twice.
+func (s *Store) RecentUnpinnedObservations(project, scope string, limit int) ([]*domain.Record, error) {
+	return s.recentObservations(project, scope, limit, pinExcluded)
+}
+
+func (s *Store) recentObservations(project, scope string, limit int, pin pinFilter) ([]*domain.Record, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -458,13 +563,27 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]*domain.
 		WHERE deleted_at IS NULL`
 	args := []any{}
 
+	switch pin {
+	case pinOnly:
+		q += "\n  AND pinned = 1"
+	case pinExcluded:
+		q += "\n  AND pinned = 0"
+	case pinAny:
+		// no predicate
+	}
 	if project != "" {
 		q += "\n  AND LOWER(project) = ?"
 		args = append(args, project)
 	}
-	if scope != "" {
+	// Normalize BEFORE the emptiness test, not inside the predicate: testing the
+	// raw string and filtering on the trimmed one makes a whitespace-only scope
+	// filter on `scope = ''`, which matches nothing — while CountPinned, which
+	// trims first, reads the same argument as "no scope filter" and counts
+	// everything. Two answers to one question is exactly what CountPinned exists
+	// to prevent (see its doc comment).
+	if scope = strings.ToLower(strings.TrimSpace(scope)); scope != "" {
 		q += "\n  AND scope = ?"
-		args = append(args, strings.ToLower(strings.TrimSpace(scope)))
+		args = append(args, scope)
 	}
 
 	q += "\nORDER BY datetime(created_at) DESC, id DESC\nLIMIT ?"
@@ -569,19 +688,68 @@ func truncateStr(s string, n int) string {
 	return string(runes[:n]) + "..."
 }
 
+// contextPinnedLimit and contextRecentLimit are the two halves of FormatContext's
+// observation budget, and they are stated together because what matters is the
+// SUM: 10 + 20 = at most 30 bullets, each up to 300 characters, which is the most
+// of a caller's context window mem_context is willing to spend on observations.
+//
+// Pinned is the smaller half deliberately. It was 20 — equal to recents — which
+// meant a store with 20 pins rendered a context blob that was HALF pins, and
+// pinning enough memories could push recent work down past where an agent
+// actually reads. Ten is a shortlist; twenty is a second feed. The rows past the
+// cap are not hidden: FormatContext prints how many were left out and where to
+// find them (see CountPinned).
+const (
+	contextPinnedLimit = 10
+	contextRecentLimit = 20
+)
+
+// writeObservationBullet renders one observation line. Shared by the "### Pinned"
+// and "### Recent Observations" sections so the two can never drift into
+// different shapes for the same data.
+func writeObservationBullet(b *strings.Builder, obs *domain.Record) {
+	fmt.Fprintf(b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncateStr(obs.Content, 300))
+}
+
+// sessionObservationCountQuery is FormatContext's per-session observation
+// COUNT. It is a named constant so the scale test can EXPLAIN the exact
+// statement that ships (it must stay an idx_mem_session SEARCH).
+const sessionObservationCountQuery = `SELECT count(*) FROM memories WHERE session_id = ? AND deleted_at IS NULL`
+
 // FormatContext assembles the agent-facing memory context blob from recent
 // sessions and recent observations, mirroring the legacy predecessor's
 // store.FormatContext.
 //
-// Format (faithful to the legacy predecessor):
+// Format:
 //
 //	## Memory from Previous Sessions
 //
 //	### Recent Sessions
-//	- **project** (started_at)[: summary] [N observations]
+//	- **project** (started_at → last_activity_at)[: summary] [N observations]
+//
+//	### Pinned
+//	- [type] **title**: content_preview
 //
 //	### Recent Observations
 //	- [type] **title**: content_preview
+//
+// Pinned comes FIRST and Recent Observations excludes pinned rows. Both halves
+// of that matter: a pin is the user saying "this one, always", so burying it in
+// recency order defeats the point — and repeating it below would spend the
+// caller's context window saying the same thing twice. The section is capped
+// (contextPinnedLimit) so an over-enthusiastic pinning session cannot crowd out
+// every recent observation, and when the cap bites it says so — an "…and N more
+// pinned" line, because a silently truncated section leaves the caller believing
+// they are looking at everything they pinned. It is omitted entirely when nothing
+// is pinned, so a store that has never used mem_pin renders exactly as it always
+// did.
+//
+// The session bullet carries BOTH timestamps because the list is ordered by
+// last activity (see RecentSessions): showing only started_at would leave the
+// ordering looking arbitrary — an older-started session correctly ranked first
+// for having been worked in five minutes ago would read as a sorting bug. The
+// arrow is omitted when the two are equal, so an idle session renders exactly
+// as it always did.
 //
 // Returns an empty string when there are no sessions and no observations.
 // project and scope are optional — empty string means "all".
@@ -591,12 +759,17 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", fmt.Errorf("FormatContext: RecentSessions: %w", err)
 	}
 
-	observations, err := s.RecentObservations(project, scope, 20)
+	pinned, err := s.PinnedObservations(project, scope, contextPinnedLimit)
 	if err != nil {
-		return "", fmt.Errorf("FormatContext: RecentObservations: %w", err)
+		return "", fmt.Errorf("FormatContext: PinnedObservations: %w", err)
 	}
 
-	if len(sessions) == 0 && len(observations) == 0 {
+	observations, err := s.RecentUnpinnedObservations(project, scope, contextRecentLimit)
+	if err != nil {
+		return "", fmt.Errorf("FormatContext: RecentUnpinnedObservations: %w", err)
+	}
+
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 {
 		return "", nil
 	}
 
@@ -614,14 +787,19 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 			// errors are silently ignored to avoid failing FormatContext on a
 			// non-critical count.
 			var obsCount int
-			_ = s.db.QueryRow(
-				`SELECT count(*) FROM memories WHERE session_id = ? AND deleted_at IS NULL`,
-				sess.ID,
-			).Scan(&obsCount)
+			_ = s.db.QueryRow(sessionObservationCountQuery, sess.ID).Scan(&obsCount)
+
+			// Show the span the session actually covers. When nothing happened
+			// after registration the two stamps coincide and only one is printed.
+			started := sess.StartedAt.UTC().Format("2006-01-02 15:04:05")
+			when := started
+			if last := sess.LastActivityAt.UTC().Format("2006-01-02 15:04:05"); last != started && last != "" {
+				when = started + " → " + last
+			}
 
 			fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n",
 				sess.Project,
-				sess.StartedAt.UTC().Format("2006-01-02 15:04:05"),
+				when,
 				summary,
 				obsCount,
 			)
@@ -629,11 +807,27 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("\n")
 	}
 
+	if len(pinned) > 0 {
+		b.WriteString("### Pinned\n")
+		for _, obs := range pinned {
+			writeObservationBullet(&b, obs)
+		}
+		// Only count when the section is full — a short section IS the whole set,
+		// and the extra query would answer a question nobody asked. A count error
+		// is swallowed for the same reason the per-session COUNT above is: an
+		// overflow footnote is not worth failing the whole context blob over.
+		if len(pinned) >= contextPinnedLimit {
+			if total, err := s.CountPinned(project, scope); err == nil && total > len(pinned) {
+				fmt.Fprintf(&b, "- …and %d more pinned (use mem_search)\n", total-len(pinned))
+			}
+		}
+		b.WriteString("\n")
+	}
+
 	if len(observations) > 0 {
 		b.WriteString("### Recent Observations\n")
 		for _, obs := range observations {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncateStr(obs.Content, 300))
+			writeObservationBullet(&b, obs)
 		}
 		b.WriteString("\n")
 	}

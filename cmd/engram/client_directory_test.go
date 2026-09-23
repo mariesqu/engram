@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/controlapi"
 	"github.com/mariesqu/engram/internal/localstore"
+	projectpkg "github.com/mariesqu/engram/internal/project"
 )
 
 // These tests cover the client-directory forwarding contract end to end: the
@@ -483,11 +485,14 @@ func TestDaemonTool_MemSave_ForwardedDirectoryBeatsDaemonCwd(t *testing.T) {
 	}
 }
 
-// TestDaemonTool_MemSave_NoDirectoryStillUsesCwd pins the back-compat path: an
-// older `engram connect`, or a per-client `engram daemon --transport stdio`
-// (whose cwd IS the project), forwards nothing and must behave exactly as
-// before — project detected from os.Getwd().
-func TestDaemonTool_MemSave_NoDirectoryStillUsesCwd(t *testing.T) {
+// TestDaemonTool_MemSave_NoDirectoryIsRefused supersedes the old back-compat
+// path: a call with NEITHER "directory"/"cwd" NOR "project" is dirSourceDaemonCwd
+// (see resolveSaveProject), and the daemon cannot tell an old `engram connect`
+// or a per-client `engram daemon --transport stdio` (whose cwd IS the project)
+// apart from the SHARED resident daemon's own working directory — the incident
+// this whole feature exists to prevent. Writes now refuse it; reads stay
+// lenient (resolveReadProject still answers from os.Getwd()).
+func TestDaemonTool_MemSave_NoDirectoryIsRefused(t *testing.T) {
 	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "cwd_save.db"), syncInterval: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("buildDaemon: %v", err)
@@ -502,16 +507,8 @@ func TestDaemonTool_MemSave_NoDirectoryStillUsesCwd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler transport error: %v", err)
 	}
-	if result.IsError {
-		t.Fatalf("handler returned tool error: %v", result.Content)
-	}
-
-	rec, err := components.store.GetObservation(1)
-	if err != nil {
-		t.Fatalf("GetObservation(1): %v", err)
-	}
-	if rec.Project != "cwd-repo" {
-		t.Errorf("Project = %q, want %q (no forwarded directory → cwd detection)", rec.Project, "cwd-repo")
+	if !result.IsError {
+		t.Fatalf("mem_save accepted a write with no directory and no project; it must refuse dirSourceDaemonCwd: %v", result.Content)
 	}
 }
 
@@ -701,13 +698,12 @@ func TestDaemonTool_MemSessionStart_ExplicitProjectCorrectsStoredRow(t *testing.
 	junkProject := chdirToJunkDir(t)
 	startTool := components.mcpServer.ListTools()["mem_session_start"]
 
-	// First registration: no project, no directory — misfiled under the daemon cwd.
-	if result, err := startTool.Handler(t.Context(), newToolRequest("mem_session_start", map[string]any{
-		"id": "sess-to-correct",
-	})); err != nil {
-		t.Fatalf("first handler transport error: %v", err)
-	} else if result.IsError {
-		t.Fatalf("first call returned tool error: %v", result.Content)
+	// Seed the misfiled row directly: mem_session_start itself now REFUSES a
+	// no-project, no-directory call (dirSourceDaemonCwd), so it can no longer
+	// reproduce the pre-fix misfile it used to. This still exercises the
+	// corrective path for a row that was misfiled before this fix shipped.
+	if err := components.store.CreateSession("sess-to-correct", junkProject, ""); err != nil {
+		t.Fatalf("CreateSession: %v", err)
 	}
 	if sess, err := components.store.GetSession("sess-to-correct"); err != nil {
 		t.Fatalf("GetSession: %v", err)
@@ -956,6 +952,42 @@ func TestRegisterTools_DirectoryAwareToolsDeclareDirectory(t *testing.T) {
 	}
 }
 
+// TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias pins the third half of
+// the lockstep. The agent protocol engram itself injects tells models to name
+// the workspace in "cwd", and readDirectoryArg honours that alias in EVERY
+// directory-aware handler — so every one of them must also advertise it. A tool
+// that reads an argument it never declares is an argument no agent knows to
+// send, and (under a strict-schema client) one no agent is allowed to send.
+func TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias(t *testing.T) {
+	components, err := buildDaemon(daemonCfg{db: filepath.Join(t.TempDir(), "schema_cwd.db"), syncInterval: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("buildDaemon: %v", err)
+	}
+	t.Cleanup(components.Close)
+
+	registered := components.mcpServer.ListTools()
+	for name := range directoryAwareTools {
+		tool, ok := registered[name]
+		if !ok {
+			t.Errorf("directoryAwareTools names %q, which is not a registered tool", name)
+			continue
+		}
+		prop, ok := tool.Tool.InputSchema.Properties["cwd"]
+		if !ok {
+			t.Errorf("tool %q is directory-aware but its schema does not declare the \"cwd\" alias", name)
+			continue
+		}
+		schema, ok := prop.(map[string]any)
+		if !ok {
+			t.Errorf("tool %q: cwd property is %T, want a schema object", name, prop)
+			continue
+		}
+		if got := schema["description"]; got != cwdArgDescription {
+			t.Errorf("tool %q cwd description =\n  %v\nwant\n  %v", name, got, cwdArgDescription)
+		}
+	}
+}
+
 // ─── every directory-aware handler honours an explicit project ───────────────
 
 // Probe fixtures for the harness below. Both memories share a searchable token,
@@ -1035,6 +1067,24 @@ func TestDaemonTools_EveryDirectoryAwareToolHonoursExplicitProject(t *testing.T)
 		seed   func(t *testing.T, store *localstore.Store, junkProject string)
 		verify func(t *testing.T, store *localstore.Store, text string)
 	}{
+		"mem_current_project": {
+			args: map[string]any{},
+			verify: func(t *testing.T, _ *localstore.Store, text string) {
+				t.Helper()
+				var env map[string]any
+				if err := json.Unmarshal([]byte(text), &env); err != nil {
+					t.Fatalf("response is not JSON (%v): %s", err, text)
+				}
+				if env["project"] != harnessProject {
+					t.Errorf("project = %v, want %q — the explicit project was ignored:\n%s",
+						env["project"], harnessProject, text)
+				}
+				if env["project_source"] != projectpkg.SourceExplicitOverride {
+					t.Errorf("project_source = %v, want %q:\n%s",
+						env["project_source"], projectpkg.SourceExplicitOverride, text)
+				}
+			},
+		},
 		"mem_session_start": {
 			args: map[string]any{"id": "harness-session"},
 			verify: func(t *testing.T, store *localstore.Store, _ string) {
@@ -1081,6 +1131,22 @@ func TestDaemonTools_EveryDirectoryAwareToolHonoursExplicitProject(t *testing.T)
 			args:   map[string]any{"action": "list", "status": "all"},
 			seed:   seedHarnessProbes,
 			verify: assertScopedToExplicitProject,
+		},
+		"mem_doctor": {
+			args: map[string]any{},
+			verify: func(t *testing.T, _ *localstore.Store, text string) {
+				t.Helper()
+				var report struct {
+					Project string `json:"project"`
+				}
+				if err := json.Unmarshal([]byte(text), &report); err != nil {
+					t.Fatalf("response is not a diagnostic report (%v): %s", err, text)
+				}
+				if report.Project != harnessProject {
+					t.Errorf("report project = %q, want %q — the diagnostics were scoped to the daemon's cwd",
+						report.Project, harnessProject)
+				}
+			},
 		},
 	}
 
@@ -1228,6 +1294,103 @@ func TestResolveClientDir_EnvOverride(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("resolveClientDir() = %q, want the override %q", got, want)
+	}
+}
+
+// TestResolveClientDir_RelativeOverrideIsMadeAbsolute is the fix for an
+// override that passed every check and helped nobody. A relative value — "." is
+// the one everybody writes, a bare folder name the next — used to be forwarded
+// VERBATIM: the daemon resolved it with filepath.Abs against ITS own working
+// directory, so every write was refused with a message quoting a "directory"
+// the user never typed, and nothing in the chain ever mentioned the value they
+// did set. `engram connect` runs in the client's workspace, which is the whole
+// reason its directory is worth forwarding, so that is the base.
+func TestResolveClientDir_RelativeOverrideIsMadeAbsolute(t *testing.T) {
+	workspace := t.TempDir()
+	child := filepath.Join(workspace, "repo")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	chdirTo(t, workspace)
+	// t.TempDir on Windows can hand back a short-name ("MTL~1.MES") path while
+	// Getwd reports the long one, so the expectation is derived from the cwd the
+	// process actually has rather than from the fixture's string.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+
+	for _, value := range []string{".", "repo", filepath.Join(".", "repo")} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("ENGRAM_CLIENT_DIR", value)
+
+			got, err := resolveClientDir()
+			if err != nil {
+				t.Fatalf("resolveClientDir: %v", err)
+			}
+			want := filepath.Clean(filepath.Join(cwd, value))
+			if got != want {
+				t.Errorf("resolveClientDir() = %q, want %q — a relative override resolves against THIS process's cwd",
+					got, want)
+			}
+			if !filepath.IsAbs(got) {
+				t.Errorf("resolveClientDir() = %q, which is not absolute: the daemon would resolve it against its own directory", got)
+			}
+		})
+	}
+}
+
+// TestResolveClientDir_GitBashPathIsTranslated covers the Windows shape that is
+// neither relative nor usable: "/c/GitLab/repo", which is what `pwd` prints in
+// the shell many people configure their MCP host from. filepath.Abs would turn
+// it into "C:\c\GitLab\repo" — a directory that does not exist, whose basename
+// becomes a brand-new junk project, minted by the very setting that exists to
+// prevent junk projects.
+func TestResolveClientDir_GitBashPathIsTranslated(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("/c/... is an ordinary absolute path off Windows")
+	}
+	repo := pinnedProjectDir(t, "git-bash-client-repo")
+	volume := filepath.VolumeName(repo)
+	if len(volume) != 2 || volume[1] != ':' {
+		t.Skipf("temp directory %q has no drive letter to translate", repo)
+	}
+	posix := "/" + strings.ToLower(volume[:1]) + strings.ReplaceAll(repo[len(volume):], `\`, "/")
+	t.Setenv("ENGRAM_CLIENT_DIR", posix)
+
+	got, err := resolveClientDir()
+	if err != nil {
+		t.Fatalf("resolveClientDir(%q): %v", posix, err)
+	}
+	if got != filepath.Clean(repo) {
+		t.Errorf("resolveClientDir() = %q, want the native form of %q (%q)", got, posix, repo)
+	}
+}
+
+// TestResolveClientDir_UntranslatableGitBashPathIsFatal keeps the fail-closed
+// rule for the case the translation cannot check: a drive letter this machine
+// does not have. The message has to name the SHAPE — "not an existing
+// directory" would send the user looking for a folder, when what is wrong is
+// the syntax.
+func TestResolveClientDir_UntranslatableGitBashPathIsFatal(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("/q/... is an ordinary absolute path off Windows")
+	}
+	const value = "/q/no/such/repo" // Q: is unmounted by convention
+	t.Setenv("ENGRAM_CLIENT_DIR", value)
+
+	got, err := resolveClientDir()
+	if err == nil {
+		t.Fatalf("resolveClientDir() = %q, nil — want a startup error for %q", got, value)
+	}
+	if got != "" {
+		t.Errorf("resolveClientDir() returned %q alongside the error; nothing must be forwarded", got)
+	}
+	msg := err.Error()
+	for _, want := range []string{"ENGRAM_CLIENT_DIR", fmt.Sprintf("%q", value), "Git Bash/MSYS path", clientDirDisabled} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error must mention %q so the user can act on it; got: %s", want, msg)
+		}
 	}
 }
 
@@ -1398,5 +1561,110 @@ func TestNewMCPBridge_ClientDirDisabledSkipsInjection(t *testing.T) {
 	msg := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem_save","arguments":{"title":"t"}}}`)
 	if got := injectClientDirectory(msg, b.clientDir); !bytes.Equal(got, msg) {
 		t.Errorf("disabled forwarding must leave the frame verbatim;\n got %s\nwant %s", got, msg)
+	}
+}
+
+// ─── the shared directory-contract table ────────────────────────────────────
+
+// directoryAwareMinimalArgs is the smallest valid argument set for each
+// directory-aware tool: everything a handler needs to get PAST its own
+// required-argument checks and reach the directory resolution under test.
+//
+// It exists so that the tests which walk directoryAwareTools — the map the
+// daemon and the `engram connect` bridge already share — can drive every tool
+// on it instead of a hand-written list beside it. The previous non-string
+// -directory table listed seven of the nine tools and silently missed
+// mem_doctor from the day it was added. A tool added to directoryAwareTools
+// with no entry here now FAILS those tests, which is the only way a contract
+// about "every directory-aware tool" stays true.
+var directoryAwareMinimalArgs = map[string]map[string]any{
+	"mem_current_project": {},
+	"mem_doctor":          {},
+	"mem_save":            {"title": "t"},
+	"mem_save_prompt":     {"content": "c"},
+	"mem_search":          {"query": "q"},
+	"mem_context":         {},
+	"mem_review":          {"action": "list"},
+	"mem_session_start":   {"id": "s1"},
+	"mem_session_summary": {"content": "## Goal\nx"},
+}
+
+// directoryAwareWriteTools names the directory-aware tools that WRITE, i.e. the
+// ones mem_current_project's writes_blocked flag makes a promise about. Kept as
+// an explicit list rather than derived from a schema annotation, because "does
+// this call create a row" is a fact about the handler, not about its arguments
+// — and TestDirectoryAwareTools_EveryToolIsClassified fails until a newly added
+// tool is put on one side of the line or the other.
+var directoryAwareWriteTools = []string{
+	"mem_save",
+	"mem_save_prompt",
+	"mem_session_start",
+	"mem_session_summary",
+}
+
+// directoryAwareReadTools is the other half: tools that answer from the store
+// and never write, so a blocked directory only makes their answer a guess.
+var directoryAwareReadTools = []string{
+	"mem_current_project",
+	"mem_context",
+	"mem_doctor",
+	"mem_review",
+	"mem_search",
+}
+
+// minimalArgsFor returns a fresh copy of a tool's minimal arguments with extra
+// merged over it. A tool with no entry fails the test rather than being skipped
+// — a silently skipped case is a contract nobody is checking.
+func minimalArgsFor(t *testing.T, tool string, extra map[string]any) map[string]any {
+	t.Helper()
+	base, ok := directoryAwareMinimalArgs[tool]
+	if !ok {
+		t.Fatalf("directory-aware tool %q has no entry in directoryAwareMinimalArgs — "+
+			"add one so the directory-contract tests actually cover it", tool)
+	}
+	args := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		args[k] = v
+	}
+	for k, v := range extra {
+		args[k] = v
+	}
+	return args
+}
+
+// TestDirectoryAwareTools_EveryToolIsClassified keeps the three tables above in
+// step with the one map that is real. Adding a directory-aware tool without
+// classifying it leaves the writes_blocked contract untested for exactly the
+// tool most likely to break it.
+func TestDirectoryAwareTools_EveryToolIsClassified(t *testing.T) {
+	classified := map[string]int{}
+	for _, name := range directoryAwareWriteTools {
+		classified[name]++
+	}
+	for _, name := range directoryAwareReadTools {
+		classified[name]++
+	}
+	for name := range directoryAwareTools {
+		switch classified[name] {
+		case 0:
+			t.Errorf("directory-aware tool %q is in neither directoryAwareWriteTools nor directoryAwareReadTools — "+
+				"decide whether a blocked directory must REFUSE it or merely make its answer a guess", name)
+		case 1:
+		default:
+			t.Errorf("tool %q is classified as both a read and a write tool", name)
+		}
+		if _, ok := directoryAwareMinimalArgs[name]; !ok {
+			t.Errorf("directory-aware tool %q has no entry in directoryAwareMinimalArgs", name)
+		}
+	}
+	for name := range classified {
+		if !directoryAwareTools[name] {
+			t.Errorf("%q is classified here but is not in directoryAwareTools", name)
+		}
+	}
+	for name := range directoryAwareMinimalArgs {
+		if !directoryAwareTools[name] {
+			t.Errorf("directoryAwareMinimalArgs names %q, which is not directory-aware", name)
+		}
 	}
 }

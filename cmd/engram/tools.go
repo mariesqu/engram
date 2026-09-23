@@ -2,16 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/mariesqu/engram/internal/controlapi"
+	"github.com/mariesqu/engram/internal/diagnostic"
 	"github.com/mariesqu/engram/internal/embedding"
 	"github.com/mariesqu/engram/internal/localstore"
 	projectpkg "github.com/mariesqu/engram/internal/project"
@@ -30,6 +35,249 @@ const directoryArgDescription = "Directory to resolve the project from. Normally
 	"(the client's working directory); set it by hand only to target a different checkout. " +
 	"Where a tool also accepts 'project', prefer that."
 
+// cwdArgDescription is the shared doc string for the "cwd" alias of the
+// "directory" argument. Every directory-aware tool declares it and every
+// directory-aware handler reads it through readDirectoryArg, so the alias the
+// injected agent protocol tells models to use ("call it with the workspace in
+// cwd") means the same thing everywhere instead of on mem_current_project only.
+// TestRegisterTools_DirectoryAwareToolsDeclareCwdAlias pins the text.
+const cwdArgDescription = "Alias for \"directory\", read ONLY when \"directory\" is absent or blank — " +
+	"'engram connect' injects the real client directory into \"directory\", and that value must keep " +
+	"winning over a hand-written path. Pass an ABSOLUTE path: a relative one (\".\", \"./repo\") is " +
+	"resolved with filepath.Abs against the DAEMON's working directory — a shared, resident process that " +
+	"is almost never in your repo — so write tools refuse it."
+
+// Directory-source labels. They answer the question an agent cannot otherwise
+// ask — WHOSE idea was the directory this answer describes? — and are reported
+// verbatim in mem_current_project's directory_source field.
+const (
+	// dirSourceArgument: the "directory" argument decided. Normally that is the
+	// CLIENT's working directory, injected by `engram connect`.
+	dirSourceArgument = "argument"
+	// dirSourceCwdAlias: the "cwd" alias decided, i.e. a path the MODEL supplied.
+	// Weaker evidence than dirSourceArgument by construction — see readDirectoryArg.
+	dirSourceCwdAlias = "cwd_alias"
+	// dirSourceDaemonCwd: nothing reached the daemon, so the answer describes the
+	// SHARED daemon's own working directory — the original junk-project misfile.
+	dirSourceDaemonCwd = "daemon_cwd"
+	// dirSourceInvalid: "directory" was present but not a JSON string. Never
+	// silently downgraded to the alias — see readDirectoryArg.
+	dirSourceInvalid = "invalid_directory_argument"
+	// dirSourceRelativePath: the value that decided (either key) was RELATIVE.
+	// resolveProjectDir resolves it with filepath.Abs, i.e. against the DAEMON's
+	// working directory — so it is neither the caller's directory nor an honest
+	// daemon_cwd answer, and it gets a label of its own.
+	dirSourceRelativePath = "relative_path"
+	// dirSourceTranslatedPosix: the value was a Git Bash/MSYS path ("/c/GitLab/x")
+	// and this is Windows, so it was rewritten to its native form before anything
+	// resolved it. The answer is about the caller's directory — that is why it is
+	// not dirSourceRelativePath — but the path in it is NOT the string they sent,
+	// and a source label that hid that would make the one field that exists to
+	// say "how did we get here?" lie. cwd_input still carries the original.
+	dirSourceTranslatedPosix = "translated_posix_path"
+)
+
+// relativeDirectoryHint is the one sentence every surface uses for a relative
+// directory — the tool errors write tools return and the hint
+// mem_current_project reports. One wording, so an agent that has read it once
+// recognises it wherever it turns up.
+const relativeDirectoryHint = "a RELATIVE path was resolved against the daemon's working directory, not yours — " +
+	"pass an absolute path or an explicit project"
+
+// directoryArg is the outcome of reading the directory a tool call resolves its
+// project from. Source is one of the dirSource* labels; Err is non-nil only for
+// dirSourceInvalid.
+type directoryArg struct {
+	Directory string
+	// Input is what the caller actually sent, verbatim. It differs from
+	// Directory only when a path was normalized (a Git Bash path translated, an
+	// extended-length prefix stripped), and mem_current_project reports IT as
+	// cwd_input: a caller shown only the rewritten value cannot tell what engram
+	// did with what they typed, which is the question that field answers.
+	Input  string
+	Source string
+	Err    error
+	// Relative is true when Directory is a non-absolute path (Source is then
+	// dirSourceRelativePath). Write tools REFUSE it: filepath.Abs would resolve
+	// it against the daemon's cwd, filing the memory under whatever directory the
+	// autostart or tray happened to launch from.
+	Relative bool
+	// Warning is an advisory mem_current_project turns into a hint. It has two
+	// sources: a "cwd" alias that was present but not a string (NOT promoted to
+	// Err — the alias is a courtesy, and a malformed one falls back to the same
+	// daemon-cwd answer an absent one would — but not silence either, because the
+	// caller believes they supplied a directory), and a Git Bash path that was
+	// translated, where the answer is right but is about a path the caller never
+	// wrote.
+	Warning string
+}
+
+// readDirectoryArg extracts the directory a directory-aware tool call resolves
+// its project from, applying one precedence for ALL of them:
+//
+//  1. "directory", when it is a non-blank string. `engram connect` injects the
+//     CLIENT process's working directory here — the only value in the chain that
+//     is OBSERVED rather than guessed.
+//  2. "cwd", the alias the injected agent protocol tells models to fill in. It is
+//     consulted ONLY when the "directory" KEY is absent, JSON null, or a blank
+//     string, so a hallucinated path can never re-point a session that already
+//     carries a real directory.
+//  3. Neither — the caller gets "" and resolveProjectDir falls back to the
+//     daemon's own cwd.
+//
+// A RELATIVE value in either key is kept (reads still answer from it) but
+// labelled dirSourceRelativePath, because resolveProjectDir resolves it with
+// filepath.Abs — against the DAEMON's working directory, not the caller's. "."
+// is the value a model filling in the alias writes sooner or later, and left
+// unlabelled it reads exactly like an observed directory while describing the
+// resident daemon's own folder.
+//
+// A "directory" that is PRESENT but not a string is a caller error, reported as
+// such (Err non-nil) rather than treated as absent. That case is the one the
+// bridge cannot help with: injectClientDirectory deliberately suppresses
+// injection for a non-string "directory" (hasNonEmptyStringArg in connect.go —
+// "the caller's error to see, not ours to paper over"), so silently falling
+// through to "cwd" here would resolve the session from a model-supplied path
+// while the caller believes their own argument is in force.
+func readDirectoryArg(args map[string]any) directoryArg {
+	if raw, present := args["directory"]; present && raw != nil {
+		dir, ok := raw.(string)
+		if !ok {
+			return directoryArg{
+				Source: dirSourceInvalid,
+				Err: fmt.Errorf("directory must be a string, got %T; "+
+					"drop it and let 'engram connect' inject the client directory, or pass project explicitly", raw),
+			}
+		}
+		if dir = strings.TrimSpace(dir); dir != "" {
+			return newDirectoryArg(dir, dirSourceArgument)
+		}
+	}
+	if raw, present := args["cwd"]; present && raw != nil {
+		cwd, ok := raw.(string)
+		if !ok {
+			// The mirror of the non-string "directory" case, one notch softer: the
+			// alias is optional, so a malformed one resolves like an absent one —
+			// but the caller thinks they named a workspace, so it is reported.
+			return directoryArg{
+				Source: dirSourceDaemonCwd,
+				Warning: fmt.Sprintf("the \"cwd\" alias was not a string (got %T) and was IGNORED — "+
+					"this answer describes the daemon's own directory", raw),
+			}
+		}
+		if cwd = strings.TrimSpace(cwd); cwd != "" {
+			return newDirectoryArg(cwd, dirSourceCwdAlias)
+		}
+	}
+	return directoryArg{Source: dirSourceDaemonCwd}
+}
+
+// newDirectoryArg labels a non-blank directory, downgrading absoluteSource to
+// dirSourceRelativePath when the path is not absolute. The value is kept either
+// way: reads answer from it (leniently, via the daemon-cwd resolution), and
+// mem_current_project reports the ORIGINAL verbatim in cwd_input so the caller
+// can see what the daemon did with what they sent.
+//
+// "Not absolute" is decided by normalizeHostPath, not by filepath.IsAbs alone,
+// because on Windows IsAbs gets two real shapes wrong (see hostpath.go):
+//
+//   - "/c/GitLab/engram" — a Git Bash path, which IsAbs calls relative. It is
+//     nothing of the sort: it names a specific directory on this machine, and
+//     labelling it relative both refused every write and explained the refusal
+//     with a sentence about the daemon's working directory that had nothing to
+//     do with what went wrong. It is translated when the drive exists, and when
+//     it cannot be it stays refused — with the hint that names the shape.
+//   - "\\?\C:\GitLab\engram" — an extended-length path, which IsAbs correctly
+//     calls absolute and which then travels on in a spelling that compares
+//     unequal to every other reference to the same directory. The prefix is
+//     stripped here, once, at the door.
+func newDirectoryArg(dir, absoluteSource string) directoryArg {
+	resolved := normalizeHostPath(dir)
+	if !resolved.Absolute {
+		return directoryArg{Directory: dir, Input: dir, Source: dirSourceRelativePath, Relative: true}
+	}
+	arg := directoryArg{Directory: resolved.Path, Input: dir, Source: absoluteSource}
+	if resolved.Translated {
+		arg.Source = dirSourceTranslatedPosix
+		arg.Warning = fmt.Sprintf("%q is a Git Bash/MSYS path and was translated to %q — "+
+			"this answer is about that directory", dir, resolved.Path)
+	}
+	return arg
+}
+
+// toolError renders a dirSourceInvalid directoryArg as the MCP tool error the
+// calling tool returns. mem_current_project is the one caller that does NOT use
+// it: it never errors, and reports the same condition in its envelope instead.
+func (d directoryArg) toolError(tool string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(tool + ": " + d.Err.Error())
+}
+
+// relativeError renders a relative directory as the refusal a WRITE tool
+// returns. Reads stay lenient (they answer from whatever the daemon's cwd makes
+// of it); a write would file a memory under a project nobody chose, and the one
+// thing the caller can do about it is spell the path out or name the project.
+func (d directoryArg) relativeError(tool string) *mcp.CallToolResult {
+	if hint, ok := d.gitBashHint(); ok {
+		return mcp.NewToolResultError(fmt.Sprintf("%s: directory %s", tool, hint))
+	}
+	return mcp.NewToolResultError(fmt.Sprintf("%s: directory %q is not absolute — %s", tool, d.Directory, relativeDirectoryHint))
+}
+
+// gitBashHint returns the Git Bash wording when that is what this directory is,
+// and ok=false when the generic relative-path sentence is the right one.
+//
+// The distinction is the whole point: "pass an absolute path" is unactionable
+// advice for someone who just passed what their shell calls an absolute path.
+// Only reachable for a path that could NOT be translated — an unmounted drive,
+// or a leading slash that names no drive at all ("/repos/x") — since a
+// translated one is absolute and never refused.
+func (d directoryArg) gitBashHint() (string, bool) {
+	if runtime.GOOS != "windows" || !looksLikeGitBashPath(d.Directory) {
+		return "", false
+	}
+	return gitBashDirectoryHint(d.Directory), true
+}
+
+// daemonCwdError is the write-tool refusal for dirSourceDaemonCwd: no
+// "directory"/"cwd" argument reached the daemon, so the project would be
+// detected from the SHARED daemon's own working directory rather than the
+// caller's — the resident daemon now starts in its config directory
+// (spawnWorkingDir), so this used to file the memory under project "engram"
+// for every caller that forgot to send one. The remedy is the same one
+// missingDirectoryError and relativeError already teach: pass directory (or
+// "cwd") explicitly, or name the project.
+func (d directoryArg) daemonCwdError(tool string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(fmt.Sprintf(
+		"%s: no directory reached the daemon, so this write would be filed under the DAEMON's own working "+
+			"directory rather than yours — pass directory (or \"cwd\") explicitly, or pass project explicitly", tool))
+}
+
+// missingDirectoryError is the write-tool refusal for a directory that is not
+// on this machine. Detection derives a basename from any string, so without it
+// a typo'd path silently CREATES a project — the flag mem_current_project
+// reports as writes_blocked with project_source="missing_directory".
+func missingDirectoryError(tool, dir string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(fmt.Sprintf(
+		"%s: the resolved directory %q does not exist (or is not a directory), so any project name would be "+
+			"invented from its basename — pass a real directory or an explicit project", tool, dir))
+}
+
+// directoryExists reports whether dir is present and is a directory. The empty
+// string (the daemon could not read its own cwd) is NOT treated as missing:
+// DetectProjectFull reads it as ".", which is the historic daemon-cwd answer.
+// In practice this branch is now unreachable from the write-tool callers below
+// — resolveSaveProject and handleSessionStart both refuse dirSourceDaemonCwd
+// (the only source that resolves to "") before calling this — but it stays
+// lenient here too, since a read tool reaching an empty dir must still answer
+// rather than error.
+func directoryExists(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return true
+	}
+	info, err := os.Stat(dir)
+	return err == nil && info.IsDir()
+}
+
 // directoryAwareTools names the MCP tools whose handlers resolve the project
 // from a directory (resolveProjectDir → resolveReadProject / resolveSaveProject
 // / handleSessionStart). It is the single source of truth shared by the daemon
@@ -43,6 +291,8 @@ const directoryArgDescription = "Directory to resolve the project from. Normally
 // mem_judge, …) or derived from the data itself (mem_similar reads the source
 // row's project).
 var directoryAwareTools = map[string]bool{
+	"mem_current_project": true,
+	"mem_doctor":          true,
 	"mem_session_start":   true,
 	"mem_session_summary": true,
 	"mem_save":            true,
@@ -64,14 +314,27 @@ var directoryAwareTools = map[string]bool{
 //     per-client `engram daemon --transport stdio`, which the MCP client spawns
 //     in the project directory itself.
 //
+// The result is ABSOLUTE and Clean: detection's own basename fallback reads
+// filepath.Base(dir) verbatim, so a relative "." or "./repo" — which an agent
+// filling in the "cwd" alias will write sooner or later — would otherwise
+// resolve to the project "unknown" or "repo" while every neighbouring tool
+// answered from a different name. Abs failing (an unreadable cwd) leaves the
+// input untouched rather than inventing a path.
+//
 // A "" return (cwd unavailable) is passed through to DetectProjectFull, which
 // treats it as ".".
 func resolveProjectDir(directory string) string {
-	if d := strings.TrimSpace(directory); d != "" {
-		return d
+	dir := strings.TrimSpace(directory)
+	if dir == "" {
+		dir, _ = os.Getwd()
 	}
-	cwd, _ := os.Getwd()
-	return cwd
+	if dir == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs // filepath.Abs Cleans its result
+	}
+	return filepath.Clean(dir)
 }
 
 // resolveReadProject resolves the project for a READ tool call. Unlike write
@@ -116,7 +379,47 @@ func resolveReadProject(explicitProject, directory string) string {
 //
 // activity must be non-nil; it is shared across all write handlers so that
 // mem_save_prompt can record the current prompt and mem_save can auto-capture it.
-func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) {
+//
+// daemonCwdIsWorkspace is true only for a per-client `engram daemon --transport
+// stdio` (README.md's documented setup: the MCP client spawns the daemon IN
+// the project directory, so its cwd genuinely IS that client's workspace) —
+// see buildDaemon, which sets it from cfg.mcpTransport == "stdio". It is false
+// for the SHARED resident daemon (`--transport http`, what `engram connect`
+// bridges to), whose cwd is wherever autostart/tray happened to launch it
+// from and is never trustworthy. Threaded down to resolveSaveProject,
+// handleSessionStart and currentProjectEnvelope, the only places that decide
+// whether a dirSourceDaemonCwd directory is refused.
+func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity, daemonCwdIsWorkspace bool) {
+	// ── mem_current_project ──────────────────────────────────────────────────
+	// Registered first because it is meant to be CALLED first: agent protocols
+	// (gentle-ai's ODD protocol among them) open a session by asking which
+	// project this caller resolves to, before any read or write.
+	srv.AddTool(
+		mcp.NewTool("mem_current_project",
+			mcp.WithDescription(`Detect the project Engram resolves for THIS caller, and how it got there. Returns project, project_source, project_path (the canonical directory of the project — repo root, config directory, or the resolved cwd), cwd (absolute, cleaned), cwd_input (what you passed, verbatim), directory_source, directory_exists, available_projects, fallback, writes_blocked and optional hints. NEVER errors — use it for discovery before writing. Recommended as the first call when starting a new session.
+
+Three fields say "do not trust this name blindly":
+  fallback=true         — the project name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Pass an explicit project on later calls if that is not the name you want.
+  writes_blocked=true   — mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, missing, relative, no directory at all, or an omitted project) until you pass project explicitly — or, when error_hint says directory is not a string, until you send it as a string or omit it.
+  directory_exists=false — the resolved directory does not exist, so any name here is invented from its basename. Pass a real directory or an explicit project.`),
+			mcp.WithTitleAnnotation("Detect Current Project"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project. When set it is echoed back verbatim with project_source=\"explicit_override\" and no detection runs — the way to confirm the exact name your later calls will use."),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
+		),
+		handleCurrentProject(store, daemonCwdIsWorkspace),
+	)
+
 	// ── mem_session_start ────────────────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_session_start",
@@ -136,8 +439,11 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
-		handleSessionStart(store),
+		handleSessionStart(store, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_session_end ──────────────────────────────────────────────────────
@@ -210,11 +516,14 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 			mcp.WithBoolean("capture_prompt",
 				mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
 			),
 		),
-		handleSave(store, loop, embedLoop, gated, writerID, activity),
+		handleSave(store, loop, embedLoop, gated, writerID, activity, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_save_prompt ──────────────────────────────────────────────────────
@@ -239,8 +548,11 @@ TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query s
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
-		handleSavePrompt(store, loop, writerID, activity),
+		handleSavePrompt(store, loop, writerID, activity, daemonCwdIsWorkspace),
 	)
 
 	// ── mem_get_observation ──────────────────────────────────────────────────
@@ -329,7 +641,7 @@ The suggestion is deterministic — the same title/type/content always yields th
 				mcp.Description("Search query — natural language or keywords"),
 			),
 			mcp.WithString("type",
-				mcp.Description("Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern"),
+				mcp.Description("Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern, config, discovery, learning"),
 			),
 			mcp.WithString("project",
 				mcp.Description("Filter by project name"),
@@ -340,11 +652,23 @@ The suggestion is deterministic — the same title/type/content always yields th
 			mcp.WithNumber("limit",
 				mcp.Description("Max results (default: 10, max: 20)"),
 			),
+			mcp.WithNumber("offset",
+				mcp.Description("Skip the first N results — page 2 of limit=10 is offset=10. Must be a non-negative integer; default 0. Paging past the end returns no results rather than page one."),
+			),
+			mcp.WithString("created_from",
+				mcp.Description(`Only return memories created on or after this instant. RFC3339 ("2024-06-01T09:00:00Z") or a plain date ("2024-06-01", read as UTC midnight).`),
+			),
+			mcp.WithString("created_to",
+				mcp.Description(`Only return memories created on or before this instant. RFC3339 ("2024-06-30T23:59:59Z") or a plain date ("2024-06-30", which covers the WHOLE day). Must not be earlier than created_from.`),
+			),
 			mcp.WithString("mode",
 				mcp.Description(`Retrieval mode: "" or "fts" (keyword search, default), "semantic" (cosine only), "hybrid" (FTS + cosine fused via RRF). Semantic modes require an embedding provider to be configured; they degrade gracefully to FTS when unavailable.`),
 			),
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
 			),
 		),
 		handleSearch(store),
@@ -368,8 +692,46 @@ The suggestion is deterministic — the same title/type/content always yields th
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
 		handleContext(store),
+	)
+
+	// ── mem_pin / mem_unpin ───────────────────────────────────────────────────
+	// Registered next to mem_context because that is where a pin is CASHED IN:
+	// pinned memories render in their own section ahead of recent observations.
+	srv.AddTool(
+		mcp.NewTool("mem_pin",
+			mcp.WithDescription("Pin a memory so it is surfaced in mem_context ahead of recent observations, and ranked slightly higher in keyword search. Use it for the handful of facts that must stay in front of you — the stack decision, the one gotcha that keeps biting. Pinned state is LOCAL to this machine and is never synced."),
+			mcp.WithTitleAnnotation("Pin Memory"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithNumber("id",
+				mcp.Required(),
+				mcp.Description("The observation ID to pin (from mem_search or mem_get_observation)"),
+			),
+		),
+		handlePin(store, true),
+	)
+
+	srv.AddTool(
+		mcp.NewTool("mem_unpin",
+			mcp.WithDescription("Unpin a memory so it returns to normal recency order in mem_context and loses its search boost. Pinned state is LOCAL to this machine and is never synced."),
+			mcp.WithTitleAnnotation("Unpin Memory"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithNumber("id",
+				mcp.Required(),
+				mcp.Description("The observation ID to unpin"),
+			),
+		),
+		handlePin(store, false),
 	)
 
 	// ── mem_judge ─────────────────────────────────────────────────────────────
@@ -454,10 +816,12 @@ action="list": list memories by review status — status filter is one of:
   Returns id, title, type, project, status, review_after.
 
 action="mark_reviewed": reset the staleness clock on memories you have verified.
-  Provide ids (a number array) OR a topic_key (resolves to its current observation).
-  Sets review_after = now + window; returns the count updated.
+  Provide ids (a number array, max 200 per call) OR a topic_key (resolves to its
+  current observation). The new due date is recomputed from the memory's TYPE —
+  decision +6 months, policy +12, preference +3, anything else + the staleness
+  window. Returns the count updated.
 
-Status is computed at read time: a memory is "needs_review" once it ages past the staleness window, "expired" once past its expires_at, else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
+Status is computed at read time: a memory is "needs_review" once past its review_after (set for decision/policy/preference, and the clock runs from the LAST SAVE OR REVISION — rewriting a memory restarts it, exactly as marking it reviewed does) or, when it has none, once it ages past the staleness window; "expired" once past its expires_at; else "active". mark_reviewed is a LOCAL-ONLY write (it does not sync).`),
 			mcp.WithTitleAnnotation("Review Memory Lifecycle"),
 			mcp.WithReadOnlyHintAnnotation(false),
 			mcp.WithDestructiveHintAnnotation(false),
@@ -471,7 +835,7 @@ Status is computed at read time: a memory is "needs_review" once it ages past th
 				mcp.Description("list filter: needs_review (default) | active | expired | all"),
 			),
 			mcp.WithArray("ids",
-				mcp.Description("mark_reviewed: observation IDs (numbers) to mark as reviewed"),
+				mcp.Description("mark_reviewed: observation IDs (numbers) to mark as reviewed — at most 200 per call"),
 				mcp.Items(map[string]any{"type": "number"}),
 			),
 			mcp.WithString("topic_key",
@@ -485,6 +849,9 @@ Status is computed at read time: a memory is "needs_review" once it ages past th
 			),
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
 			),
 		),
 		handleReview(store),
@@ -511,6 +878,39 @@ Renames every local memory under "from" to live under "to", and dedups the per-p
 			),
 		),
 		handleMergeProjects(store),
+	)
+
+	// ── mem_doctor ───────────────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_doctor",
+			mcp.WithDescription(`Run read-only operational diagnostics over the local store and return a structured report.
+
+Answers the questions that otherwise surface as confusing symptoms much later: observations whose session no longer exists, a session filed under a project its directory no longer resolves to, several sessions still "open" for the same directory, projects syncing on a default nobody chose, SQLite lock contention, a review backlog that has swallowed the lifecycle signal, and an outbox that is not draining.
+
+Response: {status, project, summary{total,ok,warnings,blocked,errors}, checks[{check_id, result, severity, reason_code, message, why, evidence, safe_next_step, requires_confirmation, findings[]}]}. status rolls up worst-first: error > blocked > warning > ok.
+
+It NEVER modifies your memories: it reports, it does not repair. (Not a pure reader of the FILE — the lock probe runs PRAGMA wal_checkpoint(PASSIVE), which may move pages out of the WAL. No row, session or project is touched.) Every finding carries a safe_next_step for YOU to run deliberately — the conditions it reports are the ones where the right fix depends on context the store does not have.
+
+A finding with severity "error" means one CHECK could not answer, not that the call failed; the other checks still report. Only an unrunnable request (an unknown check id) comes back as a tool error.`),
+			mcp.WithTitleAnnotation("Run Diagnostics"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(false),
+			mcp.WithString("project",
+				mcp.Description("Optional explicit project to scope the per-project checks to. When omitted it is auto-detected from the working directory, exactly as mem_search and mem_context resolve it. The node-wide checks (sqlite_lock_contention, sync_backlog) report the same either way."),
+			),
+			mcp.WithString("check",
+				mcp.Description("Optional single check to run: "+strings.Join(diagnostic.RegisteredCodes(), ", ")+". Omit to run all of them."),
+			),
+			mcp.WithString("directory",
+				mcp.Description(directoryArgDescription),
+			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
+		),
+		handleDoctor(store),
 	)
 
 	// ── mem_session_summary ──────────────────────────────────────────────────
@@ -555,9 +955,285 @@ FORMAT — use this exact structure in the content field:
 			mcp.WithString("directory",
 				mcp.Description(directoryArgDescription),
 			),
+			mcp.WithString("cwd",
+				mcp.Description(cwdArgDescription),
+			),
 		),
-		handleSessionSummary(store, loop, writerID),
+		handleSessionSummary(store, loop, writerID, daemonCwdIsWorkspace),
 	)
+}
+
+// handleCurrentProject returns the handler for mem_current_project — the
+// session-bootstrap probe. It answers one question: which project will THIS
+// caller's tool calls resolve to, and how was that name derived?
+//
+// It reports the LENIENT read resolution (the resolveReadProject chain:
+// explicit project → detection from the resolved directory → basename), because
+// that is what mem_search / mem_context / mem_review actually answer from. What
+// it adds on top is the part an agent cannot otherwise see until something goes
+// wrong — the ways that name is a GUESS rather than an identity:
+//
+//   - fallback=true: the project is only a directory basename, or a lenient
+//     fallback after a resolution error. Nothing declared it (no
+//     .engram/config.json, no git remote, no git root), so it changes the day
+//     the folder is renamed.
+//   - directory_source="daemon_cwd": no directory reached the daemon, so the
+//     answer describes the DAEMON's working directory. The daemon is shared and
+//     typically resident from wherever autostart or the tray launched it (on
+//     Windows commonly C:\Windows\system32) — the original junk-project misfile.
+//   - directory_source="cwd_alias": the directory came from the MODEL, not from
+//     `engram connect`. It is an assertion about the workspace, not an
+//     observation of it.
+//   - directory_source="relative_path": the value was relative, so it was
+//     resolved against the DAEMON's working directory rather than the caller's.
+//     "." is the answer a model gives when asked for its cwd, and it resolves to
+//     a real, existing, entirely unrelated project.
+//   - directory_exists=false: the resolved directory is not there at all, so the
+//     basename it yields names nothing that exists.
+//
+// Plus writes_blocked=true for the read/write asymmetry: an ambiguous
+// directory, a broken .engram/config.json, a missing directory, or an omitted
+// project all answer reads from the basename while making every write tool
+// refuse. Without the flag an agent learns that only from a failed mem_save,
+// halfway through a session.
+//
+// store is read ONLY for the project's sync policy (PolicyOmitted ⇒ writes are
+// refused before any row is written — see handleSave). It may be nil, which
+// skips that check; every other field is filesystem-derived.
+//
+// Like its upstream counterpart it NEVER returns a tool error: a discovery call
+// that fails is a discovery call an agent stops making. That holds even for a
+// non-string "directory", which every OTHER directory-aware tool rejects as a
+// caller error — here it is reported in the envelope
+// (directory_source="invalid_directory_argument") so the agent can still see
+// what the daemon would resolve.
+func handleCurrentProject(store *localstore.Store, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		explicitProject, _ := args["project"].(string)
+		dirArg := readDirectoryArg(args)
+
+		envelope := currentProjectEnvelope(store, explicitProject, dirArg, daemonCwdIsWorkspace)
+
+		out, err := json.Marshal(envelope)
+		if err != nil {
+			// Unreachable: the envelope holds only strings, bools and []string.
+			// Degrade to the one field that matters rather than to an error — the
+			// never-errors contract is the point of this tool.
+			return mcp.NewToolResultText(fmt.Sprintf("project: %v", envelope["project"])), nil
+		}
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+// currentProjectEnvelope builds the mem_current_project response body. It is
+// separated from the MCP plumbing so the resolution contract can be tested
+// directly; it reads the filesystem (detection), the store (policy), and — only
+// when no directory reached the daemon — the process working directory.
+//
+// Field contract. Always present:
+//
+//	project, project_source, project_path (CANONICAL directory of the project:
+//	the repo root for the git cases, the directory holding .engram/config.json
+//	for a pinned one, else the resolved cwd), cwd (absolute and cleaned),
+//	cwd_input (the caller's value verbatim, "" when none), directory_source,
+//	directory_exists, available_projects (never null), fallback, writes_blocked.
+//
+// Advisory, present only when they have something to say: warning, error_hint,
+// hints. hints is an ARRAY — the reasons a name is untrustworthy compose (a
+// daemon-cwd answer for a missing directory under an omitted project is three
+// separate problems), and a joined sentence makes an agent parse prose to tell
+// them apart.
+func currentProjectEnvelope(store *localstore.Store, explicitProject string, dirArg directoryArg, daemonCwdIsWorkspace bool) map[string]any {
+	dir := resolveProjectDir(dirArg.Directory)
+
+	env := map[string]any{
+		"project":            "",
+		"project_source":     "",
+		"project_path":       "",
+		"cwd":                dir,
+		"cwd_input":          dirArg.Input,
+		"directory_source":   dirArg.Source,
+		"directory_exists":   false,
+		"available_projects": []string{},
+		"fallback":           false,
+		"writes_blocked":     false,
+	}
+
+	var hints []string
+	if dirArg.Err != nil {
+		// The one caller error this tool reports instead of raising: the bridge
+		// leaves a non-string "directory" alone (see injectClientDirectory), so
+		// nothing else in the chain would ever mention it.
+		// Writes are blocked even beside an explicit project: every write tool
+		// raises this type error (readDirectoryArg) before it looks at project, so
+		// the remedy here is to fix or drop "directory", not to name a project.
+		env["error_hint"] = dirArg.Err.Error()
+		env["writes_blocked"] = true
+		hints = append(hints, "the \"directory\" argument was not a string and was IGNORED (the \"cwd\" alias is "+
+			"deliberately not consulted for it) — this answer describes the daemon's own directory",
+			"every write tool refuses a non-string \"directory\", even with an explicit project — send it as a string or omit it")
+	}
+	if dirArg.Warning != "" {
+		// The alias's own malformed-argument case. It is not an error_hint: nothing
+		// was refused, and the answer below is the one an absent alias would give.
+		hints = append(hints, dirArg.Warning)
+	}
+
+	// Does the directory the answer is about actually exist? Detection happily
+	// derives a basename from a path that is not there, which is how a typo'd
+	// ENGRAM_CLIENT_DIR or a hallucinated "cwd" invents a brand-new project.
+	info, statErr := os.Stat(dir)
+	switch {
+	case statErr == nil && info.IsDir():
+		env["directory_exists"] = true
+	case dir == "":
+		hints = append(hints, "the daemon could not read its own working directory, so no directory could be resolved — pass directory or project explicitly")
+	default:
+		hints = append(hints, "the resolved directory does not exist (or is not a directory), so any project name here is invented from its basename — pass a real directory or an explicit project")
+	}
+
+	// An explicit project wins outright in every other tool (resolveReadProject /
+	// resolveSaveProject), so no detection runs here either: reporting a detected
+	// project beside an explicit one would only invite an agent to second-guess
+	// the name it just supplied. The policy check below still applies — an
+	// explicit name does not make an omitted project writable.
+	if explicitProject = strings.TrimSpace(explicitProject); explicitProject != "" {
+		env["project"] = explicitProject
+		env["project_source"] = projectpkg.SourceExplicitOverride
+		applyPolicyBlock(store, env, &hints)
+		setHints(env, hints)
+		return env
+	}
+
+	if dirArg.Relative {
+		// Reported BEFORE the existence check so a relative path that resolves to
+		// nothing still says WHY it resolved there. Writes are blocked for the same
+		// reason resolveSaveProject refuses them: the path was resolved against the
+		// daemon's cwd, so the project it names belongs to the daemon, not to the
+		// caller. Kept out of the explicit-project branch above on purpose — naming
+		// a project skips the directory entirely, so nothing is blocked.
+		env["writes_blocked"] = true
+		if hint, ok := dirArg.gitBashHint(); ok {
+			// Same sentence the write tools return, so an agent that has read one
+			// recognises the other.
+			hints = append(hints, hint+" — every write tool refuses it")
+		} else {
+			hints = append(hints, fmt.Sprintf("the directory you passed (%q) is RELATIVE: %s — "+
+				"every write tool refuses it", dirArg.Directory, relativeDirectoryHint))
+		}
+	}
+
+	if !env["directory_exists"].(bool) {
+		// Detection would answer from the basename of a path that is not there.
+		// Report the name every read tool will use, but never as a normal answer:
+		// missing_directory says the name describes nothing on this machine.
+		env["project"] = projectpkg.DetectProject(dir)
+		env["project_source"] = sourceMissingDirectory
+		env["project_path"] = dir
+		env["fallback"] = true
+		env["writes_blocked"] = true
+		hints = append(hints, "writes (mem_save, mem_session_start, mem_session_summary) should not file memories under a directory that does not exist — pass project explicitly")
+		applyPolicyBlock(store, env, &hints)
+		setHints(env, hints)
+		return env
+	}
+
+	det := projectpkg.DetectProjectFull(dir)
+	env["project"] = det.Project
+	env["project_source"] = det.Source
+	env["project_path"] = det.Path
+	if len(det.AvailableProjects) > 0 {
+		env["available_projects"] = det.AvailableProjects
+	}
+	if det.Warning != "" {
+		env["warning"] = det.Warning
+	}
+
+	if det.Error != nil {
+		// Lenient, exactly like resolveReadProject: reads answer from the basename
+		// rather than erroring. project_source keeps det.Source — a broken
+		// .engram/config.json is still a CONFIG answer, and relabelling it
+		// "dir_basename" would send the agent looking for a missing config file
+		// instead of the malformed one it has.
+		env["project"] = projectpkg.DetectProject(dir)
+		env["project_path"] = dir
+		env["fallback"] = true
+		env["error_hint"] = det.Error.Error()
+		if errors.Is(det.Error, projectpkg.ErrInvalidConfig) || errors.Is(det.Error, projectpkg.ErrAmbiguousProject) {
+			env["writes_blocked"] = true
+			hints = append(hints, "reads fall back to the directory basename but writes (mem_save, mem_session_start, mem_session_summary) will REFUSE this directory — pass project explicitly")
+		}
+		if errors.Is(det.Error, projectpkg.ErrInvalidConfig) {
+			hints = append(hints, "the .engram/config.json in this directory is present but unusable — fix its project_name, or pass project explicitly")
+		}
+	}
+	if env["project_source"] == projectpkg.SourceDirBasename {
+		env["fallback"] = true
+		hints = append(hints, "the project name is only a directory basename (no .engram/config.json, git remote or git root) — pass project explicitly if that is not the name you want")
+	}
+	switch dirArg.Source {
+	case dirSourceDaemonCwd:
+		if daemonCwdIsWorkspace {
+			// A per-client `engram daemon --transport stdio` (README.md's documented
+			// setup): the MCP client spawned THIS daemon process in the project
+			// directory, so its cwd genuinely is the caller's workspace — not the
+			// SHARED resident daemon's own directory. Nothing is blocked; the label
+			// still says where the answer came from, softened to say why it is
+			// trusted here.
+			hints = append(hints, "no directory reached the daemon, but this daemon is running in per-client stdio "+
+				"mode (--transport stdio), so its own working directory IS your workspace — writes are not blocked")
+		} else {
+			env["writes_blocked"] = true
+			hints = append(hints, "no directory reached the daemon, so this is the DAEMON's own working directory and typically NOT your repo — every write tool refuses it without an explicit project; restart the resident daemon on a current binary, set ENGRAM_CLIENT_DIR, or pass directory/project explicitly")
+		}
+	case dirSourceCwdAlias:
+		hints = append(hints, "this directory came from the \"cwd\" alias you supplied, not from 'engram connect' — if it is not the workspace you are actually in, every later call is filed under the wrong project")
+		// dirSourceRelativePath is deliberately absent: its hint is emitted above,
+		// before the existence check, so it survives the missing-directory return.
+	}
+
+	applyPolicyBlock(store, env, &hints)
+	setHints(env, hints)
+	return env
+}
+
+// sourceMissingDirectory is the project_source reported when the resolved
+// directory does not exist. It is deliberately NOT one of the projectpkg
+// Source* constants: those all describe evidence found on disk, and there is
+// none here.
+const sourceMissingDirectory = "missing_directory"
+
+// applyPolicyBlock sets writes_blocked when the resolved project's sync policy
+// is "omitted", the one reason a write is refused that no amount of filesystem
+// evidence can reveal: mem_save, mem_save_prompt, mem_session_start and
+// mem_session_summary all check GetPolicy and return "capture refused" BEFORE
+// writing anything, whether the project was detected or named explicitly. A nil store (direct unit tests)
+// skips the check; a failed lookup is reported as a hint rather than swallowed.
+func applyPolicyBlock(store *localstore.Store, env map[string]any, hints *[]string) {
+	project, _ := env["project"].(string)
+	if store == nil || strings.TrimSpace(project) == "" {
+		return
+	}
+	pol, err := store.GetPolicy(project)
+	if err != nil {
+		*hints = append(*hints, fmt.Sprintf("could not read the sync policy for project %q (%v) — writes may still be refused", project, err))
+		return
+	}
+	if pol == localstore.PolicyOmitted {
+		env["writes_blocked"] = true
+		*hints = append(*hints, fmt.Sprintf("project %q has policy \"omitted\": every write tool refuses it (capture refused) — "+
+			"change it with 'engram projects policy %s local-only' or save under a different project", project, project))
+	}
+}
+
+// setHints attaches the advisory hints array, omitting the key entirely when
+// there is nothing to say (the shape the response-schema contract pins).
+func setHints(env map[string]any, hints []string) {
+	if len(hints) > 0 {
+		env["hints"] = hints
+	}
 }
 
 // handleSessionStart returns the handler for mem_session_start. It reads the
@@ -579,10 +1255,19 @@ FORMAT — use this exact structure in the content field:
 //     handleSessionStart, REQ-308): the supplied "directory" if any, else
 //     os.Getwd() — see resolveProjectDir.
 //
+// It is a WRITE tool and refuses everything the other write tools refuse: a
+// relative directory, no directory at all (dirSourceDaemonCwd), a missing one
+// (resolveSaveProject's three guards, reimplemented here because this handler
+// resolves its own project to keep the corrective CreateSessionWithProject
+// path), and an "omitted" project. Registering a
+// session for a project that cannot accept a single memory is a session row
+// whose only effect is to make mem_context report activity that produced
+// nothing.
+//
 // This tool's optional "directory" argument is the model every other
 // directory-aware tool now follows; `engram connect` fills it with the client's
 // working directory when the caller left both it and "project" empty.
-func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
+func handleSessionStart(store *localstore.Store, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		id, _ := args["id"].(string)
@@ -593,8 +1278,11 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		explicitProject, _ := args["project"].(string)
 		explicitProject = strings.TrimSpace(explicitProject)
-		directory, _ := args["directory"].(string)
-		directory = strings.TrimSpace(directory)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_session_start"), nil
+		}
+		directory := dirArg.Directory
 
 		// The directory the session row records, and — absent an explicit
 		// project — the one detection runs against.
@@ -602,6 +1290,19 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		project := explicitProject
 		if project == "" {
+			// The same three refusals resolveSaveProject applies, in the same order
+			// and for the same reason: an explicit project skips all of them (it is
+			// the remedy every writes_blocked hint offers), everything else must not
+			// invent one.
+			if dirArg.Relative {
+				return dirArg.relativeError("mem_session_start"), nil
+			}
+			if dirArg.Source == dirSourceDaemonCwd && !daemonCwdIsWorkspace {
+				return dirArg.daemonCwdError("mem_session_start"), nil
+			}
+			if !directoryExists(resolvedDir) {
+				return missingDirectoryError("mem_session_start", resolvedDir), nil
+			}
 			// Surface broken-config and ambiguous-project resolution errors as tool
 			// errors (faithful to the legacy predecessor) rather than silently storing
 			// the session under a wrong/basename project. ErrInvalidConfig = malformed
@@ -625,6 +1326,19 @@ func handleSessionStart(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				}
 			}
 			project = det.Project
+		}
+
+		// Policy check: an "omitted" project refuses capture, so registering a
+		// session for one promises a place to save that does not exist. Applied
+		// AFTER resolution so an explicit project is checked too — naming a project
+		// skips detection, not the policy (mem_current_project reports exactly this
+		// as writes_blocked, for mem_session_start by name).
+		pol, polErr := store.GetPolicy(project)
+		if polErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("mem_session_start: policy check for project %q: %v", project, polErr)), nil
+		}
+		if pol == localstore.PolicyOmitted {
+			return mcp.NewToolResultError(fmt.Sprintf("project %q is omitted: capture refused", project)), nil
 		}
 
 		// If the caller supplied a directory, use it; otherwise use the cwd we
@@ -692,21 +1406,53 @@ func handleSessionEnd(store *localstore.Store, activity *SessionActivity) mcpser
 // fire against the resolved directory, so a forwarded directory is diagnosed
 // exactly like a cwd would be.
 //
+// Before any detection runs it applies the three refusals mem_current_project
+// advertises as writes_blocked and nothing used to enforce:
+//
+//   - a RELATIVE directory (dirSourceRelativePath): filepath.Abs resolves it
+//     against the SHARED daemon's cwd, so the memory would be filed under
+//     whatever folder the autostart or tray happened to launch from;
+//   - no directory at all (dirSourceDaemonCwd): the project would be detected
+//     from the daemon's OWN working directory — %APPDATA%\engram for the
+//     resident daemon, see spawnWorkingDir — not the caller's; SKIPPED when
+//     daemonCwdIsWorkspace is true, i.e. this is a per-client `engram daemon
+//     --transport stdio` (README.md's documented setup), whose cwd genuinely
+//     IS the caller's workspace — see registerTools;
+//   - a directory that is not on this machine: detection derives a basename
+//     from any string, so a typo'd path silently creates a brand-new project.
+//
+// All three are skipped when the caller named a project. An explicit name is
+// the remedy every writes_blocked hint offers, and honouring it here is what
+// makes that advice true.
+//
+// tool is the caller's tool name, used verbatim in the error text: an agent
+// that reads "mem_save: …" after calling mem_session_summary learns the wrong
+// thing about which call failed.
+//
 // Conflict detection (explicit project vs store's known projects) is DEFERRED
 // to a future PR.
-func resolveSaveProject(store *localstore.Store, explicitProject, directory string) (string, *mcp.CallToolResult) {
+func resolveSaveProject(store *localstore.Store, tool, explicitProject string, dirArg directoryArg, daemonCwdIsWorkspace bool) (string, *mcp.CallToolResult) {
 	if strings.TrimSpace(explicitProject) != "" {
 		return strings.TrimSpace(explicitProject), nil
 	}
+	if dirArg.Relative {
+		return "", dirArg.relativeError(tool)
+	}
+	if dirArg.Source == dirSourceDaemonCwd && !daemonCwdIsWorkspace {
+		return "", dirArg.daemonCwdError(tool)
+	}
 
-	dir := resolveProjectDir(directory)
+	dir := resolveProjectDir(dirArg.Directory)
+	if !directoryExists(dir) {
+		return "", missingDirectoryError(tool, dir)
+	}
 	det := projectpkg.DetectProjectFull(dir)
 	if det.Error != nil {
 		switch {
 		case errors.Is(det.Error, projectpkg.ErrInvalidConfig):
-			return "", mcp.NewToolResultError("mem_save: project resolution: " + det.Error.Error())
+			return "", mcp.NewToolResultError(tool + ": project resolution: " + det.Error.Error())
 		case errors.Is(det.Error, projectpkg.ErrAmbiguousProject):
-			msg := "mem_save: project resolution: " + det.Error.Error()
+			msg := tool + ": project resolution: " + det.Error.Error()
 			if len(det.AvailableProjects) > 0 {
 				msg += " (candidates: " + strings.Join(det.AvailableProjects, ", ") +
 					"); pass project= explicitly or supply a more specific directory"
@@ -730,7 +1476,7 @@ func resolveSaveProject(store *localstore.Store, explicitProject, directory stri
 // embedLoop (may be nil): after a successful save, embedLoop.Trigger() is called
 // nil-safely so the backfill loop picks up the new row without waiting for the
 // next periodic 60s tick. The Trigger is non-blocking (coalesced, size-1 channel).
-func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding.Loop, gated embedding.EmbeddingProvider, writerID string, activity *SessionActivity, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -747,7 +1493,10 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 		scope, _ := args["scope"].(string)
 		topicKey, _ := args["topic_key"].(string)
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_save"), nil
+		}
 
 		// capture_prompt defaults to true when absent; explicit false disables it.
 		capturePrompt := true
@@ -755,16 +1504,18 @@ func handleSave(store *localstore.Store, loop *syncer.Loop, embedLoop *embedding
 			capturePrompt = v
 		}
 
-		project, toolErr := resolveSaveProject(store, explicitProject, directory)
+		project, toolErr := resolveSaveProject(store, "mem_save", explicitProject, dirArg, daemonCwdIsWorkspace)
 		if toolErr != nil {
 			return toolErr, nil
 		}
 
 		// Default session_id to "manual-save-{project}" when omitted, using the
 		// FINAL resolved project (auto-detected or explicit) — matches the tool
-		// description's documented default.
+		// description's documented default. The id is minted from the store's own
+		// constant so mem_doctor can recognise it instead of reporting it as an
+		// orphaned session (see localstore.ManualSaveSessionPrefix).
 		if sessionID == "" {
-			sessionID = fmt.Sprintf("manual-save-%s", project)
+			sessionID = localstore.DefaultManualSessionID(project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write.
@@ -936,6 +1687,84 @@ func handleGetObservation(store *localstore.Store) mcpserver.ToolHandlerFunc {
 	}
 }
 
+// toolObservationID decodes a REQUIRED numeric "id" argument into an int64,
+// returning a caller-facing error string prefixed with the tool name.
+//
+// The numeric validation itself is parseObservationID's — this wrapper adds only
+// the two things that are specific to "id is a required argument of THIS tool":
+// the missing-key check and the tool prefix. Duplicating the float64 rules here
+// (which is what this used to do) means two copies of a subtle boundary check —
+// float64(math.MaxInt64) rounds UP to 2^63, so the exact boundary must be
+// rejected or int64() overflows negative — that can drift apart silently.
+func toolObservationID(args map[string]any, tool string) (int64, string) {
+	raw, ok := args["id"]
+	if !ok {
+		return 0, tool + ": id is required"
+	}
+	id, err := parseObservationID(raw)
+	if err != nil {
+		return 0, tool + ": id " + err.Error()
+	}
+	return id, ""
+}
+
+// handlePin returns the handler for mem_pin (pinned=true) and mem_unpin
+// (pinned=false) — one implementation, since the two differ only in the value
+// they write.
+//
+// Pinning is LOCAL-ONLY: it writes the memories.pinned column directly, enqueues
+// no mutation, and never reaches central. A pin is "what I want in front of me
+// on THIS machine", which has no business reordering a teammate's context.
+//
+// An id that names no LIVE row is an error, not a silent success: telling the
+// caller a deleted memory is now pinned would leave it waiting for something
+// that can never surface.
+func handlePin(store *localstore.Store, pinned bool) mcpserver.ToolHandlerFunc {
+	tool := "mem_unpin"
+	if pinned {
+		tool = "mem_pin"
+	}
+
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, errMsg := toolObservationID(req.GetArguments(), tool)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		state, err := store.SetPinned(id, pinned)
+		if err != nil {
+			if errors.Is(err, localstore.ErrObservationNotFound) {
+				return mcp.NewToolResultError(fmt.Sprintf("%s: observation #%d not found", tool, id)), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("%s: %s", tool, err)), nil
+		}
+
+		// Read the row back for its sync_id so the response identifies the memory
+		// the same way every other tool does. A read-back failure does not undo a
+		// successful pin — report the state we know rather than an error.
+		syncID := ""
+		if rec, rerr := store.GetObservation(id); rerr == nil {
+			syncID = rec.SyncID
+		}
+
+		word := "unpinned"
+		if state {
+			word = "pinned"
+		}
+		out, err := json.Marshal(map[string]any{
+			"result":  fmt.Sprintf("Memory #%d %s", id, word),
+			"id":      id,
+			"sync_id": syncID,
+			"pinned":  state,
+		})
+		if err != nil {
+			// Unreachable: the map holds only strings, an int64 and a bool.
+			return mcp.NewToolResultText(fmt.Sprintf("Memory #%d %s", id, word)), nil
+		}
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
 // handleUpdate returns the handler for mem_update. It edits a live observation
 // in place by ID, filling any omitted field from the current record, then writes
 // a versioned OpUpsert via store.UpdateMemory (materialized + enqueued for push).
@@ -1036,7 +1865,7 @@ func handleSuggestTopicKey() mcpserver.ToolHandlerFunc {
 //     a reliable per-call signal; the session row is.
 //  3. Detection from the resolved directory (forwarded "directory", else the
 //     daemon's cwd).
-func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID string) mcpserver.ToolHandlerFunc {
+func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID string, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -1059,11 +1888,14 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 			}
 		}
 		if project == "" {
-			directory, _ := args["directory"].(string)
+			dirArg := readDirectoryArg(args)
+			if dirArg.Err != nil {
+				return dirArg.toolError("mem_session_summary"), nil
+			}
 			var toolErr *mcp.CallToolResult
 			// Returns explicitProject verbatim when set; otherwise detects from the
 			// forwarded directory / daemon cwd and may hard-error.
-			project, toolErr = resolveSaveProject(store, explicitProject, directory)
+			project, toolErr = resolveSaveProject(store, "mem_session_summary", explicitProject, dirArg, daemonCwdIsWorkspace)
 			if toolErr != nil {
 				return toolErr, nil
 			}
@@ -1071,10 +1903,11 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 
 		// Default session_id to "manual-save-{project}" when omitted, using the
 		// FINAL resolved project — matches the tool description's documented
-		// default. Applied AFTER the session-lookup above so an explicit empty
-		// session_id still resolves the project from cwd rather than a session row.
+		// default (localstore.ManualSaveSessionPrefix). Applied AFTER the
+		// session-lookup above so an explicit empty session_id still resolves the
+		// project from cwd rather than a session row.
 		if sessionID == "" {
-			sessionID = fmt.Sprintf("manual-save-%s", project)
+			sessionID = localstore.DefaultManualSessionID(project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write —
@@ -1108,9 +1941,79 @@ func handleSessionSummary(store *localstore.Store, loop *syncer.Loop, writerID s
 	}
 }
 
+// toolSearchOffset decodes mem_search's optional "offset" argument. Absent is 0
+// (page one). Present-but-unusable is an ERROR rather than a silent 0: answering
+// "give me rows 50-59" with rows 0-9 is indistinguishable from a correct answer
+// on the caller's side, and an agent paging through results would loop forever
+// on page one without ever being told why.
+func toolSearchOffset(args map[string]any) (int, string) {
+	raw, ok := args["offset"]
+	if !ok {
+		return 0, ""
+	}
+	f, ok := raw.(float64)
+	if !ok {
+		return 0, "mem_search: offset must be a number"
+	}
+	// A fractional or negative offset is a caller bug, not a page.
+	if f != math.Trunc(f) || f < 0 {
+		return 0, "mem_search: offset must be a non-negative integer"
+	}
+	// The ceiling gets its OWN message. int is 32-bit on some builds, so the
+	// bound is real — but "must be a non-negative integer" told a caller who
+	// passed a well-formed integer to pass an integer, which is advice they
+	// cannot act on. Naming the actual problem is the difference between a caller
+	// that shrinks the offset and one that retries the same value forever.
+	if f > float64(math.MaxInt32) {
+		return 0, fmt.Sprintf("mem_search: offset is too large (max %d)", math.MaxInt32)
+	}
+	return int(f), ""
+}
+
+// toolSearchTime decodes one of mem_search's optional date-bound arguments,
+// accepting RFC3339 or a bare "YYYY-MM-DD" date. The zero time.Time means the
+// bound is unset.
+//
+// endOfDay makes a DATE-only value cover the whole day, and it is what the
+// "created_to" bound passes: SearchFilter's bounds are inclusive, so reading
+// "2024-06-30" as UTC midnight would silently exclude everything saved that day
+// — the exact day the caller asked to include. The same helper backs the web UI's
+// filter bar (controlapi.InclusiveDayEnd), so the two surfaces cannot drift into
+// different meanings for the same date string.
+//
+// A malformed value is an error, not an ignored filter. Silently dropping the
+// bound would answer a question about last week with the entire corpus, and the
+// caller has no way to see that it happened.
+func toolSearchTime(args map[string]any, key string, endOfDay bool) (time.Time, string) {
+	raw, ok := args[key]
+	if !ok {
+		return time.Time{}, ""
+	}
+	str, ok := raw.(string)
+	if !ok {
+		return time.Time{}, "mem_search: " + key + " must be a string"
+	}
+	str = strings.TrimSpace(str)
+	if str == "" {
+		return time.Time{}, ""
+	}
+
+	if t, err := time.Parse(time.RFC3339, str); err == nil {
+		return t.UTC(), ""
+	}
+	if t, err := time.Parse("2006-01-02", str); err == nil {
+		if endOfDay {
+			return controlapi.InclusiveDayEnd(t.UTC()), ""
+		}
+		return t.UTC(), ""
+	}
+	return time.Time{}, "mem_search: " + key + ` must be RFC3339 ("2024-06-01T09:00:00Z") or a date ("2024-06-01")`
+}
+
 // handleSearch returns the handler for mem_search. It performs a search with
-// optional type/scope/mode filters, using the LENIENT read-project policy so a
-// search never hard-errors on an ambiguous or misconfigured cwd.
+// optional type/scope/mode filters, date bounds and offset paging, using the
+// LENIENT read-project policy so a search never hard-errors on an ambiguous or
+// misconfigured cwd.
 //
 // Mode values: "" / "fts" → FTS only (default, byte-identical to before);
 // "semantic" → cosine only; "hybrid" → FTS + cosine fused via RRF.
@@ -1134,7 +2037,11 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 
 		typ, _ := args["type"].(string)
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_search"), nil
+		}
+		directory := dirArg.Directory
 		scope, _ := args["scope"].(string)
 		mode, _ := args["mode"].(string)
 
@@ -1147,6 +2054,33 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			}
 		}
 
+		// offset / created_from / created_to are STRICT where limit is lenient, and
+		// the difference is deliberate: a bad limit still answers the caller's
+		// question (with a different number of rows), while a bad offset or date
+		// silently answers a DIFFERENT question — page one instead of page five, or
+		// the whole corpus instead of last week. Those are the answers an agent
+		// cannot tell apart from the right one, so they are refused out loud.
+		offset, errMsg := toolSearchOffset(args)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		createdFrom, errMsg := toolSearchTime(args, "created_from", false)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		createdTo, errMsg := toolSearchTime(args, "created_to", true)
+		if errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		// An inverted window is empty by construction: the store ANDs the two
+		// bounds, so this search can only ever return nothing. Answering "no
+		// memories found" would be true and useless — the caller would go on
+		// believing the corpus is empty for that window instead of seeing that
+		// they swapped their arguments.
+		if !createdFrom.IsZero() && !createdTo.IsZero() && createdFrom.After(createdTo) {
+			return mcp.NewToolResultError("mem_search: created_from is after created_to"), nil
+		}
+
 		project := resolveReadProject(explicitProject, directory)
 		// REQ-391: personal-scope memories are NOT project-scoped. When scope is
 		// personal and no explicit project was given, search across ALL projects so
@@ -1156,9 +2090,12 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		results, degradation, err := store.SearchMemoriesFiltered(query, project, limit, localstore.SearchFilter{
-			Type:  typ,
-			Scope: scope,
-			Mode:  mode,
+			Type:        typ,
+			Scope:       scope,
+			Mode:        mode,
+			Offset:      offset,
+			CreatedFrom: createdFrom,
+			CreatedTo:   createdTo,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("mem_search: search error: %s. Try simpler keywords.", err)), nil
@@ -1169,7 +2106,18 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		// Page one renders exactly as it always has. Past it the header names the
+		// row range and the numbering continues from the offset, because "Found 10
+		// memories" over items [1]–[10] describes page one, page three and page
+		// nine identically — and an agent walking pages has no other way to tell
+		// which one it is holding. The count stays the count of THIS page; the
+		// range is what says where the page sits.
+		if offset > 0 {
+			fmt.Fprintf(&b, "Found %d memories (rows %d–%d):\n\n",
+				len(results), offset+1, offset+len(results))
+		} else {
+			fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		}
 		anyTruncated := false
 		for i, r := range results {
 			preview := r.Content
@@ -1179,7 +2127,7 @@ func handleSearch(store *localstore.Store) mcpserver.ToolHandlerFunc {
 				preview = string([]rune(r.Content)[:previewLen]) + " [preview]"
 			}
 			fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    project: %s | scope: %s\n",
-				i+1, r.ID, r.Type, r.Title,
+				offset+i+1, r.ID, r.Type, r.Title,
 				preview,
 				r.Project, r.Scope)
 			if r.TopicKey != nil && *r.TopicKey != "" {
@@ -1214,7 +2162,11 @@ func handleContext(store *localstore.Store) mcpserver.ToolHandlerFunc {
 		args := req.GetArguments()
 
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_context"), nil
+		}
+		directory := dirArg.Directory
 		scope, _ := args["scope"].(string)
 
 		project := resolveReadProject(explicitProject, directory)
@@ -1313,7 +2265,7 @@ func handleJudge(store *localstore.Store) mcpserver.ToolHandlerFunc {
 // prompt via AddPrompt (which enqueues an outbox entry for central push) and
 // records it in the in-memory SessionActivity so that a subsequent mem_save
 // with capture_prompt=true can auto-capture it without a re-insert (dedup).
-func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity) mcpserver.ToolHandlerFunc {
+func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID string, activity *SessionActivity, daemonCwdIsWorkspace bool) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -1327,17 +2279,20 @@ func handleSavePrompt(store *localstore.Store, loop *syncer.Loop, writerID strin
 		sessionID = strings.TrimSpace(sessionID)
 
 		explicitProject, _ := args["project"].(string)
-		directory, _ := args["directory"].(string)
-		project, toolErr := resolveSaveProject(store, explicitProject, directory)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_save_prompt"), nil
+		}
+		project, toolErr := resolveSaveProject(store, "mem_save_prompt", explicitProject, dirArg, daemonCwdIsWorkspace)
 		if toolErr != nil {
 			return toolErr, nil
 		}
 
 		// Default session_id to "manual-save-{project}" when omitted, using the
 		// FINAL resolved project (auto-detected or explicit) — matches the tool
-		// description's documented default.
+		// description's documented default (localstore.ManualSaveSessionPrefix).
 		if sessionID == "" {
-			sessionID = fmt.Sprintf("manual-save-%s", project)
+			sessionID = localstore.DefaultManualSessionID(project)
 		}
 
 		// Policy check: refuse writes for omitted projects BEFORE any store write.
@@ -1475,17 +2430,37 @@ func parseObservationID(raw any) (int64, error) {
 	return int64(f), nil
 }
 
+// reviewIDsPerCall caps mark_reviewed's ids[] array, mirroring the 200-row
+// ceiling ListForReview puts on its own limit.
+const reviewIDsPerCall = 200
+
 // handleReview returns the handler for mem_review. action="list" lists memories
 // by review status; action="mark_reviewed" resets the staleness clock on the
 // given ids (or the row resolved from topic_key). mark_reviewed is a LOCAL-ONLY
 // write — it never enqueues an outbox entry, so no sync trigger is needed.
+//
+// Why it resolves its project the lenient READ way (resolveReadProject) even
+// though mark_reviewed writes. Every other write tool goes through
+// resolveSaveProject, which REFUSES a relative directory, because a wrong
+// project there invents a name and files a new memory under it — a fabrication
+// nobody asked for. mem_review cannot do that: both project uses are LOOKUPS
+// scoped by project (ListForReview filters by it, IDByTopicKey resolves a topic
+// inside it), so a wrong project finds nothing and the call is a no-op with an
+// empty list or a "no live memory for topic_key" error. It cannot mark someone
+// else's memory reviewed, because ids are explicit and topic keys are
+// project-scoped. A refusal here would buy nothing and would block the listing
+// half of the tool for callers whose directory the daemon cannot resolve.
 func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
 		action, _ := args["action"].(string)
 		action = strings.TrimSpace(strings.ToLower(action))
-		directory, _ := args["directory"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_review"), nil
+		}
+		directory := dirArg.Directory
 		switch action {
 		case "list":
 			explicitProject, _ := args["project"].(string)
@@ -1524,6 +2499,17 @@ func handleReview(store *localstore.Store) mcpserver.ToolHandlerFunc {
 			var ids []int64
 
 			if rawIDs, ok := args["ids"].([]any); ok && len(rawIDs) > 0 {
+				// Same 200 ceiling ListForReview caps `limit` at, for the same
+				// reason: mark_reviewed is the action you take on a list you just
+				// read, so a batch can never legitimately exceed a page of it. It
+				// REFUSES rather than truncating — silently marking the first 200
+				// of 500 ids and reporting success would leave the caller believing
+				// 300 memories were verified that were not.
+				if len(rawIDs) > reviewIDsPerCall {
+					return mcp.NewToolResultError(fmt.Sprintf(
+						"mem_review: mark_reviewed accepts at most %d ids per call (got %d) — split it into pages",
+						reviewIDsPerCall, len(rawIDs))), nil
+				}
 				for i, raw := range rawIDs {
 					id, err := parseObservationID(raw)
 					if err != nil {
@@ -1631,3 +2617,71 @@ func normalizeForDrift(s string) string {
 
 // (levenshtein/min3 removed: the name-drift warning is now case/separator-only,
 // see nearVariantProject.)
+
+// handleDoctor returns the handler for mem_doctor — the read-only diagnostics
+// pass over this node's store.
+//
+// Project scope follows the LENIENT read resolution (resolveReadProject), the
+// same chain mem_search and mem_context answer from, so the per-project checks
+// describe the project the agent's other calls are actually using. The two
+// node-wide checks (sqlite_lock_contention, sync_backlog) ignore the scope by
+// construction: a held lock and an undrained outbox belong to the machine.
+//
+// The result is the diagnostic.Report envelope as JSON. It is marked IsError
+// only for a RUN-LEVEL failure (Report.IsRunLevelFailure: an unknown check
+// code, a scope the runner could not use) — never for what the report found. A
+// report full of warnings is a SUCCESSFUL diagnosis, and so is one where a
+// single probe could not read its own pragma and said so with severity=error:
+// six other checks answered. Flagging either as a tool error teaches an agent
+// that running the doctor is something that fails, and the agent stops running
+// it — on exactly the store that needed it.
+func handleDoctor(store *localstore.Store) mcpserver.ToolHandlerFunc {
+	return handleDoctorWithRunner(store, diagnostic.NewRunner())
+}
+
+// handleDoctorWithRunner is handleDoctor with an injectable runner, so the
+// dispatch (all checks vs exactly one) can be tested against a registry that
+// counts what it was asked to run. With the default registry that assertion is
+// indirect at best: every real check answers ok on a clean store, so a handler
+// that ran ALL of them and then ran one again looked identical in the response
+// — which is precisely how it shipped.
+func handleDoctorWithRunner(store *localstore.Store, runner diagnostic.Runner) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+
+		explicitProject, _ := args["project"].(string)
+		dirArg := readDirectoryArg(args)
+		if dirArg.Err != nil {
+			return dirArg.toolError("mem_doctor"), nil
+		}
+		check, _ := args["check"].(string)
+
+		scope := diagnostic.Scope{
+			Store:   store,
+			Project: resolveReadProject(explicitProject, dirArg.Directory),
+			Now:     time.Now().UTC(),
+		}
+
+		// if/else, not run-then-overwrite: the previous version ran the whole
+		// registry and THREW THE REPORT AWAY whenever check was supplied, so asking
+		// for one check cost a full diagnostic pass — including the WAL checkpoint
+		// probe and two scans of the sessions table.
+		var report diagnostic.Report
+		if check = strings.TrimSpace(check); check != "" {
+			report = runner.RunOne(ctx, scope, check)
+		} else {
+			report = runner.RunAll(ctx, scope)
+		}
+
+		out, err := json.Marshal(report)
+		if err != nil {
+			// Unreachable in practice (the report holds strings, ints and
+			// pre-marshaled evidence), but a diagnostics tool that dies on its own
+			// formatting would be a poor advertisement for diagnostics.
+			return mcp.NewToolResultError("mem_doctor: encode report: " + err.Error()), nil
+		}
+		result := mcp.NewToolResultText(string(out))
+		result.IsError = report.IsRunLevelFailure()
+		return result, nil
+	}
+}

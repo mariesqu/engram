@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mariesqu/engram/internal/domain"
+	"github.com/mariesqu/engram/internal/mutation"
 )
 
 // ErrPromptNotFound is returned by prompt lookup helpers when no live row exists
@@ -61,6 +62,7 @@ type AddPromptParams struct {
 // entry is enqueued atomically by localWriteLocked so the prompt is pushed to
 // central on the next sync cycle.
 func (s *Store) AddPrompt(p AddPromptParams) (Prompt, error) {
+	p = sanitizeAddPromptParams(p)
 	p.Project = normalizeProject(p.Project)
 
 	s.mu.Lock()
@@ -90,6 +92,9 @@ func (s *Store) AddPrompt(p AddPromptParams) (Prompt, error) {
 // AddPrompt/AddPromptIfMissing/ApplyPulled can interleave between the check
 // and the insert.  This mirrors AddObservation's read-modify-write pattern.
 func (s *Store) AddPromptIfMissing(p AddPromptParams) (Prompt, error) {
+	// Deduplicate on the same value localWriteLocked will materialize. Otherwise
+	// a repeated prompt containing NUL would miss its already-sanitized row.
+	p = sanitizeAddPromptParams(p)
 	p.Project = normalizeProject(p.Project)
 
 	s.mu.Lock()
@@ -112,6 +117,14 @@ func (s *Store) AddPromptIfMissing(p AddPromptParams) (Prompt, error) {
 	}
 
 	return resolvePromptRow(s.db, m.SyncID)
+}
+
+func sanitizeAddPromptParams(p AddPromptParams) AddPromptParams {
+	p.SessionID = mutation.RemoveNUL(p.SessionID)
+	p.Content = mutation.RemoveNUL(p.Content)
+	p.Project = mutation.RemoveNUL(p.Project)
+	p.WriterID = mutation.RemoveNUL(p.WriterID)
+	return p
 }
 
 // addPromptLocked builds the domain.Mutation and calls localWriteLocked.

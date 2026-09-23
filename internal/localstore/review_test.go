@@ -1,6 +1,7 @@
 package localstore
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -275,5 +276,92 @@ func TestDistinctProjects(t *testing.T) {
 	}
 	if len(projs) != 2 {
 		t.Errorf("distinct count = %d, want 2", len(projs))
+	}
+}
+// TestMarkReviewed_ChunksLargeIDBatches passes more ids than one IN (...) list
+// may safely carry.
+//
+// SQLITE_MAX_VARIABLE_NUMBER is a property of the SQLite build, not of this
+// code: 999 on the classic default, 32766 on a modern one. A batch that happens
+// to fit today fails on a driver rebuilt with the older ceiling, and it fails at
+// the statement — mid-transaction, with nothing marked. 1200 ids is past the
+// pessimistic limit and spans three chunks of the store's own 500, so the
+// chunking is exercised rather than merely present.
+//
+// Two types, because the ids are grouped by type BEFORE they are chunked: this
+// pins that both loops nest correctly, not just the single-group case.
+func TestMarkReviewed_ChunksLargeIDBatches(t *testing.T) {
+	s := openTempStore(t)
+
+	const total = 1200
+	ids := make([]int64, 0, total)
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("begin seed: %v", err)
+	}
+	stmt, err := tx.Prepare(`
+		INSERT INTO memories
+		  (sync_id, session_id, entity_type, type, title, content, project, scope, writer_id,
+		   created_at, updated_at)
+		VALUES (?, 'sess', 'memory', ?, 'bulk', 'body', 'bulk', 'project', 'w1',
+		        datetime('now','-40 days'), datetime('now','-40 days'))`)
+	if err != nil {
+		t.Fatalf("prepare seed: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		typ := "decision"
+		if i%2 == 1 {
+			typ = "preference"
+		}
+		res, err := stmt.Exec(fmt.Sprintf("bulk-%04d", i), typ)
+		if err != nil {
+			t.Fatalf("seed row %d: %v", i, err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatalf("seed row %d: last insert id: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("close seed stmt: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	n, err := s.MarkReviewed(ids)
+	if err != nil {
+		t.Fatalf("MarkReviewed(%d ids): %v", len(ids), err)
+	}
+	if n != total {
+		t.Errorf("MarkReviewed marked %d rows, want %d", n, total)
+	}
+
+	// Every row must actually carry a future review_after — a chunk that was
+	// silently skipped would leave rows behind while the count still looked right
+	// only if the count were computed rather than measured.
+	var stale int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM memories
+		WHERE project = 'bulk' AND deleted_at IS NULL
+		  AND (review_after IS NULL OR datetime(review_after) <= datetime('now'))`,
+	).Scan(&stale); err != nil {
+		t.Fatalf("count unmarked rows: %v", err)
+	}
+	if stale != 0 {
+		t.Errorf("%d of %d rows came out of MarkReviewed without a future review_after", stale, total)
+	}
+
+	// A duplicated id is still ONE row, across chunk boundaries too: the read
+	// dedups, so the count cannot be inflated by repeating ids.
+	dup, err := s.MarkReviewed(append(append([]int64{}, ids...), ids...))
+	if err != nil {
+		t.Fatalf("MarkReviewed with duplicated ids: %v", err)
+	}
+	if dup != total {
+		t.Errorf("MarkReviewed over %d ids (each listed twice) reported %d rows, want %d",
+			2*total, dup, total)
 	}
 }

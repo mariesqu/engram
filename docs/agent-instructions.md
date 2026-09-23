@@ -2,6 +2,8 @@
 
 Copy this block into your agent's instruction file (CLAUDE.md for Claude Code, AGENTS.md, .cursorrules for Cursor, or whichever file your MCP client reads as system-level instructions).
 
+> You may not have to. The daemon already ships a condensed version of this protocol through the MCP `instructions` channel, which clients that honour it prepend to the model's system prompt. And `engram setup hooks --agent claude-code|codex` (see [Lifecycle hooks](../README.md#lifecycle-hooks)) installs a `session-start` hook that injects the same protocol **plus the project's recent memory** at the start of every session — including after a compaction, which is exactly when a file the model can no longer see stops helping. Copy this block when you want the long form, or when your client supports neither.
+
 ---
 
 ## Engram Persistent Memory — Protocol
@@ -12,6 +14,7 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 
 | Tool | Purpose |
 |------|---------|
+| `mem_current_project` | Report which project THIS caller resolves to, and how (`fallback`/`writes_blocked` flag a guess) — the recommended first call of a session |
 | `mem_session_start` | Register the start of a coding session |
 | `mem_session_end` | Mark a session as completed with an optional summary |
 | `mem_save` | Save an observation (decision, bug fix, discovery, …) to persistent memory |
@@ -19,13 +22,32 @@ You have access to Engram, a persistent memory system exposed over MCP. It survi
 | `mem_save_prompt` | Save the user's prompt so `mem_save` can auto-attach it to the next observation |
 | `mem_get_observation` | Retrieve the full untruncated content of an observation by numeric ID |
 | `mem_update` | Edit a specific observation in place by ID (omitted fields keep their value; versioned and re-synced) |
-| `mem_search` | Full-text, semantic, or hybrid search across observations |
+| `mem_search` | Full-text, semantic, or hybrid search across observations (`offset` paging, `created_from` / `created_to` date bounds) |
 | `mem_similar` | Find observations semantically nearest a given memory (by sync_id) |
 | `mem_review` | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the clock (local-only) |
 | `mem_context` | Assemble recent sessions and observations into a context summary |
+| `mem_pin` | Pin a memory so it leads `mem_context` and ranks higher in keyword search (local-only) |
+| `mem_unpin` | Unpin a memory, returning it to normal recency order (local-only) |
 | `mem_session_summary` | Save a structured end-of-session summary |
 | `mem_judge` | Record a verdict on a conflict candidate surfaced by `mem_save` |
 | `mem_merge_projects` | Merge a source project's memories into a target name to fix name drift (local-only) |
+| `mem_doctor` | Run read-only diagnostics over this node's store (orphaned sessions, project drift, SQLite lock contention, sync backlog) |
+
+---
+
+### Confirm the project first
+
+Start a session with `mem_current_project`. It never errors, and it tells you which project every later call will be filed under plus how that name was derived. Three fields decide what you do next:
+
+- `fallback: true` — the name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Nothing declared it, so pass an explicit `project` on later calls if it is not the name you want.
+- `writes_blocked: true` — `mem_save` / `mem_save_prompt` / `mem_session_start` / `mem_session_summary` will refuse this directory until you pass `project` explicitly. Reads still answer from the basename. Causes: an ambiguous directory (a parent of several repos), a malformed `.engram/config.json`, a directory that does not exist, a RELATIVE directory, or a project whose policy is `omitted`.
+- `directory_exists: false` — the resolved directory is not on this machine, so any name here was invented from its basename. Pass a real directory or an explicit `project`.
+
+The response also carries `hints` — an ARRAY of one plain-language sentence per reason the answer is untrustworthy — plus `directory_source` (`argument` = injected by `engram connect`; `cwd_alias` = the path *you* supplied; `daemon_cwd` = nobody supplied one, so this describes the daemon's own directory, typically NOT your repo; `relative_path` = you supplied a relative path, which was resolved against the *daemon's* directory rather than yours), `cwd` (absolute, cleaned), `cwd_input` (what you passed, verbatim) and `project_path` (the project's canonical directory).
+
+Always pass an **absolute** path in `directory`/`cwd`. The daemon is a separate, usually resident process, so `.` means *its* directory, not yours — reads answer from it leniently, writes refuse it.
+
+Pass the workspace in `directory` when you have to name one; `cwd` is accepted as an alias by every project-resolving tool and is read only when `directory` is absent or blank.
 
 ---
 
@@ -60,6 +82,14 @@ When the user references past work ("remember…", "how did we…", "what was th
 3. If a result looks relevant, call `mem_get_observation` with its numeric ID to get the full untruncated content (search results are truncated)
 
 Also search **proactively** at the start of a session when the user's first message references a project, feature, or problem — call `mem_search` before responding.
+
+---
+
+### Pinning
+
+`mem_pin` keeps a memory in front of you: pinned observations render in their own `### Pinned` section at the top of `mem_context` (ahead of recent observations, which exclude them) and get a small ranking boost in keyword search. Reserve it for the handful of facts that must not scroll away — the stack decision, the gotcha that keeps biting. `mem_unpin` reverses it.
+
+Pinned state is **local to this machine** and never syncs: it is your judgment about your own context, not shared truth.
 
 ---
 
@@ -112,3 +142,11 @@ If you see a compaction notice or a "context cleared" event:
 3. Only then continue working
 
 The persistent store survives compaction — the agent just needs to re-read it.
+
+---
+
+### Diagnostics
+
+When something looks wrong — memories landing under a name nobody recognises, saves failing, context that never mentions a session you are sure happened — call `mem_doctor`. It runs read-only checks over this node's store and returns `{status, project, summary, checks[]}`, each check carrying a `message`, a `why`, an `evidence` blob and a `safe_next_step`.
+
+It never repairs anything, and neither should you on its say-so: a finding with `requires_confirmation: true` describes a condition whose correct fix depends on context the store does not have (which of two project names is canonical, which of three open sessions is yours). Surface the finding and its `safe_next_step` to the user, and let them choose.

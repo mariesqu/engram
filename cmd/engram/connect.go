@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -301,7 +303,9 @@ const clientDirDisabled = "none"
 //     directory. The escape hatch for MCP hosts that spawn their servers
 //     somewhere other than the workspace (a launcher starting every server in
 //     $HOME would otherwise file everything under the home directory's name,
-//     with nothing the user could do about it).
+//     with nothing the user could do about it). The value is made ABSOLUTE
+//     against this process's working directory before anything else looks at
+//     it — see resolveClientDirWith.
 //  3. Otherwise this process's cwd, which for a client-spawned bridge IS the
 //     project directory.
 //
@@ -326,34 +330,48 @@ func resolveClientDir() (string, error) {
 // already-trimmed ENGRAM_CLIENT_DIR value and getwd stands in for os.Getwd —
 // the same injection shape ensureConnectDaemonWith uses, and the only way to
 // exercise the non-UTF-8 cwd branch without a hostile filesystem.
+//
+// The override is normalized to an ABSOLUTE path before it is checked, and the
+// checks then run on the absolute value. A relative override ("." is the one
+// everybody writes, "repo" the next) used to pass every check and be forwarded
+// verbatim: the daemon resolved it against ITS OWN working directory, so every
+// write was refused with a message blaming a "directory" the user never typed,
+// and nothing in the chain ever mentioned the value they did. This process's
+// cwd is the right base — it is the client's workspace, which is the whole
+// reason the directory is forwarded at all.
 func resolveClientDirWith(env string, getwd func() (string, error)) (string, error) {
 	switch {
 	case env == "":
 	case strings.EqualFold(env, clientDirDisabled):
 		return "", nil
 	default:
-		if info, err := os.Stat(env); err != nil || !info.IsDir() {
-			return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%q is not an existing directory\n"+
+		dir, err := absoluteClientDir(env)
+		if err != nil {
+			return "", err
+		}
+		if info, statErr := os.Stat(dir); statErr != nil || !info.IsDir() {
+			return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%q is not an existing directory%s\n"+
 				"Either fix the path, or set ENGRAM_CLIENT_DIR=none to turn directory forwarding off\n"+
-				"(the daemon then resolves projects from its own working directory)", env)
+				"(the daemon then resolves projects from its own working directory)", dir, resolvedFrom(env, dir))
 		}
 		// json.Marshal of a Go string REPLACES invalid UTF-8 with U+FFFD instead
 		// of failing, so an unvalidated path would reach the daemon corrupted and
 		// resolve to a phantom project — the same class of failure as the typo,
-		// and just as much the user's explicit configuration.
+		// and just as much the user's explicit configuration. Checked on the
+		// ABSOLUTE value, which is what would be forwarded.
 		//
 		// Deliberately untested: the stat above runs first, so reaching this needs
 		// an EXISTING directory whose name is not valid UTF-8. That is a POSIX-only
 		// filesystem (paths are raw bytes there); on Windows environment values
 		// arrive as UTF-16 and convert to valid UTF-8, making this branch dead
 		// code. It stays because it is the correct guard on POSIX.
-		if !utf8.ValidString(env) {
+		if !utf8.ValidString(dir) {
 			return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%q is not valid UTF-8 and cannot be "+
 				"forwarded without corruption\n"+
 				"Either point it at a UTF-8 path, or set ENGRAM_CLIENT_DIR=none to turn directory "+
-				"forwarding off", env)
+				"forwarding off", dir)
 		}
-		return env, nil
+		return dir, nil
 	}
 
 	cwd, err := getwd()
@@ -371,6 +389,53 @@ func resolveClientDirWith(env string, getwd func() (string, error)) (string, err
 		return "", nil
 	}
 	return cwd, nil
+}
+
+// absoluteClientDir turns an ENGRAM_CLIENT_DIR value into the absolute path
+// that will be forwarded, or explains why it cannot.
+//
+// A Git Bash / MSYS path ("/c/GitLab/engram") is translated to its native
+// Windows form when the drive it names exists. It is the shape a user gets from
+// `pwd` in the shell they configured their MCP host in, and filepath.Abs would
+// otherwise turn it into "C:\c\GitLab\engram" — an existing-looking path that
+// is not there, i.e. the junk project this variable exists to prevent, minted
+// by the very setting meant to prevent it. When the translation cannot be
+// checked the override FAILS CLOSED like every other unusable value, and the
+// message names the shape so the user knows what to type instead.
+func absoluteClientDir(env string) (string, error) {
+	resolved := normalizeHostPath(env)
+	if resolved.Absolute {
+		return resolved.Path, nil
+	}
+	if runtime.GOOS == "windows" && looksLikeGitBashPath(env) {
+		return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%s\n"+
+			"Either fix the path, or set ENGRAM_CLIENT_DIR=none to turn directory forwarding off\n"+
+			"(the daemon then resolves projects from its own working directory)", gitBashDirectoryHint(env))
+	}
+	abs, err := filepath.Abs(resolved.Path)
+	if err != nil {
+		// filepath.Abs fails only when the working directory cannot be read, and
+		// that is not something the user can act on from the variable — say both
+		// halves, since the value alone is not the problem.
+		return "", fmt.Errorf("connect: ENGRAM_CLIENT_DIR=%q is relative and this process's working "+
+			"directory could not be read to resolve it: %w\n"+
+			"Set ENGRAM_CLIENT_DIR to an absolute path, or to none to turn directory forwarding off", env, err)
+	}
+	return abs, nil
+}
+
+// resolvedFrom is the parenthetical that names the ORIGINAL value when it
+// differs from the absolute one. A message that quotes only the resolved path
+// leaves a user who set "." staring at a directory they never typed.
+func resolvedFrom(env, dir string) string {
+	switch {
+	case env == dir:
+		return ""
+	case looksLikeGitBashPath(env):
+		return fmt.Sprintf(" (translated from the Git Bash path %q)", env)
+	default:
+		return fmt.Sprintf(" (resolved from %q against this process's working directory)", env)
+	}
 }
 
 // snapshot returns the current port and token under lock.
