@@ -1,7 +1,7 @@
 {
   "name": "engram",
   "description": "Persistent memory for AI coding agents. Survives across sessions and compactions.",
-  "version": "0.1.0",
+  "version": "1.6.0",
   "homepage": "https://github.com/mariesqu/engram",
   "repository": "https://github.com/mariesqu/engram",
   "license": "MIT"
