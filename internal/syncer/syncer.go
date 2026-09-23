@@ -536,6 +536,9 @@ func Sync(ctx context.Context, n *Node, central Central, project string) (pushed
 //  1. Push: drain the outbox (project-agnostic, policy-filtered) to central once.
 //  2. ListProjects: discover all projects known to n's local store.
 //  3. Pull each project using its own per-project cursor.
+//  4. BackfillCreatedAt (FUP-005c): after a SUCCESSFUL pull, attempt the
+//     one-time created_at backfill for that project. A no-op after the first
+//     completion (one cheap local read); see BackfillCreatedAt's doc comment.
 //
 // Policy filter on pull (PR-②): projects with policy local-only or omitted are
 // excluded from the pull loop entirely.  Their per-project cursors remain
@@ -625,6 +628,16 @@ func SyncAllProjects(ctx context.Context, n *Node, central Central) (pushed, pul
 		pulled += cnt
 		if perr != nil {
 			errs = append(errs, perr)
+			continue // do not attempt the backfill against a central we just failed to reach
+		}
+
+		// FUP-005c: the one-time created_at backfill, attempted only after a
+		// SUCCESSFUL pull for this project — confirmation central is reachable
+		// and this writer is authenticated this round. It is a no-op (one cheap
+		// local read) on every call after the first successful completion, so
+		// this costs nothing once a project is backfilled.
+		if _, err := BackfillCreatedAt(ctx, n, central, proj); err != nil {
+			errs = append(errs, fmt.Errorf("SyncAllProjects %s: created_at backfill %q: %w", n.Name, proj, err))
 		}
 	}
 

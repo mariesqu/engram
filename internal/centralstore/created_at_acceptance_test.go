@@ -72,11 +72,7 @@ func TestOriginalCreatedAt_ReturnsEarliestOccurredAtPerSyncID(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("entries = %+v, want exactly 1 (one sync_id)", entries)
 	}
-	got, err := time.Parse(time.RFC3339Nano, entries[0].CreatedAt)
-	if err != nil {
-		t.Fatalf("parse CreatedAt %q: %v", entries[0].CreatedAt, err)
-	}
-	if !got.Equal(original) {
+	if got := entries[0].CreatedAt; !got.Equal(original) {
 		t.Errorf("CreatedAt = %v, want the EARLIEST occurred_at %v, not the revision's %v", got, original, revision)
 	}
 }

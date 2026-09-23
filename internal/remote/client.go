@@ -445,3 +445,77 @@ func (c *Client) State(ctx context.Context) (WriterState, error) {
 	}
 	return WriterState{PurgeEpoch: sr.PurgeEpoch}, nil
 }
+
+// OriginalCreatedAt fetches ONE PAGE of (sync_id, earliest occurred_at) pairs
+// for project (POST /v1/created-at, HMAC-signed like every other route),
+// starting strictly after the after cursor ("" for the first page). This is
+// the client side of FUP-005's created_at backfill: a node that pulled a
+// memory before execInsert started reading OccurredAt still shows the date it
+// happened to apply the pull, and central — the append-only journal every
+// push for a sync_id's whole history lands in — is the only place with the
+// true original date to correct it from.
+//
+// A 404 (an older central predating this route's introduction — the catch-all
+// 404, matching isDiscoveryUnsupported's real mixed-version case), a 405
+// (method mismatch against a route an old central answers differently), or a
+// 501 (the wrapped Central lacks the createdAtLister capability) are all
+// "not supported by this server" — the caller (syncer's backfill driver) is
+// expected to treat every one of them the same way project discovery treats
+// 404/501: skip quietly this round and retry the NEXT time the backfill is
+// attempted (an older central may be upgraded later; a 501 rarely resolves on
+// its own, but retrying costs one cheap round-trip). Any OTHER non-2xx status
+// returns a *StatusError as usual.
+//
+// Returns []domain.CreatedAtEntry, not the wire DTO — mirroring PullSince
+// (which decodes syncwire.WireMutation into domain.Mutation before
+// returning): the wire's string-typed CreatedAt exists only for JSON and is
+// parsed here, once, rather than leaking a text-timestamp type to callers.
+func (c *Client) OriginalCreatedAt(ctx context.Context, project, after string, limit int) ([]domain.CreatedAtEntry, error) {
+	body, err := json.Marshal(syncwire.CreatedAtRequest{
+		Project: project,
+		After:   after,
+		Limit:   limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("remote.OriginalCreatedAt: marshal CreatedAtRequest: %w", err)
+	}
+
+	req, err := c.buildRequest(ctx, http.MethodPost, "/v1/created-at", body)
+	if err != nil {
+		return nil, fmt.Errorf("remote.OriginalCreatedAt: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("remote.OriginalCreatedAt: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("remote.OriginalCreatedAt: read response body: %w", err)
+	}
+	// Status before size cap (see Apply): the 404/405/501 that mean "this server
+	// does not support the backfill" must survive as a StatusError.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, &StatusError{Code: resp.StatusCode, Body: statusBody(respBody)}
+	}
+	if len(respBody) > maxResponseBytes {
+		return nil, fmt.Errorf("remote.OriginalCreatedAt: response body exceeds cap of %d bytes: %w",
+			maxResponseBytes, transport.ErrResponseTooLarge)
+	}
+
+	var cr syncwire.CreatedAtResponse
+	if err := json.Unmarshal(respBody, &cr); err != nil {
+		return nil, fmt.Errorf("remote.OriginalCreatedAt: decode CreatedAtResponse: %w", err)
+	}
+	entries := make([]domain.CreatedAtEntry, len(cr.Entries))
+	for i, e := range cr.Entries {
+		t, err := time.Parse(time.RFC3339Nano, e.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("remote.OriginalCreatedAt: parse created_at[%d] %q: %w", i, e.CreatedAt, err)
+		}
+		entries[i] = domain.CreatedAtEntry{SyncID: e.SyncID, CreatedAt: t.UTC()}
+	}
+	return entries, nil
+}

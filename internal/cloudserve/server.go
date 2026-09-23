@@ -44,6 +44,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/syncwire"
 	"github.com/mariesqu/engram/internal/transport"
 	"github.com/mariesqu/engram/internal/wireauth"
@@ -724,8 +725,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 // satisfies it; a Central that does not causes /v1/created-at to return 501 —
 // the SAME capability-gating pattern as projectLister/projectDeleter/
 // writerPurgeEpoch above.
+//
+// Returns []domain.CreatedAtEntry (like PullSince returns []domain.Mutation),
+// not the wire DTO — handleCreatedAt converts to syncwire.CreatedAtEntry only
+// at the JSON boundary.
 type createdAtLister interface {
-	OriginalCreatedAt(ctx context.Context, project, after string, limit int) ([]syncwire.CreatedAtEntry, error)
+	OriginalCreatedAt(ctx context.Context, project, after string, limit int) ([]domain.CreatedAtEntry, error)
 }
 
 // handleCreatedAt processes a POST /v1/created-at request — the client
@@ -773,7 +778,11 @@ func (s *Server) handleCreatedAt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, syncwire.CreatedAtResponse{Entries: entries})
+	wire := make([]syncwire.CreatedAtEntry, len(entries))
+	for i, e := range entries {
+		wire[i] = syncwire.CreatedAtEntry{SyncID: e.SyncID, CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339Nano)}
+	}
+	writeJSON(w, http.StatusOK, syncwire.CreatedAtResponse{Entries: wire})
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

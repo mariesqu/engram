@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mariesqu/engram/internal/cloudserve"
 	"github.com/mariesqu/engram/internal/domain"
@@ -19,13 +20,15 @@ import (
 
 // createdAtCentral is a test Central that implements BOTH the core transport
 // interface AND the optional createdAtLister capability (structurally — the
-// interface itself is unexported in package cloudserve).
+// interface itself is unexported in package cloudserve). It returns
+// []domain.CreatedAtEntry, matching centralstore.Store.OriginalCreatedAt's own
+// signature (the wire conversion happens inside handleCreatedAt, not here).
 type createdAtCentral struct {
 	*mockCentral
 
 	// entriesByProject maps project → the full ordered entry set OriginalCreatedAt
 	// paginates over (keyset by SyncID, exactly like the real implementation).
-	entriesByProject map[string][]syncwire.CreatedAtEntry
+	entriesByProject map[string][]domain.CreatedAtEntry
 	err              error
 
 	gotProject string
@@ -41,13 +44,13 @@ func (c *createdAtCentral) PullSince(ctx context.Context, project string, sinceS
 	return c.mockCentral.PullSince(ctx, project, sinceSeq, limit)
 }
 
-func (c *createdAtCentral) OriginalCreatedAt(_ context.Context, project, after string, limit int) ([]syncwire.CreatedAtEntry, error) {
+func (c *createdAtCentral) OriginalCreatedAt(_ context.Context, project, after string, limit int) ([]domain.CreatedAtEntry, error) {
 	c.gotProject, c.gotAfter, c.gotLimit = project, after, limit
 	if c.err != nil {
 		return nil, c.err
 	}
 	all := c.entriesByProject[project]
-	var page []syncwire.CreatedAtEntry
+	var page []domain.CreatedAtEntry
 	for _, e := range all {
 		if after != "" && e.SyncID <= after {
 			continue
@@ -93,10 +96,10 @@ func postCreatedAt(t *testing.T, url string, req syncwire.CreatedAtRequest) (*ht
 func TestHandleCreatedAt_ReturnsPage(t *testing.T) {
 	central := &createdAtCentral{
 		mockCentral: &mockCentral{},
-		entriesByProject: map[string][]syncwire.CreatedAtEntry{
+		entriesByProject: map[string][]domain.CreatedAtEntry{
 			"proj-a": {
-				{SyncID: "sync-1", CreatedAt: "2020-01-01T00:00:00Z"},
-				{SyncID: "sync-2", CreatedAt: "2021-06-15T00:00:00Z"},
+				{SyncID: "sync-1", CreatedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)},
+				{SyncID: "sync-2", CreatedAt: time.Date(2021, 6, 15, 0, 0, 0, 0, time.UTC)},
 			},
 		},
 	}
@@ -130,10 +133,10 @@ func TestHandleCreatedAt_ReturnsPage(t *testing.T) {
 func TestHandleCreatedAt_KeysetPagingReachesEmptyPage(t *testing.T) {
 	central := &createdAtCentral{
 		mockCentral: &mockCentral{},
-		entriesByProject: map[string][]syncwire.CreatedAtEntry{
+		entriesByProject: map[string][]domain.CreatedAtEntry{
 			"proj-b": {
-				{SyncID: "sync-1", CreatedAt: "2020-01-01T00:00:00Z"},
-				{SyncID: "sync-2", CreatedAt: "2020-01-02T00:00:00Z"},
+				{SyncID: "sync-1", CreatedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)},
+				{SyncID: "sync-2", CreatedAt: time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)},
 			},
 		},
 	}

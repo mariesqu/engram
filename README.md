@@ -206,6 +206,8 @@ SELECT tablename FROM pg_tables WHERE schemaname = 'engram' ORDER BY tablename;
 -- central_tombstones, central_user_prompts, cloud_sync_audit, cloud_writer_keys
 ```
 
+**`created_at` semantics.** A memory's `created_at` is the ORIGINAL write time (the mutation's `occurred_at`, carried on the wire), not the moment any particular node happened to pull it — the same memory shows the same creation date on every node, in `mem_get_observation`'s "Created:" line, in `created_from`/`created_to` search filters, and in ordering. On first connecting to a NEW central (or after upgrading from a version that predated this), each node automatically backfills `created_at` for its already-synced projects once, correcting any row that had defaulted to a pull's arrival time; nothing to run manually. An older central without the backfill endpoint is simply skipped (retried automatically once it is upgraded), and an older client talking to a new central keeps working exactly as before.
+
 ### 1. Start the central server
 
 ```bash

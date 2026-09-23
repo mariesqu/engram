@@ -145,6 +145,20 @@ type Mutation struct {
 	Payload []byte
 }
 
+// CreatedAtEntry is one sync_id's ORIGINAL creation time — the earliest
+// occurred_at central has ever recorded for that identity, across every
+// mutation any writer ever pushed for it (see centralstore.Store.
+// OriginalCreatedAt / transport's optional created-at-backfill capability,
+// FUP-005). It is the shared, transport-agnostic shape both
+// *centralstore.Store and *remote.Client return from OriginalCreatedAt,
+// mirroring how PullSince/Apply exchange domain.Mutation rather than a wire
+// DTO — the wire format (syncwire.CreatedAtEntry, a string-typed CreatedAt
+// for JSON) exists only at the actual HTTP boundary inside cloudserve/remote.
+type CreatedAtEntry struct {
+	SyncID    string
+	CreatedAt time.Time
+}
+
 // Action is the low-level operation the adapter must execute.
 type Action int
 

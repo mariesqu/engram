@@ -47,7 +47,7 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
 - [x] **FUP-004d — Visibility: doctor check + CLI for parked mutations** — Route: delegated writer
 - [x] **FUP-005a — Client: stamp created_at from occurred_at** — Route: delegated writer
 - [x] **FUP-005b — Server: serve original creation times** — Route: delegated writer
-- [ ] **FUP-005c — Client: backfill created_at once per project** — Route: delegated writer
+- [x] **FUP-005c — Client: backfill created_at once per project** — Route: delegated writer
 
 ## Progress
 
@@ -363,6 +363,63 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   acceptance -count=1` (ENGRAM_DSN unset, embedded-postgres): ok.
   Commit: pending (recorded after commit).
 
+- FUP-005c done (delegated writer), closing FUP-005 and the whole feature
+  document. REFACTOR (small, justified, done as part of this task): changed
+  centralstore.Store.OriginalCreatedAt's return type from
+  []syncwire.CreatedAtEntry to []domain.CreatedAtEntry (new type added to
+  internal/domain/memory.go) to match the established PullSince/Apply
+  convention — every OTHER Central capability exchanges domain or primitive
+  types, never the wire DTO; cloudserve's handleCreatedAt now converts
+  domain→wire at the JSON boundary, and remote.Client.OriginalCreatedAt
+  parses wire→domain (time.Parse RFC3339Nano) before returning. Updated the
+  two FUP-005b test files (server_createdat_test.go,
+  created_at_acceptance_test.go) to the new type; both already-committed
+  FUP-005b behavior is otherwise unchanged (same routes, same statuses,
+  same paging contract) — verified by re-running the full acceptance
+  suites for both packages, all green.
+  New: remote.Client.OriginalCreatedAt (mirrors PullSince's shape, treats
+  404/405/501 as StatusError like ListProjects/State already do).
+  internal/localstore/created_at_backfill.go: Store.BackfillCreatedAt
+  (older-of-the-two per sync_id, unknown sync_id skipped, review_after
+  deliberately left untouched — documented in code: no reviewed/never-
+  reviewed marker exists independent of review_after itself, per the
+  brief's own fallback instruction), Store.CreatedAtBackfillDone/
+  MarkCreatedAtBackfillDone backed by new schema v17 table
+  created_at_backfill(project PK, completed_at) — additive, own table
+  rather than a project_policy column since completion tracking and policy
+  are unrelated concerns. internal/syncer/created_at_backfill.go:
+  BackfillCreatedAt (the paging driver, keyset cursor, page limit 500),
+  wired into SyncAllProjects right after a successful per-project Pull
+  (skipped entirely on a failed pull); isCreatedAtUnsupported classifies
+  404/405/501 as "not this round, stays retryable" — matches
+  isDiscoveryUnsupported's existing pattern exactly.
+  DEVIATION on "resumable": a run interrupted mid-paging does NOT persist
+  a resume cursor — the next attempt restarts from page one. This is safe
+  (BackfillCreatedAt's per-page UPDATE is idempotent and each page's
+  effect is durable immediately, so a retry only re-applies already-
+  correct rows) but not literally cursor-resumption; documented in code
+  and covered by a dedicated test proving the interrupted run's partial
+  progress survives and a second run still converges and marks done.
+  Tests added: `internal/remote/client_createdat_test.go` (4: 200 decode+
+  parse, 200 empty, 404 StatusError, 501 StatusError).
+  `internal/localstore/created_at_backfill_test.go` (4: older-of-two,
+  unknown sync_id skipped, empty-entries no-op, done-tracking scoped per
+  project). `internal/syncer/created_at_backfill_test.go` (6: full paging
+  success + marks done, already-done makes zero network calls, capability-
+  absent no-op, 404 skips quietly and stays retryable, generic error
+  propagates and stays retryable, interrupted-then-retried convergence).
+  No existing assertion changed anywhere.
+  Verification: `go build ./...`: ok. `go vet ./...`: ok.
+  `go test ./cmd/... ./internal/... -count=1` (ENGRAM_DSN unset): all
+  packages ok except the three known environmental failures.
+  `go test ./internal/centralstore/... ./internal/cloudserve/... -tags
+  acceptance -count=1` (ENGRAM_DSN unset, embedded-postgres): ok (90s +
+  58s, full suites, confirming the domain.CreatedAtEntry refactor and v17
+  schema change regressed nothing already covered there).
+  Commit: pending (recorded after commit).
+
 ## Next Step
 
-FUP-005c (client backfill, once per project).
+FUP-001 through FUP-005 are all closed. Nothing further planned in this
+feature document; a new ODD feature document should be created for any
+follow-on work.

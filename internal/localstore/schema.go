@@ -209,7 +209,18 @@ import (
 //	(ALTER TABLE ADD COLUMN, guarded by PRAGMA table_info like v2→v3's
 //	last_write_mutation_id), and the index is CREATE INDEX IF NOT EXISTS, so a
 //	fresh DB where ApplySchema already created them is a no-op here.
-const currentSchemaVersion = 16
+//
+// v16 → v17: add created_at_backfill(project PK, completed_at) (FUP-005c).
+//
+//	Tracks, per project, whether this node has already run the ONE-TIME
+//	created_at backfill against central's new /v1/created-at endpoint (see
+//	syncer's BackfillCreatedAt) — a row present means "done, do not repeat".
+//	A separate table rather than a project_policy column: policy and backfill
+//	completion are unrelated concerns, and a project with no row here simply
+//	has not been backfilled yet (including one that predates this feature
+//	entirely), which is the correct default with no data migration needed.
+//	CREATE TABLE IF NOT EXISTS makes this idempotent for a fresh DB.
+const currentSchemaVersion = 17
 
 // ── Shared FTS DDL constants (single source of truth) ───────────────────────
 //
@@ -628,9 +639,17 @@ func runMigrations(db *sql.DB) error {
 		ver = 16
 	}
 
+	if ver < 17 {
+		if err := migrateV16ToV17(db); err != nil {
+			return err
+		}
+		// Keep ver in sync so future migration cases evaluate the correct version.
+		ver = 17
+	}
+
 	// ver is read by the `if ver < N` conditions above. This blank read consumes
-	// the final `ver = 16` assignment so it is not flagged as ineffectual (SA4006);
-	// the value stays in sync for any future `if ver < 17` migration block.
+	// the final `ver = 17` assignment so it is not flagged as ineffectual (SA4006);
+	// the value stays in sync for any future `if ver < 18` migration block.
 	_ = ver
 	return nil
 }
@@ -1558,6 +1577,40 @@ func migrateV15ToV16(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// createdAtBackfillTableDDL is the authoritative CREATE TABLE statement for
+// created_at_backfill — shared between ApplySchema and migrateV16ToV17 so
+// both install the identical schema. See the currentSchemaVersion v16→v17
+// note for the FUP-005c rationale.
+const createdAtBackfillTableDDL = `CREATE TABLE IF NOT EXISTS created_at_backfill (
+	project      TEXT PRIMARY KEY,
+	completed_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`
+
+// migrateV16ToV17 creates created_at_backfill. A fresh DB created by
+// ApplySchema already has it (CREATE TABLE IF NOT EXISTS), so this migration
+// is a no-op there.
+//
+// All work runs inside ONE transaction with the unconditional defer
+// tx.Rollback() + return tx.Commit() pattern: Commit succeeds → deferred
+// Rollback is a no-op; any error → deferred Rollback reverts everything and
+// user_version stays at 16.
+func migrateV16ToV17(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if _, err := tx.Exec(createdAtBackfillTableDDL); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 17`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ApplySchema creates all tables, indexes, FTS5 virtual table, and triggers
 // in db. All statements use IF NOT EXISTS / CREATE INDEX IF NOT EXISTS so
 // the function is fully idempotent and safe to call on every Open.
@@ -1678,6 +1731,9 @@ func ApplySchema(db *sql.DB) error {
 		// ── daemon_meta — generic daemon-scoped key/value settings (v12) ─────
 		// First consumer: honored_purge_epoch (remote-purge feature).
 		daemonMetaTableDDL,
+
+		// ── created_at_backfill — FUP-005c one-time-per-project marker (v17) ──
+		createdAtBackfillTableDDL,
 
 		// ── Indexes ──────────────────────────────────────────────────────────
 		`CREATE INDEX IF NOT EXISTS idx_mem_topic

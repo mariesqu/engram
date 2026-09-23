@@ -3,9 +3,8 @@ package centralstore
 import (
 	"context"
 	"fmt"
-	"time"
 
-	"github.com/mariesqu/engram/internal/syncwire"
+	"github.com/mariesqu/engram/internal/domain"
 )
 
 // createdAtDefaultLimit / createdAtMaxLimit mirror cloudserve's own pull
@@ -34,7 +33,12 @@ const (
 // An empty result (nil, nil) signals the project is fully paged — the
 // client's backfill loop stops there, mirroring PullSince's own
 // empty-batch-means-drained contract.
-func (s *Store) OriginalCreatedAt(ctx context.Context, project, after string, limit int) ([]syncwire.CreatedAtEntry, error) {
+//
+// Returns []domain.CreatedAtEntry, not a syncwire type: this mirrors
+// PullSince/Apply, which exchange domain.Mutation rather than
+// syncwire.WireMutation — the wire DTO belongs at the actual HTTP boundary
+// (cloudserve's handler converts this to syncwire.CreatedAtEntry for JSON).
+func (s *Store) OriginalCreatedAt(ctx context.Context, project, after string, limit int) ([]domain.CreatedAtEntry, error) {
 	switch {
 	case limit <= 0:
 		limit = createdAtDefaultLimit
@@ -56,19 +60,14 @@ func (s *Store) OriginalCreatedAt(ctx context.Context, project, after string, li
 	}
 	defer rows.Close()
 
-	var out []syncwire.CreatedAtEntry
+	var out []domain.CreatedAtEntry
 	for rows.Next() {
-		var (
-			syncID    string
-			createdAt time.Time
-		)
-		if err := rows.Scan(&syncID, &createdAt); err != nil {
+		var e domain.CreatedAtEntry
+		if err := rows.Scan(&e.SyncID, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("centralstore.OriginalCreatedAt(%q): scan: %w", project, err)
 		}
-		out = append(out, syncwire.CreatedAtEntry{
-			SyncID:    syncID,
-			CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
-		})
+		e.CreatedAt = e.CreatedAt.UTC()
+		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("centralstore.OriginalCreatedAt(%q): rows: %w", project, err)
