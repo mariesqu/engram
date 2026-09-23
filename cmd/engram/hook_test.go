@@ -107,6 +107,26 @@ func runHook(t *testing.T, event string, input map[string]any, args ...string) s
 	return runHookRaw(t, event, string(body), args...)
 }
 
+// withUnhurriedHookBudget lifts one event's budget for the rest of the test.
+//
+// For tests that assert WHAT a hook stored, not how fast: under the real 200ms
+// prompt budget, a loaded CI box (Windows runners especially) can spend the
+// whole budget before the save goes out, the hook fails open exactly as it
+// should, and the test then reads "sql: no rows" — a flake that says nothing
+// about the behaviour under test. The budget contract has its own tests
+// (TestHookUserPromptSubmit_NoDaemonStaysWithinBudget,
+// TestHookUserPromptSubmit_SlowControlAPIStaysWithinBudget,
+// TestHookBudgets_FitInsideEveryPackTimeout), which never call this.
+func withUnhurriedHookBudget(t *testing.T, event string) {
+	t.Helper()
+	old, ok := hookBudgets[event]
+	if !ok {
+		t.Fatalf("no budget for hook event %q", event)
+	}
+	hookBudgets[event] = time.Minute
+	t.Cleanup(func() { hookBudgets[event] = old })
+}
+
 // runHookRaw is runHook with a verbatim stdin body, for the malformed-input cases.
 //
 // It isolates the hook state directory itself rather than trusting each test to
@@ -321,6 +341,7 @@ func TestHookSessionStart_NoDaemon_StillPrintsThePointer(t *testing.T) {
 // session: the prompt is captured AND the tool bootstrap is injected, in the
 // only field a UserPromptSubmit hook can reach the model through.
 func TestHookUserPromptSubmit_FirstPromptBootstraps(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "prompt-repo")
 	sessionID := "hook-prompt-" + t.Name()
@@ -784,7 +805,7 @@ func (stubConfigStore) Apply(controlapi.ConfigPatch) (bool, error) { return fals
 func cleanupHookState(t *testing.T, sessionID string) {
 	t.Helper()
 	remove := func() {
-		for _, kind := range []string{"tools-loaded", "last-nudge"} {
+		for _, kind := range []string{"tools-loaded", "last-nudge", "project"} {
 			_ = os.Remove(hookStateFile(sessionID, kind))
 		}
 	}
@@ -1237,6 +1258,7 @@ func TestHookSessionEnd_ClearsSessionState(t *testing.T) {
 // test for a duplicate prompt save: the SAME prompt, in the SAME session,
 // delivered twice, must be captured exactly once.
 func TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "dup-prompt-repo")
 	sessionID := "hook-dup-prompt-" + t.Name()
@@ -1264,6 +1286,7 @@ func TestHookUserPromptSubmit_DuplicateDeliverySavesPromptOnce(t *testing.T) {
 // the marker has aged past hookOccurrenceDedupWindow, is a new occurrence (a
 // retyped "continue"), not a duplicate delivery, and must be saved again.
 func TestHookUserPromptSubmit_DedupWindowExpiryStillSaves(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "stale-marker-prompt-repo")
 	sessionID := "hook-stale-marker-prompt-" + t.Name()
@@ -1292,6 +1315,7 @@ func TestHookUserPromptSubmit_DedupWindowExpiryStillSaves(t *testing.T) {
 // on the occurrence, not just the session: two DIFFERENT prompts in the same
 // session must both be captured.
 func TestHookUserPromptSubmit_DifferentPromptsBothSaved(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "distinct-prompt-repo")
 	sessionID := "hook-distinct-prompt-" + t.Name()
@@ -1628,7 +1652,12 @@ func TestReadHookInput_StillReadsAClosedStdinImmediately(t *testing.T) {
 // TestHookUserPromptSubmit_TruncatesAHugePrompt — a prompt can carry a pasted
 // file. Saved whole it becomes a memory nobody can read, and mem_save then
 // attaches it to an observation, spending the model's context on it twice.
+//
+// It asserts the stored bytes, so it runs without the 200ms budget: under that
+// budget a loaded Windows CI runner timed out the save (fail-open, correctly)
+// and this read "sql: no rows". See withUnhurriedHookBudget.
 func TestHookUserPromptSubmit_TruncatesAHugePrompt(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit")
 	dbPath, components := hookDaemonFixture(t)
 	repo := pinnedProjectDir(t, "huge-prompt-repo")
 	sessionID := "hook-huge-" + t.Name()
@@ -1682,5 +1711,93 @@ func TestHookUserPromptSubmit_SlowControlAPIStaysWithinBudget(t *testing.T) {
 	// is nowhere near the server's 2s sleep.
 	if limit := time.Second; elapsed > limit {
 		t.Errorf("hook took %v against a daemon that sleeps 2s, want well under %v", elapsed, limit)
+	}
+}
+
+// ─── the per-session project cache ──────────────────────────────────────────
+
+// TestHookSessionStart_CachesProjectForThePromptHook — session-start resolves
+// the workspace inside an 8s budget; the prompt hook must not pay for that
+// again (two git spawns in the daemon) inside its 200ms one.
+func TestHookSessionStart_CachesProjectForThePromptHook(t *testing.T) {
+	dbPath, _ := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "cached-start-repo")
+	sessionID := "hook-cache-start-" + t.Name()
+	cleanupHookState(t, sessionID)
+
+	_ = runHook(t, "session-start", map[string]any{"session_id": sessionID, "cwd": repo},
+		"--db", dbPath, "--no-autostart")
+
+	if got := hookCachedProject(sessionID, repo); got != "cached-start-repo" {
+		t.Errorf("cached project after session-start = %q, want %q", got, "cached-start-repo")
+	}
+}
+
+// TestHookUserPromptSubmit_UsesCachedProject proves a cache hit skips the
+// resolution entirely: the cache names a project the workspace would NOT
+// resolve to, so a prompt filed under it can only have come from the cache.
+// A cache written for a different cwd is a different question and must miss.
+func TestHookUserPromptSubmit_UsesCachedProject(t *testing.T) {
+	withUnhurriedHookBudget(t, "user-prompt-submit") // asserts what was stored, not how fast
+	dbPath, components := hookDaemonFixture(t)
+	repo := pinnedProjectDir(t, "live-repo")
+
+	hit := "hook-cache-hit-" + t.Name()
+	cleanupHookState(t, hit)
+	hookCacheProject(hit, repo, "cached-repo")
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": hit, "cwd": repo, "prompt": "from the cache",
+	}, "--db", dbPath)
+
+	miss := "hook-cache-miss-" + t.Name()
+	cleanupHookState(t, miss)
+	hookCacheProject(miss, t.TempDir(), "cached-repo")
+	_ = runHook(t, "user-prompt-submit", map[string]any{
+		"session_id": miss, "cwd": repo, "prompt": "resolved live",
+	}, "--db", dbPath)
+
+	for _, tc := range []struct {
+		session, project, prompt string
+		want                     int
+	}{
+		{hit, "cached-repo", "from the cache", 1},
+		{hit, "live-repo", "from the cache", 0},
+		{miss, "live-repo", "resolved live", 1},
+		{miss, "cached-repo", "resolved live", 0},
+	} {
+		count, err := components.store.CountPromptsForSession(tc.session, tc.project, tc.prompt)
+		if err != nil {
+			t.Fatalf("CountPromptsForSession: %v", err)
+		}
+		if count != tc.want {
+			t.Errorf("prompt %q under project %q: %d, want %d", tc.prompt, tc.project, count, tc.want)
+		}
+	}
+	// The live answer is cached for the session's next prompt.
+	if got := hookCachedProject(miss, repo); got != "live-repo" {
+		t.Errorf("cached project after a live resolution = %q, want %q", got, "live-repo")
+	}
+}
+
+// TestHookProjectCache_RefusalsAreNotCachedAndClearStateRemovesIt — an empty
+// answer is a refused workspace, and caching it would outlive whatever made
+// it; and a resumed or ended session must resolve afresh.
+func TestHookProjectCache_RefusalsAreNotCachedAndClearStateRemovesIt(t *testing.T) {
+	isolateHookStateDir(t)
+	const sessionID = "hook-cache-clear"
+	cwd := t.TempDir()
+
+	hookCacheProject(sessionID, cwd, "")
+	if _, err := os.Stat(hookStateFile(sessionID, hookStateProject)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("an empty (refused) project was cached: stat err = %v", err)
+	}
+
+	hookCacheProject(sessionID, cwd, "p")
+	if got := hookCachedProject(sessionID, cwd); got != "p" {
+		t.Fatalf("hookCachedProject = %q, want %q", got, "p")
+	}
+	hookClearState(sessionID)
+	if got := hookCachedProject(sessionID, cwd); got != "" {
+		t.Errorf("hookClearState left the cached project %q behind", got)
 	}
 }

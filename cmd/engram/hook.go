@@ -656,6 +656,9 @@ func hookSessionStart(ctx context.Context, dbFlag string, in hookInput, compacti
 		fmt.Fprintf(os.Stderr, "engram hook session-start: %v\n", err)
 	} else {
 		project = hookResolveProject(ctx, client, in.CWD)
+		// Paid for here, inside an 8s budget, so the 200ms prompt hook does not
+		// have to pay for it again on every message. See hookCacheProject.
+		hookCacheProject(in.SessionID, in.CWD, project)
 		if project != "" && strings.TrimSpace(in.SessionID) != "" {
 			if _, err := client.callTool(ctx, "mem_session_start", map[string]any{
 				"id":        in.SessionID,
@@ -866,6 +869,11 @@ func hookUserPromptSubmit(ctx context.Context, dbFlag string, in hookInput) {
 // memoized too: a workspace that could not be resolved once will not resolve on
 // a second call, and retrying it inside a 200ms budget spends the budget twice
 // to learn the same thing.
+//
+// Across runs it goes through the per-session cache (hookCachedProject): a hit
+// costs one small file read instead of a daemon round trip that spawns git
+// twice, and a live answer is cached for the next prompt of the same session.
+// A session whose session-start hook ran therefore never resolves here at all.
 func onceProject(ctx context.Context, client *mcpBridge, in hookInput) func() string {
 	var (
 		project string
@@ -873,7 +881,10 @@ func onceProject(ctx context.Context, client *mcpBridge, in hookInput) func() st
 	)
 	return func() string {
 		if !done {
-			project = hookProject(ctx, client, in)
+			if project = hookCachedProject(in.SessionID, in.CWD); project == "" {
+				project = hookProject(ctx, client, in)
+				hookCacheProject(in.SessionID, in.CWD, project)
+			}
 			done = true
 		}
 		return project
@@ -1182,6 +1193,9 @@ const (
 	hookStateToolsLoaded = "tools-loaded"
 	// hookStateLastNudge marks when the save reminder last fired.
 	hookStateLastNudge = "last-nudge"
+	// hookStateProject caches the project the session's workspace resolved to
+	// (see hookCacheProject). Unlike the two markers above it has content.
+	hookStateProject = "project"
 )
 
 // hookStateDir returns the directory the per-session markers live in:
@@ -1251,8 +1265,9 @@ func hookSessionHashHex(sessionID string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// hookClearState removes both fixed markers of a session, plus every
-// per-occurrence dedup marker hookClaimOccurrence left behind for it.
+// hookClearState removes the fixed per-session files (both markers and the
+// cached project), plus every per-occurrence dedup marker hookClaimOccurrence
+// left behind for it.
 //
 // It runs at session-start/post-compaction and at session-end, for two
 // different reasons that happen to want the same thing. A `--resume` (and a
@@ -1266,7 +1281,7 @@ func hookClearState(sessionID string) {
 	if strings.TrimSpace(sessionID) == "" {
 		return
 	}
-	for _, kind := range []string{hookStateToolsLoaded, hookStateLastNudge} {
+	for _, kind := range []string{hookStateToolsLoaded, hookStateLastNudge, hookStateProject} {
 		if err := os.Remove(hookStateFile(sessionID, kind)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintf(os.Stderr, "engram hook: could not clear session state: %v\n", err)
 		}
@@ -1474,6 +1489,76 @@ func hookTouchState(path string) {
 	if errors.Is(err, os.ErrExist) {
 		_ = os.Chtimes(path, now, now)
 	}
+}
+
+// ── per-session project cache ───────────────────────────────────────────────
+//
+// Resolving a workspace is the one expensive step on the prompt hook's hot
+// path: mem_current_project makes the daemon run `git` twice (remote, then
+// toplevel — internal/project/detect.go), and on Windows two process spawns
+// measured 65–120ms of a 200ms budget on an idle machine, and blew it outright
+// under load, so the prompt was silently not captured. The answer cannot change
+// within a session for the same cwd, and session-start (8s budget) has already
+// paid for it once, so it is cached per session and user-prompt-submit reads
+// it back instead of asking again.
+
+// hookCachedProjectFile is the cache's on-disk shape. The cwd it was resolved
+// FOR is stored beside the answer: a payload whose cwd differs (the user cd'd,
+// or a host reports a subdirectory) is a different question, and gets a live
+// resolution rather than a stale answer.
+type hookCachedProjectFile struct {
+	CWD     string `json:"cwd"`
+	Project string `json:"project"`
+}
+
+// hookCacheProject records that cwd resolved to project for sessionID. Only a
+// USABLE answer is cached — an empty project means the workspace was refused,
+// and caching the refusal would outlive whatever made it (a directory created a
+// moment later, a monorepo that gained its config). Failures are ignored: a
+// missing cache costs the next prompt one live resolution, nothing more.
+//
+// Written to a temp file and renamed, so a concurrent reader (the prompt hook
+// of a double install) sees the old content or the new, never half a file.
+func hookCacheProject(sessionID, cwd, project string) {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(cwd) == "" || strings.TrimSpace(project) == "" {
+		return
+	}
+	body, err := json.Marshal(hookCachedProjectFile{CWD: cwd, Project: project})
+	if err != nil {
+		return
+	}
+	path := hookStateFile(sessionID, hookStateProject)
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return
+	}
+	_, writeErr := tmp.Write(body)
+	closeErr := tmp.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(tmp.Name())
+		return
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		_ = os.Remove(tmp.Name())
+	}
+}
+
+// hookCachedProject returns the project cached for sessionID when it was
+// resolved for exactly this cwd, and "" otherwise — a miss, which the caller
+// answers with a live resolution.
+func hookCachedProject(sessionID, cwd string) string {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(cwd) == "" {
+		return ""
+	}
+	body, err := os.ReadFile(hookStateFile(sessionID, hookStateProject))
+	if err != nil {
+		return ""
+	}
+	var cached hookCachedProjectFile
+	if err := json.Unmarshal(body, &cached); err != nil || cached.CWD != cwd {
+		return ""
+	}
+	return strings.TrimSpace(cached.Project)
 }
 
 // urlQueryEscape percent-encodes a query-string value. Kept local (and
