@@ -298,6 +298,17 @@ func TestLoop_BackoffRetryable(t *testing.T) {
 // TestLoop_NonRetryableNoHotLoop: a non-retryable (4xx) error must not cause
 // hot-looping. The loop should respect the Interval even after a non-retryable
 // failure.
+//
+// The two things this test proves are measured separately. "The loop runs at
+// all" is a bounded wait for the FIRST sync. "No hot loop" is a count over a
+// window that starts only AFTER that first sync. Measuring both from Start in
+// one 80ms window conflated them: the first cycle does local SQLite work (the
+// NUL-repair scan, the outbox drain, pushing and acking openNode's seed write)
+// before it ever reaches PullSince, and under the full -tags acceptance run
+// (embedded Postgres clusters initialising alongside) it was observed to take
+// longer than 80ms — 0 syncs, reported as a stall, in a run where the test as a
+// whole took 0.54s and the loop was plainly alive. The upper bound is
+// unchanged.
 func TestLoop_NonRetryableNoHotLoop(t *testing.T) {
 	cfg := fastCfg()
 	cfg.Interval = 8 * time.Millisecond
@@ -312,25 +323,26 @@ func TestLoop_NonRetryableNoHotLoop(t *testing.T) {
 	l := syncer.NewLoop(node, central, cfg)
 	l.Start(ctx)
 
-	// Allow 80ms = 10 × Interval. Expect roughly 8-12 syncs (Interval cadence).
+	// 1. The loop runs: the first sync lands. The bound is generous on purpose
+	//    — it only has to separate "slow first cycle" from "never".
+	if got := central.waitN(1, 5*time.Second); got < 1 {
+		cancel()
+		l.Stop()
+		t.Fatal("non-retryable: loop did not run at all (no sync within 5s) — stalled")
+	}
+
+	// 2. No hot loop: over 80ms = 10 × Interval after the first failure, expect
+	//    roughly 8-12 syncs (Interval cadence). A hot loop would give hundreds.
+	before := central.callN.Load()
 	time.Sleep(80 * time.Millisecond)
 	cancel()
 	l.Stop()
 
-	count := int(central.callN.Load())
-	t.Logf("non-retryable syncs in 80ms: %d", count)
+	count := int(central.callN.Load() - before)
+	t.Logf("non-retryable syncs in 80ms after the first failure: %d", count)
 
-	// Hot-loop would give hundreds. Normal cadence gives ~10.
 	if count > 30 {
 		t.Errorf("non-retryable: %d syncs in 80ms — looks like a hot-loop (want ≤30)", count)
-	}
-	// Lower bound is intentionally loose (>=1, not a tight cadence count): under
-	// heavy parallel CPU load (e.g. the full -tags acceptance run) the loop
-	// goroutine can be starved enough to fire only a couple of syncs in 80ms of
-	// wall clock — a scheduling artifact, not a stall. The MEANINGFUL assertion is
-	// the upper bound above (no hot-loop); this floor just proves the loop ran.
-	if count < 1 {
-		t.Errorf("non-retryable: loop did not run at all (%d syncs in 80ms) — stalled", count)
 	}
 }
 

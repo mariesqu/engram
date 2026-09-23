@@ -362,3 +362,56 @@ func TestSyncAllProjects_RetryablePushStillPulls(t *testing.T) {
 		t.Error("PullSince was never called — a retryable push failure must not skip pull")
 	}
 }
+
+// TestLoop_ParkedEntryNotRetriedEachTick is TestLoop_NonRetryableNoHotLoop's
+// intent under FUP-004's mechanism. A permanent Apply rejection no longer
+// surfaces as a cycle error at all: Push parks the entry and returns nil, so
+// the Loop sees a successful round and keeps its normal Interval cadence. What
+// keeps that from being a hot loop against central is that DrainOutbox
+// excludes parked rows — the rejected mutation must reach Apply exactly ONCE,
+// however many ticks run afterwards.
+func TestLoop_ParkedEntryNotRetriedEachTick(t *testing.T) {
+	node := openNode(t, "park-loop")
+	writeVersion(t, node, "proj", "sync-rejected-loop", 1, time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC))
+
+	central := &parkCentral{
+		applyErrFor: map[string]error{
+			"sync-rejected-loop": &parkStatusErr{code: 422, msg: "rejected"},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	l := syncer.NewLoop(node, central, fastCfg())
+	l.Start(ctx)
+
+	// Every round pulls both projects (testproject + proj), so 20 pull calls is
+	// ~10 rounds after the one that parked the entry.
+	deadline := time.Now().Add(5 * time.Second)
+	for central.pullCallCount() < 20 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	l.Stop()
+
+	if n := central.pullCallCount(); n < 20 {
+		t.Fatalf("loop made only %d pull calls in 5s — too few rounds to prove anything", n)
+	}
+	rejectedApplies := 0
+	for _, sid := range central.appliedSyncIDs() {
+		if sid == "sync-rejected-loop" {
+			rejectedApplies++
+		}
+	}
+	if rejectedApplies != 1 {
+		t.Errorf("parked entry reached Apply %d times over %d pull calls, want exactly 1 — "+
+			"a parked entry is being retried every tick", rejectedApplies, central.pullCallCount())
+	}
+	parked, err := node.Store.ListParked()
+	if err != nil {
+		t.Fatalf("ListParked: %v", err)
+	}
+	if len(parked) != 1 {
+		t.Errorf("ListParked returned %d entries, want 1", len(parked))
+	}
+}
