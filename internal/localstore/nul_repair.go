@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/mutation"
 )
 
@@ -90,7 +91,7 @@ func (s *Store) RepairUnackedNULMutations() (int, error) {
 
 // repairOneNULMutation repairs one outbox row inside a SINGLE transaction, so
 // a crash mid-repair can never leave sync_mutations, applied_mutations, and
-// the materialized memories/memory_tombstones rows disagreeing about which
+// the materialized memories/memory_tombstones/user_prompts rows disagreeing about which
 // mutation_id is current. Returns (false, nil) for a benign no-op: the
 // payload no longer decodes (DrainOutbox's own decode-failure park handles
 // that case), sanitizing produced an IDENTICAL payload (nothing to repair —
@@ -188,9 +189,8 @@ func (s *Store) repairOneNULMutation(localSeq int64, oldMutationID, payload stri
 	// UPDATE immediately above) — the same "still this exact write" guard, so
 	// a superseding write's fresher content is never clobbered by this repair.
 	// A prompt mutation's sync_id matches no memories row, so this — and the
-	// last_write_mutation_id updates above — are a harmless no-op for it;
-	// prompts have no last_write_mutation_id column to repair in the first
-	// place (see promptTombstonesTableDDL's doc comment).
+	// last_write_mutation_id updates above — are a harmless no-op for it; its
+	// materialized row is repaired separately below.
 	if _, err := tx.Exec(
 		`UPDATE memories
 		   SET title = ?, content = ?, type = ?, session_id = ?, project = ?, scope = ?,
@@ -202,6 +202,27 @@ func (s *Store) repairOneNULMutation(localSeq int64, oldMutationID, payload stri
 		m.SyncID, newMutationID,
 	); err != nil {
 		return false, fmt.Errorf("update materialized memories row: %w", err)
+	}
+
+	// The materialized user_prompts row, for a prompt upsert. It must be fixed
+	// HERE: the new mutation_id is already in applied_mutations, so the sanitized
+	// prompt coming back on a later pull is a no-op and never touches this row.
+	// user_prompts has no last_write_mutation_id, so the "still this exact write"
+	// guard is the row's content itself: it is rewritten only while every column
+	// the old mutation wrote (applyPromptUpsertTx) still holds that mutation's
+	// exact, unsanitized values. A superseding write (different values) is left
+	// alone, and a deleted prompt (no row) stays deleted — an UPDATE never
+	// re-creates it.
+	if m.EntityType == domain.EntityPrompt && m.Op == domain.OpUpsert {
+		if _, err := tx.Exec(
+			`UPDATE user_prompts
+			   SET session_id = ?, content = ?, project = ?, writer_id = ?
+			 WHERE sync_id = ? AND session_id = ? AND content = ? AND project = ? AND writer_id = ?`,
+			sanitized.SessionID, sanitized.Content, sanitized.Project, sanitized.WriterID,
+			m.SyncID, m.SessionID, m.Content, m.Project, m.WriterID,
+		); err != nil {
+			return false, fmt.Errorf("update materialized user_prompts row: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

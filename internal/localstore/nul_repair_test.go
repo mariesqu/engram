@@ -308,3 +308,111 @@ func containsNUL(s string) bool {
 	}
 	return false
 }
+
+// seedNULOutboxAndPrompt is seedNULOutboxAndMemory's prompt counterpart: a
+// sync_mutations row, its materialized user_prompts row, and the
+// applied_mutations marker, all carrying the same NUL-bearing prompt. Returns
+// the local_seq and the OLD (NUL-derived) mutation_id.
+func seedNULOutboxAndPrompt(t *testing.T, s *Store, syncID string) (int64, string) {
+	t.Helper()
+
+	m := domain.Mutation{
+		Op:         domain.OpUpsert,
+		SyncID:     syncID,
+		SessionID:  "sess",
+		EntityType: domain.EntityPrompt,
+		Content:    "bad\x00prompt",
+		Project:    "engram",
+		Scope:      "project",
+		Version:    1,
+		WriterID:   "writer-nul",
+		UpdatedAt:  baseT,
+	}
+	payload := mutation.CanonicalPayload(m)
+	mutID := mutation.NewMutationID(payload)
+
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_mutations (mutation_id, entity, entity_key, op, payload, writer_id, occurred_at)
+		VALUES (?, 'prompt', ?, 'upsert', ?, 'writer-nul', ?)`,
+		mutID, syncID, string(payload), baseT.Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("seed sync_mutations: %v", err)
+	}
+	var localSeq int64
+	if err := s.db.QueryRow(`SELECT local_seq FROM sync_mutations WHERE mutation_id = ?`, mutID).
+		Scan(&localSeq); err != nil {
+		t.Fatalf("read seeded local_seq: %v", err)
+	}
+	if _, err := s.db.Exec(`
+		INSERT INTO user_prompts (sync_id, session_id, content, project, writer_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		syncID, m.SessionID, m.Content, m.Project, m.WriterID, baseT.Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("seed user_prompts row: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO applied_mutations(mutation_id) VALUES (?)`, mutID); err != nil {
+		t.Fatalf("seed applied_mutations: %v", err)
+	}
+	return localSeq, mutID
+}
+
+// TestRepairUnackedNULMutations_RepairsMaterializedPrompt: a prompt's repair
+// must sanitize the live user_prompts row in the same transaction. The new
+// mutation_id is recorded as applied, so the sanitized prompt coming back on a
+// later pull is a no-op and could never fix the local row itself.
+func TestRepairUnackedNULMutations_RepairsMaterializedPrompt(t *testing.T) {
+	s := openTempStore(t)
+	seedNULOutboxAndPrompt(t, s, "sync-nul-prompt")
+
+	if n, err := s.RepairUnackedNULMutations(); err != nil {
+		t.Fatalf("RepairUnackedNULMutations: %v", err)
+	} else if n != 1 {
+		t.Fatalf("repaired %d row(s), want 1", n)
+	}
+
+	var content string
+	if err := s.db.QueryRow(`SELECT content FROM user_prompts WHERE sync_id = 'sync-nul-prompt'`).
+		Scan(&content); err != nil {
+		t.Fatalf("read user_prompts row: %v", err)
+	}
+	if content != "badprompt" {
+		t.Errorf("user_prompts.content = %q, want the sanitized %q", content, "badprompt")
+	}
+}
+
+// TestRepairUnackedNULMutations_PromptRepairLeavesSupersededAndDeletedRowsAlone:
+// the prompt row is repaired only while it still holds exactly what the old
+// mutation wrote. A superseding write's content is never clobbered, and a
+// deleted prompt is never re-created.
+func TestRepairUnackedNULMutations_PromptRepairLeavesSupersededAndDeletedRowsAlone(t *testing.T) {
+	s := openTempStore(t)
+	seedNULOutboxAndPrompt(t, s, "sync-nul-prompt-superseded")
+	seedNULOutboxAndPrompt(t, s, "sync-nul-prompt-deleted")
+
+	if _, err := s.db.Exec(
+		`UPDATE user_prompts SET content = 'fresh prompt' WHERE sync_id = 'sync-nul-prompt-superseded'`,
+	); err != nil {
+		t.Fatalf("simulate newer write: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM user_prompts WHERE sync_id = 'sync-nul-prompt-deleted'`); err != nil {
+		t.Fatalf("simulate delete: %v", err)
+	}
+
+	if n, err := s.RepairUnackedNULMutations(); err != nil {
+		t.Fatalf("RepairUnackedNULMutations: %v", err)
+	} else if n != 2 {
+		t.Fatalf("repaired %d row(s), want 2 (both outbox entries still repair)", n)
+	}
+
+	var content string
+	if err := s.db.QueryRow(`SELECT content FROM user_prompts WHERE sync_id = 'sync-nul-prompt-superseded'`).
+		Scan(&content); err != nil {
+		t.Fatalf("read superseded row: %v", err)
+	}
+	if content != "fresh prompt" {
+		t.Errorf("the superseding prompt write was clobbered: content=%q", content)
+	}
+	if n := countUserPromptsBySyncID(t, s, "sync-nul-prompt-deleted"); n != 0 {
+		t.Errorf("the deleted prompt was re-created by the repair (%d row(s))", n)
+	}
+}
