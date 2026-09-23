@@ -52,6 +52,8 @@ Make the v1.6.1 codebase a safe base for the provenance roadmap (`sdd/explore/co
 
 - Mapping complete (read-only explorer): isolation root cause traced to config-file fallback in `daemon.go:257-349` and stdio transport default returning exit 0 on empty stdin.
 
+- BH-001: parent follow-up keeps `ENGRAM_TEST_*` harness overrides (e.g. `ENGRAM_TEST_PG_DSN`) out of the unset list.
+
 ## Next Step
 
-Choose chain strategy, then BH-001.
+BH-001 PR through CI and review bot, then BH-002 (size:exception decision).

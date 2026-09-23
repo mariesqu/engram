@@ -65,7 +65,9 @@ func isolateUserEnv() (cleanup func(), err error) {
 	}
 	for _, kv := range os.Environ() {
 		name, _, ok := strings.Cut(kv, "=")
-		if ok && strings.HasPrefix(name, "ENGRAM_") {
+		// ENGRAM_TEST_* are test-harness overrides (e.g. ENGRAM_TEST_PG_DSN),
+		// not user state, so they pass through untouched.
+		if ok && strings.HasPrefix(name, "ENGRAM_") && !strings.HasPrefix(name, "ENGRAM_TEST_") {
 			touched[name] = struct{}{}
 		}
 	}
