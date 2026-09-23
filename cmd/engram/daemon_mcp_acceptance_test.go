@@ -127,6 +127,7 @@ func TestAcceptance_MCPHTTPTransport_RoundTrip(t *testing.T) {
 		"mem_merge_projects",
 		"mem_pin",
 		"mem_unpin",
+		"mem_doctor",
 	}
 	if len(toolsResult.Tools) != len(wantTools) {
 		names := make([]string, len(toolsResult.Tools))
