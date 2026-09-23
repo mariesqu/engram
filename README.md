@@ -32,9 +32,9 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 
 ## Features
 
-- **14 MCP tools** for session tracking, memory write, edit, topic-key suggestion, search, similarity, lifecycle review, project merge, and conflict resolution
+- **18 MCP tools** for project resolution, session tracking, memory write, edit, topic-key suggestion, search, similarity, pinning, lifecycle review, project merge, diagnostics, and conflict resolution
 - **Human memory management** — browse, search, edit, and delete memories, and delete whole projects (local / unshare / purge-all), from both the CLI and the web UI
-- **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open
+- **SQLite store** — single file, WAL mode, FTS5 full-text search, automatic schema migration on open; case-insensitive project lookups (`mem_search`, `mem_context`) use an expression index on `LOWER(project)` rather than a full table scan
 - **Local-only mode** — no network, no credentials required
 - **Optional central sync** — push/pull over HTTP with HMAC-SHA256 per-writer authentication
 - **Autosync** — configurable interval (default 30 s) plus immediate trigger on every write
@@ -62,6 +62,7 @@ In local-only mode the bottom tier is absent. The daemon writes only to the loca
 - [Build from source](#build-from-source)
 - [Quickstart: local-only mode](#quickstart-local-only-mode)
 - [Quickstart: central sync](#quickstart-central-sync)
+- [Upgrading](#upgrading)
 - [Resident daemon](#resident-daemon)
 - [Web UI](#web-ui)
 - [Windows tray](#windows-tray)
@@ -206,7 +207,9 @@ SELECT tablename FROM pg_tables WHERE schemaname = 'engram' ORDER BY tablename;
 -- central_tombstones, central_user_prompts, cloud_sync_audit, cloud_writer_keys
 ```
 
-**`created_at` semantics.** A memory's `created_at` is the ORIGINAL write time (the mutation's `occurred_at`, carried on the wire), not the moment any particular node happened to pull it — the same memory shows the same creation date on every node, in `mem_get_observation`'s "Created:" line, in `created_from`/`created_to` search filters, and in ordering. On first connecting to a NEW central (or after upgrading from a version that predated this), each node automatically backfills `created_at` for its already-synced projects once, correcting any row that had defaulted to a pull's arrival time; nothing to run manually. An older central without the backfill endpoint is simply skipped (retried automatically once it is upgraded), and an older client talking to a new central keeps working exactly as before.
+**`created_at` semantics.** A memory's `created_at` is the ORIGINAL write time (the mutation's `occurred_at`, carried on the wire and stamped at the point of the mutation itself, not at apply or pull time), not the moment any particular node happened to pull it — the same memory shows the same creation date on every node, in `mem_get_observation`'s "Created:" line, in `created_from`/`created_to` search filters, and in ordering. On first connecting to a NEW central (or after upgrading from a version that predated this), each node automatically backfills `created_at` for its already-synced projects once, correcting any row that had defaulted to a pull's arrival time; nothing to run manually. The backfill runs over `POST /v1/created-at`, an endpoint `engram serve` exposes that pages a project's original creation times, keyset-ordered by `sync_id`; the node records completion per project so a fully-backfilled project is never re-walked.
+
+**Compatibility.** The backfill endpoint is additive: an older central that predates it (or any other Central implementation that does not add the capability) returns `404`/`501`, which the node treats as "nothing to do yet" and retries the next time the backfill is attempted — it never blocks ordinary push/pull. A v1.6.0 **client** against a pre-v1.6.0 **central** degrades the same way: push and pull are unaffected, simply without the backfill or the `422`-driven parking behaviour (an older central has no reason to ever return `422` for a permanent rejection, so nothing to park). The other direction is the one to know about: a pre-v1.6.0 **client** against a v1.6.0 **central** still syncs normally in the common case, but it predates the client-side parking logic — if it ever pushes a mutation central rejects with `422` (the NUL-byte case above is the one this release actually fixes), that old client has no park step, so it keeps re-offering the same rejected mutation at the head of every push cycle, which — on that older client's `Push` implementation — halts the *whole* cycle's outbox (not just that one mutation) and skips pull for the round, repeating on every subsequent cycle until the client itself is upgraded or the offending row is removed at the source. Upgrading the client is the fix; the central-side `422` mapping is what makes the upgrade path visible instead of a silent retry loop.
 
 ### 1. Start the central server
 
@@ -258,6 +261,24 @@ $env:ENGRAM_WRITER_KEY = "<hex key>"
   --central-url http://your-central-host:8080 `
   --writer-id my-laptop
 ```
+
+## Upgrading
+
+Local SQLite schema migrations run automatically, in order, every time the local store opens — a v1.6.0 binary opening a database left by an older version applies whatever migrations are pending in sequence, and each one is additive (`ALTER TABLE ADD COLUMN`, `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), so it is safe to run against a database already partway there. There is nothing to run by hand.
+
+v1.6.0 carries five such migrations (schema v13 → v17):
+
+| Version | Adds |
+|---------|------|
+| v13 | The `pinned` column backing `mem_pin`/`mem_unpin`. |
+| v14 | A one-time `review_after` backfill for existing `decision`/`policy`/`preference` rows (the per-type decay map), plus an index that backs `mem_context`'s per-session lookup. |
+| v15 | Expression indexes on `LOWER(project)` for case-insensitive project lookups. |
+| v16 | The `sync_mutations` `attempts`/`last_error`/`last_attempt_at`/`parked_at` columns and their drain index — parked mutations. |
+| v17 | The `created_at_backfill` tracking table (marks a project done after its one-time `created_at` backfill). |
+
+**Restart both ends.** Migrations run at the moment the store is *opened*, not continuously — a resident daemon (or `engram serve`) that is already running when you replace the binary keeps executing the OLD code against the OLD schema until it is restarted. Deploy the new binary and then restart `engram serve` on the central side and the resident local daemon on every node (quit the tray and relaunch, or stop the daemon process and let the next `engram connect`/`engram tray` auto-start the upgraded one — auto-start only ever ADDS a daemon, never restarts an existing one). Postgres schema changes on central are applied automatically by `engram serve` on every startup, exactly as before — there is no separate `migrate` command to run against the database.
+
+**The `created_at` backfill needs an upgraded server.** `POST /v1/created-at` is a new capability this release adds to `engram serve`; a v1.6.0 client talking to a pre-v1.6.0 central simply skips the backfill and retries automatically once that central is upgraded — nothing else about push/pull is affected. See "Compatibility" under [Quickstart: central sync](#quickstart-central-sync) for the reverse direction (an old client against a v1.6.0 central).
 
 ## Resident daemon
 
@@ -372,7 +393,11 @@ Mutating endpoints (`PUT`, `POST`, `DELETE`) additionally require an `Origin: ht
 
 `sync now`, `status`, `ui`, and `config` talk to the running resident daemon and read `daemon.json` from the same directory as `--db`; if no daemon is running, they exit non-zero with a clear error message. `sync parked`/`retry`/`discard` open the local database directly (SQLite's WAL mode makes this safe alongside a running daemon) and work whether or not the daemon is up.
 
-**Parked mutations.** central can reject a pushed mutation *permanently* — malformed content, a request too large, or a deterministic data problem (see `transport.ErrPermanent`) — instead of transiently. Retrying a permanent rejection forever accomplishes nothing, so the syncer parks that single outbox entry: it stops being resent (and stops blocking the rest of its own sync_id's version chain), but stays on disk, unacked, until an operator looks at it. `mem_doctor`'s `parked_mutations` check surfaces the same entries with their `last_error`.
+**Parked mutations.** central rejects a pushed mutation with HTTP `422` when the rejection is *permanent* — malformed content, a request too large (`400`/`413`), or a deterministic data problem (see `transport.ErrPermanent`) — instead of transient (a `5xx` or network error, which the syncer keeps retrying on the normal schedule). Retrying a permanent rejection forever accomplishes nothing, so the syncer parks that single outbox entry: it stops being resent (and stops blocking the rest of its own sync_id's version chain, since entries within one identity's version chain must apply in order), but stays on disk, unacked, until an operator looks at it. Parking one entry does not stop the rest of that push cycle — every other, unaffected outbox entry keeps going. `mem_doctor`'s `parked_mutations` check surfaces the same entries with their `last_error` (see [Diagnostics](#diagnostics-mem_doctor) below).
+
+**A push failure no longer blocks pull.** Before this release, any push error short-circuited the whole sync cycle and skipped pulling entirely — one bad mutation could stop a node from ever applying central's other writes. Now a permanent rejection is parked (see above) rather than propagated as an error, and a *retryable* push failure (a `5xx` or network error) is recorded but does not stop the cycle either: the cycle still lists projects and pulls from central, because a broken outbox does not mean central has nothing worth applying. Only a fatal, non-retryable push failure — `401`/`403`, a credential problem pull would hit identically — still short-circuits the cycle, since nothing pull could do would help.
+
+**Unacked NUL mutations are repaired automatically.** A small number of pre-fix clients could enqueue an outbox entry whose content carried a literal `U+0000` byte, which Postgres' `text` type rejects outright — central would keep bouncing the push forever. Every `Push` cycle now repairs any still-unacked (pending or parked) outbox entry carrying a `U+0000` byte *before* draining the outbox, so a previously stuck or parked entry gets a chance to push again on the very next cycle. The repair is best-effort: a failure to repair one entry is logged and does not block the push of every other, unaffected entry.
 
 **Config keys**
 
@@ -894,7 +919,7 @@ Each reads the host's hook JSON on stdin and talks to the resident daemon over t
 
 ### Installing
 
-Into your agent's settings (append-only merge — your other hooks and every unknown key are preserved, and re-running it is a no-op). The file is written through a temp file and a rename, never truncated in place, and the first modification leaves a `<file>.bak` copy of your original beside it. Two things the merge does not preserve, both stated on stdout: the ORDER of top-level keys and the original indentation.
+Into your agent's settings (append-only merge — your other hooks and every unknown key are preserved, and re-running it is a no-op). The file is written through a temp file and a rename, never truncated in place, and the first modification leaves a `<file>.bak` copy of your original beside it (later re-runs never overwrite that one pristine copy). The merge disables JSON's default HTML-escaping, so a hook command containing `&&`, `<`, or `>` — an ordinary shell command — is written back byte-for-byte instead of being silently rewritten into six-character unicode escapes. A settings file that is itself a symlink (common with `stow`/`chezmoi`-managed dotfiles) is written through to its real target, leaving the link itself untouched, instead of `os.Rename` replacing the link with a plain file. Two things the merge does not preserve, both stated on stdout: the ORDER of top-level keys and the original indentation.
 
 ```bash
 engram setup hooks --agent claude-code   # ~/.claude/settings.json  (honours CLAUDE_CONFIG_DIR)
@@ -911,7 +936,9 @@ claude plugin install engram@engram
 
 Both paths install the same hooks — `TestEngramHookPack_MatchesShippedPack` fails the build if they ever drift apart.
 
-**Use one or the other, not both.** The plugin and `engram setup hooks` register the identical hook commands, so a host with both active fires every event twice. The runtime deduplicates the resulting saves (each prompt/report is claimed once per session before it is saved, so a duplicate delivery is a no-op rather than a duplicate memory), but you still pay for two process launches per event. `engram setup hooks --agent claude-code` prints a warning when it can detect the plugin is also enabled in your `settings.json`.
+**Use one or the other, not both.** The plugin and `engram setup hooks` register the identical hook commands, so a host with both active fires every event twice. The runtime deduplicates the resulting saves within a 30-second window (each `(session, event, payload)` occurrence is claimed once before it is saved, so a near-simultaneous duplicate delivery from the two install paths firing back-to-back is a no-op rather than a duplicate memory — outside that window it is treated as a new occurrence), but you still pay for two process launches per event. `engram setup hooks --agent claude-code` prints a warning when it can detect the plugin is also enabled in your `settings.json`.
+
+**Tool names in hook text are bare** (`mem_save`, `mem_current_project`, …), never prefixed with `mcp__engram__` or similar, because the fully-qualified name depends on how the host registered the server — a direct MCP registration and the Claude Code plugin install expose the same tools under different prefixes (`mcp__engram__…` vs `mcp__plugin_engram_engram__…`), and a hardcoded prefix would name a tool that does not exist under the other install. The one place that DOES need a concrete, callable name — the first-prompt bootstrap's "Available tools" list, for a host that defers MCP tool loading — lists both fully-qualified forms side by side, since nothing at hook-execution time says which one the host actually used.
 
 The commands call `engram` **from PATH**, so the binary has to be there (`engram` / `engram.exe`), and the daemon needs a database: set `ENGRAM_DB` or put `db_path` in the [config file](#config-file).
 
@@ -935,6 +962,8 @@ Each event runs under one clock that starts when the process does — stdin incl
 ## Using engram from your agent
 
 Wiring the daemon as an MCP server makes the tools available — but the agent won't use them proactively unless its instructions say so. This section describes the protocol to add to your agent's instruction file. Copy [docs/agent-instructions.md](docs/agent-instructions.md) into your CLAUDE.md, AGENTS.md, .cursorrules, or whichever file your client reads as system-level instructions.
+
+You may not have to copy anything. The daemon now also ships a condensed version of this protocol over the MCP `instructions` field in its `initialize` response — for a client that honours it (prepends it to the model's system prompt), the tool roster, the proactive-save rule, and the recovery steps arrive automatically, with no file to maintain. `engram setup hooks` (below) layers the same protocol plus the project's actual recent memory on top, at the one moment the instructions channel alone cannot reach: after a context compaction. Copy `docs/agent-instructions.md` when you want the long form, or your client honours neither channel.
 
 The protocol works with any MCP-capable agent (Claude Code, Cursor, OpenCode, or any client that exposes MCP tools to its model).
 
@@ -997,7 +1026,7 @@ The daemon exposes 18 tools to the connected agent.
 | `mem_search`          | Search observations; `mode` (`""` FTS / `"semantic"` / `"hybrid"`), plus `offset` paging and `created_from` / `created_to` date bounds |
 | `mem_similar`         | Find observations semantically nearest a source memory via its stored embedding vector |
 | `mem_review`          | List memories by lifecycle/staleness status, or `mark_reviewed` to reset the staleness clock (local-only) |
-| `mem_context`         | Assemble recent sessions and observations into a context summary for the agent       |
+| `mem_context`         | Assemble recent sessions and observations into a context summary for the agent — sessions are ordered by last activity (the latest of start, end, and newest memory), not by when they were registered |
 | `mem_pin`             | Pin a memory so it leads `mem_context` and ranks higher in keyword search (local-only) |
 | `mem_unpin`           | Unpin a memory, returning it to normal recency order (local-only)                    |
 | `mem_session_summary` | Save a structured end-of-session summary (Goal / Discoveries / Accomplished / …)    |
@@ -1030,6 +1059,7 @@ Read-only checks over the local store, for the moments when something looks wron
 | `orphaned_observation_session` | Live observations whose `session_id` has no row in `sessions` — they can never be grouped back under the session that produced them. Not an FK violation: the FK was removed on purpose so an out-of-order sync pull can land an observation before its session. Saves filed under the store's own `manual-save-{project}` default are **excluded**: that is what a `mem_save` with no `session_id` does, and warning about it made every store that had ever taken a manual save permanently "warning". They are reported instead as an `info` finding, `unregistered_session_saves`, which does not move the check out of `ok`. The exclusion is an EXACT match against the id this store would mint for that row's project (`manual-save-` + project, case-sensitive): an id naming a *different* project, or one in a casing engram does not produce, is not the store's own default and stays a warning. |
 | `session_project_directory_mismatch` | A session filed under one project whose directory resolves to another today. Only *declared* identities count (config file, git remote, git root) — comparing two basename guesses would report drift that is not there. |
 | `ambiguous_active_sessions` | Two or more sessions still open for the same project + directory, usually an agent host that exited without firing its session-end hook. |
+| `parked_mutations` | Outbox entries central has permanently rejected (see "Parked mutations" under [CLI subcommands](#cli-subcommands)) — each finding names the mutation, project, entity, attempt count and `last_error`, mirroring `engram sync parked`'s own output so either surface leads straight to `engram sync retry`/`discard`. Only evaluated when central is configured; reports `ok` with `central_configured: false` otherwise, since a local-only node can never have a parked outbox entry. |
 | `project_policy_unknown` | Projects with memories but no explicit policy row, **only when central is configured** — they are being pushed on a computed default of `synced` that nobody chose. Informational. |
 | `sqlite_lock_contention` | A WAL checkpoint that cannot complete (another process is holding the database), or a `busy_timeout` of 0, which turns ordinary contention into a failed `mem_save`. |
 | `stale_review_backlog` | Most of a project flagged `needs_review` or `expired`, at which point the lifecycle flag has stopped distinguishing anything. |
@@ -1040,6 +1070,15 @@ Scope: the per-project checks follow the same project resolution as `mem_search`
 **It never modifies your memories.** Every finding ends in a `safe_next_step` for a human to run, and `requires_confirmation: true` marks the ones where the right fix depends on context the store does not have — which of two project names is canonical, which of three open sessions is yours. A repair that guesses at those destroys the evidence on its way. (The wording is deliberate: no row, session or project is ever touched, but `sqlite_lock_contention` probes with `PRAGMA wal_checkpoint(PASSIVE)`, which can move pages out of the WAL. Calling that "never writes" would be a claim the code does not make.)
 
 **Tool errors vs findings.** The call is flagged as an error only when the *request* could not be run — an unknown `check` id. A check that reports `severity: "error"` failed to ANSWER (the lock probe could not read its pragma, say); the other checks still reported, and the call succeeded. A doctor whose calls "fail" is a doctor nobody runs on the store that needs it.
+
+### Lifecycle: review_after decay
+
+A memory's `review_after` is set once, at insert time, and never recomputed except by `mem_review`'s `mark_reviewed`. Two rules decide the value, in this order:
+
+1. **Per-type decay.** Three types carry an explicit staleness window because their useful life is measured in months, not weeks: `decision` (6 months), `policy` (12 months — meant to outlive the work it governs), `preference` (3 months — the most volatile of the three). A row of one of these types gets `review_after = created_at + <window>` at insert time.
+2. **Fallback window.** Every other type (`bugfix`, `architecture`, `pattern`, `discovery`, `learning`, `manual`, …) gets no `review_after` at insert time and instead goes stale at `updated_at + review_window_days` — a `config.json`-only, restart-required setting (default **30 days**; any value ≤ 0 is treated as the default). It has no CLI flag or control-API key; set it directly in [the config file](#config-file).
+
+`needs_review` fires the moment `now` passes whichever due date applies; `expired` (a separate, rarer state — `expires_at`) always takes priority over `needs_review` when both are set. Neither `review_after` nor `expires_at` is part of the sync payload: lifecycle status is a per-node judgment about staleness, not shared truth, so two nodes can legitimately disagree about whether the same memory needs a second look.
 
 ### Conflict detection
 

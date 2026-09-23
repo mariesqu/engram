@@ -30,6 +30,15 @@ for what actually landed.
 > `engram projects consolidate` (CLI, `cmd/engram/projects.go` lines ~69-155). The passages below
 > describing these as "not implemented" or "a documented no-op" reflect the state at proposal time,
 > not the current codebase.
+>
+> **v1.6.0 update:** the flat 30-day window below (`review_window_days`, still the *fallback*
+> default) is no longer the only source of `review_after`. `decision`, `policy`, and `preference`
+> now get an explicit per-type window stamped at insert time (6 / 12 / 3 months respectively —
+> `internal/localstore/review.go`'s `decayReviewAfterMonths`), narrower than the original design's
+> "load-bearing types only" idea and wider in scope (`policy`/`preference` were not in the original
+> type list). `mem_pin`/`mem_unpin` also shipped since this proposal — a related but separate
+> local-only mechanism (see README's "Pinning" section) that keeps a memory in front of the agent
+> regardless of its review status.
 
 ---
 

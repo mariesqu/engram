@@ -42,6 +42,23 @@ Agents write and read observations through the
 file (WAL mode) accessed by a pure-Go driver, so the whole engine ships as one
 binary: no C toolchain, no database server, no install ceremony.
 
+The daemon does not wait to be told the protocol either: it hands a condensed
+version to any MCP client that honours the `initialize` response's
+`instructions` field, and an installed session-start hook injects the same
+protocol plus the project's actual recent memory at the start of every
+session — including right after a compaction, the one moment a file the
+model can no longer see stops helping.
+
+Most observations age on their own schedule — a rolling window from the last
+save or edit. A few types carry an explicit one instead, because their
+useful life is measured in months rather than weeks: a `decision` is worth
+rechecking after six months, a stated `preference` after three, a `policy`
+after a year. Past that point a note is `needs_review`, not wrong — a nudge
+to verify against current reality before trusting it, not a reason to
+discard it. And when one fact must not scroll away — the stack decision, the
+gotcha that keeps recurring — pinning it keeps it leading the agent's context
+every session, ahead of ordinary recency.
+
 ## Finding by exact words: FTS5 + BM25
 
 SQLite's FTS5 extension maintains a full-text index — like the index at the
@@ -120,6 +137,16 @@ trigger on every write.
 
 Local-first means engram works on a plane. Central means memory survives a
 laptop and can be shared across machines and teammates.
+
+Not every push succeeds, and sync is built to keep going anyway. A mutation
+central rejects for a deterministic reason — malformed content, a request
+too large — would fail identically on every retry, so instead it is set
+aside, "parked," without blocking the rest of the outbox or the next pull; an
+operator can inspect it (`mem_doctor`, `engram sync parked`) and retry or
+discard it once fixed. A merely transient failure — a dropped connection, a
+central that is briefly down — no longer stops the whole cycle either: the
+node still pulls whatever central has for it, because a stuck outbox is not
+a reason to also stop listening.
 
 ## The design principles
 
