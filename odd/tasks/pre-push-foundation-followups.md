@@ -438,6 +438,30 @@ without measurement.
   `TestLoop_ParkedEntryNotRetriedEachTick` proving FUP-004 parking keeps
   the intent (parked entry reaches Apply once). Commit fb3d6d7.
 
+## Review follow-up (PR #105, chatgpt-codex-connector)
+
+Four threads, all verified real with a failing test first.
+- A: `isParkableRejection` ignored a bare `transport.ErrPermanent` (no
+  StatusCode), so an in-process Central's rejection was retried forever.
+  Now parks on `errors.Is(err, transport.ErrPermanent)`. Commit be07c15.
+- B: a parked head only held its sync_id chain for the current Push; the
+  next DrainOutbox returned v2/v3 out of order. DrainOutbox now withholds
+  rows with an earlier unacked parked row of the same entity_key (new
+  partial index `idx_sync_mutations_parked_chain`, no schema bump);
+  retry/discard of the head releases the chain in order. SyncBacklog no
+  longer counts blocked rows; ListParked, mem_doctor and `engram sync
+  parked` report `blocked_behind`. Commit 036d10a (its intermediate tree
+  briefly dropped one unchanged retryable test; be07c15 restores it).
+- C: NUL repair left the prompt's `user_prompts` row unsanitized. Now
+  fixed in the same transaction, guarded on the row still holding the old
+  mutation's exact values (user_prompts has no last_write_mutation_id).
+  Commit f1b0411.
+- D: mem_current_project left `writes_blocked=false` for a non-string
+  directory that every write tool refuses, explicit project or not. Now
+  true, with a hint. Commit cbc15ef.
+  Verification: build, vet, vet -tags acceptance ok; `go test ./...` and
+  the acceptance subset ok except the three known env failures.
+
 ## Next Step
 
 FUP-001 through FUP-005 are all closed. Nothing further planned in this
