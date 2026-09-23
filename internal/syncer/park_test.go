@@ -10,6 +10,7 @@ package syncer_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/mariesqu/engram/internal/domain"
 	"github.com/mariesqu/engram/internal/syncer"
+	"github.com/mariesqu/engram/internal/transport"
 )
 
 // parkCentral is a test-only Central whose Apply behavior is driven by a
@@ -335,6 +337,78 @@ func TestPush_ParkedHeadBlocksChainAcrossCycles(t *testing.T) {
 				t.Errorf("PendingCount after %s = %d, %v; want 0", release, n, err)
 			}
 		})
+	}
+}
+
+// TestPush_ParksTransportErrPermanent covers an in-process Central (e.g.
+// centralstore.Store) that reports a deterministic rejection as
+// transport.ErrPermanent directly, with no HTTP status: it must be parked like
+// a 422, not recorded as retryable and resent forever.
+func TestPush_ParksTransportErrPermanent(t *testing.T) {
+	ctx := context.Background()
+	node := openNode(t, "park-errpermanent")
+
+	writeVersion(t, node, "proj", "sync-permanent", 1, time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC))
+
+	central := &parkCentral{
+		applyErrFor: map[string]error{
+			"sync-permanent": fmt.Errorf("Apply: invalid mutation: %w: bad field", transport.ErrPermanent),
+		},
+	}
+
+	if _, err := syncer.Push(ctx, node, central); err != nil {
+		t.Fatalf("Push: %v (a transport.ErrPermanent must park, not surface as a retryable error)", err)
+	}
+	parked, err := node.Store.ListParked()
+	if err != nil {
+		t.Fatalf("ListParked: %v", err)
+	}
+	if len(parked) != 1 {
+		t.Fatalf("ListParked returned %d entries, want 1 (the ErrPermanent mutation)", len(parked))
+	}
+}
+
+// TestPush_RetryableFailureRecordsAttemptsAndPropagates covers the OTHER
+// branch: a 5xx-shaped (or unclassified) failure must NOT be parked, but must
+// be recorded (attempts/last_error) and returned as a Push error so the Loop's
+// backoff still engages.
+func TestPush_RetryableFailureRecordsAttemptsAndPropagates(t *testing.T) {
+	ctx := context.Background()
+	node := openNode(t, "park-retryable")
+
+	writeVersion(t, node, "proj", "sync-flaky", 1, time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC))
+
+	central := &parkCentral{
+		applyErrFor: map[string]error{
+			"sync-flaky": &parkStatusErr{code: 503, msg: "overloaded"},
+		},
+	}
+
+	_, err := syncer.Push(ctx, node, central)
+	if err == nil {
+		t.Fatal("Push: want a non-nil error for a retryable (5xx) failure, got nil")
+	}
+
+	parked, err := node.Store.ListParked()
+	if err != nil {
+		t.Fatalf("ListParked: %v", err)
+	}
+	if len(parked) != 0 {
+		t.Errorf("ListParked returned %d entries, want 0 — a 5xx must never be auto-parked", len(parked))
+	}
+
+	entries, err := node.Store.DrainOutbox(0)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Mutation.SyncID == "sync-flaky" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("sync-flaky is not pending after a retryable failure — it must stay in the outbox for the next cycle")
 	}
 }
 

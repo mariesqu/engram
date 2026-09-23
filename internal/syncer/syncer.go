@@ -722,12 +722,17 @@ const (
 
 // isParkableRejection reports whether err is a central rejection so specific
 // to THIS mutation that retrying it unmodified can never succeed (400, 413, or
-// 422 — see the status table above). Push parks the single outbox entry on a
-// true result rather than retrying it forever.
+// 422 — see the status table above — or transport.ErrPermanent itself, which is
+// how an in-process Central such as centralstore.Store reports the same
+// deterministic rejection with no HTTP status at all). Push parks the single
+// outbox entry on a true result rather than retrying it forever.
 func isParkableRejection(err error) bool {
+	if errors.Is(err, transport.ErrPermanent) {
+		return true
+	}
 	var sc statusCoder
 	if !errors.As(err, &sc) {
-		return false // no status at all — a network error, not a rejection
+		return false // no status and no ErrPermanent — a network error, not a rejection
 	}
 	switch sc.StatusCode() {
 	case httpStatusBadRequest, httpStatusRequestTooLarge, httpStatusUnprocessableEntity:
