@@ -400,7 +400,7 @@ func registerTools(srv *mcpserver.MCPServer, store *localstore.Store, loop *sync
 
 Three fields say "do not trust this name blindly":
   fallback=true         — the project name is a GUESS (a directory basename, or a lenient fallback after a resolution error). Pass an explicit project on later calls if that is not the name you want.
-  writes_blocked=true   — mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, missing, relative, no directory at all, or an omitted project) until you pass project explicitly.
+  writes_blocked=true   — mem_save/mem_save_prompt/mem_session_start/mem_session_summary will REFUSE this directory (ambiguous, misconfigured, missing, relative, no directory at all, or an omitted project) until you pass project explicitly — or, when error_hint says directory is not a string, until you send it as a string or omit it.
   directory_exists=false — the resolved directory does not exist, so any name here is invented from its basename. Pass a real directory or an explicit project.`),
 			mcp.WithTitleAnnotation("Detect Current Project"),
 			mcp.WithReadOnlyHintAnnotation(true),
@@ -1066,9 +1066,14 @@ func currentProjectEnvelope(store *localstore.Store, explicitProject string, dir
 		// The one caller error this tool reports instead of raising: the bridge
 		// leaves a non-string "directory" alone (see injectClientDirectory), so
 		// nothing else in the chain would ever mention it.
+		// Writes are blocked even beside an explicit project: every write tool
+		// raises this type error (readDirectoryArg) before it looks at project, so
+		// the remedy here is to fix or drop "directory", not to name a project.
 		env["error_hint"] = dirArg.Err.Error()
+		env["writes_blocked"] = true
 		hints = append(hints, "the \"directory\" argument was not a string and was IGNORED (the \"cwd\" alias is "+
-			"deliberately not consulted for it) — this answer describes the daemon's own directory")
+			"deliberately not consulted for it) — this answer describes the daemon's own directory",
+			"every write tool refuses a non-string \"directory\", even with an explicit project — send it as a string or omit it")
 	}
 	if dirArg.Warning != "" {
 		// The alias's own malformed-argument case. It is not an error_hint: nothing

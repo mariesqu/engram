@@ -250,6 +250,36 @@ func TestCurrentProject_NonStringDirectoryNeverFallsThroughToCwd(t *testing.T) {
 	}
 }
 
+// TestCurrentProject_NonStringDirectoryBlocksWrites: every write tool refuses a
+// non-string "directory" outright — even beside an explicit project, since
+// readDirectoryArg's type error is raised before the project is consulted — so
+// the probe must report writes_blocked for it, explicit project or not.
+func TestCurrentProject_NonStringDirectoryBlocksWrites(t *testing.T) {
+	chdirToJunkDir(t)
+	for name, args := range map[string]map[string]any{
+		"no project":       {"directory": 42},
+		"explicit project": {"directory": 42, "project": "named-by-the-agent"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			components := currentProjectDaemon(t)
+			env := callCurrentProjectOn(t, components, args)
+			if env["writes_blocked"] != true {
+				t.Errorf("writes_blocked = %v, want true: every write tool refuses a non-string directory", env["writes_blocked"])
+			}
+			registered := components.mcpServer.ListTools()
+			for _, tool := range directoryAwareWriteTools {
+				result, err := registered[tool].Handler(t.Context(), newToolRequest(tool, minimalArgsFor(t, tool, args)))
+				if err != nil {
+					t.Fatalf("%s: handler transport error: %v", tool, err)
+				}
+				if !result.IsError {
+					t.Errorf("%s accepted a non-string directory; the premise of this test is gone: %v", tool, result.Content)
+				}
+			}
+		})
+	}
+}
+
 // TestDirectoryAwareTools_NonStringDirectoryIsACallerError is the other half:
 // mem_current_project reports the bad argument because it never errors, but
 // every other directory-aware tool must REFUSE it. Silently resolving from the
