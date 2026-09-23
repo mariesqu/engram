@@ -50,8 +50,14 @@ Make the v1.6.1 codebase a safe base for the provenance roadmap (`sdd/explore/co
   - Done (2026-09-23).
   - Proof: `go build ./...` clean; `go vet ./...` clean; `go vet -tags acceptance ./...` clean; `go test ./... -count=1` fully green (all packages `ok`, `cmd/engram` 34.6s); `go test -tags acceptance ./cmd/engram/ -count=1 -timeout 900s` fully green (82.9s). No known environmental failures.
   - Commit: see PR.
-- [ ] **BH-003 — Split hook.go by concern** — Route: delegated writer
+- [x] **BH-003 — Split hook.go by concern** — Route: delegated writer
+  - `cmd/engram/hook.go` (1641→296 lines: usage, per-event time budgets, `hookInput`, `runHookCmd` top-level dispatch, stdin read/decode); `cmd/engram/hook_transport.go` (205, new) — daemon access: `newToolClient`, `hookRemaining`, `dialHook`, `mcpBridge.callTool`, `parseToolResult`, `jsonFromMCPBody`, plus `urlQueryEscape` (moved, not replaced); `cmd/engram/hook_project.go` (279, new) — project resolution (`hookResolveProject`, `hookProject`, `hookProjectFromSession`) plus the per-session project cache (`hookProjectCacheTTL`, `hookNow`/`hookDetectionFingerprint`, `hookCachedProjectFile`, `hookProjectFingerprint`, `hookCacheProject`, `hookCachedProject`); `cmd/engram/hook_events.go` (583, new) — the four per-event handlers: session-start/post-compaction, user-prompt-submit, subagent-stop, session-end, and their private helpers; `cmd/engram/hook_state.go` (321, new) — state files: markers, hashing, clearing, the FUP-003 occurrence-dedup section, claim/age/touch.
+  - Pure move, `size:exception` applied (maintainer-approved, this PR only): every declaration copied byte-for-byte from its mapped line range (1-305 / 306-478+1628-1641 / 479-620+1502-1627 / 621-1193 / 1194-1501), no symbol renamed, no logic edited, no comment reworded — including `urlQueryEscape`, moved as-is per the maintainer's explicit instruction (its `net/url` duplication is BH-004's, not this task's). Move-proof script (sorted-multiset diff of non-blank, non-package/import lines, old `hook.go` read via `git show main:cmd/engram/hook.go` decoded as UTF-8 bytes vs the 5 new/changed files): 1506 lines on each side, 0 missing / 0 extra — PASS. `git diff -M --cached --stat main`: 5 files changed, 1388(+)/1345(-); `git diff -M --cached --color-moved=zebra --color=always main`: 2684 of 2733 diff-body (+/-) lines carry git's move-detected (zebra) color. Imports rebuilt per file against `go build` (no `goimports` in `GOBIN`); CRLF preserved (repo is `core.autocrlf=true`) — `gofmt -w` normalized the 5 files to LF, reconverted to CRLF after formatting, rebuilt/vetted clean.
+  - Done (2026-09-23).
+  - Proof: `go build ./...` clean; `go vet ./...` clean; `go vet -tags acceptance ./...` clean; `go test ./... -count=1` fully green (all packages `ok`, `cmd/engram` 27.0s); `go test -tags acceptance ./cmd/engram/ -count=1 -timeout 900s` fully green (47.8s); `go test ./cmd/engram/ -run 'TestHook' -count=20` fully green (82.5s, no flakes). No known environmental failures.
+  - Commit: see PR.
 - [ ] **BH-004 — Mapping cleanups** — Route: delegated writer
+  - New note from BH-003 mapping: `cmd/engram/connect.go:751`'s comment ("see directoryAwareTools in tools.go") is stale since BH-002 — `directoryAwareTools` now lives in `cmd/engram/tools_helpers.go`. Fold this into BH-004's stale-comment cleanup pass.
 - [ ] **BH-005 — Unified response envelope + dual id acceptance** — Route: delegated writer
 
 ## Progress
@@ -62,4 +68,4 @@ Make the v1.6.1 codebase a safe base for the provenance roadmap (`sdd/explore/co
 
 ## Next Step
 
-BH-002 PR through CI and review bot, then BH-003 (same size:exception treatment expected).
+BH-002 and BH-003 PRs through CI and review bot, then BH-004 (mapping cleanups, including the `connect.go:751` stale comment noted above).
