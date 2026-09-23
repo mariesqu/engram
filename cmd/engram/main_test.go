@@ -366,3 +366,51 @@ func TestRun_Version_InjectedValue(t *testing.T) {
 		t.Errorf("version output does not contain injected version %q: %q", "v1.2.3-test", out)
 	}
 }
+
+// TestUsage_ListsEverySyncSubcommand pins `engram --help` to the sync
+// dispatcher. The top-level usage once listed only `engram sync now` after
+// parked/retry/discard shipped, so the only way to find them was to already
+// know they existed. The expected set is read from the dispatcher's own
+// unknown-subcommand error, so a fifth subcommand added there without a help
+// line fails here.
+func TestUsage_ListsEverySyncSubcommand(t *testing.T) {
+	err := runSyncCmd([]string{"no-such-subcommand"})
+	if err == nil {
+		t.Fatal("runSyncCmd accepted an unknown subcommand")
+	}
+	_, list, ok := strings.Cut(err.Error(), "expected: ")
+	if !ok {
+		t.Fatalf("unknown-subcommand error no longer names the valid set: %v", err)
+	}
+	for _, sub := range strings.Split(list, ", ") {
+		sub = strings.TrimSpace(sub)
+		if !regexp.MustCompile(`(?m)^  engram sync\s+` + regexp.QuoteMeta(sub) + `\b`).MatchString(usage) {
+			t.Errorf("engram --help does not list `engram sync %s`", sub)
+		}
+		if !regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(sub) + `\b`).MatchString(syncUsage) {
+			t.Errorf("engram sync --help does not list %q", sub)
+		}
+	}
+	// The argument shapes, exactly as the subcommands parse them.
+	for _, want := range []string{"sync     retry <seq|all>", "sync     discard <seq>"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("engram --help is missing %q", want)
+		}
+	}
+}
+
+// TestUsage_ListsTheReleaseSubcommands covers the other subcommands this
+// release added, so they cannot fall out of `engram --help` the way the sync
+// ones did.
+func TestUsage_ListsTheReleaseSubcommands(t *testing.T) {
+	for _, want := range []string{
+		"engram hook     <session-start|post-compaction|user-prompt-submit|subagent-stop|session-end>",
+		"--no-autostart]",
+		"engram setup    hooks --agent <claude-code|codex>",
+		"engram version [--verbose]",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("engram --help is missing %q", want)
+		}
+	}
+}
