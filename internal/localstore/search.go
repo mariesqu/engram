@@ -711,6 +711,11 @@ func writeObservationBullet(b *strings.Builder, obs *domain.Record) {
 	fmt.Fprintf(b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncateStr(obs.Content, 300))
 }
 
+// sessionObservationCountQuery is FormatContext's per-session observation
+// COUNT. It is a named constant so the scale test can EXPLAIN the exact
+// statement that ships (it must stay an idx_mem_session SEARCH).
+const sessionObservationCountQuery = `SELECT count(*) FROM memories WHERE session_id = ? AND deleted_at IS NULL`
+
 // FormatContext assembles the agent-facing memory context blob from recent
 // sessions and recent observations, mirroring the legacy predecessor's
 // store.FormatContext.
@@ -782,10 +787,7 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 			// errors are silently ignored to avoid failing FormatContext on a
 			// non-critical count.
 			var obsCount int
-			_ = s.db.QueryRow(
-				`SELECT count(*) FROM memories WHERE session_id = ? AND deleted_at IS NULL`,
-				sess.ID,
-			).Scan(&obsCount)
+			_ = s.db.QueryRow(sessionObservationCountQuery, sess.ID).Scan(&obsCount)
 
 			// Show the span the session actually covers. When nothing happened
 			// after registration the two stamps coincide and only one is printed.

@@ -82,6 +82,43 @@ func seedSessionScaleFixture(tb testing.TB, s *Store, project string, sessionCou
 	}
 }
 
+// raceBudgetMultiplier scales a wall-clock backstop for the race detector. It
+// is 10 under -race (see race_disabled_test.go and the scale test's doc comment
+// for the measurements that justify it) and 1 otherwise.
+func raceBudgetMultiplier() time.Duration {
+	if raceEnabled {
+		return 10
+	}
+	return 1
+}
+
+// explainSessionObservationCount returns SQLite's query plan for FormatContext's
+// per-session observation COUNT, one detail line per plan row.
+func explainSessionObservationCount(tb testing.TB, s *Store) string {
+	tb.Helper()
+
+	rows, err := s.DB().Query(
+		"EXPLAIN QUERY PLAN "+sessionObservationCountQuery, "sess-0000")
+	if err != nil {
+		tb.Fatalf("EXPLAIN QUERY PLAN (count): %v", err)
+	}
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			tb.Fatalf("scan count plan row: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatalf("count plan rows: %v", err)
+	}
+	return strings.Join(plan, "\n")
+}
+
 // explainRecentSessions returns SQLite's query plan for the EXACT statement
 // RecentSessions ships, one detail line per plan row.
 func explainRecentSessions(tb testing.TB, s *Store, project string, limit int) []string {
@@ -120,10 +157,18 @@ func explainRecentSessions(tb testing.TB, s *Store, project string, limit int) [
 // correlated subquery is a SHAPE, and SQLite names it in the plan
 // ("CORRELATED SCALAR SUBQUERY"). Asserting on the shape fails for the right
 // reason on any machine, where a wall-clock threshold tight enough to separate
-// the two shapes is also tight enough to flake on a loaded CI runner. The 1s
-// budget below is a deliberately generous BACKSTOP — six times the worst number
-// the broken shape produced here is 1.58s, so a regression that somehow keeps
-// the plan clean still cannot hide — not a performance target.
+// the two shapes is also tight enough to flake on a loaded CI runner. The same
+// goes for FormatContext's per-session COUNT: its bound is the plan (an
+// idx_mem_session SEARCH per returned session), not the clock.
+//
+// The 1s budget below is a deliberately generous BACKSTOP, not a performance
+// target: the fixed shape measures ~25ms (RecentSessions) / ~65ms
+// (FormatContext) and the correlated shape ~3s for both, so a regression that
+// somehow keeps the plan clean still cannot hide. Under -race the budget is
+// scaled by raceBudgetMultiplier, because the race detector instruments every
+// memory access of the transpiled SQLite VM: the fixed shape measures
+// 0.6-1.1s / 1.7-2.8s there (CI ubuntu and a local run) and the correlated
+// shape ~62s, so a 10s race budget keeps the same separation.
 //
 // The fixture is the one the slowdown was measured on (300 sessions, 20k
 // memories) rather than the benchmark's 5k, and both halves of the hot path are
@@ -164,9 +209,19 @@ func TestRecentSessions_ScalesToThreeHundredSessions(t *testing.T) {
 			"newest-memory-per-session pass is gone:\n%s", joined)
 	}
 
-	// 2. Backstop: the whole mem_context read path stays far away from the
+	// 2. Bounded per-session work: FormatContext counts observations once per
+	//    returned session, and each count must be an index SEARCH on
+	//    session_id rather than a scan of the memories table.
+	countPlan := explainSessionObservationCount(t, s)
+	t.Logf("per-session COUNT query plan:\n%s", countPlan)
+	if !strings.Contains(countPlan, "idx_mem_session") || strings.Contains(strings.ToUpper(countPlan), "SCAN") {
+		t.Errorf("per-session observation COUNT no longer searches idx_mem_session — "+
+			"FormatContext's per-session work scans memories again:\n%s", countPlan)
+	}
+
+	// 3. Backstop: the whole mem_context read path stays far away from the
 	//    seconds the correlated form cost.
-	const budget = time.Second
+	budget := time.Second * raceBudgetMultiplier()
 
 	start := time.Now()
 	sessions, err := s.RecentSessions(project, 5)

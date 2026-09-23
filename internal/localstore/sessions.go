@@ -238,12 +238,13 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // TestRecentSessions_ScalesToThreeHundredSessions).
 //
 // The SHAPE is the win here, not the index. The grouped pass still visits every
-// LIVE MEMORY IN THE FILTERED PROJECT — idx_mem_project_lower (schema v15) lets
-// SQLite reach those rows by an index scan on LOWER(project) instead of
-// grouping the whole table; idx_mem_session (schema v14) then lets it walk them
-// already in session order — "SCAN memories USING INDEX idx_mem_session" in the
-// plan — instead of sorting them for the GROUP BY. That saves a sort, not the
-// O(sessions × memories) evaluation: the correlated subquery had to go for that.
+// LIVE MEMORY IN THE FILTERED PROJECT. With a project filter the plan is
+// "SEARCH memories USING INDEX idx_mem_project_lower" plus a temp B-tree for
+// the GROUP BY: idx_mem_project_lower (schema v15) reaches only that project's
+// rows instead of grouping the whole table. Without a filter SQLite instead
+// walks idx_mem_session (schema v14) already in session order and skips that
+// sort. Either way the index saves a scan or a sort, not the O(sessions ×
+// memories) evaluation: the correlated subquery had to go for that.
 // Where the index measurably pays for itself is the OTHER half of the mem_context
 // path, FormatContext's per-session observation COUNT — one indexed lookup per
 // returned session instead of a scan each, ~26% off FormatContext at this
