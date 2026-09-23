@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mariesqu/engram/internal/controlapi"
+	projectpkg "github.com/mariesqu/engram/internal/project"
 )
 
 // hook.go implements `engram hook <event>` — the lifecycle hooks an agent host
@@ -655,10 +656,12 @@ func hookSessionStart(ctx context.Context, dbFlag string, in hookInput, compacti
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram hook session-start: %v\n", err)
 	} else {
-		project = hookResolveProject(ctx, client, in.CWD)
 		// Paid for here, inside an 8s budget, so the 200ms prompt hook does not
-		// have to pay for it again on every message. See hookCacheProject.
-		hookCacheProject(in.SessionID, in.CWD, project)
+		// have to pay for it again on every message. The fingerprint is taken
+		// BEFORE resolving; see hookCacheProject.
+		fingerprint := hookProjectFingerprint(in.CWD)
+		project = hookResolveProject(ctx, client, in.CWD)
+		hookCacheProject(in.SessionID, in.CWD, project, fingerprint)
 		if project != "" && strings.TrimSpace(in.SessionID) != "" {
 			if _, err := client.callTool(ctx, "mem_session_start", map[string]any{
 				"id":        in.SessionID,
@@ -871,8 +874,9 @@ func hookUserPromptSubmit(ctx context.Context, dbFlag string, in hookInput) {
 // to learn the same thing.
 //
 // Across runs it goes through the per-session cache (hookCachedProject): a hit
-// costs one small file read instead of a daemon round trip that spawns git
-// twice, and a live answer is cached for the next prompt of the same session.
+// costs one small file read plus a few stats that revalidate it, instead of a
+// daemon round trip that spawns git twice, and a live answer is cached for the
+// next prompt of the same session.
 // A session whose session-start hook ran therefore never resolves here at all.
 func onceProject(ctx context.Context, client *mcpBridge, in hookInput) func() string {
 	var (
@@ -881,9 +885,13 @@ func onceProject(ctx context.Context, client *mcpBridge, in hookInput) func() st
 	)
 	return func() string {
 		if !done {
-			if project = hookCachedProject(in.SessionID, in.CWD); project == "" {
+			var fingerprint string
+			if project, fingerprint = hookCachedProject(in.SessionID, in.CWD); project == "" {
+				if fingerprint == "" {
+					fingerprint = hookProjectFingerprint(in.CWD)
+				}
 				project = hookProject(ctx, client, in)
-				hookCacheProject(in.SessionID, in.CWD, project)
+				hookCacheProject(in.SessionID, in.CWD, project, fingerprint)
 			}
 			done = true
 		}
@@ -1497,33 +1505,76 @@ func hookTouchState(path string) {
 // path: mem_current_project makes the daemon run `git` twice (remote, then
 // toplevel — internal/project/detect.go), and on Windows two process spawns
 // measured 65–120ms of a 200ms budget on an idle machine, and blew it outright
-// under load, so the prompt was silently not captured. The answer cannot change
-// within a session for the same cwd, and session-start (8s budget) has already
-// paid for it once, so it is cached per session and user-prompt-submit reads
-// it back instead of asking again.
+// under load, so the prompt was silently not captured. session-start (8s
+// budget) has already paid for that answer once, so it is cached per session
+// and user-prompt-submit reads it back instead of asking again.
+//
+// The answer is NOT fixed for the session, though: editing or creating a
+// .engram/config.json, checking out a branch that carries a different one, or
+// changing the git remote all move the same cwd to a different project — and
+// mem_save_prompt receives the cached name as an EXPLICIT project, which skips
+// detection, so a stale hit misfiles the prompt silently. Every hit is
+// therefore revalidated against project.DetectionFingerprint, the stat-level
+// summary of every input detection reads (no git spawn), and bounded by
+// hookProjectCacheTTL for the inputs a stat cannot see.
+
+// hookProjectCacheTTL is the defence-in-depth backstop: whatever the
+// fingerprint misses (a global git config, an includeIf'd file) is re-asked
+// at least this often.
+const hookProjectCacheTTL = 10 * time.Minute
+
+// hookNow and hookDetectionFingerprint are the cache's clock and validator,
+// swappable so tests can age a cache and inject a stat failure.
+var (
+	hookNow                  = time.Now
+	hookDetectionFingerprint = projectpkg.DetectionFingerprint
+)
 
 // hookCachedProjectFile is the cache's on-disk shape. The cwd it was resolved
 // FOR is stored beside the answer: a payload whose cwd differs (the user cd'd,
 // or a host reports a subdirectory) is a different question, and gets a live
 // resolution rather than a stale answer.
 type hookCachedProjectFile struct {
-	CWD     string `json:"cwd"`
-	Project string `json:"project"`
+	CWD         string    `json:"cwd"`
+	Project     string    `json:"project"`
+	Fingerprint string    `json:"fingerprint"`
+	ResolvedAt  time.Time `json:"resolved_at"`
 }
 
-// hookCacheProject records that cwd resolved to project for sessionID. Only a
-// USABLE answer is cached — an empty project means the workspace was refused,
-// and caching the refusal would outlive whatever made it (a directory created a
-// moment later, a monorepo that gained its config). Failures are ignored: a
-// missing cache costs the next prompt one live resolution, nothing more.
+// hookProjectFingerprint is the detection fingerprint of cwd, or "" when it
+// cannot be computed — which makes the answer uncacheable, never "unchanged".
+func hookProjectFingerprint(cwd string) string {
+	if strings.TrimSpace(cwd) == "" {
+		return ""
+	}
+	fp, err := hookDetectionFingerprint(cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "engram hook: project cache: %v\n", err)
+		return ""
+	}
+	return fp
+}
+
+// hookCacheProject records that cwd resolved to project for sessionID, with
+// the fingerprint the caller took BEFORE resolving: an input that changes
+// while the daemon is answering then mismatches on the next read, rather than
+// being blessed by a fingerprint taken afterwards.
+//
+// Only a USABLE answer with a fingerprint is cached — an empty project means
+// the workspace was refused, and caching the refusal would outlive whatever
+// made it. Failures are ignored: a missing cache costs the next prompt one
+// live resolution, nothing more.
 //
 // Written to a temp file and renamed, so a concurrent reader (the prompt hook
 // of a double install) sees the old content or the new, never half a file.
-func hookCacheProject(sessionID, cwd, project string) {
-	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(cwd) == "" || strings.TrimSpace(project) == "" {
+func hookCacheProject(sessionID, cwd, project, fingerprint string) {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(cwd) == "" ||
+		strings.TrimSpace(project) == "" || fingerprint == "" {
 		return
 	}
-	body, err := json.Marshal(hookCachedProjectFile{CWD: cwd, Project: project})
+	body, err := json.Marshal(hookCachedProjectFile{
+		CWD: cwd, Project: project, Fingerprint: fingerprint, ResolvedAt: hookNow(),
+	})
 	if err != nil {
 		return
 	}
@@ -1544,21 +1595,32 @@ func hookCacheProject(sessionID, cwd, project string) {
 }
 
 // hookCachedProject returns the project cached for sessionID when it was
-// resolved for exactly this cwd, and "" otherwise — a miss, which the caller
-// answers with a live resolution.
-func hookCachedProject(sessionID, cwd string) string {
+// resolved for exactly this cwd, within hookProjectCacheTTL, and every
+// detection input still fingerprints the same; "" otherwise — a miss, which
+// the caller answers with a live resolution.
+//
+// fingerprint is the CURRENT fingerprint when this call computed one, so a
+// caller that misses can cache its live answer without re-statting.
+func hookCachedProject(sessionID, cwd string) (project, fingerprint string) {
 	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(cwd) == "" {
-		return ""
+		return "", ""
 	}
 	body, err := os.ReadFile(hookStateFile(sessionID, hookStateProject))
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var cached hookCachedProjectFile
-	if err := json.Unmarshal(body, &cached); err != nil || cached.CWD != cwd {
-		return ""
+	if err := json.Unmarshal(body, &cached); err != nil || cached.CWD != cwd || cached.Fingerprint == "" {
+		return "", ""
 	}
-	return strings.TrimSpace(cached.Project)
+	if age := hookNow().Sub(cached.ResolvedAt); age < 0 || age >= hookProjectCacheTTL {
+		return "", ""
+	}
+	fingerprint = hookProjectFingerprint(cwd)
+	if fingerprint == "" || fingerprint != cached.Fingerprint {
+		return "", fingerprint
+	}
+	return strings.TrimSpace(cached.Project), fingerprint
 }
 
 // urlQueryEscape percent-encodes a query-string value. Kept local (and
