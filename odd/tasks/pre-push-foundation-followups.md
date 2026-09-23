@@ -418,6 +418,26 @@ Close the remaining review findings on `feat/upstream-parity` before the branch 
   schema change regressed nothing already covered there).
   Commit: 7ff48b8.
 
+## CI follow-up (PR #105)
+
+Three tests failed after push; each root-caused, no threshold loosened
+without measurement.
+- `TestRecentSessions_ScalesToThreeHundredSessions` (CI `-race` only):
+  not a regression. modernc SQLite under `-race` is ~20-40x slower;
+  FormatContext measured 65ms plain / 2.3-2.8s race at HEAD, and the test
+  fails under `-race` at 51f6993^ and 6539c20^ too (plans identical
+  HEAD vs 51f6993^; 6539c20^ used idx_mem_session / full scan). The
+  correlated shape measures ~3s plain / ~62s race. Budget now x10 under a
+  `race` build-tag constant; added a plan assertion on the per-session
+  COUNT. Commit c1206bf.
+- `TestAcceptance_MCPHTTPTransport_RoundTrip`: stale 17-tool list, missing
+  `mem_doctor`. Commit eb0cd51.
+- `TestLoop_NonRetryableNoHotLoop`: "0 syncs in 80ms" under full
+  acceptance load; the one window mixed "loop runs" with "no hot loop".
+  Now waits for the first sync, then counts over 80ms. Added
+  `TestLoop_ParkedEntryNotRetriedEachTick` proving FUP-004 parking keeps
+  the intent (parked entry reaches Apply once). Commit fb3d6d7.
+
 ## Next Step
 
 FUP-001 through FUP-005 are all closed. Nothing further planned in this
